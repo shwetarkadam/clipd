@@ -30,7 +30,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let menu_channel = MenuEvent::receiver();
-    let mut daemon: Option<Child> = None;
+
+    // Auto-start daemon on launch
+    let mut daemon: Option<Child> = match start_daemon() {
+        Ok(child) => {
+            item_start.set_enabled(false);
+            item_stop.set_enabled(true);
+            Some(child)
+        }
+        Err(e) => {
+            eprintln!("clipd-ui: failed to auto-start daemon: {e}");
+            None
+        }
+    };
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -46,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     item_start.set_enabled(false);
                                     item_stop.set_enabled(true);
                                 }
-                                Err(e) => eprintln!("❌ Failed to start daemon: {e}"),
+                                Err(e) => eprintln!("clipd-ui: failed to start daemon: {e}"),
                             }
                         }
                     }
@@ -55,22 +67,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let _ = child.kill();
                             let _ = child.wait();
                         }
+                        stop_existing_daemons();
                         item_start.set_enabled(true);
                         item_stop.set_enabled(false);
                     }
                     MENU_ID_SEARCH => {
-                        let exe = resolve_clipd_exe();
-                        let _ = Command::new(exe)
-                            .arg("search")
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .spawn();
+                        open_search_in_terminal();
                     }
                     MENU_ID_QUIT => {
                         if let Some(mut child) = daemon.take() {
                             let _ = child.kill();
                             let _ = child.wait();
                         }
+                        stop_existing_daemons();
                         *control_flow = ControlFlow::Exit;
                     }
                     _ => {}
@@ -81,6 +90,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn start_daemon() -> Result<Child, Box<dyn std::error::Error>> {
+    stop_existing_daemons();
+
     let exe = resolve_clipd_exe();
     eprintln!("clipd-ui: launching daemon from {}", exe.display());
 
@@ -97,6 +108,57 @@ fn start_daemon() -> Result<Child, Box<dyn std::error::Error>> {
         .stderr(Stdio::from(log_file_err))
         .spawn()?;
     Ok(child)
+}
+
+fn open_search_in_terminal() {
+    let exe = resolve_clipd_exe();
+    let exe_str = exe.to_string_lossy().to_string();
+    let cmd = format!("cd /tmp && {} search", exe_str);
+
+    // Try Warp first, then fall back to Terminal.app
+    let warp_script = format!(
+        r#"tell application "Warp"
+  activate
+  delay 0.3
+  tell application "System Events"
+    keystroke "t" using command down
+    delay 0.4
+    keystroke "{}"
+    delay 0.1
+    key code 36
+  end tell
+end tell"#,
+        cmd
+    );
+    let warp_result = Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&warp_script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    if warp_result.map_or(true, |s| !s.success()) {
+        let terminal_script = format!(
+            "tell application \"Terminal\"\n  activate\n  do script \"{}\"\nend tell",
+            cmd
+        );
+        let _ = Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(&terminal_script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
+fn stop_existing_daemons() {
+    // Best-effort cleanup to avoid multiple daemons fighting over hotkeys.
+    let _ = Command::new("/usr/bin/pkill")
+        .arg("-f")
+        .arg("clipd daemon")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn resolve_clipd_exe() -> PathBuf {
