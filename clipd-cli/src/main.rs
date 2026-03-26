@@ -145,9 +145,17 @@ fn main() {
             println!("    clipd clear          Clear history/slots");
             println!();
             println!("  Hotkeys (when daemon is running):");
-            println!("    Cmd+Shift+1..9       Copy to slot");
-            println!("    Cmd+Option+1..9      Paste from slot");
-            println!("    Cmd+Shift+V          Open search TUI");
+            println!();
+            println!("    Option A — Cmd multi-tap:");
+            println!("      Cmd+C × 2  → slot 1    Cmd+V × 2  → paste slot 1");
+            println!("      Cmd+C × 3  → slot 2    Cmd+V × 3  → paste slot 2");
+            println!();
+            println!("    Option B — Ctrl tap (after Cmd+C):");
+            println!("      Ctrl+C × 1 → slot 1    Ctrl+V × 1 → paste slot 1");
+            println!("      Ctrl+C × 2 → slot 2    Ctrl+V × 2 → paste slot 2");
+            println!();
+            println!("    Ctrl+R → search TUI");
+            println!("    (action fires 0.35s after last tap)");
             println!();
             println!("  Run 'clipd --help' for full options.");
         }
@@ -286,8 +294,8 @@ fn cmd_slots() {
     println!("  Start the daemon with: clipd daemon");
     println!();
     println!("  Hotkeys:");
-    println!("    Cmd+Shift+1..9   → copy to slot");
-    println!("    Cmd+Option+1..9  → paste from slot");
+    println!("    Cmd+C × N or Ctrl+C × N  → save to slot");
+    println!("    Cmd+V × N or Ctrl+V × N  → paste from slot");
     println!("  {}", "─".repeat(50));
 }
 

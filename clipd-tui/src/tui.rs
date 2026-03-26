@@ -240,9 +240,9 @@ fn draw_search_bar(f: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .title(" 🔍 Search clips ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(Color::Rgb(100, 180, 255))),
         )
-        .style(Style::default().fg(Color::White));
+        .style(Style::default().fg(Color::Rgb(240, 240, 240)));
 
     f.render_widget(search_bar, area);
 }
@@ -263,11 +263,11 @@ fn draw_clip_list(f: &mut Frame, app: &mut App, area: Rect) {
                 ),
                 Span::styled(
                     truncate_str(&clip.preview, (area.width as usize).saturating_sub(16)),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(Color::Rgb(220, 220, 220)),
                 ),
                 Span::styled(
                     format!(" {}", time_str),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Rgb(100, 180, 255)),
                 ),
             ]);
 
@@ -288,12 +288,12 @@ fn draw_clip_list(f: &mut Frame, app: &mut App, area: Rect) {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue)),
+                .border_style(Style::default().fg(Color::Rgb(80, 140, 220))),
         )
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
-                .fg(Color::White)
+                .bg(Color::Rgb(50, 80, 140))
+                .fg(Color::Rgb(255, 255, 255))
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -312,11 +312,11 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
         );
 
         let content_color = match clip.content_type {
-            ContentType::Code => Color::Green,
-            ContentType::Url => Color::Cyan,
-            ContentType::Email => Color::Yellow,
-            ContentType::Path => Color::Magenta,
-            _ => Color::White,
+            ContentType::Code => Color::Rgb(140, 220, 140),
+            ContentType::Url => Color::Rgb(100, 200, 255),
+            ContentType::Email => Color::Rgb(255, 220, 100),
+            ContentType::Path => Color::Rgb(200, 150, 255),
+            _ => Color::Rgb(230, 230, 230),
         };
 
         (
@@ -328,7 +328,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
         (
             " Preview ".to_string(),
             "No clip selected".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(100, 100, 100)),
         )
     };
 
@@ -337,7 +337,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta)),
+                .border_style(Style::default().fg(Color::Rgb(160, 100, 220))),
         )
         .style(style)
         .wrap(Wrap { trim: false });
@@ -347,14 +347,27 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let status = if let Some(ref msg) = app.copied_message {
-        msg.clone()
+        Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Rgb(100, 220, 100))))
     } else {
-        " ↑↓ Navigate │ Enter Copy │ Ctrl+D Delete │ Ctrl+U Clear │ Esc Quit".to_string()
+        Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(100, 180, 255))),
+            Span::styled("Navigate", Style::default().fg(Color::Rgb(170, 170, 170))),
+            Span::styled(" │ ", Style::default().fg(Color::Rgb(80, 80, 80))),
+            Span::styled("Enter ", Style::default().fg(Color::Rgb(100, 180, 255))),
+            Span::styled("Copy", Style::default().fg(Color::Rgb(170, 170, 170))),
+            Span::styled(" │ ", Style::default().fg(Color::Rgb(80, 80, 80))),
+            Span::styled("Ctrl+D ", Style::default().fg(Color::Rgb(100, 180, 255))),
+            Span::styled("Delete", Style::default().fg(Color::Rgb(170, 170, 170))),
+            Span::styled(" │ ", Style::default().fg(Color::Rgb(80, 80, 80))),
+            Span::styled("Ctrl+U ", Style::default().fg(Color::Rgb(100, 180, 255))),
+            Span::styled("Clear", Style::default().fg(Color::Rgb(170, 170, 170))),
+            Span::styled(" │ ", Style::default().fg(Color::Rgb(80, 80, 80))),
+            Span::styled("Esc ", Style::default().fg(Color::Rgb(100, 180, 255))),
+            Span::styled("Quit", Style::default().fg(Color::Rgb(170, 170, 170))),
+        ])
     };
 
-    let status_bar = Paragraph::new(status)
-        .style(Style::default().fg(Color::DarkGray));
-
+    let status_bar = Paragraph::new(status);
     f.render_widget(status_bar, area);
 }
 
@@ -363,15 +376,15 @@ fn format_relative_time(dt: &chrono::DateTime<Utc>) -> String {
     let diff = now.signed_duration_since(*dt);
 
     if diff.num_seconds() < 60 {
-        "now".to_string()
+        "just now".to_string()
     } else if diff.num_minutes() < 60 {
-        format!("{}m", diff.num_minutes())
+        format!("{}m ago", diff.num_minutes())
     } else if diff.num_hours() < 24 {
-        format!("{}h", diff.num_hours())
+        format!("{}h ago", diff.num_hours())
     } else if diff.num_days() < 7 {
-        format!("{}d", diff.num_days())
+        format!("{}d ago", diff.num_days())
     } else {
-        format!("{}w", diff.num_weeks())
+        format!("{}w ago", diff.num_weeks())
     }
 }
 
