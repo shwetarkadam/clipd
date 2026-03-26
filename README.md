@@ -15,6 +15,10 @@ This is fine for simple tasks. But the moment you're doing anything real — fil
 clipd fixes this.
 
 ---
+🎬 See how clipd lets you copy multiple things and paste any of them instantly:
+
+
+---
 
 ## Multi-Slot Clipboard
 
