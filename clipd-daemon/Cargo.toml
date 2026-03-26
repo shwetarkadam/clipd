@@ -1,0 +1,14 @@
+[package]
+name = "clipd-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clipd-core = { workspace = true }
+arboard = { workspace = true }
+global-hotkey = "0.6"
+enigo = "0.2"
+ctrlc = "3"
+log = "0.4"
+env_logger = "0.11"

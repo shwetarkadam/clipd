@@ -1,0 +1,19 @@
+[package]
+name = "clipd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AI clipboard daemon for developers"
+
+[[bin]]
+name = "clipd"
+path = "src/main.rs"
+
+[dependencies]
+clipd-core = { workspace = true }
+clipd-daemon = { workspace = true }
+clipd-tui = { path = "../clipd-tui" }
+chrono = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"

@@ -1,0 +1,15 @@
+[package]
+name = "clipd-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Menu bar UI launcher for clipd daemon"
+
+[[bin]]
+name = "clipd-ui"
+path = "src/main.rs"
+
+[dependencies]
+tao = "0.30"
+tray-icon = "0.19"
+dirs = "5"

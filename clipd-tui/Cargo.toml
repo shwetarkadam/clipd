@@ -1,0 +1,15 @@
+[package]
+name = "clipd-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clipd-core = { workspace = true }
+arboard = { workspace = true }
+chrono = { workspace = true }
+ratatui = "0.29"
+crossterm = "0.28"
+fuzzy-matcher = "0.3"
+unicode-width = "0.2"
+log = "0.4"
