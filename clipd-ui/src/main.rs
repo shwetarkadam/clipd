@@ -4,12 +4,13 @@ use std::process::{Child, Command, Stdio};
 
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoop};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, CheckMenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 
 const MENU_ID_START: &str = "start";
 const MENU_ID_STOP: &str = "stop";
 const MENU_ID_SEARCH: &str = "search";
+const MENU_ID_TUI_MODE: &str = "tui_mode";
 const MENU_ID_QUIT: &str = "quit";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,9 +20,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let item_start = MenuItem::with_id(MENU_ID_START, "Start clipd daemon", true, None);
     let item_stop = MenuItem::with_id(MENU_ID_STOP, "Stop clipd daemon", false, None);
     let item_search = MenuItem::with_id(MENU_ID_SEARCH, "Open clipd search", true, None);
+    let item_tui_mode = CheckMenuItem::with_id(
+        MENU_ID_TUI_MODE,
+        "Developer mode (TUI)",
+        true,
+        load_tui_mode(),
+        None,
+    );
     let item_quit = MenuItem::with_id(MENU_ID_QUIT, "Quit clipd UI", true, None);
 
-    menu.append_items(&[&item_start, &item_stop, &item_search, &item_quit])?;
+    menu.append(&item_start)?;
+    menu.append(&item_stop)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&item_search)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&item_tui_mode)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&item_quit)?;
 
     let _tray_icon = TrayIconBuilder::new()
         .with_tooltip("clipd ui")
@@ -72,7 +87,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         item_stop.set_enabled(false);
                     }
                     MENU_ID_SEARCH => {
-                        open_search_in_terminal();
+                        if item_tui_mode.is_checked() {
+                            open_search_in_terminal();
+                        } else {
+                            open_gui_search();
+                        }
+                    }
+                    MENU_ID_TUI_MODE => {
+                        save_tui_mode(item_tui_mode.is_checked());
                     }
                     MENU_ID_QUIT => {
                         if let Some(mut child) = daemon.take() {
@@ -89,25 +111,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 }
 
-fn start_daemon() -> Result<Child, Box<dyn std::error::Error>> {
-    stop_existing_daemons();
+// ── TUI mode persistence ──
 
-    let exe = resolve_clipd_exe();
-    eprintln!("clipd-ui: launching daemon from {}", exe.display());
+fn tui_mode_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("clipd")
+        .join("use_tui")
+}
 
-    let log_path = daemon_log_path();
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let log_file_err = log_file.try_clone()?;
+fn load_tui_mode() -> bool {
+    tui_mode_path().exists()
+}
 
-    let child = Command::new(exe)
-        .arg("daemon")
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file_err))
-        .spawn()?;
-    Ok(child)
+fn save_tui_mode(enabled: bool) {
+    let path = tui_mode_path();
+    if enabled {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&path, "true").ok();
+    } else {
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+// ── Launch search UIs ──
+
+fn open_gui_search() {
+    let exe = resolve_clipd_gui_exe();
+    eprintln!("clipd-ui: opening GUI search from {}", exe.display());
+    let _ = Command::new(&exe)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn open_search_in_terminal() {
@@ -115,7 +152,6 @@ fn open_search_in_terminal() {
     let exe_str = exe.to_string_lossy().to_string();
     let cmd = format!("cd /tmp && {} search", exe_str);
 
-    // Try Warp first, then fall back to Terminal.app
     let warp_script = format!(
         r#"tell application "Warp"
   activate
@@ -151,8 +187,30 @@ end tell"#,
     }
 }
 
+// ── Daemon management ──
+
+fn start_daemon() -> Result<Child, Box<dyn std::error::Error>> {
+    stop_existing_daemons();
+
+    let exe = resolve_clipd_exe();
+    eprintln!("clipd-ui: launching daemon from {}", exe.display());
+
+    let log_path = daemon_log_path();
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let log_file_err = log_file.try_clone()?;
+
+    let child = Command::new(exe)
+        .arg("daemon")
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err))
+        .spawn()?;
+    Ok(child)
+}
+
 fn stop_existing_daemons() {
-    // Best-effort cleanup to avoid multiple daemons fighting over hotkeys.
     let _ = Command::new("/usr/bin/pkill")
         .arg("-f")
         .arg("clipd daemon")
@@ -161,31 +219,44 @@ fn stop_existing_daemons() {
         .status();
 }
 
+// ── Path resolution ──
+
 fn resolve_clipd_exe() -> PathBuf {
-    // 1) Prefer workspace dev build (cargo run flow)
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let dev_clipd = workspace_root.join("target/debug/clipd");
-    if dev_clipd.exists() {
-        return dev_clipd;
-    }
 
-    // 2) Then workspace release build
-    let rel_clipd = workspace_root.join("target/release/clipd");
-    if rel_clipd.exists() {
-        return rel_clipd;
-    }
+    let dev = workspace_root.join("target/debug/clipd");
+    if dev.exists() { return dev; }
 
-    // 3) Then installed cargo binary
+    let rel = workspace_root.join("target/release/clipd");
+    if rel.exists() { return rel; }
+
     let cargo_bin = PathBuf::from("/Users/shwetakadam/.cargo/bin/clipd");
-    if cargo_bin.exists() {
-        return cargo_bin;
+    if cargo_bin.exists() { return cargo_bin; }
+
+    PathBuf::from("clipd")
+}
+
+fn resolve_clipd_gui_exe() -> PathBuf {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let dev = workspace_root.join("target/debug/clipd-gui");
+    if dev.exists() { return dev; }
+
+    let rel = workspace_root.join("target/release/clipd-gui");
+    if rel.exists() { return rel; }
+
+    if let Some(home) = dirs::home_dir() {
+        let cargo_bin = home.join(".cargo/bin/clipd-gui");
+        if cargo_bin.exists() { return cargo_bin; }
     }
 
-    // 4) Fallback to PATH
-    PathBuf::from("clipd")
+    PathBuf::from("clipd-gui")
 }
 
 fn daemon_log_path() -> PathBuf {
@@ -201,7 +272,6 @@ fn make_icon() -> Icon {
     let height = 16u32;
     let mut rgba = vec![0u8; (width * height * 4) as usize];
 
-    // Simple paperclip-like white glyph on transparent background.
     for y in 3..13 {
         for x in 6..10 {
             if x == 6 || x == 9 || y == 3 || y == 12 {

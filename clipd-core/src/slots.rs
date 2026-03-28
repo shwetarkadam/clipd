@@ -59,6 +59,21 @@ impl SlotManager {
         Ok(())
     }
 
+    /// Push new content into the history ring.
+    /// Shifts slots 1..8 down to 2..9 (oldest in slot 9 is evicted),
+    /// inserts the new content into slot 1 (most recent) and slot 0 (OS mirror).
+    pub fn push_history(&self, content: String) -> Result<(), String> {
+        let mut slots = self.slots.write().map_err(|e| e.to_string())?;
+        for s in (1..9).rev() {
+            if let Some(val) = slots.remove(&s) {
+                slots.insert(s + 1, val);
+            }
+        }
+        slots.insert(1, content.clone());
+        slots.insert(0, content);
+        Ok(())
+    }
+
     /// Check if a slot has content.
     pub fn has_content(&self, slot: u8) -> bool {
         self.slots

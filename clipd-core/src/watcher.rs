@@ -24,7 +24,13 @@ impl ClipWatcher {
 
     /// Start watching the clipboard in a loop, sending events to the channel.
     /// This blocks the current thread — run it in a spawned thread.
-    pub fn watch(&self, sender: mpsc::Sender<ClipEvent>, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    pub fn watch(
+        &self,
+        sender: mpsc::Sender<ClipEvent>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        suppress: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        refresh_hash: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
         let mut last_hash = String::new();
 
         // Try to create the clipboard handle
@@ -42,6 +48,26 @@ impl ClipWatcher {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 log::info!("Clipboard watcher stopping");
                 break;
+            }
+
+            // Don't read clipboard while our own paste operations are in progress.
+            // Must be checked BEFORE get_text() to avoid a race where the paste
+            // function clears suppress between our read and our check.
+            if suppress.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(self.poll_interval);
+                continue;
+            }
+
+            // The daemon mutated the clipboard (e.g. restored slot 1 after multi-tap copy).
+            // Re-sync last_hash so we don't emit a duplicate NewClip.
+            if refresh_hash.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                if let Ok(text) = clipboard.get_text() {
+                    if !text.is_empty() {
+                        last_hash = Self::hash_content(&text);
+                    }
+                }
+                std::thread::sleep(self.poll_interval);
+                continue;
             }
 
             // Poll for text content

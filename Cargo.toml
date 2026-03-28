@@ -6,6 +6,7 @@ members = [
     "clipd-tui",
     "clipd-cli",
     "clipd-ui",
+    "clipd-gui",
 ]
 
 [workspace.package]

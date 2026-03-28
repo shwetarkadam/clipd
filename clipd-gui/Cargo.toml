@@ -1,0 +1,16 @@
+[package]
+name = "clipd-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native GUI clipboard viewer for clipd"
+
+[[bin]]
+name = "clipd-gui"
+path = "src/main.rs"
+
+[dependencies]
+clipd-core = { workspace = true }
+eframe = "0.30"
+arboard = { workspace = true }
+chrono = { workspace = true }

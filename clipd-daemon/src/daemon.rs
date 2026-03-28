@@ -35,6 +35,12 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let stop_watcher = stop.clone();
     let stop_hotkey = stop.clone();
 
+    let suppress = Arc::new(AtomicBool::new(false));
+    let suppress_watcher = suppress.clone();
+
+    let refresh_hash = Arc::new(AtomicBool::new(false));
+    let refresh_hash_watcher = refresh_hash.clone();
+
     let stop_ctrlc = stop.clone();
     setup_ctrlc(stop_ctrlc);
 
@@ -44,7 +50,7 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let watcher_handle = std::thread::Builder::new()
         .name("clipd-watcher".into())
         .spawn(move || {
-            watcher.watch(clip_tx, stop_watcher);
+            watcher.watch(clip_tx, stop_watcher, suppress_watcher, refresh_hash_watcher);
         })?;
 
     // ── Store Writer Thread ──
@@ -114,13 +120,15 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("  ⌨️  Hotkeys (two ways to save/paste):");
     println!();
-    println!("     Option A — Cmd multi-tap:");
-    println!("       Cmd+C × 2  → save to slot 1    Cmd+V × 2  → paste slot 1");
-    println!("       Cmd+C × 3  → save to slot 2    Cmd+V × 3  → paste slot 2");
+    println!("     Cmd+C        → auto-saved to slot 1 (most recent)");
     println!();
-    println!("     Option B — Ctrl tap (after normal Cmd+C):");
-    println!("       Ctrl+C × 1 → save to slot 1    Ctrl+V × 1 → paste slot 1");
-    println!("       Ctrl+C × 2 → save to slot 2    Ctrl+V × 2 → paste slot 2");
+    println!("     Option A — Cmd multi-tap:");
+    println!("       Cmd+C × 2  → save to slot 2    Cmd+V × 2  → paste slot 2");
+    println!("       Cmd+C × 3  → save to slot 3    Cmd+V × 3  → paste slot 3");
+    println!();
+    println!("     Option B — Ctrl tap:");
+    println!("       Ctrl+V × 1 → paste slot 1      Ctrl+C × 1 → save to slot 1");
+    println!("       Ctrl+V × 2 → paste slot 2      Ctrl+C × 2 → save to slot 2");
     println!();
     println!("     Ctrl+R → open search TUI");
     println!("     (action fires 0.35s after last tap)");
@@ -164,14 +172,14 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
                         cmd_c_taps = cmd_c_taps.saturating_add(1);
                         cmd_c_deadline = Some(Instant::now() + TAP_WINDOW);
                         if cmd_c_taps >= 2 {
-                            log::info!("⌨️  Cmd+C tap #{} → slot {}", cmd_c_taps, cmd_c_taps - 1);
+                            log::info!("⌨️  Cmd+C tap #{} → slot {}", cmd_c_taps, cmd_c_taps);
                         }
                     }
                     HotkeyTick::CmdVTap => {
                         cmd_v_taps = cmd_v_taps.saturating_add(1);
                         cmd_v_deadline = Some(Instant::now() + TAP_WINDOW);
                         if cmd_v_taps >= 2 {
-                            log::info!("⌨️  Cmd+V tap #{} → slot {}", cmd_v_taps, cmd_v_taps - 1);
+                            log::info!("⌨️  Cmd+V tap #{} → slot {}", cmd_v_taps, cmd_v_taps);
                         }
                     }
                     HotkeyTick::CtrlCTap => {
@@ -192,24 +200,29 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
 
             let now = Instant::now();
 
-            // Cmd+C: 2+ taps → save to slot (taps-1)
+            // Cmd+C: 1 tap → auto-save to slot 1 (most recent),
+            //        2+ taps → save to slot N, then restore clipboard to slot 1
             if let Some(dl) = cmd_c_deadline {
                 if now >= dl && cmd_c_taps > 0 {
-                    if cmd_c_taps >= 2 {
-                        let slot = (cmd_c_taps - 1).min(9);
+                    if cmd_c_taps == 1 {
+                        execute_copy(1, &hotkey_slot_mgr);
+                        log::info!("⌨️  Cmd+C → auto-saved to slot 1");
+                    } else {
+                        let slot = cmd_c_taps.min(9);
                         execute_copy(slot, &hotkey_slot_mgr);
+                        restore_clipboard_to_slot(&hotkey_slot_mgr, &suppress, &refresh_hash, 1);
                     }
                     cmd_c_taps = 0;
                     cmd_c_deadline = None;
                 }
             }
 
-            // Cmd+V: 2+ taps → undo normal pastes, paste from slot (taps-1)
+            // Cmd+V: 2+ taps → undo normal pastes, paste from slot (taps)
             if let Some(dl) = cmd_v_deadline {
                 if now >= dl && cmd_v_taps > 0 {
                     if cmd_v_taps >= 2 {
-                        let slot = (cmd_v_taps - 1).min(9);
-                        execute_undo_paste(slot, cmd_v_taps, &hotkey_slot_mgr);
+                        let slot = cmd_v_taps.min(9);
+                        execute_undo_paste(slot, cmd_v_taps, &hotkey_slot_mgr, &suppress);
                     }
                     cmd_v_taps = 0;
                     cmd_v_deadline = None;
@@ -230,7 +243,7 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(dl) = ctrl_v_deadline {
                 if now >= dl && ctrl_v_taps > 0 {
                     let slot = ctrl_v_taps.min(9);
-                    execute_direct_paste(slot, &hotkey_slot_mgr);
+                    execute_direct_paste(slot, &hotkey_slot_mgr, &suppress);
                     ctrl_v_taps = 0;
                     ctrl_v_deadline = None;
                 }
@@ -252,7 +265,7 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         match action {
                             FinalAction::CopyToSlot(s) => execute_copy(*s, &hotkey_slot_mgr),
-                            FinalAction::PasteFromSlot(s) => execute_direct_paste(*s, &hotkey_slot_mgr),
+                            FinalAction::PasteFromSlot(s) => execute_direct_paste(*s, &hotkey_slot_mgr, &suppress),
                             FinalAction::OpenTui => open_tui_search(),
                         }
                     }
@@ -291,6 +304,27 @@ enum FinalAction {
 
 // ── Action executors ──
 
+/// After a multi-tap copy, restore the OS clipboard to the given slot's content
+/// so that a normal Cmd+V pastes the "first" copy rather than the multi-tap content.
+fn restore_clipboard_to_slot(
+    mgr: &SlotManager,
+    suppress: &Arc<AtomicBool>,
+    refresh_hash: &Arc<AtomicBool>,
+    slot: u8,
+) {
+    if let Ok(Some(content)) = mgr.get_slot(slot) {
+        suppress.store(true, Ordering::SeqCst);
+        if let Ok(mut cb) = Clipboard::new() {
+            if let Err(e) = cb.set_text(&content) {
+                log::warn!("Failed to restore clipboard to slot {}: {}", slot, e);
+            }
+        }
+        refresh_hash.store(true, Ordering::SeqCst);
+        suppress.store(false, Ordering::SeqCst);
+        log::debug!("Clipboard restored to slot {} content", slot);
+    }
+}
+
 fn execute_copy(slot: u8, mgr: &SlotManager) {
     let mut cb = match Clipboard::new() {
         Ok(c) => c,
@@ -306,13 +340,19 @@ fn execute_copy(slot: u8, mgr: &SlotManager) {
 }
 
 /// Cmd+V multi-tap path: system already pasted N times, so undo then re-paste slot content.
-fn execute_undo_paste(slot: u8, tap_count: u8, mgr: &SlotManager) {
+/// Suppresses the watcher and restores the original clipboard afterwards.
+fn execute_undo_paste(slot: u8, tap_count: u8, mgr: &SlotManager, suppress: &Arc<AtomicBool>) {
     if let Ok(Some(content)) = mgr.get_slot(slot) {
         let mut cb = match Clipboard::new() {
             Ok(c) => c,
             Err(e) => { log::warn!("Paste from slot {} failed: {}", slot, e); return; }
         };
+
+        let original = cb.get_text().ok();
+        suppress.store(true, Ordering::SeqCst);
+
         if let Err(e) = cb.set_text(&content) {
+            suppress.store(false, Ordering::SeqCst);
             log::warn!("Paste from slot {} failed: {}", slot, e);
             return;
         }
@@ -323,19 +363,40 @@ fn execute_undo_paste(slot: u8, tap_count: u8, mgr: &SlotManager) {
         } else {
             log::info!("📋 Pasted from slot {}: {}", slot, truncate(&content, 40));
         }
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        let clipboard_unchanged = cb.get_text()
+            .map(|current| current == content)
+            .unwrap_or(false);
+        if clipboard_unchanged {
+            if let Some(ref orig) = original {
+                if let Err(e) = cb.set_text(orig) {
+                    log::warn!("Failed to restore clipboard after paste: {}", e);
+                }
+            }
+        }
+
+        suppress.store(false, Ordering::SeqCst);
     } else {
         log::info!("📋 Slot {} is empty", slot);
     }
 }
 
 /// Ctrl+V path: nothing was pasted by the system, so just set clipboard and send Cmd+V.
-fn execute_direct_paste(slot: u8, mgr: &SlotManager) {
+/// Suppresses the watcher and restores the original clipboard afterwards.
+fn execute_direct_paste(slot: u8, mgr: &SlotManager, suppress: &Arc<AtomicBool>) {
     if let Ok(Some(content)) = mgr.get_slot(slot) {
         let mut cb = match Clipboard::new() {
             Ok(c) => c,
             Err(e) => { log::warn!("Paste from slot {} failed: {}", slot, e); return; }
         };
+
+        let original = cb.get_text().ok();
+        suppress.store(true, Ordering::SeqCst);
+
         if let Err(e) = cb.set_text(&content) {
+            suppress.store(false, Ordering::SeqCst);
             log::warn!("Paste from slot {} failed: {}", slot, e);
             return;
         }
@@ -355,6 +416,24 @@ end tell"#;
                 log::info!("Slot {} content is on clipboard — press Cmd+V", slot);
             }
         }
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Only restore if the user hasn't done Cmd+C during the paste window.
+        // If the clipboard changed, someone else (the user) wrote new content
+        // and we must not overwrite it.
+        let clipboard_unchanged = cb.get_text()
+            .map(|current| current == content)
+            .unwrap_or(false);
+        if clipboard_unchanged {
+            if let Some(ref orig) = original {
+                if let Err(e) = cb.set_text(orig) {
+                    log::warn!("Failed to restore clipboard after paste: {}", e);
+                }
+            }
+        }
+
+        suppress.store(false, Ordering::SeqCst);
     } else {
         log::info!("📋 Slot {} is empty", slot);
     }

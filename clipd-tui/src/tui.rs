@@ -1,5 +1,5 @@
 use chrono::Utc;
-use clipd_core::{ClipEntry, ClipStore, ContentType};
+use clipd_core::{load_theme, save_theme, ClipEntry, ClipStore, ContentType, Rgb, Theme};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -12,22 +12,26 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::io;
 
-/// Application state for the TUI.
+fn color(c: Rgb) -> Color {
+    Color::Rgb(c.0, c.1, c.2)
+}
+
 struct App {
     store: ClipStore,
     clips: Vec<ClipEntry>,
-    filtered: Vec<usize>, // indices into clips
+    filtered: Vec<usize>,
     search_input: String,
     list_state: ListState,
     selected_clip: Option<ClipEntry>,
     should_quit: bool,
-    copied_message: Option<String>,
+    status_message: Option<(String, Color)>,
     matcher: SkimMatcherV2,
+    theme: Theme,
 }
 
 impl App {
@@ -39,6 +43,7 @@ impl App {
             list_state.select(Some(0));
         }
         let selected_clip = clips.first().cloned();
+        let theme = load_theme();
 
         App {
             store,
@@ -48,8 +53,9 @@ impl App {
             list_state,
             selected_clip,
             should_quit: false,
-            copied_message: None,
+            status_message: None,
             matcher: SkimMatcherV2::default(),
+            theme,
         }
     }
 
@@ -74,20 +80,19 @@ impl App {
                 .collect();
         }
 
-        // Reset selection
         if !self.filtered.is_empty() {
             self.list_state.select(Some(0));
-            self.update_selected();
+            self.sync_selection();
         } else {
             self.list_state.select(None);
             self.selected_clip = None;
         }
     }
 
-    fn update_selected(&mut self) {
-        if let Some(sel_idx) = self.list_state.selected() {
-            if let Some(&clip_idx) = self.filtered.get(sel_idx) {
-                self.selected_clip = self.clips.get(clip_idx).cloned();
+    fn sync_selection(&mut self) {
+        if let Some(sel) = self.list_state.selected() {
+            if let Some(&idx) = self.filtered.get(sel) {
+                self.selected_clip = self.clips.get(idx).cloned();
             }
         }
     }
@@ -97,33 +102,44 @@ impl App {
             return;
         }
         let len = self.filtered.len() as i32;
-        let current = self.list_state.selected().unwrap_or(0) as i32;
-        let next = (current + delta).clamp(0, len - 1) as usize;
+        let cur = self.list_state.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, len - 1) as usize;
         self.list_state.select(Some(next));
-        self.update_selected();
+        self.sync_selection();
     }
 
-    fn copy_selected_to_clipboard(&mut self) -> Option<String> {
+    fn copy_selected(&mut self) -> bool {
         if let Some(ref clip) = self.selected_clip {
             if let Ok(mut cb) = arboard::Clipboard::new() {
                 if cb.set_text(&clip.content).is_ok() {
-                    return Some(clip.preview.clone());
+                    return true;
                 }
             }
         }
-        None
+        false
     }
 
     fn delete_selected(&mut self) {
         if let Some(ref clip) = self.selected_clip {
             let id = clip.id;
             if self.store.delete(id).unwrap_or(false) {
-                // Reload clips
                 self.clips = self.store.get_recent(500).unwrap_or_default();
                 self.filter_clips();
-                self.copied_message = Some("🗑️  Deleted".to_string());
+                self.status_message = Some((
+                    "🗑️  Deleted".into(),
+                    color(self.theme.colors().green),
+                ));
             }
         }
+    }
+
+    fn cycle_theme(&mut self) {
+        self.theme = self.theme.next();
+        save_theme(self.theme);
+        self.status_message = Some((
+            format!("Theme: {}", self.theme.label()),
+            color(self.theme.colors().accent),
+        ));
     }
 }
 
@@ -132,7 +148,6 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = ClipStore::default_path();
     let store = ClipStore::new(&db_path)?;
 
-    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -141,7 +156,6 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App::new(store);
 
-    // Main loop
     loop {
         terminal.draw(|f| draw_ui(f, &mut app))?;
 
@@ -149,31 +163,24 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        // Handle input
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                app.copied_message = None; // Clear status on any key
+                app.status_message = None;
 
                 match key.code {
-                    KeyCode::Esc => {
-                        app.should_quit = true;
-                    }
+                    KeyCode::Esc => app.should_quit = true,
                     KeyCode::Enter => {
-                        if let Some(_preview) = app.copy_selected_to_clipboard() {
+                        if app.copy_selected() {
                             app.should_quit = true;
                         }
                     }
-                    KeyCode::Up => {
-                        app.move_selection(-1);
-                    }
-                    KeyCode::Down => {
-                        app.move_selection(1);
-                    }
+                    KeyCode::Up => app.move_selection(-1),
+                    KeyCode::Down => app.move_selection(1),
+                    KeyCode::Tab => app.cycle_theme(),
                     KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.delete_selected();
                     }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Clear search
                         app.search_input.clear();
                         app.filter_clips();
                     }
@@ -194,81 +201,75 @@ pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-
     Ok(())
 }
 
 fn draw_ui(f: &mut Frame, app: &mut App) {
-    let size = f.area();
-
-    // Main layout: search bar, then content area
-    let main_chunks = Layout::default()
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Search bar
-            Constraint::Min(10),   // Content
-            Constraint::Length(2), // Status bar
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(2),
         ])
-        .split(size);
+        .split(f.area());
 
-    draw_search_bar(f, app, main_chunks[0]);
+    draw_search(f, app, chunks[0]);
 
-    // Content: clip list (left) + preview (right)
-    let content_chunks = Layout::default()
+    let content = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(45),
-            Constraint::Percentage(55),
-        ])
-        .split(main_chunks[1]);
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(chunks[1]);
 
-    draw_clip_list(f, app, content_chunks[0]);
-    draw_preview(f, app, content_chunks[1]);
-    draw_status_bar(f, app, main_chunks[2]);
+    draw_list(f, app, content[0]);
+    draw_preview(f, app, content[1]);
+    draw_status(f, app, chunks[2]);
 }
 
-fn draw_search_bar(f: &mut Frame, app: &App, area: Rect) {
-    let cursor_char = "│";
-    let display = format!(" {}{}", app.search_input, cursor_char);
+fn draw_search(f: &mut Frame, app: &App, area: Rect) {
+    let c = app.theme.colors();
+    let cursor = "│";
+    let text = format!(" {}{}", app.search_input, cursor);
 
-    let search_bar = Paragraph::new(display)
-        .block(
-            Block::default()
-                .title(" 🔍 Search clips ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(100, 180, 255))),
-        )
-        .style(Style::default().fg(Color::Rgb(240, 240, 240)));
+    let block = Block::default()
+        .title(" 🔍 Search clips ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(color(c.accent)));
 
-    f.render_widget(search_bar, area);
+    let widget = Paragraph::new(text)
+        .block(block)
+        .style(Style::default().fg(color(c.text)));
+
+    f.render_widget(widget, area);
 }
 
-fn draw_clip_list(f: &mut Frame, app: &mut App, area: Rect) {
+fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
+    let c = app.theme.colors();
+    let inner_w = (area.width as usize).saturating_sub(4);
+
     let items: Vec<ListItem> = app
         .filtered
         .iter()
         .map(|&idx| {
             let clip = &app.clips[idx];
-            let time_str = format_relative_time(&clip.timestamp);
             let icon = clip.content_type.icon();
+            let time = relative_time(&clip.timestamp);
+
+            let time_w = time.chars().count();
+            let max_preview = inner_w.saturating_sub(time_w + 4);
+            let preview = truncate(&clip.preview, max_preview);
+            let preview_w = preview.chars().count();
+            let gap = inner_w.saturating_sub(preview_w + time_w + 2);
 
             let line = Line::from(vec![
-                Span::styled(
-                    format!("{} ", icon),
-                    Style::default(),
-                ),
-                Span::styled(
-                    truncate_str(&clip.preview, (area.width as usize).saturating_sub(16)),
-                    Style::default().fg(Color::Rgb(220, 220, 220)),
-                ),
-                Span::styled(
-                    format!(" {}", time_str),
-                    Style::default().fg(Color::Rgb(100, 180, 255)),
-                ),
+                Span::styled(format!("{} ", icon), Style::default()),
+                Span::styled(preview, Style::default().fg(color(c.text))),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(time, Style::default().fg(color(c.accent))),
             ]);
 
             ListItem::new(line)
@@ -288,12 +289,13 @@ fn draw_clip_list(f: &mut Frame, app: &mut App, area: Rect) {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(80, 140, 220))),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(color(c.border))),
         )
         .highlight_style(
             Style::default()
-                .bg(Color::Rgb(50, 80, 140))
-                .fg(Color::Rgb(255, 255, 255))
+                .bg(color(c.bg_selected))
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -302,96 +304,107 @@ fn draw_clip_list(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
-    let (title, content, style) = if let Some(ref clip) = app.selected_clip {
-        let type_str = format!(
-            "{} {} | {} | id:{}",
+    let c = app.theme.colors();
+
+    if let Some(ref clip) = app.selected_clip {
+        let source = clip.source_app.as_deref().unwrap_or("unknown");
+        let title = format!(
+            " {} {} | {} | id:{} ",
             clip.content_type.icon(),
             clip.content_type.as_str(),
-            clip.source_app.as_deref().unwrap_or("unknown"),
-            clip.id
+            source,
+            clip.id,
         );
 
         let content_color = match clip.content_type {
-            ContentType::Code => Color::Rgb(140, 220, 140),
-            ContentType::Url => Color::Rgb(100, 200, 255),
-            ContentType::Email => Color::Rgb(255, 220, 100),
-            ContentType::Path => Color::Rgb(200, 150, 255),
-            _ => Color::Rgb(230, 230, 230),
+            ContentType::Code => color(c.code),
+            ContentType::Url => color(c.url),
+            ContentType::Email => color(c.email),
+            ContentType::Path => color(c.path),
+            _ => color(c.text),
         };
 
-        (
-            format!(" {} ", type_str),
-            clip.content.clone(),
-            Style::default().fg(content_color),
-        )
+        let widget = Paragraph::new(clip.content.clone())
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(color(c.accent2))),
+            )
+            .style(Style::default().fg(content_color))
+            .wrap(Wrap { trim: false });
+
+        f.render_widget(widget, area);
     } else {
-        (
-            " Preview ".to_string(),
-            "No clip selected".to_string(),
-            Style::default().fg(Color::Rgb(100, 100, 100)),
-        )
-    };
+        let widget = Paragraph::new("  No clip selected")
+            .block(
+                Block::default()
+                    .title(" Preview ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(color(c.border))),
+            )
+            .style(Style::default().fg(color(c.overlay)));
 
-    let preview = Paragraph::new(content)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(160, 100, 220))),
-        )
-        .style(style)
-        .wrap(Wrap { trim: false });
-
-    f.render_widget(preview, area);
-}
-
-fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    let status = if let Some(ref msg) = app.copied_message {
-        Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Rgb(100, 220, 100))))
-    } else {
-        Line::from(vec![
-            Span::styled(" ↑↓ ", Style::default().fg(Color::Rgb(100, 180, 255))),
-            Span::styled("Navigate", Style::default().fg(Color::Rgb(170, 170, 170))),
-            Span::styled(" │ ", Style::default().fg(Color::Rgb(80, 80, 80))),
-            Span::styled("Enter ", Style::default().fg(Color::Rgb(100, 180, 255))),
-            Span::styled("Copy", Style::default().fg(Color::Rgb(170, 170, 170))),
-            Span::styled(" │ ", Style::default().fg(Color::Rgb(80, 80, 80))),
-            Span::styled("Ctrl+D ", Style::default().fg(Color::Rgb(100, 180, 255))),
-            Span::styled("Delete", Style::default().fg(Color::Rgb(170, 170, 170))),
-            Span::styled(" │ ", Style::default().fg(Color::Rgb(80, 80, 80))),
-            Span::styled("Ctrl+U ", Style::default().fg(Color::Rgb(100, 180, 255))),
-            Span::styled("Clear", Style::default().fg(Color::Rgb(170, 170, 170))),
-            Span::styled(" │ ", Style::default().fg(Color::Rgb(80, 80, 80))),
-            Span::styled("Esc ", Style::default().fg(Color::Rgb(100, 180, 255))),
-            Span::styled("Quit", Style::default().fg(Color::Rgb(170, 170, 170))),
-        ])
-    };
-
-    let status_bar = Paragraph::new(status);
-    f.render_widget(status_bar, area);
-}
-
-fn format_relative_time(dt: &chrono::DateTime<Utc>) -> String {
-    let now = Utc::now();
-    let diff = now.signed_duration_since(*dt);
-
-    if diff.num_seconds() < 60 {
-        "just now".to_string()
-    } else if diff.num_minutes() < 60 {
-        format!("{}m ago", diff.num_minutes())
-    } else if diff.num_hours() < 24 {
-        format!("{}h ago", diff.num_hours())
-    } else if diff.num_days() < 7 {
-        format!("{}d ago", diff.num_days())
-    } else {
-        format!("{}w ago", diff.num_weeks())
+        f.render_widget(widget, area);
     }
 }
 
-fn truncate_str(s: &str, max: usize) -> String {
-    let cleaned = s.replace('\n', " ").replace('\t', " ");
-    let char_count: usize = cleaned.chars().count();
-    if char_count > max {
+fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+    let c = app.theme.colors();
+    let accent = color(c.accent);
+    let sub = color(c.subtext);
+
+    let line = if let Some((ref msg, col)) = app.status_message {
+        Line::from(Span::styled(
+            format!(" {}", msg),
+            Style::default().fg(col),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(accent)),
+            Span::styled("Navigate", Style::default().fg(sub)),
+            Span::styled("   ", Style::default()),
+            Span::styled("Enter ", Style::default().fg(accent)),
+            Span::styled("Copy", Style::default().fg(sub)),
+            Span::styled("   ", Style::default()),
+            Span::styled("Ctrl+D ", Style::default().fg(accent)),
+            Span::styled("Delete", Style::default().fg(sub)),
+            Span::styled("   ", Style::default()),
+            Span::styled("Tab ", Style::default().fg(accent)),
+            Span::styled("Theme", Style::default().fg(sub)),
+            Span::styled("   ", Style::default()),
+            Span::styled("Esc ", Style::default().fg(accent)),
+            Span::styled("Quit", Style::default().fg(sub)),
+        ])
+    };
+
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn relative_time(dt: &chrono::DateTime<Utc>) -> String {
+    let secs = Utc::now().signed_duration_since(*dt).num_seconds();
+    if secs < 60 {
+        "now".into()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else if secs < 604800 {
+        format!("{}d ago", secs / 86400)
+    } else {
+        format!("{}w ago", secs / 604800)
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+        .collect();
+    let count = cleaned.chars().count();
+    if count > max {
         let end: String = cleaned.chars().take(max.saturating_sub(1)).collect();
         format!("{}…", end)
     } else {
