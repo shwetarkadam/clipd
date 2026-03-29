@@ -26,4 +26,4 @@ sudo mv /tmp/clipd-install/clipd-macos-v0.1.0-alpha/clipd-ui ${INSTALL_DIR}/clip
 # Cleanup
 rm -rf /tmp/clipd.zip /tmp/clipd-install
 
-echo "✅ clipd installed! Run: clipd daemon"
+echo "✅ clipd installed! Run: clipd daemon, then in a new tab run clipd-ui"
