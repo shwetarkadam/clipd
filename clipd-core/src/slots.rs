@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-/// Multi-slot clipboard manager. Slots 0-9 hold text content.
+/// Highest slot index (0 is the OS mirror; numbered slots are 1..=MAX_CLIP_SLOT).
+pub const MAX_CLIP_SLOT: u8 = 30;
+
+/// Multi-slot clipboard manager. Slots 0..=MAX_CLIP_SLOT hold text content.
 /// Slot 0 is the "default" slot (mirrors OS clipboard).
 #[derive(Clone)]
 pub struct SlotManager {
@@ -15,10 +18,10 @@ impl SlotManager {
         }
     }
 
-    /// Copy content into a numbered slot (0-9).
+    /// Copy content into a numbered slot (0..=MAX_CLIP_SLOT).
     pub fn copy_to_slot(&self, slot: u8, content: String) -> Result<(), String> {
-        if slot > 9 {
-            return Err(format!("Slot {} out of range (0-9)", slot));
+        if slot > MAX_CLIP_SLOT {
+            return Err(format!("Slot {} out of range (0-{})", slot, MAX_CLIP_SLOT));
         }
         let mut slots = self.slots.write().map_err(|e| e.to_string())?;
         slots.insert(slot, content);
@@ -27,8 +30,8 @@ impl SlotManager {
 
     /// Get content from a numbered slot.
     pub fn get_slot(&self, slot: u8) -> Result<Option<String>, String> {
-        if slot > 9 {
-            return Err(format!("Slot {} out of range (0-9)", slot));
+        if slot > MAX_CLIP_SLOT {
+            return Err(format!("Slot {} out of range (0-{})", slot, MAX_CLIP_SLOT));
         }
         let slots = self.slots.read().map_err(|e| e.to_string())?;
         Ok(slots.get(&slot).cloned())
@@ -60,11 +63,11 @@ impl SlotManager {
     }
 
     /// Push new content into the history ring.
-    /// Shifts slots 1..8 down to 2..9 (oldest in slot 9 is evicted),
+    /// Shifts slots 1..MAX_CLIP_SLOT-1 down (oldest in slot MAX_CLIP_SLOT is evicted),
     /// inserts the new content into slot 1 (most recent) and slot 0 (OS mirror).
     pub fn push_history(&self, content: String) -> Result<(), String> {
         let mut slots = self.slots.write().map_err(|e| e.to_string())?;
-        for s in (1..9).rev() {
+        for s in (1..MAX_CLIP_SLOT).rev() {
             if let Some(val) = slots.remove(&s) {
                 slots.insert(s + 1, val);
             }
@@ -109,8 +112,8 @@ mod tests {
     #[test]
     fn test_slot_out_of_range() {
         let sm = SlotManager::new();
-        assert!(sm.copy_to_slot(10, "bad".to_string()).is_err());
-        assert!(sm.get_slot(10).is_err());
+        assert!(sm.copy_to_slot(MAX_CLIP_SLOT + 1, "bad".to_string()).is_err());
+        assert!(sm.get_slot(MAX_CLIP_SLOT + 1).is_err());
     }
 
     #[test]

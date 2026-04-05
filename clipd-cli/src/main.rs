@@ -1,6 +1,6 @@
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
-use clipd_core::{ClipStore, ContentType, SearchFilters};
+use clipd_core::{ClipStore, ContentType, SearchFilters, MAX_CLIP_SLOT};
 
 #[derive(Parser)]
 #[command(
@@ -16,7 +16,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the clipd daemon (clipboard watcher + global hotkeys)
+    /// Launch the GUI with built-in daemon (recommended for general users)
+    Gui,
+
+    /// Launch the TUI with built-in daemon (recommended for developers)
+    Tui,
+
+    /// Start the clipd daemon only (headless, no UI)
     Daemon,
 
     /// List recent clipboard entries
@@ -50,7 +56,7 @@ enum Commands {
 
     /// Output a slot's content to stdout (for piping)
     Paste {
-        /// Slot number (0-9)
+        /// Slot number (0–15)
         slot: u8,
     },
 
@@ -85,6 +91,19 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Gui) => {
+            launch_gui();
+        }
+
+        Some(Commands::Tui) => {
+            launch_daemon_background();
+            if let Err(e) = clipd_tui::run_tui() {
+                eprintln!("❌ TUI error: {}", e);
+                std::process::exit(1);
+            }
+            clipd_core::release_daemon_lock();
+        }
+
         Some(Commands::Daemon) => {
             if let Err(e) = clipd_daemon::run_daemon() {
                 eprintln!("❌ Daemon error: {}", e);
@@ -131,35 +150,8 @@ fn main() {
         }
 
         None => {
-            // No subcommand → show help with branding
-            println!("  🧷 clipd v0.1.0 — AI clipboard for developers");
-            println!();
-            println!("  Usage:");
-            println!("    clipd daemon         Start the clipboard daemon");
-            println!("    clipd list           Show recent clips");
-            println!("    clipd search         Interactive search (TUI)");
-            println!("    clipd search <query> Text search");
-            println!("    clipd paste <slot>   Output slot to stdout");
-            println!("    clipd slots          Show slot contents");
-            println!("    clipd stats          Usage statistics");
-            println!("    clipd clear          Clear history/slots");
-            println!();
-            println!("  Hotkeys (when daemon is running):");
-            println!();
-            println!("    Cmd+C → auto-saved to slot 1 (most recent)");
-            println!();
-            println!("    Option A — Cmd multi-tap:");
-            println!("      Cmd+C × 2  → slot 2    Cmd+V × 2  → paste slot 2");
-            println!("      Cmd+C × 3  → slot 3    Cmd+V × 3  → paste slot 3");
-            println!();
-            println!("    Option B — Ctrl tap:");
-            println!("      Ctrl+V × 1 → slot 1    Ctrl+C × 1 → save slot 1");
-            println!("      Ctrl+V × 2 → slot 2    Ctrl+C × 2 → save slot 2");
-            println!();
-            println!("    Ctrl+R → search TUI");
-            println!("    (action fires 0.35s after last tap)");
-            println!();
-            println!("  Run 'clipd --help' for full options.");
+            // Default: launch GUI with embedded daemon (user-friendly)
+            launch_gui();
         }
     }
 }
@@ -271,8 +263,8 @@ fn cmd_search(
 }
 
 fn cmd_paste(slot: u8) {
-    if slot > 9 {
-        eprintln!("❌ Slot must be 0-9");
+    if slot > MAX_CLIP_SLOT {
+        eprintln!("❌ Slot must be 0-{}", MAX_CLIP_SLOT);
         return;
     }
 
@@ -380,6 +372,81 @@ fn cmd_clear(slot: Option<u8>, all: bool, before: Option<String>) {
         println!("    clipd clear --before 30d    Clear clips older than 30 days");
         println!("    clipd clear --slot 3        Clear slot 3");
     }
+}
+
+// ── Launch helpers ──
+
+/// Spawn the daemon in a background thread (used by `clipd tui`).
+fn launch_daemon_background() {
+    std::thread::Builder::new()
+        .name("clipd-daemon".into())
+        .spawn(|| {
+            if let Err(e) = clipd_daemon::run_daemon() {
+                log::error!("Daemon error: {}", e);
+            }
+        })
+        .ok();
+    // Give the daemon a moment to start before showing UI
+    std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+/// Find and launch the clipd-gui binary. Falls back to daemon + TUI.
+fn launch_gui() {
+    // Look for clipd-gui next to the current binary, then in PATH
+    let gui_bin = find_gui_binary();
+    if let Some(gui_path) = gui_bin {
+        println!("  🧷 Launching clipd GUI...");
+        match std::process::Command::new(&gui_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("❌ Failed to launch GUI ({}): {}", gui_path.display(), e);
+                eprintln!("   Falling back to TUI...");
+                launch_daemon_background();
+                if let Err(e) = clipd_tui::run_tui() {
+                    eprintln!("❌ TUI error: {}", e);
+                }
+                clipd_core::release_daemon_lock();
+            }
+        }
+    } else {
+        eprintln!("  clipd-gui binary not found — launching TUI instead.");
+        eprintln!("  (Build the GUI with: cargo build --release -p clipd-gui)");
+        eprintln!();
+        launch_daemon_background();
+        if let Err(e) = clipd_tui::run_tui() {
+            eprintln!("❌ TUI error: {}", e);
+        }
+        clipd_core::release_daemon_lock();
+    }
+}
+
+fn find_gui_binary() -> Option<std::path::PathBuf> {
+    // 1. Check next to the current executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("clipd-gui");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    // 2. Check PATH via `which`
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("clipd-gui")
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(std::path::PathBuf::from(path));
+            }
+        }
+    }
+    None
 }
 
 // ── Helpers ──

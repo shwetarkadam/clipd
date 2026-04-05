@@ -1,3 +1,4 @@
+use crate::embedding::{embedding_from_bytes, embedding_to_bytes, Embedding};
 use crate::models::{ClipEntry, ClipStats, ContentType, SearchFilters};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Result as SqlResult};
@@ -62,6 +63,15 @@ impl ClipStore {
             CREATE INDEX IF NOT EXISTS idx_clips_hash ON clips(content_hash);
             CREATE INDEX IF NOT EXISTS idx_clips_type ON clips(content_type);
             CREATE INDEX IF NOT EXISTS idx_clips_app ON clips(source_app);
+            ",
+        )?;
+
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS clip_embeddings (
+                clip_id   INTEGER PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                embedding BLOB NOT NULL
+            );
             ",
         )?;
 
@@ -305,6 +315,64 @@ impl ClipStore {
     pub fn clear_all(&self) -> SqlResult<usize> {
         let count = self.conn.execute("DELETE FROM clips", [])?;
         Ok(count)
+    }
+
+    /// Store an embedding vector for a clip.
+    pub fn store_embedding(&self, clip_id: i64, embedding: &Embedding) -> SqlResult<()> {
+        let bytes = embedding_to_bytes(embedding);
+        self.conn.execute(
+            "INSERT OR REPLACE INTO clip_embeddings (clip_id, embedding) VALUES (?1, ?2)",
+            params![clip_id, bytes],
+        )?;
+        Ok(())
+    }
+
+    /// Get the embedding for a specific clip.
+    pub fn get_embedding(&self, clip_id: i64) -> SqlResult<Option<Embedding>> {
+        let result: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT embedding FROM clip_embeddings WHERE clip_id = ?1",
+                params![clip_id],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(result.map(|bytes| embedding_from_bytes(&bytes)))
+    }
+
+    /// Get all stored embeddings (for search).
+    pub fn get_all_embeddings(&self) -> SqlResult<Vec<(i64, Embedding)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT clip_id, embedding FROM clip_embeddings")?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((id, embedding_from_bytes(&bytes)))
+        })?;
+        rows.collect()
+    }
+
+    /// Get clip IDs that don't have embeddings yet.
+    pub fn get_unembedded_clip_ids(&self, limit: usize) -> SqlResult<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id FROM clips c
+             LEFT JOIN clip_embeddings e ON c.id = e.clip_id
+             WHERE e.clip_id IS NULL
+             ORDER BY c.timestamp DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Count how many clips have embeddings.
+    pub fn embedding_count(&self) -> SqlResult<usize> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM clip_embeddings",
+            [],
+            |row| row.get(0),
+        )
     }
 
     /// Gather statistics about the store.

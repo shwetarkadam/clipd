@@ -1,4 +1,5 @@
 use crate::models::ClipEntry;
+use crate::privacy::{load_privacy_config, should_skip_clip};
 use sha2::{Digest, Sha256};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -32,6 +33,7 @@ impl ClipWatcher {
         refresh_hash: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
         let mut last_hash = String::new();
+        let privacy_config = load_privacy_config();
 
         // Try to create the clipboard handle
         let mut clipboard = match arboard::Clipboard::new() {
@@ -78,8 +80,17 @@ impl ClipWatcher {
                     if hash != last_hash {
                         last_hash = hash;
 
-                        // Detect the source app (macOS-specific, best-effort)
                         let source_app = Self::get_frontmost_app();
+
+                        if let Some(reason) = should_skip_clip(
+                            &text,
+                            source_app.as_deref(),
+                            &privacy_config,
+                        ) {
+                            log::info!("🔒 Clip skipped ({})", reason);
+                            std::thread::sleep(self.poll_interval);
+                            continue;
+                        }
 
                         let entry = ClipEntry::new(text, source_app);
                         log::debug!(

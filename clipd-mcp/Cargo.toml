@@ -1,0 +1,16 @@
+[package]
+name = "clipd-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP (Model Context Protocol) server for clipd — clipboard history for editors"
+
+[[bin]]
+name = "clipd-mcp"
+path = "src/main.rs"
+
+[dependencies]
+clipd-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
