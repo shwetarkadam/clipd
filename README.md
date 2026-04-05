@@ -1,6 +1,6 @@
 # clipd
 
-> A clipboard manager for macOS, built in Rust.
+> A clipboard manager for macOS, Windows, and Linux — built in Rust.
 
 clipd gives you **multiple independent clipboard slots** — so you can copy several things at once and paste any of them on demand, without losing what you copied before.
 
@@ -8,7 +8,7 @@ clipd gives you **multiple independent clipboard slots** — so you can copy sev
 
 ## The Problem with Your Clipboard Today
 
-Your Mac has one clipboard. Every time you press `Cmd+C`, whatever you copied before is gone.
+Your OS has one clipboard. Every time you press `Cmd+C` (or `Ctrl+C`), whatever you copied before is gone.
 
 This is fine for simple tasks. But the moment you're doing anything real — filling a spreadsheet, moving code around, reorganising data — you're constantly switching windows, re-copying things you already had, and losing your flow.
 
@@ -18,7 +18,9 @@ clipd fixes this.
 
 ## Install
 
-### Option 1 — One-line install (recommended)
+### macOS
+
+**One-line install (recommended):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shwetarkadam/clipd/main/install.sh | bash
@@ -26,30 +28,58 @@ curl -fsSL https://raw.githubusercontent.com/shwetarkadam/clipd/main/install.sh 
 
 This downloads the latest release, copies **Clipd.app** to `/Applications`, and puts the `clipd` CLI in `/usr/local/bin`.
 
-### Option 2 — Manual download
+**Manual download:**
 
 1. Go to [**Releases**](https://github.com/shwetarkadam/clipd/releases)
 2. Download **`Clipd-macos-arm64-vX.X.X.zip`** (Apple Silicon) or **`Clipd-macos-x86_64-vX.X.X.zip`** (Intel)
 3. Unzip, drag **Clipd.app** into **Applications**
 4. Double-click **Clipd** to launch
 
-### Option 3 — Build from source
+### Linux
 
-Requires [Rust](https://rustup.rs/) (latest stable) and Xcode Command Line Tools.
+**One-line install:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shwetarkadam/clipd/main/install.sh | bash
+```
+
+Installs `clipd` and `clipd-ui` to `~/.local/bin`. Make sure that's in your `PATH`.
+
+### Windows
+
+**PowerShell (recommended):**
+
+```powershell
+irm https://raw.githubusercontent.com/shwetarkadam/clipd/main/install.ps1 | iex
+```
+
+Installs to `%LOCALAPPDATA%\clipd` and adds it to your user PATH.
+
+**Manual download:**
+
+1. Go to [**Releases**](https://github.com/shwetarkadam/clipd/releases)
+2. Download **`Clipd-windows-x86_64-vX.X.X.zip`**
+3. Extract and add the folder to your PATH
+
+### Build from source
+
+Requires [Rust](https://rustup.rs/) (latest stable). On macOS, also requires Xcode Command Line Tools.
 
 ```bash
 git clone https://github.com/shwetarkadam/clipd.git
 cd clipd
-./release.sh
+cargo build --release
 ```
 
-Then drag `target/release/Clipd.app` to Applications.
+Binaries land in `target/release/`. On macOS you can also run `./release.sh` to get a bundled `Clipd.app`.
 
 ---
 
-## First Launch — Permissions
+## First Launch
 
-macOS requires two permissions for clipd to work. You'll be prompted automatically on first launch:
+### macOS — Permissions
+
+macOS requires two permissions for clipd to work. You'll be prompted on first launch:
 
 | Permission | Why | Where to grant |
 |-----------|-----|----------------|
@@ -60,14 +90,18 @@ Grant both, then **restart Clipd** (Quit from menu bar → reopen).
 
 > **Gatekeeper warning?** If macOS says "Clipd can't be opened because it is from an unidentified developer", go to **System Settings → Privacy & Security** and click **Open Anyway**.
 
+### Windows / Linux
+
+No special permissions needed. Just run `clipd daemon` to start the background service, and `clipd-ui` for the tray icon.
+
 ---
 
 ## How It Works
 
 When you open Clipd:
-- A **menu bar icon** appears (top-right of your screen)
+- A **tray icon** appears (menu bar on macOS, system tray on Windows/Linux)
 - The **daemon** starts automatically in the background
-- The **main window** opens for visual slot access
+- Your clipboard is monitored and slots are ready
 
 That's it. No config files, no setup.
 
@@ -92,6 +126,8 @@ Normal clipboard:         clipd:
 
 ## Hotkeys
 
+### macOS (multi-tap via rdev)
+
 clipd supports two hotkey styles — pick whichever feels natural:
 
 **Option A — Cmd multi-tap:**
@@ -112,26 +148,33 @@ clipd supports two hotkey styles — pick whichever feels natural:
 | Paste slot 1 | `Ctrl+V` × 1 |
 | Paste slot 2 | `Ctrl+V` × 2 |
 
-**Other shortcuts:**
+### Windows / Linux (global-hotkey)
+
+| Action | Hotkey |
+|--------|--------|
+| Copy to slot N | `Ctrl+Super+N` (N = 1–9) |
+| Paste slot N | `Ctrl+Super+Alt+N` |
+| Smart paste | `Ctrl+Shift+V` |
+| Open TUI search | `Ctrl+R` or `Ctrl+T` |
+| Open GUI | `Ctrl+G` |
+
+### Common shortcuts (all platforms)
 
 | Shortcut | Action |
 |----------|--------|
-| `Ctrl+R` | Open search TUI |
-| `Ctrl+G` | Open GUI window |
 | `Ctrl+Shift+V` | Smart paste (transform clipboard before pasting) |
-| `Cmd+Option+V` | Sequence paste (auto-increment through slots) |
 
-Action fires **0.35s** after the last tap.
+Action fires **0.35s** after the last tap (macOS multi-tap only).
 
 ---
 
-## Menu Bar
+## Menu Bar / Tray
 
-Click the clipd icon in the menu bar for quick access:
+Click the clipd icon for quick access:
 
 - **Start / Stop daemon**
 - **Open clipd search** (GUI or TUI depending on mode)
-- **HUD slot overlay** — enable/disable the floating overlay that shows slot numbers as you tap
+- **HUD slot overlay** — enable/disable the floating overlay that shows slot numbers as you tap (macOS: native HUD, Windows/Linux: desktop notification)
 - **Developer mode (TUI)** — switch search to terminal instead of GUI
 - **Quit clipd UI**
 
@@ -141,12 +184,30 @@ Click the clipd icon in the menu bar for quick access:
 
 - **Multi-slot clipboard** — copy multiple things, paste any of them independently
 - **Clipboard history** — full searchable history of everything you've copied
-- **Hotkeys** — multi-tap `Cmd+C` / `Cmd+V` feels completely natural
-- **Interactive search** — `Ctrl+R` to fuzzy search your history
-- **Native macOS UI** — quick visual access to your slots and settings
-- **HUD overlay** — floating display shows which slot you're targeting as you tap
+- **Hotkeys** — multi-tap Cmd+C / Cmd+V on macOS; global hotkeys on Windows/Linux
+- **Interactive search** — fuzzy search your clipboard history
+- **Tray app** — quick visual access to your slots and settings
+- **HUD overlay** — floating display shows which slot you're targeting (macOS: native Swift overlay, Windows/Linux: desktop notification)
 - **Smart paste** — transform clipboard content before pasting (trim, format JSON, fix grammar, etc.)
+- **Self-update** — `clipd update` checks for new versions
 - **Lightweight daemon** — runs quietly in the background, zero config
+
+---
+
+## Platform Support
+
+| Feature | macOS | Windows | Linux |
+|---------|-------|---------|-------|
+| Multi-slot clipboard | Yes | Yes | Yes |
+| Clipboard history + search | Yes | Yes | Yes |
+| Tray app | Yes | Yes | Yes |
+| HUD notifications | Native overlay | Desktop notification | Desktop notification |
+| Multi-tap hotkeys (Cmd×N) | Yes (rdev) | — | — |
+| Global hotkeys (Ctrl+Super+N) | — | Yes | Yes |
+| Smart paste | Yes | Yes | Yes |
+| Paste simulation | AppleScript | Enigo | Enigo |
+| Frontmost app detection | Yes | — | — |
+| Self-update | Yes | Yes | Yes |
 
 ---
 
@@ -164,6 +225,7 @@ clipd paste <slot> # Output slot to stdout
 clipd slots        # Show slot contents
 clipd stats        # Usage statistics
 clipd clear        # Clear history/slots
+clipd update       # Check for updates
 ```
 
 ---
@@ -189,27 +251,37 @@ clipd/
 ├── clipd-daemon    # Background service (hotkeys, clipboard watcher)
 ├── clipd-cli       # Command-line interface
 ├── clipd-tui       # Terminal UI for search
-├── clipd-ui        # Menu bar tray app (launches daemon + GUI)
-├── clipd-gui       # Native macOS GUI (eframe)
-├── clipd-hud       # Swift HUD overlay for slot tap feedback
+├── clipd-ui        # Tray app (launches daemon + GUI)
+├── clipd-gui       # GUI (eframe)
+├── clipd-hud       # Swift HUD overlay (macOS only)
 ├── clipd-mcp       # MCP server integration
-└── packaging/      # macOS app bundle scripts
+└── packaging/      # App bundle scripts
 ```
 
 ---
 
 ## Uninstall
 
+### macOS
+
 ```bash
-# Remove the app
 rm -rf /Applications/Clipd.app
-
-# Remove CLI (if installed)
 sudo rm -f /usr/local/bin/clipd
-
-# Remove data (clipboard history, settings)
 rm -rf ~/Library/Application\ Support/clipd
-rm -rf ~/Library/Logs/clipd-ui-daemon.log
+```
+
+### Linux
+
+```bash
+rm -f ~/.local/bin/clipd ~/.local/bin/clipd-ui
+rm -rf ~/.local/share/clipd
+```
+
+### Windows (PowerShell)
+
+```powershell
+Remove-Item -Recurse "$env:LOCALAPPDATA\clipd"
+# Then remove clipd from your PATH in System Settings > Environment Variables
 ```
 
 ---
