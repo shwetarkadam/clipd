@@ -10,6 +10,7 @@ name = "clipd-ui"
 path = "src/main.rs"
 
 [dependencies]
+clipd-core = { workspace = true }
 tao = "0.30"
 tray-icon = "0.19"
 dirs = "5"

@@ -1,25 +1,46 @@
 use std::path::PathBuf;
 use std::fs::OpenOptions;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 
+use clipd_core::{load_paste_transform_settings, save_paste_transform_settings};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoop};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, CheckMenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIconBuilder};
+use tray_icon::{Icon, TrayIconBuilder, MouseButtonState, TrayIconEvent};
 
 const MENU_ID_START: &str = "start";
 const MENU_ID_STOP: &str = "stop";
 const MENU_ID_SEARCH: &str = "search";
+const MENU_ID_HUD: &str = "hud_notifications";
 const MENU_ID_TUI_MODE: &str = "tui_mode";
 const MENU_ID_QUIT: &str = "quit";
 
+fn hud_tray_label(hud_on: bool) -> String {
+    if hud_on {
+        "HUD slot overlay: On — click to turn off".to_string()
+    } else {
+        "HUD slot overlay: Off — click to turn on".to_string()
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new();
+    let wake_proxy = event_loop.create_proxy();
+    let (tray_tx, tray_rx) = mpsc::channel::<TrayIconEvent>();
+    TrayIconEvent::set_event_handler(Some(move |ev| {
+        let _ = tray_tx.send(ev);
+        let _ = wake_proxy.send_event(());
+    }));
 
     let menu = Menu::new();
     let item_start = MenuItem::with_id(MENU_ID_START, "Start clipd daemon", true, None);
     let item_stop = MenuItem::with_id(MENU_ID_STOP, "Stop clipd daemon", false, None);
     let item_search = MenuItem::with_id(MENU_ID_SEARCH, "Open clipd search", true, None);
+    let hud_on = load_paste_transform_settings().hud_enabled;
+    // Plain MenuItem (not CheckMenuItem): macOS tray checkmarks were drifting from
+    // `paste_transform.json`; explicit on/off text + toggle keeps daemon and UI aligned.
+    let item_hud = MenuItem::with_id(MENU_ID_HUD, hud_tray_label(hud_on), true, None);
     let item_tui_mode = CheckMenuItem::with_id(
         MENU_ID_TUI_MODE,
         "Developer mode (TUI)",
@@ -34,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&item_search)?;
     menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&item_hud)?;
     menu.append(&item_tui_mode)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&item_quit)?;
@@ -59,8 +81,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Open main window when not in developer (TUI) mode — matches “GUI + tray” expectation.
+    if daemon.is_some() && !load_tui_mode() {
+        open_gui_search();
+    }
+
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
+
+        if let Event::UserEvent(()) = event {
+            while let Ok(tray_ev) = tray_rx.try_recv() {
+                match tray_ev {
+                    TrayIconEvent::Enter { .. } => {
+                        let s = load_paste_transform_settings();
+                        item_hud.set_text(hud_tray_label(s.hud_enabled));
+                        item_tui_mode.set_checked(load_tui_mode());
+                    }
+                    TrayIconEvent::Click { button_state, .. }
+                        if matches!(
+                            button_state,
+                            MouseButtonState::Down | MouseButtonState::Up
+                        ) =>
+                    {
+                        let s = load_paste_transform_settings();
+                        item_hud.set_text(hud_tray_label(s.hud_enabled));
+                        item_tui_mode.set_checked(load_tui_mode());
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         if let Event::NewEvents(_) = event {
             if let Ok(menu_event) = menu_channel.try_recv() {
@@ -92,6 +142,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             open_gui_search();
                         }
+                    }
+                    MENU_ID_HUD => {
+                        let mut s = load_paste_transform_settings();
+                        s.hud_enabled = !s.hud_enabled;
+                        save_paste_transform_settings(&s);
+                        item_hud.set_text(hud_tray_label(s.hud_enabled));
                     }
                     MENU_ID_TUI_MODE => {
                         save_tui_mode(item_tui_mode.is_checked());
@@ -221,39 +277,81 @@ fn stop_existing_daemons() {
 
 // ── Path resolution ──
 
+/// Same directory as clipd-ui (e.g. Clipd.app/Contents/MacOS/) — release / .app bundles.
+fn resolve_sibling_exe(names: &[&str]) -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    for name in names {
+        let p = dir.join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn resolve_clipd_exe() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    let clipd_names = ["clipd.exe", "clipd"];
+    #[cfg(not(target_os = "windows"))]
+    let clipd_names = ["clipd"];
+
+    if let Some(p) = resolve_sibling_exe(&clipd_names) {
+        return p;
+    }
+
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
     let dev = workspace_root.join("target/debug/clipd");
-    if dev.exists() { return dev; }
+    if dev.exists() {
+        return dev;
+    }
 
     let rel = workspace_root.join("target/release/clipd");
-    if rel.exists() { return rel; }
+    if rel.exists() {
+        return rel;
+    }
 
     let cargo_bin = PathBuf::from("/Users/shwetakadam/.cargo/bin/clipd");
-    if cargo_bin.exists() { return cargo_bin; }
+    if cargo_bin.exists() {
+        return cargo_bin;
+    }
 
     PathBuf::from("clipd")
 }
 
 fn resolve_clipd_gui_exe() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    let gui_names = ["clipd-gui.exe", "clipd-gui"];
+    #[cfg(not(target_os = "windows"))]
+    let gui_names = ["clipd-gui"];
+
+    if let Some(p) = resolve_sibling_exe(&gui_names) {
+        return p;
+    }
+
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
     let dev = workspace_root.join("target/debug/clipd-gui");
-    if dev.exists() { return dev; }
+    if dev.exists() {
+        return dev;
+    }
 
     let rel = workspace_root.join("target/release/clipd-gui");
-    if rel.exists() { return rel; }
+    if rel.exists() {
+        return rel;
+    }
 
     if let Some(home) = dirs::home_dir() {
         let cargo_bin = home.join(".cargo/bin/clipd-gui");
-        if cargo_bin.exists() { return cargo_bin; }
+        if cargo_bin.exists() {
+            return cargo_bin;
+        }
     }
 
     PathBuf::from("clipd-gui")

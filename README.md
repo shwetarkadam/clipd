@@ -1,8 +1,8 @@
 # clipd
 
-> ⚠️ Early prototype — expect rough edges.
+> A clipboard manager for macOS, built in Rust.
 
-A clipboard manager for macOS, built in Rust. clipd gives you **multiple independent clipboard slots** — so you can copy several things at once and paste any of them on demand, without losing what you copied before.
+clipd gives you **multiple independent clipboard slots** — so you can copy several things at once and paste any of them on demand, without losing what you copied before.
 
 ---
 
@@ -15,16 +15,67 @@ This is fine for simple tasks. But the moment you're doing anything real — fil
 clipd fixes this.
 
 ---
-🎬 See how clipd lets you copy multiple things and paste any of them instantly:
 
+## Install
+
+### Option 1 — One-line install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shwetarkadam/clipd/main/install.sh | bash
+```
+
+This downloads the latest release, copies **Clipd.app** to `/Applications`, and puts the `clipd` CLI in `/usr/local/bin`.
+
+### Option 2 — Manual download
+
+1. Go to [**Releases**](https://github.com/shwetarkadam/clipd/releases)
+2. Download **`Clipd-macos-arm64-vX.X.X.zip`** (Apple Silicon) or **`Clipd-macos-x86_64-vX.X.X.zip`** (Intel)
+3. Unzip, drag **Clipd.app** into **Applications**
+4. Double-click **Clipd** to launch
+
+### Option 3 — Build from source
+
+Requires [Rust](https://rustup.rs/) (latest stable) and Xcode Command Line Tools.
+
+```bash
+git clone https://github.com/shwetarkadam/clipd.git
+cd clipd
+./release.sh
+```
+
+Then drag `target/release/Clipd.app` to Applications.
+
+---
+
+## First Launch — Permissions
+
+macOS requires two permissions for clipd to work. You'll be prompted automatically on first launch:
+
+| Permission | Why | Where to grant |
+|-----------|-----|----------------|
+| **Accessibility** | Simulating paste (Cmd+V) into apps | System Settings → Privacy & Security → Accessibility |
+| **Input Monitoring** | Detecting Cmd+C / Ctrl+C hotkey taps | System Settings → Privacy & Security → Input Monitoring |
+
+Grant both, then **restart Clipd** (Quit from menu bar → reopen).
+
+> **Gatekeeper warning?** If macOS says "Clipd can't be opened because it is from an unidentified developer", go to **System Settings → Privacy & Security** and click **Open Anyway**.
+
+---
+
+## How It Works
+
+When you open Clipd:
+- A **menu bar icon** appears (top-right of your screen)
+- The **daemon** starts automatically in the background
+- The **main window** opens for visual slot access
+
+That's it. No config files, no setup.
 
 ---
 
 ## Multi-Slot Clipboard
 
-Instead of one clipboard, clipd gives you **multiple slots**. Think of them as clipboard 1, clipboard 2, clipboard 3 — all active at the same time.
-
-Double-tap `Cmd+C` to copy to slot 1. Triple-tap to copy to slot 2. Then paste any slot back whenever you need it.
+Instead of one clipboard, clipd gives you **up to 30 slots**. Think of them as clipboard 1, clipboard 2, clipboard 3 — all active at the same time.
 
 ```
 Normal clipboard:         clipd:
@@ -36,52 +87,6 @@ Normal clipboard:         clipd:
 │   gone) │               Cmd+V×2       Cmd+V×3       Cmd+V×4
 └─────────┘
 ```
-
----
-
-## Who Is This For?
-
-### 📊 Excel / Spreadsheet Users
-
-Copying values across sheets is painful. You grab a number from one cell, switch sheets, paste it, go back, grab the next one — and if you accidentally copy something else in between, you have to start over.
-
-With clipd:
-- Copy your first value → slot 1 (`Cmd+C` twice)
-- Copy your second value → slot 2 (`Cmd+C` three times)
-- Switch to your destination sheet
-- Paste slot 1 where you need it (`Cmd+V` twice)
-- Paste slot 2 where you need it (`Cmd+V` three times)
-
-No switching back. No re-copying. No mistakes.
-
----
-
-### 👩‍💻 Developers
-
-How many times have you copied a variable name, then copied a file path, and lost the variable name? Or been refactoring and needed to juggle three snippets at once?
-
-With clipd:
-- Keep a function signature in slot 1 while you copy its body to slot 2
-- Hold a git commit hash in slot 1 while searching for a related error message
-- Copy an API key to slot 1 and an endpoint to slot 2 — paste both into your config without switching tabs
-- Search your full clipboard history with `Ctrl+R` when you need something from earlier
-
----
-
-### 🙋 General Mac Users
-
-Ever filled a long form and lost a piece of info because you needed to copy something else mid-way? clipd keeps everything you copied available until you're done.
-
----
-
-## Features
-
-- 🗂️ **Multi-slot clipboard** — copy multiple things, paste any of them independently
-- 📋 **Clipboard history** — full searchable history of everything you've copied
-- ⌨️ **Hotkeys** — multi-tap `Cmd+C` / `Cmd+V` feels completely natural, no new shortcuts to memorise
-- 🔍 **Interactive search** — `Ctrl+R` to fuzzy search your history in the terminal
-- 🖥️ **Native macOS UI** — quick visual access to your slots
-- ⚡ **Lightweight daemon** — runs quietly in the background, zero config
 
 ---
 
@@ -107,49 +112,72 @@ clipd supports two hotkey styles — pick whichever feels natural:
 | Paste slot 1 | `Ctrl+V` × 1 |
 | Paste slot 2 | `Ctrl+V` × 2 |
 
-- `Ctrl+R` — open search TUI
-- Action fires **0.35s** after the last tap
+**Other shortcuts:**
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+R` | Open search TUI |
+| `Ctrl+G` | Open GUI window |
+| `Ctrl+Shift+V` | Smart paste (transform clipboard before pasting) |
+| `Cmd+Option+V` | Sequence paste (auto-increment through slots) |
+
+Action fires **0.35s** after the last tap.
+
+---
+
+## Menu Bar
+
+Click the clipd icon in the menu bar for quick access:
+
+- **Start / Stop daemon**
+- **Open clipd search** (GUI or TUI depending on mode)
+- **HUD slot overlay** — enable/disable the floating overlay that shows slot numbers as you tap
+- **Developer mode (TUI)** — switch search to terminal instead of GUI
+- **Quit clipd UI**
+
+---
+
+## Features
+
+- **Multi-slot clipboard** — copy multiple things, paste any of them independently
+- **Clipboard history** — full searchable history of everything you've copied
+- **Hotkeys** — multi-tap `Cmd+C` / `Cmd+V` feels completely natural
+- **Interactive search** — `Ctrl+R` to fuzzy search your history
+- **Native macOS UI** — quick visual access to your slots and settings
+- **HUD overlay** — floating display shows which slot you're targeting as you tap
+- **Smart paste** — transform clipboard content before pasting (trim, format JSON, fix grammar, etc.)
+- **Lightweight daemon** — runs quietly in the background, zero config
 
 ---
 
 ## CLI Usage
 
+The `clipd` binary doubles as a full CLI:
+
 ```bash
-clipd daemon         # Start the clipboard daemon
-clipd list           # Show recent clips
-clipd search         # Interactive search (TUI)
-clipd search <query> # Text search
-clipd paste <slot>   # Output slot to stdout
-clipd slots          # Show slot contents
-clipd stats          # Usage statistics
-clipd clear          # Clear history/slots
+clipd              # Launch GUI + daemon (default)
+clipd daemon       # Start daemon only (headless)
+clipd list         # Show recent clips
+clipd search       # Interactive search (TUI)
+clipd search <q>   # Text search
+clipd paste <slot> # Output slot to stdout
+clipd slots        # Show slot contents
+clipd stats        # Usage statistics
+clipd clear        # Clear history/slots
 ```
 
 ---
 
-## Download
+## Who Is This For?
 
-Pre-built binaries for macOS are available on the [Releases](https://github.com/shwetarkadam/clipd/releases) page.
+### Spreadsheet Users
+Copy values from multiple cells, switch to your destination, paste them all — no switching back and forth.
 
-```bash
-chmod +x clipd
-./clipd
-```
+### Developers
+Keep a function signature in slot 1 while you copy its body to slot 2. Hold API keys, git hashes, and error messages in parallel slots.
 
-> If macOS blocks the app, go to **System Settings → Privacy & Security** and click **Open Anyway**.
-
----
-
-## Build from Source
-
-Requires [Rust](https://rustup.rs/) (latest stable).
-
-```bash
-git clone https://github.com/shwetarkadam/clipd.git
-cd clipd
-cargo build --release
-./target/release/clipd daemon
-```
+### Everyone
+Ever filled a long form and lost something because you needed to copy something else? clipd keeps everything available.
 
 ---
 
@@ -157,18 +185,38 @@ cargo build --release
 
 ```
 clipd/
-├── clipd-core      # Shared core logic
-├── clipd-daemon    # Background service that watches the clipboard
+├── clipd-core      # Shared core logic (clipboard, storage, transforms)
+├── clipd-daemon    # Background service (hotkeys, clipboard watcher)
 ├── clipd-cli       # Command-line interface
-├── clipd-tui       # Terminal UI
-└── clipd-ui        # Native macOS UI
+├── clipd-tui       # Terminal UI for search
+├── clipd-ui        # Menu bar tray app (launches daemon + GUI)
+├── clipd-gui       # Native macOS GUI (eframe)
+├── clipd-hud       # Swift HUD overlay for slot tap feedback
+├── clipd-mcp       # MCP server integration
+└── packaging/      # macOS app bundle scripts
+```
+
+---
+
+## Uninstall
+
+```bash
+# Remove the app
+rm -rf /Applications/Clipd.app
+
+# Remove CLI (if installed)
+sudo rm -f /usr/local/bin/clipd
+
+# Remove data (clipboard history, settings)
+rm -rf ~/Library/Application\ Support/clipd
+rm -rf ~/Library/Logs/clipd-ui-daemon.log
 ```
 
 ---
 
 ## License
 
-Licensed under the [Business Source License 1.1](./LICENSE).  
+Licensed under the [Business Source License 1.1](./LICENSE).
 Free for personal use. Commercial use requires a license from the author.
 
 ---

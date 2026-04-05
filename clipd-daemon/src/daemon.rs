@@ -152,6 +152,12 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             registered_hotkeys.push((smart_hk, FinalAction::SmartPaste));
         }
+        let tui_hk_r = HotKey::new(Some(Modifiers::CONTROL), Code::KeyR);
+        if let Err(e) = hotkey_manager.register(tui_hk_r) {
+            log::warn!("Failed to register Ctrl+R: {}", e);
+        } else {
+            registered_hotkeys.push((tui_hk_r, FinalAction::OpenTui));
+        }
         let tui_hk2 = HotKey::new(Some(Modifiers::CONTROL), Code::KeyT);
         if let Err(e) = hotkey_manager.register(tui_hk2) {
             log::warn!("Failed to register Ctrl+T: {}", e);
@@ -574,12 +580,19 @@ fn execute_undo_paste(slot: u8, tap_count: u8, mgr: &SlotManager, suppress: &Arc
         std::thread::sleep(Duration::from_millis(100));
         if let Err(e) = undo_then_paste(tap_count) {
             log::warn!("Auto-paste failed: {}", e);
+            #[cfg(target_os = "macos")]
             log::warn!(
                 "If paste never works: grant Accessibility to the app running clipd \
                  (System Settings → Privacy & Security → Accessibility), and ensure \
                  Automation is allowed for System Events."
             );
-            log::info!("Slot {} content is on clipboard — press Cmd+V", slot);
+            #[cfg(not(target_os = "macos"))]
+            log::warn!(
+                "If paste never works: run clipd as the same user as the foreground app; \
+                 on Windows, synthesized Ctrl+V may require running the terminal as administrator \
+                 in some setups."
+            );
+            log::info!("Slot {} content is on clipboard — paste manually if needed", slot);
         } else {
             log::info!("📋 Pasted from slot {}: {}", slot, truncate(&content, 40));
         }
@@ -665,21 +678,8 @@ fn execute_direct_paste(
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
-        let script = r#"tell application "System Events"
-  keystroke "v" using command down
-end tell"#;
-        let output = std::process::Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(script)
-            .output();
-        match output {
-            Ok(o) if o.status.success() => {
-                log::info!("📋 Pasted from slot {}: {}", slot, truncate(&content, 40));
-            }
-            _ => {
-                log::info!("Slot {} content is on clipboard — press Cmd+V", slot);
-            }
-        }
+        simulate_paste();
+        log::info!("📋 Pasted from slot {}: {}", slot, truncate(&content, 40));
 
         std::thread::sleep(Duration::from_millis(200));
 
@@ -801,21 +801,8 @@ fn execute_smart_paste(
 
     std::thread::sleep(Duration::from_millis(50));
 
-    let script = r#"tell application "System Events"
-  keystroke "v" using command down
-end tell"#;
-    let output = std::process::Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            log::info!("📋 Smart pasted: {}", truncate(&content, 60));
-        }
-        _ => {
-            log::info!("Smart paste content is on clipboard — press Cmd+V");
-        }
-    }
+    simulate_paste();
+    log::info!("📋 Smart pasted: {}", truncate(&content, 60));
 
     std::thread::sleep(Duration::from_millis(200));
     suppress.store(false, Ordering::SeqCst);
@@ -943,6 +930,15 @@ fn simulate_paste() {
     if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
         let _ = enigo.key(Key::Control, Direction::Press);
         let _ = enigo.key(Key::Unicode('v'), Direction::Click);
+        let _ = enigo.key(Key::Control, Direction::Release);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn simulate_undo() {
+    if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
+        let _ = enigo.key(Key::Control, Direction::Press);
+        let _ = enigo.key(Key::Unicode('z'), Direction::Click);
         let _ = enigo.key(Key::Control, Direction::Release);
     }
 }
@@ -1081,7 +1077,9 @@ fn show_slot_notification(action: &str, slot: u8) {
 /// Respects the user's hud_enabled setting.
 #[cfg(target_os = "macos")]
 fn show_hud(text: &str) {
-    if !load_paste_transform_settings().hud_enabled {
+    let settings = load_paste_transform_settings();
+    if !settings.hud_enabled {
+        log::info!("HUD suppressed (hud_enabled=false)");
         return;
     }
 
@@ -1098,13 +1096,14 @@ fn show_hud(text: &str) {
     }
 
     let hud_bin = find_hud_binary();
-    let text = text.to_string();
+    log::info!("HUD: launching {} with text {:?}", hud_bin.display(), text);
 
     match std::process::Command::new(&hud_bin)
-        .arg(&text)
+        .arg(text)
         .spawn()
     {
         Ok(child) => {
+            log::info!("HUD: spawned pid {}", child.id());
             if let Ok(mut prev) = pid_lock.lock() {
                 *prev = Some(child.id());
             }
@@ -1116,20 +1115,34 @@ fn show_hud(text: &str) {
 /// Find the `clipd-hud` binary next to the current executable, or in PATH.
 #[cfg(target_os = "macos")]
 fn find_hud_binary() -> std::path::PathBuf {
+    if let Ok(from_env) = std::env::var("CLIPD_HUD_BIN") {
+        let p = std::path::PathBuf::from(from_env);
+        if p.is_file() {
+            return p;
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("clipd-hud");
-            if candidate.exists() {
-                return candidate;
+            candidates.push(dir.join("clipd-hud"));
+        }
+        if let Ok(canonical) = exe.canonicalize() {
+            if let Some(dir) = canonical.parent() {
+                candidates.push(dir.join("clipd-hud"));
+            }
+        }
+        for c in candidates {
+            if c.is_file() {
+                return c;
             }
         }
     }
     std::path::PathBuf::from("clipd-hud")
 }
 
+#[cfg(target_os = "macos")]
 fn undo_then_paste(undo_count: u8) -> Result<(), Box<dyn std::error::Error>> {
     // Send undos one at a time with enough delay for the app to process each.
-    // 0.05s was too fast — apps batch rapid Cmd+Z and undo more than intended.
     let undos: String = (0..undo_count)
         .map(|_| "  keystroke \"z\" using command down\n  delay 0.12")
         .collect::<Vec<_>>()
@@ -1154,15 +1167,29 @@ end tell"#,
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
+fn undo_then_paste(undo_count: u8) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..undo_count {
+        simulate_undo();
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    simulate_paste();
+    Ok(())
+}
+
 fn open_tui_search() {
     log::info!("🔍 Opening TUI search...");
     let exe = match std::env::current_exe() {
-        Ok(e) => e.to_string_lossy().to_string(),
+        Ok(e) => e,
         Err(_) => return,
     };
-    let cmd = format!("cd /tmp && {} search", exe);
-    let script = format!(
-        r#"tell application "Warp"
+
+    #[cfg(target_os = "macos")]
+    {
+        let cmd = format!("cd /tmp && {} search", exe.to_string_lossy());
+        let script = format!(
+            r#"tell application "Warp"
   activate
   delay 0.3
   tell application "System Events"
@@ -1173,22 +1200,38 @@ fn open_tui_search() {
     key code 36
   end tell
 end tell"#,
-        cmd
-    );
-    let result = std::process::Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(&script)
-        .output();
-    if result.map_or(true, |o| !o.status.success()) {
-        let fallback = format!(
-            "tell application \"Terminal\"\n  activate\n  do script \"{}\"\nend tell",
             cmd
         );
-        std::process::Command::new("/usr/bin/osascript")
+        let result = std::process::Command::new("/usr/bin/osascript")
             .arg("-e")
-            .arg(&fallback)
-            .spawn()
-            .ok();
+            .arg(&script)
+            .output();
+        if result.map_or(true, |o| !o.status.success()) {
+            let fallback = format!(
+                "tell application \"Terminal\"\n  activate\n  do script \"{}\"\nend tell",
+                cmd
+            );
+            std::process::Command::new("/usr/bin/osascript")
+                .arg("-e")
+                .arg(&fallback)
+                .spawn()
+                .ok();
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        let _ = std::process::Command::new(&exe)
+            .arg("search")
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn();
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = std::process::Command::new(&exe).arg("search").spawn();
     }
 }
 
@@ -1197,13 +1240,30 @@ fn open_gui() {
     // Look for clipd-gui next to the current binary
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("clipd-gui");
-            if candidate.exists() {
-                if std::process::Command::new(&candidate)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .is_ok()
+            #[cfg(target_os = "windows")]
+            {
+                for name in ["clipd-gui.exe", "clipd-gui"] {
+                    let candidate = dir.join(name);
+                    if candidate.exists()
+                        && std::process::Command::new(&candidate)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                            .is_ok()
+                    {
+                        return;
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let candidate = dir.join("clipd-gui");
+                if candidate.exists()
+                    && std::process::Command::new(&candidate)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .is_ok()
                 {
                     return;
                 }
@@ -1211,13 +1271,29 @@ fn open_gui() {
         }
     }
     // Fallback: try PATH
-    if std::process::Command::new("clipd-gui")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .is_ok()
+    #[cfg(target_os = "windows")]
     {
-        return;
+        for name in ["clipd-gui.exe", "clipd-gui"] {
+            if std::process::Command::new(name)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if std::process::Command::new("clipd-gui")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            return;
+        }
     }
     log::warn!("clipd-gui binary not found — build it with: cargo build --release -p clipd-gui");
 }

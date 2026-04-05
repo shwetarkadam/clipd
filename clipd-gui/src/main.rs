@@ -88,19 +88,49 @@ fn spawn_daemon_process() -> Option<std::process::Child> {
 }
 
 fn find_cli_binary() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("clipd");
-            if candidate.exists() {
-                return Some(candidate);
+            #[cfg(target_os = "windows")]
+            for name in ["clipd.exe", "clipd"] {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let candidate = dir.join("clipd");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
             }
         }
     }
-    if let Ok(output) = std::process::Command::new("which").arg("clipd").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(std::path::PathBuf::from(path));
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("where").arg("clipd").output() {
+            if output.status.success() {
+                let line = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                if !line.is_empty() {
+                    return Some(PathBuf::from(line));
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(output) = std::process::Command::new("which").arg("clipd").output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Some(PathBuf::from(path));
+                }
             }
         }
     }

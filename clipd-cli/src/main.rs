@@ -5,9 +5,12 @@ use clipd_core::{ClipStore, ContentType, SearchFilters, MAX_CLIP_SLOT};
 #[derive(Parser)]
 #[command(
     name = "clipd",
-    version = "0.1.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "🧷 clipd — AI clipboard daemon for developers",
-    long_about = "Multi-slot copy/paste, searchable history, and editor integration.\nThink \"Atuin for your clipboard\"."
+    long_about = "Multi-slot copy/paste, searchable history, and editor integration.\nThink \"Atuin for your clipboard\".\n\n\
+                  DEFAULT (no subcommand): starts the graphical app and the background daemon — one step.\n\
+                  Put `clipd`, `clipd-gui`, and `clipd-hud` in the same folder (see release zip).",
+    after_help = "Quick start: run `clipd` with no arguments — GUI opens and the daemon starts automatically."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -16,7 +19,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Launch the GUI with built-in daemon (recommended for general users)
+    /// Same as running `clipd` with no arguments (GUI + daemon)
     Gui,
 
     /// Launch the TUI with built-in daemon (recommended for developers)
@@ -80,6 +83,9 @@ enum Commands {
         #[arg(long)]
         before: Option<String>,
     },
+
+    /// Check for updates (or update in-place)
+    Update,
 }
 
 fn main() {
@@ -89,6 +95,8 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    check_update_background();
 
     match cli.command {
         Some(Commands::Gui) => {
@@ -147,6 +155,10 @@ fn main() {
 
         Some(Commands::Clear { slot, all, before }) => {
             cmd_clear(slot, all, before);
+        }
+
+        Some(Commands::Update) => {
+            cmd_update();
         }
 
         None => {
@@ -374,6 +386,90 @@ fn cmd_clear(slot: Option<u8>, all: bool, before: Option<String>) {
     }
 }
 
+// ── Update ──
+
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const GITHUB_REPO: &str = "shwetarkadam/clipd";
+
+fn fetch_latest_version() -> Option<String> {
+    let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
+    let resp = ureq::get(&url)
+        .set("User-Agent", "clipd-updater")
+        .call()
+        .ok()?;
+    let body: serde_json::Value = resp.into_json().ok()?;
+    body["tag_name"]
+        .as_str()
+        .map(|s| s.strip_prefix('v').unwrap_or(s).to_string())
+}
+
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u32> {
+        v.split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect()
+    };
+    parse(latest) > parse(current)
+}
+
+fn cmd_update() {
+    println!("  Current version: {}", CURRENT_VERSION);
+    print!("  Checking for updates... ");
+
+    match fetch_latest_version() {
+        Some(latest) if version_is_newer(&latest, CURRENT_VERSION) => {
+            println!("v{} available!", latest);
+            println!();
+            println!("  To update, run:");
+            println!("    curl -fsSL https://raw.githubusercontent.com/{}/main/install.sh | bash", GITHUB_REPO);
+            println!();
+            println!("  Or download from:");
+            println!("    https://github.com/{}/releases/latest", GITHUB_REPO);
+        }
+        Some(latest) => {
+            println!("you're on the latest (v{}).", latest);
+        }
+        None => {
+            println!("couldn't reach GitHub. Check your connection.");
+        }
+    }
+}
+
+/// Check for updates in the background (non-blocking). Prints a one-line
+/// notice to stderr if a newer version exists — runs at most once per day.
+fn check_update_background() {
+    use std::path::PathBuf;
+
+    let marker = dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("clipd")
+        .join("last_update_check");
+
+    if let Ok(meta) = std::fs::metadata(&marker) {
+        if let Ok(modified) = meta.modified() {
+            if modified.elapsed().unwrap_or_default() < std::time::Duration::from_secs(86400) {
+                return;
+            }
+        }
+    }
+
+    std::thread::spawn(move || {
+        if let Some(latest) = fetch_latest_version() {
+            if version_is_newer(&latest, CURRENT_VERSION) {
+                eprintln!(
+                    "  💡 clipd v{} is available (you have v{}). Run: clipd update",
+                    latest, CURRENT_VERSION
+                );
+            }
+            if let Some(parent) = marker.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&marker, "");
+        }
+    });
+}
+
 // ── Launch helpers ──
 
 /// Spawn the daemon in a background thread (used by `clipd tui`).
@@ -425,24 +521,53 @@ fn launch_gui() {
 }
 
 fn find_gui_binary() -> Option<std::path::PathBuf> {
-    // 1. Check next to the current executable
+    use std::path::PathBuf;
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("clipd-gui");
-            if candidate.exists() {
-                return Some(candidate);
+            #[cfg(target_os = "windows")]
+            for name in ["clipd-gui.exe", "clipd-gui"] {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let candidate = dir.join("clipd-gui");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
             }
         }
     }
-    // 2. Check PATH via `which`
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("clipd-gui")
-        .output()
+
+    #[cfg(target_os = "windows")]
     {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(std::path::PathBuf::from(path));
+        if let Ok(output) = std::process::Command::new("where").arg("clipd-gui").output() {
+            if output.status.success() {
+                let line = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                if !line.is_empty() {
+                    return Some(PathBuf::from(line));
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(output) = std::process::Command::new("which")
+            .arg("clipd-gui")
+            .output()
+        {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Some(PathBuf::from(path));
+                }
             }
         }
     }

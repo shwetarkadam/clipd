@@ -15,5 +15,8 @@ clipd-daemon = { workspace = true }
 clipd-tui = { path = "../clipd-tui" }
 chrono = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+dirs = { workspace = true }
+ureq = { workspace = true }
+serde_json = { workspace = true }
 log = "0.4"
 env_logger = "0.11"

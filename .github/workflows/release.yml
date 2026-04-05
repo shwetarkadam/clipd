@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14        # Apple Silicon (M1+)
+            arch: arm64
+          - runner: macos-13        # Intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Build clipd-hud (Swift)
+        run: |
+          cd clipd-hud
+          swiftc -O -o clipd-hud clipd-hud.swift -framework Cocoa
+          cp -f clipd-hud ../target/release/clipd-hud
+          chmod +x ../target/release/clipd-hud
+
+      - name: Create Clipd.app bundle
+        run: bash packaging/macos/create-app-bundle.sh
+
+      - name: Ad-hoc code sign
+        run: codesign --force --deep --sign - target/release/Clipd.app
+
+      - name: Package zip
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          ZIP_NAME="Clipd-macos-${{ matrix.arch }}-${VERSION}"
+          mkdir -p "target/release/${ZIP_NAME}"
+          cp -R target/release/Clipd.app "target/release/${ZIP_NAME}/"
+          cp -f target/release/clipd "target/release/${ZIP_NAME}/"
+          chmod +x "target/release/${ZIP_NAME}/clipd"
+          cp -f install.sh README.md "target/release/${ZIP_NAME}/" || true
+          cd target/release && zip -qr "${ZIP_NAME}.zip" "${ZIP_NAME}/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipd-macos-${{ matrix.arch }}
+          path: target/release/Clipd-macos-*.zip
+
+  create-release:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*.zip
