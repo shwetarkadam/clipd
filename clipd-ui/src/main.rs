@@ -205,11 +205,13 @@ fn open_gui_search() {
 
 fn open_search_in_terminal() {
     let exe = resolve_clipd_exe();
-    let exe_str = exe.to_string_lossy().to_string();
-    let cmd = format!("cd /tmp && {} search", exe_str);
 
-    let warp_script = format!(
-        r#"tell application "Warp"
+    #[cfg(target_os = "macos")]
+    {
+        let exe_str = exe.to_string_lossy().to_string();
+        let cmd = format!("cd /tmp && {} search", exe_str);
+        let warp_script = format!(
+            r#"tell application "Warp"
   activate
   delay 0.3
   tell application "System Events"
@@ -220,26 +222,53 @@ fn open_search_in_terminal() {
     key code 36
   end tell
 end tell"#,
-        cmd
-    );
-    let warp_result = Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(&warp_script)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    if warp_result.map_or(true, |s| !s.success()) {
-        let terminal_script = format!(
-            "tell application \"Terminal\"\n  activate\n  do script \"{}\"\nend tell",
             cmd
         );
-        let _ = Command::new("/usr/bin/osascript")
+        let warp_result = Command::new("/usr/bin/osascript")
             .arg("-e")
-            .arg(&terminal_script)
+            .arg(&warp_script)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .status();
+        if warp_result.map_or(true, |s| !s.success()) {
+            let terminal_script = format!(
+                "tell application \"Terminal\"\n  activate\n  do script \"{}\"\nend tell",
+                cmd
+            );
+            let _ = Command::new("/usr/bin/osascript")
+                .arg("-e")
+                .arg(&terminal_script)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("cmd")
+            .args(["/C", "start", "cmd", "/K"])
+            .arg(exe)
+            .arg("search")
             .spawn();
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        for term in ["x-terminal-emulator", "gnome-terminal", "konsole", "xterm"] {
+            if Command::new(term)
+                .arg("-e")
+                .arg(&exe)
+                .arg("search")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
+            {
+                return;
+            }
+        }
+        let _ = Command::new(&exe).arg("search").spawn();
     }
 }
 
@@ -267,12 +296,23 @@ fn start_daemon() -> Result<Child, Box<dyn std::error::Error>> {
 }
 
 fn stop_existing_daemons() {
-    let _ = Command::new("/usr/bin/pkill")
-        .arg("-f")
-        .arg("clipd daemon")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    #[cfg(unix)]
+    {
+        let _ = Command::new("pkill")
+            .arg("-f")
+            .arg("clipd daemon")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "clipd.exe"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 // ── Path resolution ──
@@ -314,9 +354,11 @@ fn resolve_clipd_exe() -> PathBuf {
         return rel;
     }
 
-    let cargo_bin = PathBuf::from("/Users/shwetakadam/.cargo/bin/clipd");
-    if cargo_bin.exists() {
-        return cargo_bin;
+    if let Some(home) = dirs::home_dir() {
+        let cargo_bin = home.join(".cargo").join("bin").join("clipd");
+        if cargo_bin.exists() {
+            return cargo_bin;
+        }
     }
 
     PathBuf::from("clipd")
@@ -358,11 +400,18 @@ fn resolve_clipd_gui_exe() -> PathBuf {
 }
 
 fn daemon_log_path() -> PathBuf {
-    let logs_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Library/Logs");
+    let logs_dir = if cfg!(target_os = "macos") {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Library/Logs")
+    } else {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("clipd")
+            .join("logs")
+    };
     let _ = std::fs::create_dir_all(&logs_dir);
-    logs_dir.join("clipd-ui-daemon.log")
+    logs_dir.join("clipd-daemon.log")
 }
 
 fn make_icon() -> Icon {

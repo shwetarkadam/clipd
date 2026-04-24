@@ -422,7 +422,11 @@ fn cmd_update() {
             println!("v{} available!", latest);
             println!();
             println!("  To update, run:");
-            println!("    curl -fsSL https://raw.githubusercontent.com/{}/main/install.sh | bash", GITHUB_REPO);
+            if cfg!(target_os = "windows") {
+                println!("    irm https://raw.githubusercontent.com/{}/main/install.ps1 | iex", GITHUB_REPO);
+            } else {
+                println!("    curl -fsSL https://raw.githubusercontent.com/{}/main/install.sh | bash", GITHUB_REPO);
+            }
             println!();
             println!("  Or download from:");
             println!("    https://github.com/{}/releases/latest", GITHUB_REPO);

@@ -447,14 +447,20 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
                         .iter().find(|(hk, _)| hk.id() == event.id)
                     {
                         match action {
-                            FinalAction::CopyToSlot(s) => execute_copy(*s, &hotkey_slot_mgr),
-                            FinalAction::PasteFromSlot(s) => execute_direct_paste(
-                                *s,
-                                &hotkey_slot_mgr,
-                                &suppress,
-                                &transform_config,
-                                &paste_transform,
-                            ),
+                            FinalAction::CopyToSlot(s) => {
+                                show_slot_notification("Copy", *s);
+                                execute_copy(*s, &hotkey_slot_mgr);
+                            }
+                            FinalAction::PasteFromSlot(s) => {
+                                show_slot_notification("Paste", *s);
+                                execute_direct_paste(
+                                    *s,
+                                    &hotkey_slot_mgr,
+                                    &suppress,
+                                    &transform_config,
+                                    &paste_transform,
+                                );
+                            }
                             FinalAction::OpenTui => open_tui_search(),
                             FinalAction::OpenGui => open_gui(),
                             FinalAction::SmartPaste => execute_smart_paste(
@@ -786,7 +792,6 @@ fn execute_smart_paste(
 
     // HUD only when a transform ran *and* the result isn't trivially the same text
     // (e.g. TrimWhitespace often only strips a trailing newline — looks like a no-op).
-    #[cfg(target_os = "macos")]
     if transformed_any && smart_paste_text_visibly_changed(&original, &content) {
         show_hud("✨ Smart Paste");
     }
@@ -1068,7 +1073,6 @@ fn is_terminal_frontmost() -> bool {
 /// Show a brief native HUD overlay so the user sees the slot they're
 /// targeting in real-time as they multi-tap. Kills any prior HUD first
 /// so rapid taps update the display instead of stacking.
-#[cfg(target_os = "macos")]
 fn show_slot_notification(action: &str, slot: u8) {
     show_hud(&format!("📋 {} → Slot {}", action, slot));
 }
@@ -1110,6 +1114,25 @@ fn show_hud(text: &str) {
         }
         Err(e) => log::warn!("HUD overlay failed: {} (looked for {})", e, hud_bin.display()),
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_hud(text: &str) {
+    let settings = load_paste_transform_settings();
+    if !settings.hud_enabled {
+        return;
+    }
+    log::info!("HUD: {}", text);
+    std::thread::spawn({
+        let text = text.to_string();
+        move || {
+            let _ = notify_rust::Notification::new()
+                .summary("clipd")
+                .body(&text)
+                .timeout(notify_rust::Timeout::Milliseconds(800))
+                .show();
+        }
+    });
 }
 
 /// Find the `clipd-hud` binary next to the current executable, or in PATH.
