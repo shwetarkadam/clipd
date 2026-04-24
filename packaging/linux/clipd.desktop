@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Clipd
+GenericName=Clipboard Manager
+Comment=AI-powered multi-slot clipboard manager
+Exec=clipd-ui
+Icon=clipd
+Terminal=false
+Categories=Utility;Office;System;
+Keywords=clipboard;manager;copy;paste;multi-slot;
+StartupNotify=true

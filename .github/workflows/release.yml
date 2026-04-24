@@ -43,7 +43,7 @@ jobs:
       - name: Ad-hoc code sign
         run: codesign --force --deep --sign - target/release/Clipd.app
 
-      - name: Package zip
+      - name: Package zip (with .app + CLI)
         run: |
           VERSION="${GITHUB_REF_NAME}"
           ZIP_NAME="Clipd-macos-${{ matrix.arch }}-${VERSION}"
@@ -54,11 +54,37 @@ jobs:
           cp -f install.sh README.md "target/release/${ZIP_NAME}/" || true
           cd target/release && zip -qr "${ZIP_NAME}.zip" "${ZIP_NAME}/"
 
-      - name: Upload artifact
+      - name: Create DMG
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          DMG_NAME="Clipd-macos-${{ matrix.arch }}-${VERSION}.dmg"
+          brew install create-dmg 2>/dev/null || true
+          create-dmg \
+            --volname "Clipd ${VERSION}" \
+            --volicon "packaging/icons/clipd.svg" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "Clipd.app" 150 200 \
+            --app-drop-link 450 200 \
+            "target/release/${DMG_NAME}" \
+            "target/release/Clipd.app" 2>/dev/null || \
+          hdiutil create -volname "Clipd" \
+            -srcfolder "target/release/Clipd.app" \
+            -ov -format UDZO \
+            "target/release/${DMG_NAME}"
+
+      - name: Upload zip artifact
         uses: actions/upload-artifact@v4
         with:
-          name: clipd-macos-${{ matrix.arch }}
+          name: clipd-macos-${{ matrix.arch }}-zip
           path: target/release/Clipd-macos-*.zip
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipd-macos-${{ matrix.arch }}-dmg
+          path: target/release/Clipd-macos-*.dmg
 
   build-linux:
     strategy:
@@ -78,7 +104,9 @@ jobs:
             libayatana-appindicator3-dev \
             libdbus-1-dev \
             pkg-config \
-            libxdo-dev
+            libxdo-dev \
+            file \
+            desktop-file-utils
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -88,6 +116,14 @@ jobs:
 
       - name: Build release
         run: cargo build --release
+
+      - name: Strip binaries
+        run: |
+          for bin in clipd clipd-ui clipd-gui clipd-mcp; do
+            if [ -f "target/release/${bin}" ]; then
+              strip "target/release/${bin}"
+            fi
+          done
 
       - name: Package zip
         run: |
@@ -101,13 +137,35 @@ jobs:
             fi
           done
           cp -f install.sh README.md "target/release/${ZIP_NAME}/" || true
+          cp -f packaging/linux/clipd.desktop "target/release/${ZIP_NAME}/"
+          cp -f packaging/linux/install-desktop.sh "target/release/${ZIP_NAME}/"
+          cp -f packaging/icons/clipd.svg "target/release/${ZIP_NAME}/"
+          chmod +x "target/release/${ZIP_NAME}/install-desktop.sh"
           cd target/release && zip -qr "${ZIP_NAME}.zip" "${ZIP_NAME}/"
 
-      - name: Upload artifact
+      - name: Build .deb package
+        run: bash packaging/linux/create-deb.sh "${GITHUB_REF_NAME}"
+
+      - name: Build AppImage
+        run: bash packaging/linux/create-appimage.sh "${GITHUB_REF_NAME}"
+
+      - name: Upload zip artifact
         uses: actions/upload-artifact@v4
         with:
-          name: clipd-linux-${{ matrix.arch }}
+          name: clipd-linux-${{ matrix.arch }}-zip
           path: target/release/Clipd-linux-*.zip
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipd-linux-${{ matrix.arch }}-deb
+          path: target/release/clipd_*.deb
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipd-linux-${{ matrix.arch }}-appimage
+          path: target/release/Clipd-*.AppImage
 
   build-windows:
     strategy:
@@ -141,14 +199,40 @@ jobs:
               Copy-Item $src $Dir
             }
           }
+          Copy-Item packaging/windows/Clipd.bat $Dir -ErrorAction SilentlyContinue
+          Copy-Item packaging/windows/ClipdTray.vbs $Dir -ErrorAction SilentlyContinue
+          Copy-Item packaging/windows/ClipdDebug.bat $Dir -ErrorAction SilentlyContinue
           Copy-Item install.ps1, README.md $Dir -ErrorAction SilentlyContinue
           Compress-Archive -Path $Dir -DestinationPath "target/release/${ZipName}.zip"
 
-      - name: Upload artifact
+      - name: Build NSIS installer
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          $Version = $env:GITHUB_REF_NAME
+          $InstallerDir = "target/release/installer-staging"
+          New-Item -ItemType Directory -Path $InstallerDir -Force
+          foreach ($bin in @("clipd.exe", "clipd-ui.exe", "clipd-gui.exe", "clipd-mcp.exe")) {
+            $src = "target/release/$bin"
+            if (Test-Path $src) { Copy-Item $src $InstallerDir }
+          }
+          $nsiContent = Get-Content "packaging/windows/clipd-installer.nsi" -Raw
+          $nsiContent = $nsiContent -replace '!define VERSION "0.1.1"', "!define VERSION ""$($Version.TrimStart('v'))"""
+          Set-Content -Path "$InstallerDir/clipd-installer.nsi" -Value $nsiContent
+          & "C:\Program Files (x86)\NSIS\makensis.exe" "/DVERSION=$($Version.TrimStart('v'))" "$InstallerDir/clipd-installer.nsi"
+          Move-Item "$InstallerDir/Clipd-Setup-*.exe" "target/release/" -ErrorAction SilentlyContinue
+
+      - name: Upload zip artifact
         uses: actions/upload-artifact@v4
         with:
-          name: clipd-windows-${{ matrix.arch }}
+          name: clipd-windows-${{ matrix.arch }}-zip
           path: target/release/Clipd-windows-*.zip
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipd-windows-${{ matrix.arch }}-installer
+          path: target/release/Clipd-Setup-*.exe
 
   create-release:
     needs: [build-macos, build-linux, build-windows]
@@ -160,8 +244,11 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/*.zip
+          files: artifacts/**/*
