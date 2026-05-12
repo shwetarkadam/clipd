@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let menu = Menu::new();
     let item_start = MenuItem::with_id(MENU_ID_START, "Start clipd daemon", true, None);
     let item_stop = MenuItem::with_id(MENU_ID_STOP, "Stop clipd daemon", false, None);
-    let item_search = MenuItem::with_id(MENU_ID_SEARCH, "Open clipd search", true, None);
+    let item_search = MenuItem::with_id(MENU_ID_SEARCH, "Open clipd search gui", true, None);
     let hud_on = load_paste_transform_settings().hud_enabled;
     // Plain MenuItem (not CheckMenuItem): macOS tray checkmarks were drifting from
     // `paste_transform.json`; explicit on/off text + toggle keeps daemon and UI aligned.
