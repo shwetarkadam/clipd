@@ -80,6 +80,20 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <string>11.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <!-- Accessibility — required for global keyboard hook (multi-tap copy/paste slots) -->
+  <key>NSAccessibilityUsageDescription</key>
+  <string>Clipd needs Accessibility access to detect multi-tap ⌘C / ⌘V for clipboard slots. Without it, only single copy/paste works.</string>
+  <!-- Input Monitoring — required on macOS 10.15+ for rdev keyboard events -->
+  <key>NSInputMonitoringUsageDescription</key>
+  <string>Clipd monitors keyboard shortcuts (⌘C, ⌘V) to save clipboard slots. No keystrokes are logged or sent anywhere.</string>
+  <!-- AppleScript — used to open TUI in Terminal / Warp when Developer mode is on -->
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Clipd uses AppleScript to open a terminal window for the developer TUI mode.</string>
+  <!-- Run as a regular app (not just menu bar agent) so macOS prompts for permissions -->
+  <key>LSUIElement</key>
+  <false/>
+  <key>LSBackgroundOnly</key>
+  <false/>
 </dict>
 </plist>
 PLIST
