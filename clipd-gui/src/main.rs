@@ -437,48 +437,10 @@ impl eframe::App for ClipdGui {
                         .show(ui, |ui| {
                             ui.set_width((avail - 140.0).max(200.0));
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.spacing_mut().item_spacing.x = 6.0;
                                 ui.label(
                                     RichText::new("🔍").size(14.0).color(rgb(c.overlay)),
                                 );
-
-                                // Active slot badges on the LEFT, before the text input.
-                                let max_slots = 5.min(self.clips.len());
-                                for i in 0..max_slots {
-                                    let slot = i + 1;
-                                    let (fill, text_col, stroke_col) = if i == 0 {
-                                        (rgb(c.accent), rgb(c.bg_base), rgb(c.accent))
-                                    } else {
-                                        (rgb(c.bg_elevated), rgb(c.subtext), rgb(c.border))
-                                    };
-                                    let preview = self.clips[i]
-                                        .preview
-                                        .chars()
-                                        .take(20)
-                                        .collect::<String>();
-                                    let btn = ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new(format!("{}", slot))
-                                                    .size(10.0)
-                                                    .color(text_col)
-                                                    .strong(),
-                                            )
-                                            .fill(fill)
-                                            .rounding(Rounding::same(5.0))
-                                            .stroke(Stroke::new(1.0, stroke_col))
-                                            .min_size(egui::vec2(18.0, 18.0)),
-                                        )
-                                        .on_hover_text(format!("Slot {}: {}", slot, preview));
-                                    if btn.clicked() {
-                                        if let Ok(mut cb) = Clipboard::new() {
-                                            let _ = cb.set_text(&self.clips[i].content);
-                                        }
-                                    }
-                                }
-
-                                ui.separator();
-
                                 let search = ui.add_sized(
                                     [ui.available_width(), 26.0],
                                     egui::TextEdit::singleline(&mut self.search_query)
@@ -857,6 +819,23 @@ impl ClipdGui {
                                             ContentType::Path => rgb(c.path),
                                             _ => rgb(c.overlay),
                                         };
+
+                                        // Slot badge for the 5 most recent clips
+                                        if clip_idx < 5 {
+                                            let slot = clip_idx + 1;
+                                            egui::Frame::none()
+                                                .fill(rgb(c.accent))
+                                                .rounding(Rounding::same(4.0))
+                                                .inner_margin(Margin::symmetric(5.0, 1.0))
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        RichText::new(format!("S{}", slot))
+                                                            .size(10.0)
+                                                            .color(rgb(c.bg_base))
+                                                            .strong(),
+                                                    );
+                                                });
+                                        }
 
                                         egui::Frame::none()
                                             .fill(pill_bg(type_color))
