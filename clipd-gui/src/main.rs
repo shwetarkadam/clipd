@@ -437,34 +437,13 @@ impl eframe::App for ClipdGui {
                         .show(ui, |ui| {
                             ui.set_width((avail - 140.0).max(200.0));
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.spacing_mut().item_spacing.x = 4.0;
                                 ui.label(
                                     RichText::new("🔍").size(14.0).color(rgb(c.overlay)),
                                 );
 
-                                // Reserve space for slot badges on the right side of the search box.
+                                // Active slot badges on the LEFT, before the text input.
                                 let max_slots = 5.min(self.clips.len());
-                                let badge_area = (max_slots as f32) * 26.0;
-                                let search = ui.add_sized(
-                                    [(ui.available_width() - badge_area).max(40.0), 26.0],
-                                    egui::TextEdit::singleline(&mut self.search_query)
-                                        .id(egui::Id::new("clip_search"))
-                                        .hint_text("Search clips…")
-                                        .frame(false)
-                                        .font(egui::TextStyle::Body),
-                                );
-                                if self.focus_search {
-                                    search.request_focus();
-                                    self.focus_search = false;
-                                }
-                                if search.changed() {
-                                    self.apply_filter();
-                                }
-
-                                // Active slot badges inline inside the search box.
-                                ui.add_space(4.0);
-                                ui.separator();
-                                ui.add_space(4.0);
                                 for i in 0..max_slots {
                                     let slot = i + 1;
                                     let (fill, text_col, stroke_col) = if i == 0 {
@@ -496,6 +475,24 @@ impl eframe::App for ClipdGui {
                                             let _ = cb.set_text(&self.clips[i].content);
                                         }
                                     }
+                                }
+
+                                ui.separator();
+
+                                let search = ui.add_sized(
+                                    [ui.available_width(), 26.0],
+                                    egui::TextEdit::singleline(&mut self.search_query)
+                                        .id(egui::Id::new("clip_search"))
+                                        .hint_text("Search clips…")
+                                        .frame(false)
+                                        .font(egui::TextStyle::Body),
+                                );
+                                if self.focus_search {
+                                    search.request_focus();
+                                    self.focus_search = false;
+                                }
+                                if search.changed() {
+                                    self.apply_filter();
                                 }
                             });
                         });
