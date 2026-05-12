@@ -1,0 +1,4 @@
+# Cross-compile Windows binaries from macOS (requires: brew install mingw-w64).
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]

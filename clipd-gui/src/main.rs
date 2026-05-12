@@ -459,6 +459,44 @@ impl eframe::App for ClipdGui {
                             });
                         });
 
+                    ui.add_space(8.0);
+
+                    // Active slot badges — slot N = Nth most recent clip.
+                    let max_slots = 5.min(self.clips.len());
+                    for i in 0..max_slots {
+                        let slot = i + 1;
+                        let is_active = i == 0;
+                        let (fill, text_col, stroke_col) = if is_active {
+                            (rgb(c.accent), rgb(c.bg_base), rgb(c.accent))
+                        } else {
+                            (rgb(c.bg_elevated), rgb(c.subtext), rgb(c.border))
+                        };
+                        let preview = self.clips[i]
+                            .preview
+                            .chars()
+                            .take(12)
+                            .collect::<String>();
+                        let label = RichText::new(format!("{}", slot))
+                            .size(11.0)
+                            .color(text_col)
+                            .strong();
+                        let btn = ui
+                            .add(
+                                egui::Button::new(label)
+                                    .fill(fill)
+                                    .rounding(Rounding::same(6.0))
+                                    .stroke(Stroke::new(1.0, stroke_col))
+                                    .min_size(egui::vec2(20.0, 20.0)),
+                            )
+                            .on_hover_text(format!("Slot {}: {}", slot, preview));
+                        if btn.clicked() {
+                            if let Ok(mut cb) = Clipboard::new() {
+                                let _ = cb.set_text(&self.clips[i].content);
+                            }
+                        }
+                        ui.add_space(2.0);
+                    }
+
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {

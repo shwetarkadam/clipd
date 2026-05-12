@@ -769,9 +769,35 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
 fn draw_search(f: &mut Frame, app: &App, area: Rect) {
     let c = app.theme.colors();
     let cursor = "│";
-    let text = format!(" {}{}", app.search_input, cursor);
     let mode_badge = if app.semantic_mode { " 🧠 Semantic " } else { " 🔍 Fuzzy " };
     let title = format!("{} Search clips ", mode_badge);
+
+    // Build inline slot badges: [1] [2] [3] ... shown after the search input.
+    let max_slots = 5.min(app.clips.len());
+    let mut slot_spans: Vec<Span> = vec![
+        Span::styled(format!(" {}{}", app.search_input, cursor), Style::default().fg(color(c.text))),
+        Span::raw("   "),
+    ];
+    for i in 0..max_slots {
+        let badge_style = if i == 0 {
+            Style::default()
+                .fg(color(c.bg_base))
+                .bg(color(c.accent))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(color(c.bg_base))
+                .bg(color(c.subtext))
+        };
+        slot_spans.push(Span::styled(format!(" {} ", i + 1), badge_style));
+        slot_spans.push(Span::raw(" "));
+    }
+    if max_slots == 0 {
+        slot_spans.push(Span::styled(
+            "no slots",
+            Style::default().fg(color(c.overlay)),
+        ));
+    }
 
     let block = Block::default()
         .title(title)
@@ -779,9 +805,7 @@ fn draw_search(f: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(color(c.accent)));
 
-    let widget = Paragraph::new(text)
-        .block(block)
-        .style(Style::default().fg(color(c.text)));
+    let widget = Paragraph::new(Line::from(slot_spans)).block(block);
 
     f.render_widget(widget, area);
 }
