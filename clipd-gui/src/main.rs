@@ -1394,83 +1394,6 @@ impl ClipdGui {
                     save_privacy_config(&self.privacy_config);
                 }
 
-                ui.add_space(8.0);
-                ui.separator();
-
-                // ── Export History ──
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Export History")
-                        .size(13.0)
-                        .strong()
-                        .color(rgb(c.accent)),
-                );
-                ui.label(
-                    RichText::new(format!("Save all {} clips to a file", self.clips.len()))
-                        .size(11.0)
-                        .color(rgb(c.subtext)),
-                );
-                ui.add_space(6.0);
-
-                ui.horizontal(|ui| {
-                    let export_col = Color32::from_rgb(100, 180, 255);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("📄 Export as .txt")
-                                    .size(12.0)
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(pill_bg(export_col))
-                            .rounding(Rounding::same(6.0))
-                            .stroke(Stroke::new(1.0, export_col)),
-                        )
-                        .clicked()
-                    {
-                        match self.do_export_text() {
-                            Ok(path) => self.export_status = Some((format!("✓ Saved: {}", path), Instant::now())),
-                            Err(e) => self.export_status = Some((format!("✗ Error: {}", e), Instant::now())),
-                        }
-                    }
-
-                    ui.add_space(8.0);
-
-                    let csv_col = Color32::from_rgb(100, 210, 140);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("📊 Export as .csv")
-                                    .size(12.0)
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(pill_bg(csv_col))
-                            .rounding(Rounding::same(6.0))
-                            .stroke(Stroke::new(1.0, csv_col)),
-                        )
-                        .clicked()
-                    {
-                        match self.do_export_csv() {
-                            Ok(path) => self.export_status = Some((format!("✓ Saved: {}", path), Instant::now())),
-                            Err(e) => self.export_status = Some((format!("✗ Error: {}", e), Instant::now())),
-                        }
-                    }
-                });
-
-                if let Some((msg, t)) = &self.export_status {
-                    if t.elapsed() < Duration::from_secs(6) {
-                        ui.add_space(4.0);
-                        let is_err = msg.starts_with('✗');
-                        let col = if is_err {
-                            Color32::from_rgb(255, 100, 100)
-                        } else {
-                            Color32::from_rgb(100, 210, 140)
-                        };
-                        ui.label(RichText::new(msg).size(11.0).color(col));
-                    } else {
-                        self.export_status = None;
-                    }
-                }
-
                 ui.add_space(4.0);
             });
 
@@ -1995,6 +1918,74 @@ impl ClipdGui {
                                                 }
                                             });
                                     });
+
+                                ui.add_space(12.0);
+
+                                // ── Export History ──
+                                ui.separator();
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("EXPORT HISTORY")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(rgb(c.text)),
+                                );
+                                ui.label(
+                                    RichText::new(format!("{} clips saved to your Documents folder", self.clips.len()))
+                                        .size(11.0)
+                                        .color(rgb(c.subtext)),
+                                );
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    let txt_col = Color32::from_rgb(100, 180, 255);
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("📄 Export .txt").size(12.0).color(Color32::WHITE),
+                                            )
+                                            .fill(pill_bg(txt_col))
+                                            .rounding(Rounding::same(6.0))
+                                            .stroke(Stroke::new(1.0, txt_col)),
+                                        )
+                                        .clicked()
+                                    {
+                                        match self.do_export_text() {
+                                            Ok(path) => self.export_status = Some((format!("✓ Saved: {}", path), Instant::now())),
+                                            Err(e) => self.export_status = Some((format!("✗ {}", e), Instant::now())),
+                                        }
+                                    }
+                                    ui.add_space(6.0);
+                                    let csv_col = Color32::from_rgb(100, 210, 140);
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("📊 Export .csv").size(12.0).color(Color32::WHITE),
+                                            )
+                                            .fill(pill_bg(csv_col))
+                                            .rounding(Rounding::same(6.0))
+                                            .stroke(Stroke::new(1.0, csv_col)),
+                                        )
+                                        .clicked()
+                                    {
+                                        match self.do_export_csv() {
+                                            Ok(path) => self.export_status = Some((format!("✓ Saved: {}", path), Instant::now())),
+                                            Err(e) => self.export_status = Some((format!("✗ {}", e), Instant::now())),
+                                        }
+                                    }
+                                });
+                                if let Some((msg, t)) = &self.export_status {
+                                    if t.elapsed() < Duration::from_secs(6) {
+                                        ui.add_space(4.0);
+                                        let col = if msg.starts_with('✗') {
+                                            Color32::from_rgb(255, 100, 100)
+                                        } else {
+                                            Color32::from_rgb(100, 210, 140)
+                                        };
+                                        ui.label(RichText::new(msg).size(11.0).color(col));
+                                    } else {
+                                        self.export_status = None;
+                                    }
+                                }
 
                                 ui.add_space(12.0);
 
