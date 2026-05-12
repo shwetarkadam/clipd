@@ -6,6 +6,7 @@ use clipd_core::{
     paste_transforms, save_paste_transform_settings, save_privacy_config, save_theme,
     search_embeddings, ClipEntry, ClipStore, ContentType, Embedding, PasteTransformSettings,
     PrivacyConfig, Rgb, Session, SessionConfig, TfIdfIndex, Theme, TransformConfig, TransformKind,
+    MAX_CLIP_SLOT,
 };
 use eframe::egui::{self, Color32, FontId, Margin, RichText, Rounding, Stroke};
 use std::time::{Duration, Instant};
@@ -822,8 +823,8 @@ impl ClipdGui {
                                             _ => rgb(c.overlay),
                                         };
 
-                                        // Slot badge for the 5 most recent clips
-                                        if clip_idx < 5 {
+                                        // Slot badge for the most recent clips (up to MAX_CLIP_SLOT)
+                                        if clip_idx < MAX_CLIP_SLOT as usize {
                                             let slot = clip_idx + 1;
                                             egui::Frame::none()
                                                 .fill(rgb(c.accent))
