@@ -441,8 +441,12 @@ impl eframe::App for ClipdGui {
                                 ui.label(
                                     RichText::new("🔍").size(14.0).color(rgb(c.overlay)),
                                 );
+
+                                // Reserve space for slot badges on the right side of the search box.
+                                let max_slots = 5.min(self.clips.len());
+                                let badge_area = (max_slots as f32) * 26.0;
                                 let search = ui.add_sized(
-                                    [ui.available_width(), 26.0],
+                                    [(ui.available_width() - badge_area).max(40.0), 26.0],
                                     egui::TextEdit::singleline(&mut self.search_query)
                                         .id(egui::Id::new("clip_search"))
                                         .hint_text("Search clips…")
@@ -456,46 +460,45 @@ impl eframe::App for ClipdGui {
                                 if search.changed() {
                                     self.apply_filter();
                                 }
+
+                                // Active slot badges inline inside the search box.
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.add_space(4.0);
+                                for i in 0..max_slots {
+                                    let slot = i + 1;
+                                    let (fill, text_col, stroke_col) = if i == 0 {
+                                        (rgb(c.accent), rgb(c.bg_base), rgb(c.accent))
+                                    } else {
+                                        (rgb(c.bg_elevated), rgb(c.subtext), rgb(c.border))
+                                    };
+                                    let preview = self.clips[i]
+                                        .preview
+                                        .chars()
+                                        .take(20)
+                                        .collect::<String>();
+                                    let btn = ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(format!("{}", slot))
+                                                    .size(10.0)
+                                                    .color(text_col)
+                                                    .strong(),
+                                            )
+                                            .fill(fill)
+                                            .rounding(Rounding::same(5.0))
+                                            .stroke(Stroke::new(1.0, stroke_col))
+                                            .min_size(egui::vec2(18.0, 18.0)),
+                                        )
+                                        .on_hover_text(format!("Slot {}: {}", slot, preview));
+                                    if btn.clicked() {
+                                        if let Ok(mut cb) = Clipboard::new() {
+                                            let _ = cb.set_text(&self.clips[i].content);
+                                        }
+                                    }
+                                }
                             });
                         });
-
-                    ui.add_space(8.0);
-
-                    // Active slot badges — slot N = Nth most recent clip.
-                    let max_slots = 5.min(self.clips.len());
-                    for i in 0..max_slots {
-                        let slot = i + 1;
-                        let is_active = i == 0;
-                        let (fill, text_col, stroke_col) = if is_active {
-                            (rgb(c.accent), rgb(c.bg_base), rgb(c.accent))
-                        } else {
-                            (rgb(c.bg_elevated), rgb(c.subtext), rgb(c.border))
-                        };
-                        let preview = self.clips[i]
-                            .preview
-                            .chars()
-                            .take(12)
-                            .collect::<String>();
-                        let label = RichText::new(format!("{}", slot))
-                            .size(11.0)
-                            .color(text_col)
-                            .strong();
-                        let btn = ui
-                            .add(
-                                egui::Button::new(label)
-                                    .fill(fill)
-                                    .rounding(Rounding::same(6.0))
-                                    .stroke(Stroke::new(1.0, stroke_col))
-                                    .min_size(egui::vec2(20.0, 20.0)),
-                            )
-                            .on_hover_text(format!("Slot {}: {}", slot, preview));
-                        if btn.clicked() {
-                            if let Ok(mut cb) = Clipboard::new() {
-                                let _ = cb.set_text(&self.clips[i].content);
-                            }
-                        }
-                        ui.add_space(2.0);
-                    }
 
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
