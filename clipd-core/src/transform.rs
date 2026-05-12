@@ -310,15 +310,31 @@ pub fn apply_transform(
 
 // ── Built-in Implementations ──
 
+fn strip_code_fence(input: &str) -> &str {
+    let s = input.trim();
+    if s.starts_with("```") {
+        let after_fence = &s[3..];
+        // skip optional language tag on the first line
+        let body = after_fence.find('\n').map_or("", |i| &after_fence[i + 1..]);
+        let body = body.trim_end();
+        if body.ends_with("```") {
+            return body[..body.len() - 3].trim();
+        }
+    }
+    input
+}
+
 fn pretty_json(input: &str) -> Result<String, String> {
+    let src = strip_code_fence(input);
     let value: serde_json::Value =
-        serde_json::from_str(input).map_err(|e| format!("Invalid JSON: {}", e))?;
+        serde_json::from_str(src).map_err(|e| format!("Invalid JSON: {}", e))?;
     serde_json::to_string_pretty(&value).map_err(|e| format!("JSON formatting failed: {}", e))
 }
 
 fn minify_json(input: &str) -> Result<String, String> {
+    let src = strip_code_fence(input);
     let value: serde_json::Value =
-        serde_json::from_str(input).map_err(|e| format!("Invalid JSON: {}", e))?;
+        serde_json::from_str(src).map_err(|e| format!("Invalid JSON: {}", e))?;
     serde_json::to_string(&value).map_err(|e| format!("JSON minification failed: {}", e))
 }
 

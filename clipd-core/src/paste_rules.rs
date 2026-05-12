@@ -2,6 +2,19 @@ use crate::transform::TransformKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn strip_code_fence_for_detect(input: &str) -> &str {
+    let s = input.trim();
+    if s.starts_with("```") {
+        let after = &s[3..];
+        let body = after.find('\n').map_or("", |i| &after[i + 1..]);
+        let body = body.trim_end();
+        if body.ends_with("```") {
+            return body[..body.len() - 3].trim();
+        }
+    }
+    input
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PasteRule {
     pub dest_app: String,
@@ -149,15 +162,17 @@ pub fn suggest_smart_transform(
         }
     }
 
+    let json_candidate = strip_code_fence_for_detect(content);
     match content_type {
         crate::models::ContentType::Code => {
-            if let Ok(_) = serde_json::from_str::<serde_json::Value>(content) {
+            if serde_json::from_str::<serde_json::Value>(json_candidate).is_ok() {
                 suggestions.push(TransformKind::PrettyJson);
             }
         }
         _ => {
-            if content.trim_start().starts_with('{') || content.trim_start().starts_with('[') {
-                if serde_json::from_str::<serde_json::Value>(content).is_ok() {
+            let t = json_candidate.trim_start();
+            if t.starts_with('{') || t.starts_with('[') {
+                if serde_json::from_str::<serde_json::Value>(json_candidate).is_ok() {
                     suggestions.push(TransformKind::PrettyJson);
                 }
             }
