@@ -162,8 +162,14 @@ fn main() {
         }
 
         None => {
-            // Default: launch GUI with embedded daemon (user-friendly)
-            launch_gui();
+            // Default: spawn GUI in background, run TUI in the terminal
+            spawn_gui_background();
+            launch_daemon_background();
+            if let Err(e) = clipd_tui::run_tui() {
+                eprintln!("❌ TUI error: {}", e);
+                std::process::exit(1);
+            }
+            clipd_core::release_daemon_lock();
         }
     }
 }
@@ -472,6 +478,17 @@ fn check_update_background() {
 // ── Launch helpers ──
 
 /// Spawn the daemon in a background thread (used by `clipd tui`).
+fn spawn_gui_background() {
+    if let Some(gui_path) = find_gui_binary() {
+        let _ = std::process::Command::new(&gui_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        // Brief pause so the GUI/daemon can acquire the lock before we try
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
 fn launch_daemon_background() {
     std::thread::Builder::new()
         .name("clipd-daemon".into())
