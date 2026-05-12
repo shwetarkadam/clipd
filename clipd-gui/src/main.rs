@@ -1871,82 +1871,75 @@ impl ClipdGui {
                                     });
 
                                 ui.add_space(12.0);
-                            });
-                    });
 
-                // ── Danger zone: clear all history ──
-                egui::Frame::none()
-                    .inner_margin(Margin::symmetric(20.0, 8.0))
-                    .show(ui, |ui| {
-                        ui.separator();
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new("DANGER ZONE")
-                                .size(11.0)
-                                .strong()
-                                .color(Color32::from_rgb(200, 60, 60)),
-                        );
-                        ui.add_space(4.0);
-
-                        if self.confirm_clear_all {
-                            ui.horizontal(|ui| {
+                                // ── Danger zone: clear all history ──
+                                ui.separator();
+                                ui.add_space(6.0);
                                 ui.label(
-                                    RichText::new("Delete all clipboard history? This cannot be undone.")
-                                        .size(12.0)
-                                        .color(Color32::from_rgb(255, 100, 100)),
+                                    RichText::new("DANGER ZONE")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(200, 60, 60)),
                                 );
-                            });
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("✕ Yes, delete everything")
-                                                .size(12.0)
-                                                .strong()
-                                                .color(Color32::WHITE),
-                                        )
-                                        .fill(Color32::from_rgb(180, 40, 40))
-                                        .rounding(Rounding::same(6.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    let _ = self.store.clear_all();
-                                    self.confirm_clear_all = false;
-                                    self.refresh();
-                                }
-                                ui.add_space(8.0);
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Cancel").size(12.0).color(rgb(c.text)),
-                                        )
-                                        .fill(rgb(c.bg_elevated))
-                                        .rounding(Rounding::same(6.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.confirm_clear_all = false;
-                                }
-                            });
-                        } else {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("🗑 Clear All History")
+                                ui.add_space(4.0);
+
+                                if self.confirm_clear_all {
+                                    ui.label(
+                                        RichText::new("Delete all clipboard history? This cannot be undone.")
                                             .size(12.0)
                                             .color(Color32::from_rgb(255, 100, 100)),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new("✕ Yes, delete everything")
+                                                        .size(12.0)
+                                                        .strong()
+                                                        .color(Color32::WHITE),
+                                                )
+                                                .fill(Color32::from_rgb(180, 40, 40))
+                                                .rounding(Rounding::same(6.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            let _ = self.store.clear_all();
+                                            self.confirm_clear_all = false;
+                                            self.refresh();
+                                        }
+                                        ui.add_space(8.0);
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new("Cancel").size(12.0).color(rgb(c.text)),
+                                                )
+                                                .fill(rgb(c.bg_elevated))
+                                                .rounding(Rounding::same(6.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.confirm_clear_all = false;
+                                        }
+                                    });
+                                } else if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("🗑 Clear All History")
+                                                .size(12.0)
+                                                .color(Color32::from_rgb(255, 100, 100)),
+                                        )
+                                        .fill(rgb(c.bg_elevated))
+                                        .rounding(Rounding::same(6.0))
+                                        .stroke(Stroke::new(1.0, Color32::from_rgb(180, 40, 40))),
                                     )
-                                    .fill(rgb(c.bg_elevated))
-                                    .rounding(Rounding::same(6.0))
-                                    .stroke(Stroke::new(1.0, Color32::from_rgb(180, 40, 40))),
-                                )
-                                .clicked()
-                            {
-                                self.confirm_clear_all = true;
-                            }
-                        }
-                        ui.add_space(4.0);
+                                    .clicked()
+                                {
+                                    self.confirm_clear_all = true;
+                                }
+
+                                ui.add_space(8.0);
+                            });
                     });
             });
 
