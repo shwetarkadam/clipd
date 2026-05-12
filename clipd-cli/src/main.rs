@@ -162,9 +162,12 @@ fn main() {
         }
 
         None => {
-            // Default: spawn GUI in background, run TUI in the terminal
-            spawn_gui_background();
-            launch_daemon_background();
+            // Spawn menu bar UI (or GUI) in background; only start daemon
+            // ourselves if neither was available (they handle it internally).
+            let ui_launched = spawn_background_ui();
+            if !ui_launched {
+                launch_daemon_background();
+            }
             if let Err(e) = clipd_tui::run_tui() {
                 eprintln!("❌ TUI error: {}", e);
                 std::process::exit(1);
@@ -478,15 +481,28 @@ fn check_update_background() {
 // ── Launch helpers ──
 
 /// Spawn the daemon in a background thread (used by `clipd tui`).
-fn spawn_gui_background() {
+/// Spawns the best available background UI:
+///   - clipd-ui  (menu bar + daemon + GUI) if present
+///   - clipd-gui (GUI + daemon) otherwise
+/// Returns true if clipd-ui was launched (it handles the daemon itself).
+fn spawn_background_ui() -> bool {
+    if let Some(ui_path) = find_ui_binary() {
+        let _ = std::process::Command::new(&ui_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        // Give clipd-ui time to start the daemon before we connect
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        return true;
+    }
     if let Some(gui_path) = find_gui_binary() {
         let _ = std::process::Command::new(&gui_path)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
-        // Brief pause so the GUI/daemon can acquire the lock before we try
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
+    false
 }
 
 fn launch_daemon_background() {
@@ -583,6 +599,57 @@ fn find_gui_binary() -> Option<std::path::PathBuf> {
                 let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !path.is_empty() {
                     return Some(PathBuf::from(path));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_ui_binary() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            #[cfg(target_os = "windows")]
+            for name in ["clipd-ui.exe", "clipd-ui"] {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let candidate = dir.join("clipd-ui");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(output) = std::process::Command::new("which").arg("clipd-ui").output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Some(PathBuf::from(path));
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("where").arg("clipd-ui").output() {
+            if output.status.success() {
+                let line = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                if !line.is_empty() {
+                    return Some(std::path::PathBuf::from(line));
                 }
             }
         }
