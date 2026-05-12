@@ -280,16 +280,15 @@ fn cmd_paste(slot: u8) {
         return;
     }
 
-    // For v0.1, slots are in daemon memory. CLI can read from store instead.
-    // Read the most recent clip from the store as a fallback.
     let store = open_store();
-    let clips = store.get_recent(1).unwrap_or_default();
+    // slot 0 and slot 1 both mean "most recent"; slot N means Nth most recent.
+    let fetch = if slot <= 1 { 1 } else { slot as usize };
+    let clips = store.get_recent(fetch).unwrap_or_default();
 
-    if let Some(clip) = clips.first() {
-        // Output raw content to stdout for piping
+    if let Some(clip) = clips.last() {
         print!("{}", clip.content);
     } else {
-        eprintln!("❌ Slot {} is empty (or daemon not running)", slot);
+        eprintln!("❌ Slot {} is empty", slot);
     }
 }
 
