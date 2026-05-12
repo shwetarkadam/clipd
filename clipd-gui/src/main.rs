@@ -212,6 +212,7 @@ struct ClipdGui {
     new_excluded_app: String,
     new_custom_pattern: String,
     confirm_clear_all: bool,
+    export_status: Option<(String, Instant)>,
 }
 
 impl ClipdGui {
@@ -247,6 +248,7 @@ impl ClipdGui {
             new_excluded_app: String::new(),
             new_custom_pattern: String::new(),
             confirm_clear_all: false,
+            export_status: None,
         }
     }
 
@@ -709,6 +711,50 @@ impl eframe::App for ClipdGui {
 }
 
 impl ClipdGui {
+    fn export_path(ext: &str) -> std::path::PathBuf {
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        let filename = format!("clipd_history_{}.{}", ts, ext);
+        dirs::document_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(filename)
+    }
+
+    fn do_export_text(&self) -> Result<String, String> {
+        let path = Self::export_path("txt");
+        let mut out = String::new();
+        for (i, clip) in self.clips.iter().enumerate() {
+            out.push_str(&format!(
+                "=== Clip {} | {} | {} ===\n",
+                i + 1,
+                clip.timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
+                clip.source_app.as_deref().unwrap_or("Unknown"),
+            ));
+            out.push_str(&clip.content);
+            out.push_str("\n\n");
+        }
+        std::fs::write(&path, out).map_err(|e| e.to_string())?;
+        Ok(path.display().to_string())
+    }
+
+    fn do_export_csv(&self) -> Result<String, String> {
+        let path = Self::export_path("csv");
+        let mut out = String::from("slot,timestamp,source_app,content_type,content\n");
+        for (i, clip) in self.clips.iter().enumerate() {
+            let escaped = clip.content.replace('"', "\"\"");
+            out.push_str(&format!(
+                "{},{},{},{},\"{}\"\n",
+                i + 1,
+                clip.timestamp.format("%Y-%m-%d %H:%M:%S"),
+                clip.source_app.as_deref().unwrap_or(""),
+                clip.content_type.as_str(),
+                escaped,
+            ));
+        }
+        std::fs::write(&path, out).map_err(|e| e.to_string())?;
+        Ok(path.display().to_string())
+    }
+
     fn render_empty_list(&self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         ui.vertical_centered(|ui| {
             ui.add_space(80.0);
@@ -1347,6 +1393,85 @@ impl ClipdGui {
                 if dirty {
                     save_privacy_config(&self.privacy_config);
                 }
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // ── Export History ──
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Export History")
+                        .size(13.0)
+                        .strong()
+                        .color(rgb(c.accent)),
+                );
+                ui.label(
+                    RichText::new(format!("Save all {} clips to a file", self.clips.len()))
+                        .size(11.0)
+                        .color(rgb(c.subtext)),
+                );
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    let export_col = Color32::from_rgb(100, 180, 255);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("📄 Export as .txt")
+                                    .size(12.0)
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(pill_bg(export_col))
+                            .rounding(Rounding::same(6.0))
+                            .stroke(Stroke::new(1.0, export_col)),
+                        )
+                        .clicked()
+                    {
+                        match self.do_export_text() {
+                            Ok(path) => self.export_status = Some((format!("✓ Saved: {}", path), Instant::now())),
+                            Err(e) => self.export_status = Some((format!("✗ Error: {}", e), Instant::now())),
+                        }
+                    }
+
+                    ui.add_space(8.0);
+
+                    let csv_col = Color32::from_rgb(100, 210, 140);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("📊 Export as .csv")
+                                    .size(12.0)
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(pill_bg(csv_col))
+                            .rounding(Rounding::same(6.0))
+                            .stroke(Stroke::new(1.0, csv_col)),
+                        )
+                        .clicked()
+                    {
+                        match self.do_export_csv() {
+                            Ok(path) => self.export_status = Some((format!("✓ Saved: {}", path), Instant::now())),
+                            Err(e) => self.export_status = Some((format!("✗ Error: {}", e), Instant::now())),
+                        }
+                    }
+                });
+
+                if let Some((msg, t)) = &self.export_status {
+                    if t.elapsed() < Duration::from_secs(6) {
+                        ui.add_space(4.0);
+                        let is_err = msg.starts_with('✗');
+                        let col = if is_err {
+                            Color32::from_rgb(255, 100, 100)
+                        } else {
+                            Color32::from_rgb(100, 210, 140)
+                        };
+                        ui.label(RichText::new(msg).size(11.0).color(col));
+                    } else {
+                        self.export_status = None;
+                    }
+                }
+
+                ui.add_space(4.0);
             });
 
         if !open {
