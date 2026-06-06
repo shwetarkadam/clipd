@@ -19,12 +19,12 @@ impl SlotManager {
     }
 
     /// Copy content into a numbered slot (0..=MAX_CLIP_SLOT).
-    pub fn copy_to_slot(&self, slot: u8, content: &str) -> Result<(), String> {
+    pub fn copy_to_slot(&self, slot: u8, content: String) -> Result<(), String> {
         if slot > MAX_CLIP_SLOT {
             return Err(format!("Slot {} out of range (0-{})", slot, MAX_CLIP_SLOT));
         }
         let mut slots = self.slots.write().map_err(|e| e.to_string())?;
-        slots.insert(slot, content.to_string());
+        slots.insert(slot, content);
         Ok(())
     }
 
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn test_copy_and_get() {
         let sm = SlotManager::new();
-        sm.copy_to_slot(1, "hello").unwrap();
+        sm.copy_to_slot(1, "hello".to_string()).unwrap();
         assert_eq!(sm.get_slot(1).unwrap(), Some("hello".to_string()));
         assert_eq!(sm.get_slot(2).unwrap(), None);
     }
@@ -112,15 +112,15 @@ mod tests {
     #[test]
     fn test_slot_out_of_range() {
         let sm = SlotManager::new();
-        assert!(sm.copy_to_slot(MAX_CLIP_SLOT + 1, "bad").is_err());
+        assert!(sm.copy_to_slot(MAX_CLIP_SLOT + 1, "bad".to_string()).is_err());
         assert!(sm.get_slot(MAX_CLIP_SLOT + 1).is_err());
     }
 
     #[test]
     fn test_list_slots() {
         let sm = SlotManager::new();
-        sm.copy_to_slot(3, "three").unwrap();
-        sm.copy_to_slot(1, "one").unwrap();
+        sm.copy_to_slot(3, "three".to_string()).unwrap();
+        sm.copy_to_slot(1, "one".to_string()).unwrap();
 
         let list = sm.list_slots().unwrap();
         assert_eq!(list.len(), 2);
@@ -131,8 +131,8 @@ mod tests {
     #[test]
     fn test_clear() {
         let sm = SlotManager::new();
-        sm.copy_to_slot(1, "one").unwrap();
-        sm.copy_to_slot(2, "two").unwrap();
+        sm.copy_to_slot(1, "one".to_string()).unwrap();
+        sm.copy_to_slot(2, "two".to_string()).unwrap();
 
         sm.clear_slot(1).unwrap();
         assert_eq!(sm.get_slot(1).unwrap(), None);
@@ -148,7 +148,7 @@ mod tests {
         let sm2 = sm.clone();
 
         let handle = std::thread::spawn(move || {
-            sm2.copy_to_slot(5, "from thread").unwrap();
+            sm2.copy_to_slot(5, "from thread".to_string()).unwrap();
         });
 
         handle.join().unwrap();

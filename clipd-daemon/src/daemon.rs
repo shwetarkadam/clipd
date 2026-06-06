@@ -18,8 +18,6 @@ use global_hotkey::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
-#[cfg(not(target_os = "windows"))]
-use std::process::Stdio;
 #[cfg(target_os = "macos")]
 use rdev::{listen, EventType, Key as RKey};
 
@@ -60,10 +58,7 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     setup_ctrlc(stop_ctrlc);
 
     // ── Clipboard Watcher Thread ──
-    // Bound the channel to prevent unbounded memory growth if the watcher produces
-    // faster than the store-writer can consume. 100 events is ~a few KB at most.
-    const CLIP_CHANNEL_CAP: usize = 100;
-    let (clip_tx, clip_rx) = mpsc::sync_channel::<ClipEvent>(CLIP_CHANNEL_CAP);
+    let (clip_tx, clip_rx) = mpsc::channel::<ClipEvent>();
     let watcher = ClipWatcher::new(500);
     let watcher_handle = std::thread::Builder::new()
         .name("clipd-watcher".into())
@@ -83,11 +78,6 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
             };
-            // Prune old clips so the DB never grows beyond 10,000 entries.
-            const MAX_STORED_CLIPS: usize = 10_000;
-            if let Err(e) = store.prune_if_needed(MAX_STORED_CLIPS) {
-                log::warn!("Clip pruning failed (non-fatal): {}", e);
-            }
             let embed_config = load_transform_config();
             let embed_available = is_embedding_available(&embed_config);
             if embed_available {
@@ -99,7 +89,7 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
             for event in clip_rx {
                 match event {
                     ClipEvent::NewClip(entry) => {
-                        slot_writer.copy_to_slot(0, &entry.content).ok();
+                        slot_writer.copy_to_slot(0, entry.content.clone()).ok();
                         let content_for_embed = entry.content.clone();
                         match store.insert(&entry) {
                             Ok(id) => {
@@ -445,49 +435,38 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     // ── Main Event Loop (non-macOS) ──
     #[cfg(not(target_os = "macos"))]
     {
-        use std::time::Duration;
         let receiver = GlobalHotKeyEvent::receiver();
         let hotkey_slot_mgr = slot_manager.clone();
         let transform_config = load_transform_config();
         let paste_transform = load_paste_transform_settings();
         loop {
-            // Blocking recv — no CPU polling. Wake every 200ms to check stop flag.
-            let event = match receiver.recv_timeout(Duration::from_millis(200)) {
-                Ok(e) => e,
-                Err(_) => {
-                    // Timeout — check stop and loop
-                    if stop_hotkey.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    continue;
-                }
-            };
-            if stop_hotkey.load(Ordering::Relaxed) {
-                break;
-            }
-            if event.state == global_hotkey::HotKeyState::Pressed {
-                if let Some((_, action)) = registered_hotkeys
-                    .iter().find(|(hk, _)| hk.id() == event.id)
-                {
-                    match action {
-                        FinalAction::CopyToSlot(s) => execute_copy(*s, &hotkey_slot_mgr),
-                        FinalAction::PasteFromSlot(s) => execute_direct_paste(
-                            *s,
-                            &hotkey_slot_mgr,
-                            &suppress,
-                            &transform_config,
-                            &paste_transform,
-                        ),
-                        FinalAction::OpenTui => open_tui_search(),
-                        FinalAction::OpenGui => open_gui(),
-                        FinalAction::SmartPaste => execute_smart_paste(
-                            &suppress,
-                            &transform_config,
-                            &paste_transform,
-                        ),
+            if stop_hotkey.load(Ordering::Relaxed) { break; }
+            if let Ok(event) = receiver.try_recv() {
+                if event.state == global_hotkey::HotKeyState::Pressed {
+                    if let Some((_, action)) = registered_hotkeys
+                        .iter().find(|(hk, _)| hk.id() == event.id)
+                    {
+                        match action {
+                            FinalAction::CopyToSlot(s) => execute_copy(*s, &hotkey_slot_mgr),
+                            FinalAction::PasteFromSlot(s) => execute_direct_paste(
+                                *s,
+                                &hotkey_slot_mgr,
+                                &suppress,
+                                &transform_config,
+                                &paste_transform,
+                            ),
+                            FinalAction::OpenTui => open_tui_search(),
+                            FinalAction::OpenGui => open_gui(),
+                            FinalAction::SmartPaste => execute_smart_paste(
+                                &suppress,
+                                &transform_config,
+                                &paste_transform,
+                            ),
+                        }
                     }
                 }
             }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -566,9 +545,9 @@ fn execute_copy(slot: u8, mgr: &SlotManager) {
             }
         }
     }
-    if let Some(ref text) = text {
-        mgr.copy_to_slot(slot, text).ok();
-        log::info!("📋 Saved to slot {}: {}", slot, truncate(text, 40));
+    if let Some(text) = text {
+        mgr.copy_to_slot(slot, text.clone()).ok();
+        log::info!("📋 Saved to slot {}: {}", slot, truncate(&text, 40));
     } else {
         log::info!("📋 Copy to slot {} skipped (clipboard empty)", slot);
     }
@@ -1243,12 +1222,10 @@ end tell"#,
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS hides the console window completely. CREATE_NEW_CONSOLE (the old
-        // value 0x10) causes a flash of a new terminal — the very thing we want to avoid.
-        const DETACHED: u32 = 0x0000_0008;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
         let _ = std::process::Command::new(&exe)
             .arg("search")
-            .creation_flags(DETACHED)
+            .creation_flags(CREATE_NEW_CONSOLE)
             .spawn();
     }
 
@@ -1265,15 +1242,12 @@ fn open_gui() {
         if let Some(dir) = exe.parent() {
             #[cfg(target_os = "windows")]
             {
-                use std::os::windows::process::CommandExt;
-                const DETACHED: u32 = 0x0000_0008;
                 for name in ["clipd-gui.exe", "clipd-gui"] {
                     let candidate = dir.join(name);
                     if candidate.exists()
                         && std::process::Command::new(&candidate)
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .creation_flags(DETACHED)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
                             .spawn()
                             .is_ok()
                     {
@@ -1286,8 +1260,8 @@ fn open_gui() {
                 let candidate = dir.join("clipd-gui");
                 if candidate.exists()
                     && std::process::Command::new(&candidate)
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
                         .spawn()
                         .is_ok()
                 {
@@ -1299,13 +1273,10 @@ fn open_gui() {
     // Fallback: try PATH
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const DETACHED: u32 = 0x0000_0008;
         for name in ["clipd-gui.exe", "clipd-gui"] {
             if std::process::Command::new(name)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .creation_flags(DETACHED)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()
                 .is_ok()
             {
@@ -1316,8 +1287,8 @@ fn open_gui() {
     #[cfg(not(target_os = "windows"))]
     {
         if std::process::Command::new("clipd-gui")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .is_ok()
         {
