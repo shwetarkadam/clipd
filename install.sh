@@ -234,6 +234,7 @@ install_macos() {
     fi
   fi
 
+  setup_macos_permissions "$APP_PATH"
   setup_macos_autostart "$APP_PATH"
 
   echo ""
@@ -251,6 +252,120 @@ install_macos() {
   echo ""
   echo "  CLI: clipd list | clipd search | clipd slots"
   echo ""
+}
+
+setup_macos_permissions() {
+  local APP_PATH="${1:-}"
+  local EXEC=""
+  if [ -n "$APP_PATH" ] && [ -x "${APP_PATH}/Contents/MacOS/clipd" ]; then
+    EXEC="${APP_PATH}/Contents/MacOS/clipd"
+  fi
+
+  info "Requesting macOS permissions on your behalf..."
+
+  # Accessibility — required for rdev global hotkey detection (⌘C multi-tap).
+  # Sending a keystroke via osascript triggers the permission prompt.
+  if [ -n "$EXEC" ] && command -v osascript &>/dev/null; then
+    osascript -e 'tell application "System Events" to keystroke ""' 2>/dev/null || true
+  fi
+
+  # Screen Recording — required for arboard clipboard access on macOS 13+.
+  # Running screencapture triggers the macOS permission dialog if not yet granted.
+  # We intentionally suppress stderr here — if the user denied the permission,
+  # the error output would be confusing; the daemon will catch the actual failure.
+  if command -v screencapture &>/dev/null; then
+    screencapture -x /dev/null 2>/dev/null || true
+  fi
+
+  echo ""
+  info "IMPORTANT: macOS will now show permission dialogs."
+  echo ""
+  info "Grant these in System Settings → Privacy & Security:"
+  info "  1. Accessibility     — for ⌘C multi-tap slot detection"
+  info "  2. Input Monitoring  — for keyboard event monitoring"
+  info "  3. Screen Recording  — for clipboard access (clipboard.get_text)"
+  echo ""
+  info "After granting, quit and reopen Clipd."
+}
+
+# Pick a release asset URL from GitHub (handles re-tagged uploads and DMG-only macOS builds).
+resolve_release_asset() {
+  local version="$1"
+  local platform="$2"
+  local arch="$3"
+
+  local json
+  json="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/tags/${version}")" || return 1
+
+  if command -v python3 &>/dev/null; then
+    python3 - "$json" "$platform" "$arch" "$version" <<'PY'
+import json, re, sys
+data = json.loads(sys.argv[1])
+platform, arch, version = sys.argv[2], sys.argv[3], sys.argv[4]
+assets = [(a["name"], a["browser_download_url"]) for a in data.get("assets", [])]
+if not assets:
+    sys.exit(1)
+
+def score(name: str) -> int:
+    n = name.lower()
+    if platform == "windows" in n or (platform == "macos" and "linux" in n) or (platform == "linux" and ("macos" in n or "darwin" in n or n.endswith(".dmg"))):
+        return -1
+    s = 0
+    if platform == "macos":
+        if "macos" in n or "darwin" in n:
+            s += 40
+        elif arch in n and (n.endswith(".dmg") or n.endswith(".zip")):
+            s += 35  # e.g. Clipd-0.1.1-arm64.dmg
+        if arch in n or (arch == "arm64" and "aarch64" in n):
+            s += 30
+        if n.endswith(".zip"):
+            s += 25
+        elif n.endswith(".dmg"):
+            s += 15
+    elif platform == "linux":
+        if "linux" in n:
+            s += 40
+        if arch in n:
+            s += 30
+        if n.endswith(".zip"):
+            s += 25
+    if version.lower().replace("v", "") in n.replace("v", ""):
+        s += 10
+    canonical = f"clipd-{platform}-{arch}-{version}".lower().removesuffix(".zip")
+    if canonical in n.replace(".zip", "").replace(".dmg", ""):
+        s += 100
+    return s
+
+ranked = sorted(assets, key=lambda x: score(x[0]), reverse=True)
+best = ranked[0][1] if ranked and score(ranked[0][0]) > 0 else ""
+if best:
+    print(best)
+PY
+    return
+  fi
+
+  # Fallback: canonical zip name only (fails if release assets use other names).
+  echo "https://github.com/${REPO}/releases/download/${version}/Clipd-${platform}-${arch}-${version}.zip"
+}
+
+install_macos_from_dmg() {
+  local dmg_path="$1"
+  local mount_dir=""
+  mount_dir="$(hdiutil attach "$dmg_path" -nobrowse -quiet | awk '/\/Volumes\// {print $NF; exit}')"
+  if [ -z "$mount_dir" ] || [ ! -d "$mount_dir" ]; then
+    err "Could not mount DMG"
+    exit 1
+  fi
+
+  if [ ! -d "${mount_dir}/Clipd.app" ]; then
+    hdiutil detach "$mount_dir" -quiet 2>/dev/null || true
+    err "Clipd.app not found inside DMG"
+    exit 1
+  fi
+
+  SRC="${mount_dir}"
+  install_macos
+  hdiutil detach "$mount_dir" -quiet 2>/dev/null || true
 }
 
 install_linux() {
@@ -310,15 +425,38 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 ZIP_NAME="Clipd-${PLATFORM}-${ARCH}-${VERSION}"
-URL="https://github.com/${REPO}/releases/download/${VERSION}/${ZIP_NAME}.zip"
+URL="$(resolve_release_asset "$VERSION" "$PLATFORM" "$ARCH")" || true
+if [ -z "$URL" ]; then
+  URL="https://github.com/${REPO}/releases/download/${VERSION}/${ZIP_NAME}.zip"
+fi
 
-info "Downloading ${URL}..."
+ASSET_NAME="${URL##*/}"
+info "Downloading ${ASSET_NAME}..."
+info "${URL}"
+
+if [[ "$ASSET_NAME" == *.dmg ]]; then
+  curl -fSL "$URL" -o "$TMP/clipd.dmg"
+  install_macos_from_dmg "$TMP/clipd.dmg"
+  exit 0
+fi
+
+if [[ "$ASSET_NAME" != *.zip ]]; then
+  err "Unsupported release asset: ${ASSET_NAME}"
+  err "Expected .zip or .dmg for ${PLATFORM}/${ARCH}."
+  err "See https://github.com/${REPO}/releases/tag/${VERSION}"
+  exit 1
+fi
+
 curl -fSL "$URL" -o "$TMP/clipd.zip"
 unzip -qo "$TMP/clipd.zip" -d "$TMP"
 
 SRC="$TMP/${ZIP_NAME}"
 if [ ! -d "$SRC" ]; then
-  err "Expected folder ${ZIP_NAME} inside zip"
+  # Zip may use a different top-level folder name than the tag.
+  SRC="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d ! -name '__MACOSX' | head -1)"
+fi
+if [ -z "$SRC" ] || [ ! -d "$SRC" ]; then
+  err "Could not find Clipd folder inside ${ASSET_NAME}"
   exit 1
 fi
 

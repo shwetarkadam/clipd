@@ -27,7 +27,7 @@ impl ClipWatcher {
     /// This blocks the current thread — run it in a spawned thread.
     pub fn watch(
         &self,
-        sender: mpsc::Sender<ClipEvent>,
+        sender: mpsc::SyncSender<ClipEvent>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         suppress: std::sync::Arc<std::sync::atomic::AtomicBool>,
         refresh_hash: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -35,11 +35,17 @@ impl ClipWatcher {
         let mut last_hash = String::new();
         let privacy_config = load_privacy_config();
 
-        // Try to create the clipboard handle
+        // Try to create the clipboard handle.
+        // On macOS 13+, if this fails the most likely cause is missing
+        // Screen Recording permission. Without it arboard cannot read the clipboard.
         let mut clipboard = match arboard::Clipboard::new() {
             Ok(cb) => cb,
             Err(e) => {
-                log::error!("Failed to open clipboard: {}", e);
+                log::error!(
+                    "Failed to open clipboard (Screen Recording permission?): {} \
+                     Grant: System Settings → Privacy & Security → Screen Recording → clipd",
+                    e
+                );
                 return;
             }
         };

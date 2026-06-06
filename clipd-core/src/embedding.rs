@@ -74,7 +74,7 @@ pub fn generate_embeddings_batch(
 
     let trimmed: Vec<String> = texts
         .iter()
-        .map(|t| truncate_for_embedding(t, 8000))
+        .map(|t| truncate_for_embedding(t, 8000).into_owned())
         .collect();
 
     let embed_url = embedding_url_from_config(config);
@@ -179,11 +179,12 @@ pub fn embedding_from_bytes(bytes: &[u8]) -> Embedding {
         .collect()
 }
 
-fn truncate_for_embedding(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
-        text.to_string()
+fn truncate_for_embedding(text: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
+    // Return Cow::Borrowed when no truncation needed to avoid an extra allocation.
+    if text.chars().count() <= max_chars {
+        std::borrow::Cow::Borrowed(text)
     } else {
-        text.chars().take(max_chars).collect()
+        std::borrow::Cow::Owned(text.chars().take(max_chars).collect::<String>())
     }
 }
 

@@ -353,6 +353,40 @@ impl ClipStore {
         rows.collect()
     }
 
+    /// Get embeddings only for the given clip IDs. Useful when only a subset of clips
+    /// are loaded into memory (e.g., the 200 most recent), avoiding loading all embeddings.
+    /// Uses a single SQL query with an IN clause rather than one query per ID.
+    pub fn get_embeddings_for_clip_ids(
+        &self,
+        ids: &[i64],
+    ) -> SqlResult<Vec<(i64, Embedding)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT clip_id, embedding FROM clip_embeddings WHERE clip_id IN ({})",
+            placeholders
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        // Build owned Box<dyn ToSql> params and keep them alive for the query call.
+        use rusqlite::ToSql;
+        let params: Vec<Box<dyn ToSql>> =
+            ids.iter().map(|&id| Box::new(id) as Box<dyn ToSql>).collect();
+        let params_refs: Vec<&dyn ToSql> =
+            params.iter().map(|b| b.as_ref() as &dyn ToSql).collect();
+
+        let mut rows = stmt.query(params_refs.as_slice())?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            results.push((id, embedding_from_bytes(&bytes)));
+        }
+        Ok(results)
+    }
+
     /// Get clip IDs that don't have embeddings yet.
     pub fn get_unembedded_clip_ids(&self, limit: usize) -> SqlResult<Vec<i64>> {
         let mut stmt = self.conn.prepare(
@@ -373,6 +407,30 @@ impl ClipStore {
             [],
             |row| row.get(0),
         )
+    }
+
+    /// Delete clips beyond `max_clips` (keeps most recent). Removes their embeddings too.
+    /// Call this periodically to prevent unbounded DB growth.
+    pub fn prune_old_clips(&self, max_clips: usize) -> SqlResult<usize> {
+        let count: usize = self.conn.query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))?;
+        if count <= max_clips {
+            return Ok(0);
+        }
+        let to_delete = count - max_clips;
+        // Delete oldest clips (lowest id = earliest)
+        let deleted = self.conn.execute(
+            "DELETE FROM clips WHERE id IN (
+                SELECT id FROM clips ORDER BY timestamp ASC LIMIT ?1
+            )",
+            params![to_delete as i64],
+        )?;
+        log::info!("🗑️ Pruned {} old clips (capped at {})", deleted, max_clips);
+        Ok(deleted as usize)
+    }
+
+    /// Convenience: prune if total clips exceed `max_clips`.
+    pub fn prune_if_needed(&self, max_clips: usize) -> SqlResult<usize> {
+        self.prune_old_clips(max_clips)
     }
 
     /// Gather statistics about the store.
