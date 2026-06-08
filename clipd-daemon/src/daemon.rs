@@ -28,6 +28,25 @@ const TAP_WINDOW: Duration = Duration::from_millis(350);
 const TAP_DEBOUNCE: Duration = Duration::from_millis(65);
 
 pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    run_daemon_with_stop(Arc::new(AtomicBool::new(false)), true)
+}
+
+/// Run the daemon using a caller-supplied stop flag.
+///
+/// This lets an embedding process (e.g. `clipd-ui`) host the daemon — and
+/// crucially the macOS keyboard listener — *inside its own process*, instead of
+/// spawning a separate `clipd daemon` child. macOS keys Input Monitoring /
+/// Accessibility per binary, and with ad-hoc signing the grant given to
+/// `clipd-ui` does not reliably propagate to a spawned `clipd` child, so the
+/// listener never receives key events. Running in-process makes the binary that
+/// *holds* the permission the same one that *uses* it.
+///
+/// `install_ctrlc`: install a SIGINT handler (standalone CLI use). In-process
+/// GUI hosts pass `false` so they keep control of their own signal handling.
+pub fn run_daemon_with_stop(
+    stop: Arc<AtomicBool>,
+    install_ctrlc: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !try_acquire_daemon_lock() {
         log::info!("clipd daemon is already running — skipping duplicate launch");
         return Ok(());
@@ -50,7 +69,6 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let slot_manager = SlotManager::new();
     let db_path_clone = db_path.clone();
 
-    let stop = Arc::new(AtomicBool::new(false));
     let stop_watcher = stop.clone();
     let stop_hotkey = stop.clone();
 
@@ -60,8 +78,10 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     let refresh_hash = Arc::new(AtomicBool::new(false));
     let refresh_hash_watcher = refresh_hash.clone();
 
-    let stop_ctrlc = stop.clone();
-    setup_ctrlc(stop_ctrlc);
+    if install_ctrlc {
+        let stop_ctrlc = stop.clone();
+        setup_ctrlc(stop_ctrlc);
+    }
 
     // ── Clipboard Watcher Thread ──
     // Bound the channel to prevent unbounded memory growth if the watcher produces
@@ -499,6 +519,8 @@ pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     stop.store(true, Ordering::Relaxed);
     watcher_handle.join().ok();
     store_handle.join().ok();
+    // Release so an in-process host (clipd-ui) can cleanly restart the daemon.
+    release_daemon_lock();
     println!("  ✅ Goodbye!");
     Ok(())
 }

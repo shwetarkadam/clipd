@@ -37,6 +37,11 @@ if [ -f "target/release/clipd" ]; then
   chmod +x "$STAGING/clipd"
 fi
 
+# Strip quarantine so Gatekeeper doesn't block the app after mount.
+if command -v xattr &>/dev/null; then
+  xattr -rc "$STAGING/Clipd.app" 2>/dev/null || true
+fi
+
 SIZE=$(du -sm "$STAGING" | cut -f1)
 SIZE=$((SIZE + 20))
 

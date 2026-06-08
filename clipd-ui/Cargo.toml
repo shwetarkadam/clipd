@@ -11,6 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 clipd-core = { workspace = true }
+clipd-daemon = { workspace = true }
 tao = "0.30"
 tray-icon = "0.19"
 dirs = "5"
+log = "0.4"
+env_logger = "0.11"

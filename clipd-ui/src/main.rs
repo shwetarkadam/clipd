@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 use std::fs::OpenOptions;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use clipd_core::{load_paste_transform_settings, save_paste_transform_settings};
 use tao::event::Event;
@@ -25,6 +28,8 @@ fn hud_tray_label(hud_on: bool) -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+
     let event_loop = EventLoop::new();
     let wake_proxy = event_loop.create_proxy();
     let (tray_tx, tray_rx) = mpsc::channel::<TrayIconEvent>();
@@ -68,21 +73,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let menu_channel = MenuEvent::receiver();
 
-    // Auto-start daemon on launch
-    let mut daemon: Option<Child> = match start_daemon() {
-        Ok(child) => {
-            item_start.set_enabled(false);
-            item_stop.set_enabled(true);
-            Some(child)
-        }
-        Err(e) => {
-            eprintln!("clipd-ui: failed to auto-start daemon: {e}");
-            None
-        }
-    };
+    // Auto-start daemon on launch — runs IN-PROCESS (see start_daemon docs) so the
+    // macOS keyboard listener inherits clipd-ui's Input Monitoring / Accessibility grants.
+    let mut daemon: Option<DaemonHandle> = Some(start_daemon());
+    item_start.set_enabled(false);
+    item_stop.set_enabled(true);
 
     // Open main window when not in developer (TUI) mode — matches “GUI + tray” expectation.
-    if daemon.is_some() && !load_tui_mode() {
+    if !load_tui_mode() {
         open_gui_search();
     }
 
@@ -117,22 +115,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match menu_event.id.0.as_str() {
                     MENU_ID_START => {
                         if daemon.is_none() {
-                            match start_daemon() {
-                                Ok(child) => {
-                                    daemon = Some(child);
-                                    item_start.set_enabled(false);
-                                    item_stop.set_enabled(true);
-                                }
-                                Err(e) => eprintln!("clipd-ui: failed to start daemon: {e}"),
-                            }
+                            daemon = Some(start_daemon());
+                            item_start.set_enabled(false);
+                            item_stop.set_enabled(true);
                         }
                     }
                     MENU_ID_STOP => {
-                        if let Some(mut child) = daemon.take() {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                        if let Some(mut handle) = daemon.take() {
+                            handle.stop();
                         }
-                        stop_existing_daemons();
                         item_start.set_enabled(true);
                         item_stop.set_enabled(false);
                     }
@@ -153,11 +144,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         save_tui_mode(item_tui_mode.is_checked());
                     }
                     MENU_ID_QUIT => {
-                        if let Some(mut child) = daemon.take() {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                        if let Some(mut handle) = daemon.take() {
+                            handle.stop();
                         }
-                        stop_existing_daemons();
                         *control_flow = ControlFlow::Exit;
                     }
                     _ => {}
@@ -243,27 +232,70 @@ end tell"#,
     }
 }
 
-// ── Daemon management ──
+// ── Logging ──
 
-fn start_daemon() -> Result<Child, Box<dyn std::error::Error>> {
-    stop_existing_daemons();
-
-    let exe = resolve_clipd_exe();
-    eprintln!("clipd-ui: launching daemon from {}", exe.display());
-
-    let log_path = daemon_log_path();
-    let log_file = OpenOptions::new()
+/// Route the in-process daemon's `log::*` output to the same file the old
+/// child-process daemon wrote to (`~/Library/Logs/clipd-ui-daemon.log`), so
+/// existing troubleshooting steps keep working.
+fn init_logging() {
+    if let Ok(file) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)?;
-    let log_file_err = log_file.try_clone()?;
+        .open(daemon_log_path())
+    {
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("info"),
+        )
+        .format_timestamp(None)
+        .format_target(false)
+        .target(env_logger::Target::Pipe(Box::new(file)))
+        .try_init();
+    }
+}
 
-    let child = Command::new(exe)
-        .arg("daemon")
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file_err))
-        .spawn()?;
-    Ok(child)
+// ── Daemon management ──
+
+/// Handle to the in-process daemon: a shared stop flag plus its worker thread.
+struct DaemonHandle {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl DaemonHandle {
+    /// Signal the daemon to wind down and wait for its worker thread to finish.
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Start the daemon **inside this process** on a background thread.
+///
+/// The macOS keyboard listener (rdev) must run in the binary that actually
+/// holds the Input Monitoring / Accessibility grants. clipd-ui is that binary
+/// (it's `Clipd.app`'s `CFBundleExecutable`), so hosting the daemon here — rather
+/// than spawning a separate `clipd daemon` child — is what makes multi-slot
+/// copy and the HUD work under ad-hoc signing.
+fn start_daemon() -> DaemonHandle {
+    // Kill any stale *external* `clipd daemon` process so the PID lock is free
+    // and only one keyboard tap is ever active.
+    stop_existing_daemons();
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let join = std::thread::Builder::new()
+        .name("clipd-ui-daemon".into())
+        .spawn(move || {
+            if let Err(e) = clipd_daemon::run_daemon_with_stop(stop_thread, false) {
+                log::error!("clipd-ui: in-process daemon exited with error: {e}");
+            }
+        })
+        .ok();
+
+    DaemonHandle { stop, join }
 }
 
 fn stop_existing_daemons() {
