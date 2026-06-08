@@ -18,7 +18,6 @@ use global_hotkey::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
-#[cfg(not(target_os = "windows"))]
 use std::process::Stdio;
 #[cfg(target_os = "macos")]
 use rdev::{listen, EventType, Key as RKey};
