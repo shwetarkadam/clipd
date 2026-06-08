@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Enable telemetry: requires CLIPD_TELEMETRY_ENDPOINT env var at compile time.
+# Example: CLIPD_TELEMETRY_ENDPOINT=https://your-worker.workers.dev cargo build --release -p clipd-core
+default = []
+telemetry = []
+
 [dependencies]
 arboard = { workspace = true }
 rusqlite = { workspace = true }

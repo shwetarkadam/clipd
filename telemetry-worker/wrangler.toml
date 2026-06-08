@@ -1,0 +1,9 @@
+name = "clipd-telemetry"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+# Create a KV namespace in Cloudflare Dashboard → Workers & Pages → KV Namespaces
+# Then paste the namespace ID below and uncomment the line.
+# kv_namespaces = [
+#   { binding = "PING_COUNT", id = "YOUR_KV_NAMESPACE_ID" }
+# ]

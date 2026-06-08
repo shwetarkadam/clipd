@@ -11,13 +11,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "AI clipboard daemon for developers — multi-slot copy, searchable history, editor-native"
 
 [workspace.dependencies]
-clipd-core = { path = "clipd-core" }
+clipd-core = { path = "clipd-core", features = ["telemetry"] }
 clipd-daemon = { path = "clipd-daemon" }
 clipd-tui = { path = "clipd-tui" }
 arboard = "3"

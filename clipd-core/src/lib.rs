@@ -8,6 +8,7 @@ pub mod session;
 pub mod slots;
 pub mod store;
 pub mod theme;
+pub mod telemetry;
 pub mod transform;
 pub mod watcher;
 
@@ -36,3 +37,6 @@ pub use transform::{
     TransformConfig, TransformKind,
 };
 pub use watcher::{ClipEvent, ClipWatcher};
+
+/// Fire the anonymous telemetry ping (noop if telemetry is disabled or no endpoint is configured).
+pub use telemetry::ping;

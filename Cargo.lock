@@ -913,6 +913,7 @@ dependencies = [
  "arboard",
  "chrono",
  "clipd-core",
+ "dirs 5.0.1",
  "eframe",
  "env_logger",
  "log",
