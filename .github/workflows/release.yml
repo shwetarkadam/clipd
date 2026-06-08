@@ -106,7 +106,8 @@ jobs:
             pkg-config \
             libxdo-dev \
             file \
-            desktop-file-utils
+            desktop-file-utils \
+            libfuse2t64
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -146,9 +147,6 @@ jobs:
       - name: Build .deb package
         run: bash packaging/linux/create-deb.sh "${GITHUB_REF_NAME}"
 
-      - name: Build AppImage
-        run: bash packaging/linux/create-appimage.sh "${GITHUB_REF_NAME}"
-
       - name: Upload zip artifact
         uses: actions/upload-artifact@v4
         with:
@@ -160,12 +158,6 @@ jobs:
         with:
           name: clipd-linux-${{ matrix.arch }}-deb
           path: target/release/clipd_*.deb
-
-      - name: Upload AppImage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: clipd-linux-${{ matrix.arch }}-appimage
-          path: target/release/Clipd-*.AppImage
 
   build-windows:
     strategy:
