@@ -9,6 +9,13 @@ members = [
     "clipd-gui",
     "clipd-mcp",
 ]
+exclude = ["third_party/rdev"]
+
+# Vendored rdev 0.5.3 patched to avoid a macOS 15 (Sequoia) crash: upstream calls
+# main-thread-only Text Input Source APIs from the background event-tap thread,
+# which now hard-asserts (SIGTRAP) on the first key event. See third_party/rdev.
+[patch.crates-io]
+rdev = { path = "third_party/rdev" }
 
 [workspace.package]
 version = "0.1.2"
