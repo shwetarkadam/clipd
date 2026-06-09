@@ -43,11 +43,39 @@ jobs:
           cp -f clipd-hud ../target/release/clipd-hud
           chmod +x ../target/release/clipd-hud
 
+      # Import the self-signed "clipd-codesign" cert so every release shares one
+      # stable identity. Without this, ad-hoc signing changes the signature hash
+      # on each build and macOS silently drops Input Monitoring / Accessibility
+      # grants — breaking multi-slot copy + HUD after every update.
+      - name: Import signing certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [ -z "$MACOS_CERT_P12" ]; then
+            echo "::warning::MACOS_CERT_P12 secret not set — falling back to ad-hoc signing (TCC grants will NOT persist)."
+            echo "CLIPD_SIGN_ID=-" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          KEYCHAIN_PATH="$RUNNER_TEMP/clipd-signing.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -base64 24)"
+          CERT_PATH="$RUNNER_TEMP/clipd-cert.p12"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$CERT_PATH"
+          echo "CLIPD_SIGN_ID=clipd-codesign" >> "$GITHUB_ENV"
+          echo "Imported clipd-codesign signing identity."
+
       - name: Create Clipd.app bundle
         run: bash packaging/macos/create-app-bundle.sh
 
-      - name: Ad-hoc code sign
-        run: codesign --force --deep --sign - target/release/Clipd.app
+      - name: Code sign Clipd.app
+        run: codesign --force --deep --sign "${CLIPD_SIGN_ID:--}" target/release/Clipd.app
 
       - name: Package zip (with .app + CLI)
         run: |
