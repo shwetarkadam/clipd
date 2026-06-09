@@ -89,10 +89,17 @@ pub fn run_daemon_with_stop(
     const CLIP_CHANNEL_CAP: usize = 100;
     let (clip_tx, clip_rx) = mpsc::sync_channel::<ClipEvent>(CLIP_CHANNEL_CAP);
     let watcher = ClipWatcher::new(500);
+    let watcher_slot_mgr = slot_manager.clone();
     let watcher_handle = std::thread::Builder::new()
         .name("clipd-watcher".into())
         .spawn(move || {
-            watcher.watch(clip_tx, stop_watcher, suppress_watcher, refresh_hash_watcher);
+            watcher.watch(
+                clip_tx,
+                stop_watcher,
+                suppress_watcher,
+                refresh_hash_watcher,
+                Some(watcher_slot_mgr),
+            );
         })?;
 
     // ── Store Writer Thread ──

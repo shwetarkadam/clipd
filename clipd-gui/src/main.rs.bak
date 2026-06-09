@@ -337,19 +337,8 @@ impl ClipdGui {
     }
 
     fn apply_filter(&mut self) {
-        // ── Slot filter: only show clips saved to a slot ──
-        let base_indices: Vec<usize> = if self.show_active_slots_only {
-            self.clips
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.slot.is_some())
-                .map(|(i, _)| i)
-                .collect()
-        } else {
-            (0..self.clips.len()).collect()
-        };
         if self.search_query.is_empty() {
-            self.filtered = base_indices.clone();
+            self.filtered = (0..self.clips.len()).collect();
         } else if self.semantic_mode {
             // Try vector embeddings first, fall back to cached TF-IDF
             if !self.cached_embeddings.is_empty()
@@ -366,7 +355,6 @@ impl ClipdGui {
                             .clips
                             .iter()
                             .enumerate()
-                            .filter(|&(_, c)| !self.show_active_slots_only || c.slot.is_some())
                             .map(|(i, c)| (c.id, i))
                             .collect();
                         self.filtered = results
@@ -387,13 +375,7 @@ impl ClipdGui {
             }
             if let Some(ref index) = self.cached_tfidf {
                 let results = index.search(&self.search_query, 50);
-                let tfidf_indices: std::collections::HashSet<usize> =
-                    results.iter().map(|r| r.clip_index).collect();
-                self.filtered = base_indices
-                    .iter()
-                    .filter(|&&i| tfidf_indices.contains(&i))
-                    .copied()
-                    .collect();
+                self.filtered = results.iter().map(|r| r.clip_index).collect();
             }
         } else {
             // Plain text search — lowercase the query once, pre-lowercase each clip's
@@ -431,8 +413,7 @@ impl ClipdGui {
                     results = sem.iter().map(|r| r.clip_index).collect();
                 }
             }
-            let base_set: std::collections::HashSet<usize> = base_indices.iter().copied().collect();
-            self.filtered = results.into_iter().filter(|i| base_set.contains(i)).collect();
+            self.filtered = results;
         }
         if self.selected >= self.filtered.len() {
             self.selected = self.filtered.len().saturating_sub(1);

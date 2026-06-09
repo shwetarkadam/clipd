@@ -37,6 +37,13 @@ impl SlotManager {
         Ok(slots.get(&slot).cloned())
     }
 
+    /// Find which slot contains the given content string.
+    /// Returns the slot number (if found).
+    pub fn find_slot(&self, content: &str) -> Option<u8> {
+        let slots = self.slots.read().ok()?;
+        slots.iter().find_map(|(k, v)| if v == content { Some(*k) } else { None })
+    }
+
     /// List all non-empty slots, sorted by slot number.
     pub fn list_slots(&self) -> Result<Vec<(u8, String)>, String> {
         let slots = self.slots.read().map_err(|e| e.to_string())?;

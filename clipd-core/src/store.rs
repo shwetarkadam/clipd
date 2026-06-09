@@ -56,15 +56,22 @@ impl ClipStore {
                 content_hash  TEXT NOT NULL,
                 source_app    TEXT,
                 timestamp     TEXT NOT NULL,
-                preview       TEXT NOT NULL
+                preview       TEXT NOT NULL,
+                slot          INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_clips_timestamp ON clips(timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_clips_hash ON clips(content_hash);
             CREATE INDEX IF NOT EXISTS idx_clips_type ON clips(content_type);
             CREATE INDEX IF NOT EXISTS idx_clips_app ON clips(source_app);
+            CREATE INDEX IF NOT EXISTS idx_clips_slot ON clips(slot);
             ",
         )?;
+
+        // Add slot column if upgrading from schema before slot support.
+        if let Err(e) = self.conn.execute("ALTER TABLE clips ADD COLUMN slot INTEGER", []) {
+            log::debug!("slot column migration (expected on fresh DB or if already present): {}", e);
+        }
 
         self.conn.execute_batch(
             "
@@ -123,15 +130,15 @@ impl ClipStore {
         if let Some(existing_id) = existing {
             // Update timestamp to move it to the top
             self.conn.execute(
-                "UPDATE clips SET timestamp = ?1, source_app = ?2 WHERE id = ?3",
-                params![entry.timestamp.to_rfc3339(), entry.source_app, existing_id],
+                "UPDATE clips SET timestamp = ?1, source_app = ?2, slot = ?3 WHERE id = ?4",
+                params![entry.timestamp.to_rfc3339(), entry.source_app, entry.slot, existing_id],
             )?;
             return Ok(existing_id);
         }
 
         self.conn.execute(
-            "INSERT INTO clips (content, content_type, content_hash, source_app, timestamp, preview)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO clips (content, content_type, content_hash, source_app, timestamp, preview, slot)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 entry.content,
                 entry.content_type.as_str(),
@@ -139,6 +146,7 @@ impl ClipStore {
                 entry.source_app,
                 entry.timestamp.to_rfc3339(),
                 entry.preview,
+                entry.slot,
             ],
         )?;
 
@@ -148,7 +156,7 @@ impl ClipStore {
     /// Get recent clips, newest first.
     pub fn get_recent(&self, limit: usize) -> SqlResult<Vec<ClipEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, content, content_type, content_hash, source_app, timestamp, preview
+            "SELECT id, content, content_type, content_hash, source_app, timestamp, preview, slot
              FROM clips ORDER BY timestamp DESC LIMIT ?1",
         )?;
 
@@ -163,6 +171,7 @@ impl ClipStore {
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now()),
                 preview: row.get(6)?,
+                slot: row.get(7)?,
             })
         })?;
 
@@ -220,6 +229,7 @@ impl ClipStore {
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
                     preview: row.get(6)?,
+                slot: row.get(7)?,
                 })
             })?;
 
@@ -227,7 +237,7 @@ impl ClipStore {
         } else {
             // No text query — just filter
             let mut sql = String::from(
-                "SELECT id, content, content_type, content_hash, source_app, timestamp, preview
+                "SELECT id, content, content_type, content_hash, source_app, timestamp, preview, slot
                  FROM clips WHERE 1=1",
             );
             let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
@@ -267,6 +277,7 @@ impl ClipStore {
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
                     preview: row.get(6)?,
+                slot: row.get(7)?,
                 })
             })?;
 
@@ -277,7 +288,7 @@ impl ClipStore {
     /// Get a single clip by ID.
     pub fn get_by_id(&self, id: i64) -> SqlResult<ClipEntry> {
         self.conn.query_row(
-            "SELECT id, content, content_type, content_hash, source_app, timestamp, preview
+            "SELECT id, content, content_type, content_hash, source_app, timestamp, preview, slot
              FROM clips WHERE id = ?1",
             params![id],
             |row| {
@@ -291,6 +302,7 @@ impl ClipStore {
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
                     preview: row.get(6)?,
+                slot: row.get(7)?,
                 })
             },
         )

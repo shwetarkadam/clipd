@@ -115,11 +115,13 @@ pub struct ClipEntry {
     pub source_app: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub preview: String,
+    /// Slot this clip was saved to via multi-tap hotkey (None = auto-saved via OS copy).
+    pub slot: Option<u8>,
 }
 
 impl ClipEntry {
     /// Create a new clip entry with auto-detected content type.
-    pub fn new(content: String, source_app: Option<String>) -> Self {
+    pub fn new(content: String, source_app: Option<String>, slot: Option<u8>) -> Self {
         use sha2::{Digest, Sha256};
 
         let content_type = ContentType::detect(&content);
@@ -137,6 +139,7 @@ impl ClipEntry {
             source_app,
             timestamp: Utc::now(),
             preview,
+            slot,
         }
     }
 
@@ -211,7 +214,7 @@ mod tests {
     #[test]
     fn test_preview_truncation() {
         let long = "a".repeat(200);
-        let entry = ClipEntry::new(long, None);
+        let entry = ClipEntry::new(long, None, None);
         assert!(entry.preview.len() <= 83); // 80 + "…" (3 bytes utf8)
     }
 }

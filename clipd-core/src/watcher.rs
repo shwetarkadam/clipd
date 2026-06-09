@@ -1,5 +1,6 @@
 use crate::models::ClipEntry;
 use crate::privacy::{load_privacy_config, should_skip_clip};
+use crate::slots::SlotManager;
 use sha2::{Digest, Sha256};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -25,12 +26,15 @@ impl ClipWatcher {
 
     /// Start watching the clipboard in a loop, sending events to the channel.
     /// This blocks the current thread — run it in a spawned thread.
+    /// `slot_manager` is used to tag clips with the slot they were saved to
+    /// via multi-tap hotkey (None = auto-saved via OS copy).
     pub fn watch(
         &self,
         sender: mpsc::SyncSender<ClipEvent>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         suppress: std::sync::Arc<std::sync::atomic::AtomicBool>,
         refresh_hash: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        slot_manager: Option<SlotManager>,
     ) {
         let mut last_hash = String::new();
         let privacy_config = load_privacy_config();
@@ -98,11 +102,15 @@ impl ClipWatcher {
                             continue;
                         }
 
-                        let entry = ClipEntry::new(text, source_app);
+                        // Look up which slot this content is in (if any).
+                        let slot = slot_manager.as_ref().and_then(|mgr| mgr.find_slot(&text));
+
+                        let entry = ClipEntry::new(text, source_app, slot);
                         log::debug!(
-                            "New clip: {} [{}] {}",
+                            "New clip: {} [{}] slot={:?} {}",
                             entry.content_type.icon(),
                             entry.content_type.as_str(),
+                            entry.slot,
                             &entry.preview
                         );
 
