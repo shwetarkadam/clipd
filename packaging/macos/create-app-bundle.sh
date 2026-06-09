@@ -37,14 +37,29 @@ if [[ -f target/release/clipd-hud ]]; then
   chmod +x "$MACOS/clipd-hud"
 fi
 
-# Ad-hoc sign helpers so macOS allows the daemon to spawn clipd-hud (unsigned helper is often blocked).
-echo "==> codesign (ad-hoc) — MacOS binaries + app bundle"
+# Sign helpers so macOS allows the daemon to spawn clipd-hud, and — critically —
+# so the Input Monitoring / Accessibility grants persist across updates.
+#
+# Set CLIPD_SIGN_ID to a stable code-signing identity (e.g. a self-signed
+# "clipd-codesign" cert created in Keychain Access, or a Developer ID) so the
+# app keeps the SAME code signature across rebuilds. macOS keys TCC grants to
+# that identity, so users grant Input Monitoring once and it sticks.
+#
+# Without it we fall back to ad-hoc ("-"), whose signature hash changes every
+# build — that makes macOS treat each build as a new app and silently drops the
+# previously-granted Input Monitoring permission (multi-slot copy / HUD break).
+SIGN_ID="${CLIPD_SIGN_ID:--}"
+if [[ "$SIGN_ID" == "-" ]]; then
+  echo "==> codesign (ad-hoc — grants will NOT persist across updates; set CLIPD_SIGN_ID to fix)"
+else
+  echo "==> codesign (identity: ${SIGN_ID} — TCC grants persist across updates)"
+fi
 if command -v codesign &>/dev/null; then
   for bin in clipd clipd-gui clipd-ui clipd-hud; do
     [[ -f "$MACOS/$bin" ]] || continue
-    codesign --force --sign - "$MACOS/$bin" 2>/dev/null || true
+    codesign --force --sign "$SIGN_ID" "$MACOS/$bin" 2>/dev/null || true
   done
-  codesign --force --deep --sign - "$APP" 2>/dev/null || true
+  codesign --force --deep --sign "$SIGN_ID" "$APP" 2>/dev/null || true
 else
   echo "    (skip: codesign not found)"
 fi

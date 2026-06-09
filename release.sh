@@ -43,9 +43,11 @@ bash packaging/macos/create-app-bundle.sh
 
 APP="target/release/Clipd.app"
 
-# ── 4. Ad-hoc code sign (so Gatekeeper doesn't immediately block) ──
-echo "==> Code signing (ad-hoc)"
-codesign --force --deep --sign - "$APP" 2>/dev/null || echo "    (codesign skipped — install Xcode CLI tools)"
+# ── 4. Code sign (create-app-bundle.sh already signed with CLIPD_SIGN_ID; keep it
+#       consistent here so we don't clobber a stable self-signed/Developer ID signature). ──
+SIGN_ID="${CLIPD_SIGN_ID:--}"
+echo "==> Code signing (identity: ${SIGN_ID})"
+codesign --force --deep --sign "$SIGN_ID" "$APP" 2>/dev/null || echo "    (codesign skipped — install Xcode CLI tools)"
 
 # ── 5. Create distributable zip ──
 echo "==> Creating ${ZIP_NAME}.zip"
