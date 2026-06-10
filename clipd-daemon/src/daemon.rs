@@ -2,9 +2,9 @@ use arboard::Clipboard;
 use clipd_core::{
     apply_transform, find_rules_for_app, generate_embedding, is_embedding_available,
     load_paste_rules, load_paste_transform_settings, load_transform_config,
-    release_daemon_lock, suggest_smart_transform, try_acquire_daemon_lock, ClipEvent, ClipStore,
-    ClipWatcher, PasteRulesConfig, PasteTransformSettings, SlotManager, TransformConfig,
-    TransformKind, MAX_CLIP_SLOT,
+    release_daemon_lock, suggest_smart_transform, try_acquire_daemon_lock, ClipEntry, ClipEvent,
+    ClipStore, ClipWatcher, PasteRulesConfig, PasteTransformSettings, SlotManager,
+    TransformConfig, TransformKind, MAX_CLIP_SLOT,
 };
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
@@ -88,6 +88,8 @@ pub fn run_daemon_with_stop(
     // faster than the store-writer can consume. 100 events is ~a few KB at most.
     const CLIP_CHANNEL_CAP: usize = 100;
     let (clip_tx, clip_rx) = mpsc::sync_channel::<ClipEvent>(CLIP_CHANNEL_CAP);
+    // Clone for use in execute_copy calls (hotkey path) — watcher consumes clip_tx.
+    let persist_tx = clip_tx.clone();
     let watcher = ClipWatcher::new(500);
     let watcher_slot_mgr = slot_manager.clone();
     let watcher_handle = std::thread::Builder::new()
@@ -407,11 +409,11 @@ pub fn run_daemon_with_stop(
             if let Some(dl) = cmd_c_deadline {
                 if now >= dl && cmd_c_taps > 0 {
                     if cmd_c_taps == 1 {
-                        execute_copy(1, &hotkey_slot_mgr);
+                        execute_copy(1, &hotkey_slot_mgr, &persist_tx);
                         log::info!("⌨️  Cmd+C → auto-saved to slot 1");
                     } else {
                         let slot = cmd_c_taps.min(MAX_CLIP_SLOT);
-                        execute_copy(slot, &hotkey_slot_mgr);
+                        execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
                         restore_clipboard_to_slot(&hotkey_slot_mgr, &suppress, &refresh_hash, 1);
                     }
                     cmd_c_taps = 0;
@@ -449,7 +451,7 @@ pub fn run_daemon_with_stop(
             if let Some(dl) = ctrl_c_deadline {
                 if now >= dl && ctrl_c_taps > 0 {
                     let slot = ctrl_c_taps.min(MAX_CLIP_SLOT);
-                    execute_copy(slot, &hotkey_slot_mgr);
+                    execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
                     ctrl_c_taps = 0;
                     ctrl_c_deadline = None;
                 }
@@ -479,6 +481,7 @@ pub fn run_daemon_with_stop(
         use std::time::Duration;
         let receiver = GlobalHotKeyEvent::receiver();
         let hotkey_slot_mgr = slot_manager.clone();
+        let persist_tx = clip_tx.clone();
         let transform_config = load_transform_config();
         let paste_transform = load_paste_transform_settings();
         loop {
@@ -501,7 +504,7 @@ pub fn run_daemon_with_stop(
                     .iter().find(|(hk, _)| hk.id() == event.id)
                 {
                     match action {
-                        FinalAction::CopyToSlot(s) => execute_copy(*s, &hotkey_slot_mgr),
+                        FinalAction::CopyToSlot(s) => execute_copy(*s, &hotkey_slot_mgr, &persist_tx),
                         FinalAction::PasteFromSlot(s) => execute_direct_paste(
                             *s,
                             &hotkey_slot_mgr,
@@ -579,7 +582,7 @@ fn restore_clipboard_to_slot(
     }
 }
 
-fn execute_copy(slot: u8, mgr: &SlotManager) {
+fn execute_copy(slot: u8, mgr: &SlotManager, persist_tx: &mpsc::SyncSender<ClipEvent>) {
     let mut cb = match Clipboard::new() {
         Ok(c) => c,
         Err(e) => { log::warn!("Copy to slot {} failed: {}", slot, e); return; }
@@ -602,6 +605,10 @@ fn execute_copy(slot: u8, mgr: &SlotManager) {
     if let Some(ref text) = text {
         mgr.copy_to_slot(slot, text).ok();
         log::info!("📋 Saved to slot {}: {}", slot, truncate(text, 40));
+
+        // Persist slot copy to SQLite so it survives daemon restarts.
+        let entry = ClipEntry::new(text.clone(), None, Some(slot));
+        let _ = persist_tx.try_send(ClipEvent::NewClip(entry));
     } else {
         log::info!("📋 Copy to slot {} skipped (clipboard empty)", slot);
     }
@@ -1166,7 +1173,8 @@ fn show_hud(text: &str) {
     }
 }
 
-/// Find the `clipd-hud` binary next to the current executable, or in PATH.
+/// Find the `clipd-hud` binary next to the current executable or the `clipd`
+/// daemon binary (which may differ from current_exe when spawned by clipd-gui).
 #[cfg(target_os = "macos")]
 fn find_hud_binary() -> std::path::PathBuf {
     if let Ok(from_env) = std::env::var("CLIPD_HUD_BIN") {
@@ -1175,22 +1183,35 @@ fn find_hud_binary() -> std::path::PathBuf {
             return p;
         }
     }
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // Look next to current_exe (the clipd daemon binary itself).
     if let Ok(exe) = std::env::current_exe() {
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("clipd-hud"));
         }
-        if let Ok(canonical) = exe.canonicalize() {
-            if let Some(dir) = canonical.parent() {
+    }
+
+    // Also look next to a `clipd` binary in the same directory as this exe
+    // (robust when spawned by clipd-gui: current_exe may resolve to the GUI's
+    // bundled clipd rather than the CLI wrapper).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let clipd_exe = dir.join("clipd");
+            if clipd_exe.is_file() {
                 candidates.push(dir.join("clipd-hud"));
             }
         }
-        for c in candidates {
-            if c.is_file() {
-                return c;
-            }
+    }
+
+    for c in candidates {
+        if c.is_file() {
+            return c;
         }
     }
+
+    // Fallback: search PATH
     std::path::PathBuf::from("clipd-hud")
 }
 

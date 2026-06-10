@@ -64,14 +64,20 @@ impl ClipStore {
             CREATE INDEX IF NOT EXISTS idx_clips_hash ON clips(content_hash);
             CREATE INDEX IF NOT EXISTS idx_clips_type ON clips(content_type);
             CREATE INDEX IF NOT EXISTS idx_clips_app ON clips(source_app);
-            CREATE INDEX IF NOT EXISTS idx_clips_slot ON clips(slot);
             ",
         )?;
 
         // Add slot column if upgrading from schema before slot support.
+        // Must run before creating idx_clips_slot index.
         if let Err(e) = self.conn.execute("ALTER TABLE clips ADD COLUMN slot INTEGER", []) {
             log::debug!("slot column migration (expected on fresh DB or if already present): {}", e);
         }
+
+        // Now safe to create the slot index (column guaranteed to exist).
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_clips_slot ON clips(slot)",
+            [],
+        )?;
 
         self.conn.execute_batch(
             "
