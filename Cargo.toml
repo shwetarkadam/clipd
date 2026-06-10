@@ -18,7 +18,7 @@ exclude = ["third_party/rdev"]
 rdev = { path = "third_party/rdev" }
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.9"
 edition = "2021"
 license = "MIT"
 description = "AI clipboard daemon for developers — multi-slot copy, searchable history, editor-native"
