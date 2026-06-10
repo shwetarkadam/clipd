@@ -1010,7 +1010,7 @@ impl ClipdGui {
             return;
         }
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let mut filter_session: Option<usize> = None;
             let session_color = rgb(c.green);
 
@@ -1106,7 +1106,7 @@ impl ClipdGui {
         );
         ui.add_space(12.0);
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let mut dirty = false;
 
             if ui
@@ -1258,7 +1258,7 @@ impl ClipdGui {
                 );
                 ui.add_space(6.0);
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     let mut filter_session: Option<usize> = None;
                     let session_color = Color32::from_rgb(100, 200, 160);
 
