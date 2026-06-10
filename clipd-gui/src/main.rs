@@ -739,11 +739,12 @@ impl eframe::App for ClipdGui {
         // ── Center panel ──
         let preview_data = self.selected_clip().cloned();
 
+        let left_margin = if self.active_tab == MainTab::Text { 24.0 } else { 0.0 };
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
                     .fill(rgb(c.bg_base))
-                    .inner_margin(Margin::symmetric(24.0, 16.0)),
+                    .inner_margin(Margin::symmetric(left_margin, 16.0)),
             )
             .show(ctx, |ui| {
                 match self.active_tab {
