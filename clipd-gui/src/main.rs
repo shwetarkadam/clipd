@@ -9,14 +9,31 @@ use clipd_core::{
     TransformConfig, TransformKind,
 };
 use eframe::egui::{self, Color32, FontId, Margin, RichText, Rounding, Stroke};
+use std::collections::HashSet;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 /// Maximum clips to keep in memory in the GUI. Reduces RAM vs showing all clips.
 const MAX_LOADED_CLIPS: usize = 200;
 
+/// Compact UI spacing used by rows, pills, and controls.
+const CARD_ROUND: f32 = 4.0;
+const CARD_PAD_X: f32 = 9.0;
+const CARD_PAD_Y: f32 = 5.0;
+/// Pill (tag) corner radius and padding.
+const PILL_ROUND: f32 = 4.0;
+const PILL_PAD_X: f32 = 6.0;
+const PILL_PAD_Y: f32 = 1.0;
+const SETTINGS_MAX_WIDTH: f32 = 920.0;
+const SETTINGS_GUTTER_X: f32 = 28.0;
+const SETTINGS_GUTTER_Y: f32 = 18.0;
+const STARRED_COLLECTION_NAME: &str = "Starred";
 fn rgb(c: Rgb) -> Color32 {
     Color32::from_rgb(c.0, c.1, c.2)
+}
+
+fn rgba(c: Rgb, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.0, c.1, c.2, alpha)
 }
 
 fn pill_bg(col: Color32) -> Color32 {
@@ -25,16 +42,6 @@ fn pill_bg(col: Color32) -> Color32 {
         (col.g() as u16 / 3 + 15).min(255) as u8,
         (col.b() as u16 / 3 + 15).min(255) as u8,
     )
-}
-
-fn clip_list_icon(content_type: &ContentType) -> &'static str {
-    match content_type {
-        ContentType::Code => "{}",
-        ContentType::Url => "🔗",
-        ContentType::Email => "✉",
-        ContentType::Path => "📁",
-        _ => "📄",
-    }
 }
 
 /// A boxed on/off setting row (checkbox + title + description). Returns true if
@@ -48,14 +55,19 @@ fn settings_toggle(
 ) -> bool {
     let mut changed = false;
     egui::Frame::none()
-        .inner_margin(Margin::symmetric(20.0, 2.0))
+        .inner_margin(Margin {
+            left: 0.0,
+            right: 0.0,
+            top: 3.0,
+            bottom: 3.0,
+        })
         .show(ui, |ui| {
             // A subtle row — checkbox + title on one line, description muted below.
             // Light border instead of a bright outline keeps the list calm.
             egui::Frame::none()
                 .fill(rgb(c.bg_surface))
-                .rounding(Rounding::same(8.0))
-                .inner_margin(Margin::symmetric(12.0, 7.0))
+                .rounding(Rounding::same(CARD_ROUND))
+                .inner_margin(Margin::symmetric(12.0, 8.0))
                 .stroke(Stroke::new(0.5, rgb(c.border)))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -87,25 +99,28 @@ fn settings_toggle(
 /// A section header inside the settings list — a divider, then a small caption.
 fn settings_caption(ui: &mut egui::Ui, c: &clipd_core::ThemeColors, text: &str, note: &str) {
     egui::Frame::none()
-        .inner_margin(Margin::symmetric(20.0, 0.0))
+        .inner_margin(Margin {
+            left: 0.0,
+            right: 0.0,
+            top: 16.0,
+            bottom: 6.0,
+        })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.add_space(10.0);
             ui.separator();
-            ui.add_space(4.0);
+            ui.add_space(8.0);
             ui.label(RichText::new(text).size(11.0).strong().color(rgb(c.accent)));
             if !note.is_empty() {
                 ui.label(RichText::new(note).size(10.5).color(rgb(c.subtext)));
             }
-            ui.add_space(2.0);
         });
 }
 
 fn tag_pill(ui: &mut egui::Ui, label: &str, col: Color32, c: &clipd_core::ThemeColors) {
     egui::Frame::none()
         .fill(pill_bg(col))
-        .rounding(Rounding::same(6.0))
-        .inner_margin(Margin::symmetric(7.0, 2.0))
+        .rounding(Rounding::same(PILL_ROUND))
+        .inner_margin(Margin::symmetric(PILL_PAD_X, PILL_PAD_Y))
         .stroke(Stroke::new(0.5, col.gamma_multiply(0.85)))
         .show(ui, |ui| {
             ui.label(RichText::new(label).size(10.5).color(rgb(c.text)));
@@ -119,41 +134,69 @@ fn outline_button(
     _c: &clipd_core::ThemeColors,
 ) -> egui::Response {
     ui.add(
-        egui::Button::new(RichText::new(label).size(12.5).color(accent))
+        egui::Button::new(RichText::new(label).size(11.0).color(accent))
             .fill(Color32::TRANSPARENT)
-            .rounding(Rounding::same(8.0))
-            .stroke(Stroke::new(1.0, accent)),
+            .rounding(Rounding::same(5.0))
+            .stroke(Stroke::new(0.7, accent))
+            .min_size(egui::vec2(54.0, 22.0)),
     )
 }
 
-fn tab_chip(ui: &mut egui::Ui, label: &str, active: bool, c: &clipd_core::ThemeColors) -> bool {
-    let (fill, text_col, stroke_col) = if active {
-        (rgb(c.bg_selected), rgb(c.text), rgb(c.border))
+fn star_button(ui: &mut egui::Ui, starred: bool, c: &clipd_core::ThemeColors) -> egui::Response {
+    let (label, hover) = if starred {
+        ("★", "Remove from Starred")
     } else {
-        (Color32::TRANSPARENT, rgb(c.subtext), Color32::TRANSPARENT)
+        ("☆", "Save to Starred")
+    };
+    let col = if starred {
+        rgb(c.accent)
+    } else {
+        rgb(c.overlay)
     };
     ui.add(
-        egui::Button::new(RichText::new(label).size(12.5).color(text_col).strong())
-            .fill(fill)
-            .rounding(Rounding::same(8.0))
-            .stroke(Stroke::new(if active { 1.0 } else { 0.0 }, stroke_col)),
+        egui::Button::new(RichText::new(label).size(15.0).color(col))
+            .fill(Color32::TRANSPARENT)
+            .rounding(Rounding::same(5.0))
+            .stroke(Stroke::new(
+                if starred { 0.7 } else { 0.0 },
+                rgb(c.accent).gamma_multiply(0.7),
+            ))
+            .min_size(egui::vec2(28.0, 24.0)),
     )
-    .clicked()
+    .on_hover_text(hover)
+}
+
+fn tab_chip(ui: &mut egui::Ui, label: &str, active: bool, c: &clipd_core::ThemeColors) -> bool {
+    let text_col = if active { rgb(c.text) } else { rgb(c.subtext) };
+    let response = ui.add(
+        egui::Button::new(RichText::new(label).size(11.0).color(text_col))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE)
+            .min_size(egui::vec2(0.0, 22.0)),
+    );
+    if active {
+        let y = response.rect.bottom() - 1.0;
+        ui.painter().hline(
+            response.rect.x_range(),
+            y,
+            Stroke::new(1.5, rgb(c.accent).gamma_multiply(0.85)),
+        );
+    }
+    response.clicked()
 }
 
 enum Action {
     None,
     Copy,
     Delete,
-    ToggleTransform,
+    ToggleStar(i64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MainTab {
     Text,
-    Sessions,
     Collections,
-    Privacy,
+    Settings,
 }
 
 // ── Entry point ──
@@ -171,7 +214,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
-            .with_min_inner_size([640.0, 420.0]),
+            .with_min_inner_size([640.0, 420.0])
+            .with_transparent(true),
         ..Default::default()
     };
 
@@ -264,8 +308,25 @@ fn find_cli_binary() -> Option<std::path::PathBuf> {
     None
 }
 
+fn resolved_theme(ctx: &egui::Context, theme: Theme) -> Theme {
+    if theme != Theme::System {
+        return theme;
+    }
+    match ctx.system_theme() {
+        Some(egui::Theme::Light) => Theme::Light,
+        _ => Theme::Dark,
+    }
+}
+
 fn apply_theme(ctx: &egui::Context, theme: Theme) {
-    let c = theme.colors();
+    ctx.set_theme(match theme {
+        Theme::System => egui::ThemePreference::System,
+        Theme::Light => egui::ThemePreference::Light,
+        _ => egui::ThemePreference::Dark,
+    });
+
+    let effective = resolved_theme(ctx, theme);
+    let c = effective.colors();
 
     let mut style = (*ctx.style()).clone();
     style
@@ -287,10 +348,14 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
     style.visuals.menu_rounding = Rounding::same(8.0);
     ctx.set_style(style);
 
-    let mut v = egui::Visuals::dark();
+    let mut v = if effective.is_light() {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
     v.override_text_color = Some(rgb(c.text));
-    v.panel_fill = rgb(c.bg_base);
-    v.window_fill = rgb(c.bg_base);
+    v.panel_fill = rgba(c.bg_base, 235);
+    v.window_fill = rgba(c.bg_base, 238);
     v.window_stroke = Stroke::new(1.0, rgb(c.border));
     v.window_shadow = egui::epaint::Shadow {
         offset: egui::vec2(0.0, 4.0),
@@ -299,9 +364,9 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
         color: Color32::from_black_alpha(60),
     };
     v.window_rounding = Rounding::same(12.0);
-    v.extreme_bg_color = rgb(c.bg_base);
-    v.faint_bg_color = rgb(c.bg_surface);
-    v.widgets.noninteractive.bg_fill = rgb(c.bg_surface);
+    v.extreme_bg_color = rgba(c.bg_base, 235);
+    v.faint_bg_color = rgba(c.bg_surface, 225);
+    v.widgets.noninteractive.bg_fill = rgba(c.bg_surface, 232);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, rgb(c.text));
     v.widgets.noninteractive.bg_stroke = Stroke::NONE;
     v.widgets.noninteractive.rounding = Rounding::same(8.0);
@@ -350,6 +415,8 @@ struct ClipdGui {
 
     // Collections
     collections: Vec<clipd_core::Collection>,
+    starred_collection_id: Option<i64>,
+    starred_clip_ids: HashSet<i64>,
     new_collection_name: String,
     new_collection_app: String,
     ai_result: Option<String>,
@@ -363,7 +430,7 @@ impl ClipdGui {
         let count = clips.len();
         let session_config = SessionConfig::default();
         let sessions = compute_sessions(&clips, session_config.window_minutes);
-        Self {
+        let mut app = Self {
             store,
             clips,
             search_query: String::new(),
@@ -391,15 +458,69 @@ impl ClipdGui {
             confirm_clear_all: false,
             export_status: None,
             collections: Vec::new(),
+            starred_collection_id: None,
+            starred_clip_ids: HashSet::new(),
             new_collection_name: String::new(),
             new_collection_app: String::new(),
             ai_result: None,
-        }
+        };
+        app.refresh_collections();
+        app.refresh_starred();
+        app
     }
 
     /// Reload the list of collections from the store.
     fn refresh_collections(&mut self) {
         self.collections = self.store.list_collections().unwrap_or_default();
+    }
+
+    fn refresh_starred(&mut self) {
+        self.starred_clip_ids.clear();
+        self.starred_collection_id = self
+            .store
+            .get_collection_by_name(STARRED_COLLECTION_NAME)
+            .ok()
+            .flatten()
+            .map(|collection| collection.id);
+        if let Some(collection_id) = self.starred_collection_id {
+            self.starred_clip_ids = self
+                .store
+                .collection_items(collection_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| item.clip_id)
+                .collect();
+        }
+    }
+
+    fn ensure_starred_collection(&mut self) -> Option<i64> {
+        if let Some(id) = self.starred_collection_id {
+            return Some(id);
+        }
+        let id = match self.store.get_collection_by_name(STARRED_COLLECTION_NAME) {
+            Ok(Some(collection)) => Some(collection.id),
+            Ok(None) => self
+                .store
+                .create_collection(STARRED_COLLECTION_NAME, None)
+                .ok(),
+            Err(_) => None,
+        }?;
+        self.starred_collection_id = Some(id);
+        self.refresh_collections();
+        Some(id)
+    }
+
+    fn toggle_starred(&mut self, clip_id: i64) {
+        if self.starred_clip_ids.contains(&clip_id) {
+            if let Some(collection_id) = self.starred_collection_id {
+                let _ = self.store.remove_collection_item(collection_id, clip_id);
+            }
+            self.starred_clip_ids.remove(&clip_id);
+        } else if let Some(collection_id) = self.ensure_starred_collection() {
+            let _ = self.store.add_clip_to_collection(collection_id, clip_id);
+            self.starred_clip_ids.insert(clip_id);
+        }
+        self.refresh_collections();
     }
 
     fn refresh(&mut self) {
@@ -555,18 +676,30 @@ impl ClipdGui {
 // ── Rendering ──
 
 impl eframe::App for ClipdGui {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        let bg = self.theme.colors().bg_base;
-        Color32::from_rgb(bg.0, bg.1, bg.2).to_normalized_gamma_f32()
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        let effective = if self.theme == Theme::System {
+            if visuals.dark_mode {
+                Theme::Dark
+            } else {
+                Theme::Light
+            }
+        } else {
+            self.theme
+        };
+        let bg = effective.colors().bg_base;
+        Color32::from_rgba_unmultiplied(bg.0, bg.1, bg.2, 210).to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.theme == Theme::System {
+            apply_theme(ctx, self.theme);
+        }
         if self.last_refresh.elapsed() > Duration::from_secs(3) {
             self.refresh();
         }
         ctx.request_repaint_after(Duration::from_secs(3));
 
-        let c = self.theme.colors();
+        let c = resolved_theme(ctx, self.theme).colors();
         let mut action = Action::None;
 
         let search_has_focus = ctx.memory(|m| {
@@ -609,32 +742,31 @@ impl eframe::App for ClipdGui {
         egui::TopBottomPanel::top("top_bar")
             .frame(
                 egui::Frame::none()
-                    .fill(rgb(c.bg_surface))
-                    .inner_margin(Margin::symmetric(20.0, 12.0))
-                    .stroke(Stroke::new(1.0, rgb(c.border))),
+                    .fill(rgba(c.bg_surface, 238))
+                    .inner_margin(Margin::symmetric(12.0, 7.0))
+                    .stroke(Stroke::new(0.7, rgb(c.border).gamma_multiply(0.65))),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
                     ui.label(
                         RichText::new("clipd")
-                            .size(15.0)
+                            .size(12.5)
                             .strong()
                             .color(rgb(c.subtext)),
                     );
-                    ui.add_space(12.0);
 
-                    let search_w = (ui.available_width() - 120.0).max(280.0);
+                    let search_w = (ui.available_width() * 0.34).clamp(260.0, 460.0);
                     egui::Frame::none()
                         .fill(rgb(c.bg_elevated))
-                        .rounding(Rounding::same(10.0))
-                        .inner_margin(Margin::symmetric(12.0, 6.0))
-                        .stroke(Stroke::new(1.0, rgb(c.border)))
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(Margin::symmetric(8.0, 3.0))
+                        .stroke(Stroke::new(0.7, rgb(c.border).gamma_multiply(0.8)))
                         .show(ui, |ui| {
                             ui.set_width(search_w);
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("⌕").size(15.0).color(rgb(c.overlay)));
                                 let search = ui.add_sized(
-                                    [ui.available_width(), 22.0],
+                                    [ui.available_width(), 18.0],
                                     egui::TextEdit::singleline(&mut self.search_query)
                                         .id(egui::Id::new("clip_search"))
                                         .hint_text("Search clips…")
@@ -651,48 +783,9 @@ impl eframe::App for ClipdGui {
                             });
                         });
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let theme_btn = ui.add(
-                            egui::Button::new(
-                                RichText::new(self.theme.label())
-                                    .size(11.5)
-                                    .color(rgb(c.text)),
-                            )
-                            .fill(rgb(c.bg_elevated))
-                            .rounding(Rounding::same(8.0))
-                            .stroke(Stroke::new(1.0, rgb(c.border)))
-                            .min_size(egui::vec2(88.0, 26.0)),
-                        );
-                        if theme_btn.clicked() {
-                            self.cycle_theme(ui.ctx());
-                        }
-                        theme_btn.on_hover_text("Click or ⌘T to switch theme");
-
-                        let swatch = egui::vec2(14.0, 14.0);
-                        let (rect, _) = ui.allocate_exact_size(swatch, egui::Sense::hover());
-                        ui.painter()
-                            .rect_filled(rect, Rounding::same(3.0), rgb(c.accent2));
-                        ui.add_space(6.0);
-                    });
-                });
-
-                ui.add_space(10.0);
-
-                ui.horizontal(|ui| {
                     if tab_chip(ui, "Text", self.active_tab == MainTab::Text, &c) {
                         self.active_tab = MainTab::Text;
                     }
-                    ui.add_space(6.0);
-                    if tab_chip(ui, "Sessions", self.active_tab == MainTab::Sessions, &c) {
-                        self.active_tab = MainTab::Sessions;
-                        self.sessions =
-                            compute_sessions(&self.clips, self.session_config.window_minutes);
-                    }
-                    ui.add_space(6.0);
-                    if tab_chip(ui, "Privacy", self.active_tab == MainTab::Privacy, &c) {
-                        self.active_tab = MainTab::Privacy;
-                    }
-                    ui.add_space(6.0);
                     if tab_chip(
                         ui,
                         "Collections",
@@ -704,7 +797,7 @@ impl eframe::App for ClipdGui {
                     }
 
                     if self.active_tab == MainTab::Text {
-                        ui.add_space(12.0);
+                        ui.add_space(4.0);
                         let sem = if self.semantic_mode {
                             "Semantic"
                         } else {
@@ -713,7 +806,7 @@ impl eframe::App for ClipdGui {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new(sem).size(11.0).color(rgb(c.overlay)),
+                                    RichText::new(sem).size(10.5).color(rgb(c.overlay)),
                                 )
                                 .fill(Color32::TRANSPARENT)
                                 .stroke(Stroke::NONE),
@@ -729,23 +822,23 @@ impl eframe::App for ClipdGui {
                             self.apply_filter();
                         }
 
-                        ui.add_space(6.0);
+                        ui.add_space(2.0);
                         let slot_label = if self.show_active_slots_only {
-                            "Active Slots"
+                            "Slots"
                         } else {
-                            "All Clips"
+                            "All"
                         };
-                        let slot_fill = if self.show_active_slots_only {
+                        let slot_text = if self.show_active_slots_only {
                             rgb(c.accent)
                         } else {
-                            Color32::TRANSPARENT
+                            rgb(c.overlay)
                         };
                         if ui
                             .add(
                                 egui::Button::new(
-                                    RichText::new(slot_label).size(11.0).color(rgb(c.overlay)),
+                                    RichText::new(slot_label).size(10.5).color(slot_text),
                                 )
-                                .fill(slot_fill)
+                                .fill(Color32::TRANSPARENT)
                                 .stroke(Stroke::NONE),
                             )
                             .on_hover_text("Show only clips saved to slots")
@@ -757,98 +850,100 @@ impl eframe::App for ClipdGui {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let settings_active = self.active_tab == MainTab::Settings;
+                        let settings_btn = ui.add(
+                            egui::Button::new(RichText::new("Settings").size(10.5).color(
+                                if settings_active {
+                                    rgb(c.accent)
+                                } else {
+                                    rgb(c.text)
+                                },
+                            ))
+                            .fill(if settings_active {
+                                rgb(c.bg_selected).gamma_multiply(0.55)
+                            } else {
+                                rgb(c.bg_elevated)
+                            })
+                            .rounding(Rounding::same(5.0))
+                            .stroke(Stroke::new(0.7, rgb(c.border)))
+                            .min_size(egui::vec2(72.0, 22.0)),
+                        );
+                        if settings_btn.clicked() {
+                            self.active_tab = MainTab::Settings;
+                        }
+                        settings_btn.on_hover_text("Theme, privacy, and app behavior");
+                        ui.add_space(8.0);
                         ui.label(
                             RichText::new(format!("{} clips", self.filtered.len()))
-                                .size(11.5)
+                                .size(10.5)
                                 .color(rgb(c.overlay)),
                         );
+                        if let Some(t) = self.copied_at {
+                            if t.elapsed() < Duration::from_secs(2) {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("Copied")
+                                        .size(10.5)
+                                        .color(rgb(c.green))
+                                        .strong(),
+                                );
+                            } else {
+                                self.copied_at = None;
+                            }
+                        }
                     });
                 });
             });
 
-        // ── Bottom bar (minimal) ──
-        egui::TopBottomPanel::bottom("bottom_bar")
-            .frame(
-                egui::Frame::none()
-                    .fill(rgb(c.bg_surface))
-                    .inner_margin(Margin::symmetric(20.0, 6.0))
-                    .stroke(Stroke::new(1.0, rgb(c.border))),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("↑↓ navigate  ·  ⏎ copy  ·  ⌘D delete  ·  Esc close")
-                            .size(10.5)
-                            .color(rgb(c.overlay)),
-                    );
-                    if let Some(t) = self.copied_at {
-                        if t.elapsed() < Duration::from_secs(2) {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new("Copied")
-                                            .size(11.0)
-                                            .color(rgb(c.green))
-                                            .strong(),
-                                    );
-                                },
-                            );
-                        } else {
-                            self.copied_at = None;
-                        }
-                    }
-                });
-            });
+        let preview_data = self.selected_clip().cloned();
 
-        // ── Left panel: clip list (Text tab only) ──
+        // ── Right inspector: selected clip details (Text tab only) ──
         if self.active_tab == MainTab::Text {
-            egui::SidePanel::left("clip_list")
+            egui::SidePanel::right("clip_inspector")
                 .resizable(false)
-                .exact_width(340.0)
+                .exact_width(380.0)
                 .frame(
                     egui::Frame::none()
-                        .fill(rgb(c.bg_base))
-                        .inner_margin(Margin::symmetric(4.0, 8.0)),
+                        .fill(rgba(c.bg_surface, 232))
+                        .inner_margin(Margin::symmetric(16.0, 14.0))
+                        .stroke(Stroke::new(0.7, rgb(c.border).gamma_multiply(0.65))),
                 )
                 .show(ctx, |ui| {
-                    if self.filtered.is_empty() {
-                        self.render_empty_list(ui, &c);
+                    if let Some(clip) = &preview_data {
+                        let is_starred = self.starred_clip_ids.contains(&clip.id);
+                        render_preview(ui, clip, is_starred, &mut action, &c);
                     } else {
-                        self.render_clip_list(ui, &mut action, &c);
+                        render_empty_preview(ui, &c);
                     }
                 });
         }
 
         // ── Center panel ──
-        let preview_data = self.selected_clip().cloned();
-
-        let left_margin = if self.active_tab == MainTab::Text {
-            24.0
-        } else {
-            0.0
-        };
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
-                    .fill(rgb(c.bg_base))
-                    .inner_margin(Margin::symmetric(left_margin, 16.0)),
+                    .fill(rgba(c.bg_base, 224))
+                    .inner_margin(Margin::symmetric(
+                        if self.active_tab == MainTab::Text {
+                            18.0
+                        } else {
+                            0.0
+                        },
+                        12.0,
+                    )),
             )
             .show(ctx, |ui| match self.active_tab {
                 MainTab::Text => {
-                    if let Some(clip) = &preview_data {
-                        render_preview(ui, clip, &mut action, &c);
+                    if self.filtered.is_empty() {
+                        self.render_empty_list(ui, &c);
                     } else {
-                        render_empty_preview(ui, &c);
+                        self.render_clip_list(ui, &mut action, &c);
                     }
-                }
-                MainTab::Sessions => {
-                    self.render_sessions_panel(ui, &c);
                 }
                 MainTab::Collections => {
                     self.render_collections_panel(ui, &c);
                 }
-                MainTab::Privacy => {
+                MainTab::Settings => {
                     self.render_settings_panel(ui, &c);
                 }
             });
@@ -860,8 +955,9 @@ impl eframe::App for ClipdGui {
         match action {
             Action::Copy => self.do_copy(),
             Action::Delete => self.do_delete(),
-            Action::ToggleTransform => {
-                self.show_transforms = !self.show_transforms;
+            Action::ToggleStar(clip_id) => {
+                self.toggle_starred(clip_id);
+                ctx.request_repaint();
             }
             Action::None => {}
         }
@@ -922,24 +1018,24 @@ impl ClipdGui {
 
     fn render_empty_list(&self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         ui.vertical_centered(|ui| {
-            ui.add_space(80.0);
-            ui.label(RichText::new("📭").size(48.0));
-            ui.add_space(12.0);
+            ui.add_space(72.0);
             if self.search_query.is_empty() {
                 ui.label(
                     RichText::new("No clips yet")
-                        .size(16.0)
+                        .size(13.0)
+                        .strong()
                         .color(rgb(c.overlay)),
                 );
                 ui.label(
-                    RichText::new("Copy something to get started!")
-                        .size(13.0)
+                    RichText::new("Copy something to get started.")
+                        .size(11.0)
                         .color(rgb(c.overlay)),
                 );
             } else {
                 ui.label(
                     RichText::new("No matching clips")
-                        .size(16.0)
+                        .size(13.0)
+                        .strong()
                         .color(rgb(c.overlay)),
                 );
             }
@@ -952,12 +1048,39 @@ impl ClipdGui {
         action: &mut Action,
         c: &clipd_core::ThemeColors,
     ) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("History")
+                    .size(13.0)
+                    .strong()
+                    .color(rgb(c.text)),
+            );
+            ui.label(
+                RichText::new(format!("{} visible", self.filtered.len()))
+                    .size(10.5)
+                    .color(rgb(c.overlay)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let hint = if self.paste_settings.copy_on_select {
+                    "Click copies · double-click copies"
+                } else {
+                    "Click selects · double-click copies"
+                };
+                ui.label(RichText::new(hint).size(10.5).color(rgb(c.overlay)));
+            });
+        });
+        ui.add_space(8.0);
+
+        let visible_indices = self.filtered.clone();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (display_idx, &clip_idx) in self.filtered.iter().enumerate() {
+                for (display_idx, &clip_idx) in visible_indices.iter().enumerate() {
                     let clip = &self.clips[clip_idx];
+                    let clip_id_value = clip.id;
                     let is_selected = display_idx == self.selected;
+                    let is_starred = self.starred_clip_ids.contains(&clip_id_value);
+                    let mut star_clicked = false;
                     let clip_id = egui::Id::new(("clip", display_idx));
 
                     let type_color = match clip.content_type {
@@ -969,104 +1092,121 @@ impl ClipdGui {
                     };
 
                     let bg = if is_selected {
-                        rgb(c.bg_selected)
+                        rgb(c.bg_selected).gamma_multiply(0.65)
                     } else {
                         Color32::TRANSPARENT
                     };
 
                     let preview = clip.preview.trim().replace('\n', " ");
-                    let truncated: String = preview.chars().take(56).collect();
-                    let suffix = if preview.chars().count() > 56 {
+                    let truncated: String = preview.chars().take(120).collect();
+                    let suffix = if preview.chars().count() > 120 {
                         "…"
                     } else {
                         ""
                     };
                     let time = relative_time(&clip.timestamp);
+                    let source = clip.source_app.as_deref().unwrap_or("Unknown");
+                    let source_short: String = source.chars().take(18).collect();
+                    let source_suffix = if source.chars().count() > 18 {
+                        "…"
+                    } else {
+                        ""
+                    };
 
                     let frame_resp = egui::Frame::none()
                         .fill(bg)
-                        .rounding(Rounding::same(6.0))
-                        .inner_margin(Margin::symmetric(10.0, 8.0))
+                        .rounding(Rounding::same(CARD_ROUND))
+                        .inner_margin(Margin::symmetric(12.0, 8.0))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(clip_list_icon(&clip.content_type))
-                                        .size(16.0)
-                                        .color(type_color),
-                                );
-                                ui.add_space(8.0);
-
-                                ui.vertical(|ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.horizontal(|ui| {
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.label(
-                                                    RichText::new(&time)
-                                                        .size(10.5)
-                                                        .color(rgb(c.overlay)),
-                                                );
-                                                ui.with_layout(
-                                                    egui::Layout::left_to_right(
-                                                        egui::Align::Center,
-                                                    ),
-                                                    |ui| {
-                                                        ui.add(
-                                                            egui::Label::new(
-                                                                RichText::new(format!(
-                                                                    "{}{}",
-                                                                    truncated, suffix
-                                                                ))
-                                                                .size(13.0)
-                                                                .color(rgb(c.text)),
-                                                            )
-                                                            .truncate(),
-                                                        );
-                                                    },
-                                                );
-                                            },
-                                        );
-                                    });
-
-                                    ui.add_space(4.0);
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 5.0;
-                                        tag_pill(ui, clip.content_type.as_str(), type_color, c);
-                                        if let Some(ref app) = clip.source_app {
-                                            let app_short = if app.len() > 18 {
-                                                format!("{}…", &app[..18])
-                                            } else {
-                                                app.clone()
-                                            };
-                                            tag_pill(ui, &app_short, rgb(c.bg_elevated), c);
-                                        }
-                                        if let Some(slot) = clip.slot {
-                                            tag_pill(
-                                                ui,
-                                                &format!("slot {}", slot),
-                                                rgb(c.accent),
-                                                c,
+                            ui.vertical(|ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if star_button(ui, is_starred, c).clicked() {
+                                                star_clicked = true;
+                                            }
+                                            ui.label(
+                                                RichText::new(&time)
+                                                    .size(10.0)
+                                                    .color(rgb(c.overlay)),
                                             );
-                                        }
-                                        if !detect_sensitive(&clip.content, &self.privacy_config)
-                                            .is_empty()
-                                        {
-                                            tag_pill(ui, "sensitive", rgb(c.accent2), c);
-                                        }
-                                    });
+                                            ui.with_layout(
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(format!(
+                                                                "{}{}",
+                                                                truncated, suffix
+                                                            ))
+                                                            .size(12.5)
+                                                            .color(rgb(c.text)),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                },
+                                            );
+                                        },
+                                    );
+                                });
+
+                                ui.add_space(1.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 5.0;
+                                    ui.label(
+                                        RichText::new(clip.content_type.as_str())
+                                            .size(9.5)
+                                            .color(type_color),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "· {}{}",
+                                            source_short, source_suffix
+                                        ))
+                                        .size(9.5)
+                                        .color(rgb(c.overlay)),
+                                    );
+                                    if let Some(slot) = clip.slot {
+                                        ui.label(
+                                            RichText::new(format!("· slot {}", slot))
+                                                .size(9.5)
+                                                .color(rgb(c.accent)),
+                                        );
+                                    }
+                                    if !detect_sensitive(&clip.content, &self.privacy_config)
+                                        .is_empty()
+                                    {
+                                        tag_pill(ui, "sensitive", rgb(c.accent2), c);
+                                    }
                                 });
                             });
                         })
                         .response;
 
-                    let resp = ui.interact(frame_resp.rect, clip_id, egui::Sense::click());
-
-                    if resp.clicked() {
-                        self.selected = display_idx;
+                    if star_clicked {
+                        *action = Action::ToggleStar(clip_id_value);
                     }
-                    if resp.double_clicked() {
+
+                    let resp = ui.interact(frame_resp.rect, clip_id, egui::Sense::click());
+                    if is_selected {
+                        let rail = egui::Rect::from_min_max(
+                            frame_resp.rect.left_top(),
+                            egui::pos2(frame_resp.rect.left() + 2.0, frame_resp.rect.bottom()),
+                        );
+                        ui.painter()
+                            .rect_filled(rail, Rounding::same(1.0), rgb(c.accent));
+                    }
+
+                    if resp.clicked() && !star_clicked {
+                        self.selected = display_idx;
+                        if self.paste_settings.copy_on_select {
+                            *action = Action::Copy;
+                        }
+                    }
+                    if resp.double_clicked() && !star_clicked {
                         self.selected = display_idx;
                         *action = Action::Copy;
                     }
@@ -1081,7 +1221,7 @@ impl ClipdGui {
                     ui.painter().hline(
                         sep.x_range(),
                         sep.max.y,
-                        Stroke::new(1.0, rgb(c.border).gamma_multiply(0.5)),
+                        Stroke::new(0.7, rgb(c.border).gamma_multiply(0.35)),
                     );
                     ui.allocate_space(egui::vec2(ui.available_width(), 1.0));
                 }
@@ -1089,6 +1229,7 @@ impl ClipdGui {
             });
     }
 
+    #[allow(dead_code)]
     fn render_sessions_panel(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         ui.label(
             RichText::new("Sessions")
@@ -1205,138 +1346,535 @@ impl ClipdGui {
             });
     }
 
-    fn render_settings_panel(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
-        ui.label(
-            RichText::new("Privacy")
-                .size(18.0)
-                .strong()
-                .color(rgb(c.text)),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("Control what clipd saves and how sensitive content is handled.")
-                .size(12.0)
-                .color(rgb(c.subtext)),
-        );
-        ui.add_space(12.0);
+    fn render_clipboard_behavior_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        c: &clipd_core::ThemeColors,
+    ) {
+        let accent = Color32::from_rgb(255, 160, 50);
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
+        settings_caption(
+            ui,
+            c,
+            "PASTE TRANSFORM",
+            "Configure smart paste here. Normal Cmd+V remains unchanged.",
+        );
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.enabled,
+            "Transform on paste",
+            "Use Ctrl+Shift+V to apply selected transforms before pasting.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.smart_mode,
+            "Smart mode",
+            "Auto-detect content type and choose the best transform for JSON, HTML, code, and text.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+
+        egui::Frame::none()
+            .inner_margin(Margin::symmetric(0.0, 6.0))
             .show(ui, |ui| {
-                let mut dirty = false;
-
-                if ui
-                    .checkbox(
-                        &mut self.privacy_config.enabled,
-                        "Enable privacy protection",
-                    )
-                    .changed()
-                {
-                    dirty = true;
-                }
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                ui.label(
-                    RichText::new("Detection rules")
-                        .size(13.0)
-                        .strong()
-                        .color(rgb(c.accent)),
-                );
-                ui.add_space(6.0);
-
-                ui.add_enabled_ui(self.privacy_config.enabled, |ui| {
-                    if ui
-                        .checkbox(
-                            &mut self.privacy_config.detect_api_keys,
-                            "API keys (OpenAI, AWS, GitHub, Stripe, Slack…)",
-                        )
-                        .changed()
-                    {
-                        dirty = true;
-                    }
-                    if ui
-                        .checkbox(
-                            &mut self.privacy_config.detect_credentials,
-                            "Passwords, secrets & database URLs",
-                        )
-                        .changed()
-                    {
-                        dirty = true;
-                    }
-                    if ui
-                        .checkbox(
-                            &mut self.privacy_config.detect_credit_cards,
-                            "Credit card numbers",
-                        )
-                        .changed()
-                    {
-                        dirty = true;
-                    }
-                    if ui
-                        .checkbox(
-                            &mut self.privacy_config.detect_ssn,
-                            "Social Security numbers",
-                        )
-                        .changed()
-                    {
-                        dirty = true;
-                    }
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Active transforms")
+                            .size(12.0)
+                            .strong()
+                            .color(rgb(c.text)),
+                    );
+                    ui.label(
+                        RichText::new("applied on Ctrl+Shift+V")
+                            .size(10.5)
+                            .color(rgb(c.subtext)),
+                    );
                 });
+                ui.add_space(4.0);
 
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(8.0);
+                let transforms = self.transforms.clone();
+                let categories: &[(&str, Color32)] = &[
+                    ("FORMAT", Color32::from_rgb(130, 170, 255)),
+                    ("CASE", Color32::from_rgb(100, 200, 160)),
+                    ("AI ✨", accent),
+                ];
 
+                for (cat_key, cat_color) in categories {
+                    let cat_transforms: Vec<&TransformKind> = transforms
+                        .iter()
+                        .filter(|t| t.category() == *cat_key)
+                        .collect();
+                    if cat_transforms.is_empty() {
+                        continue;
+                    }
+
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(*cat_key)
+                            .size(9.5)
+                            .strong()
+                            .color(rgb(c.overlay)),
+                    );
+
+                    for t in cat_transforms {
+                        let is_active = self.paste_settings.active_transforms.contains(t);
+                        let fill = if is_active {
+                            pill_bg(*cat_color)
+                        } else {
+                            rgb(c.bg_surface)
+                        };
+                        let text_col = if is_active {
+                            rgb(c.text)
+                        } else {
+                            rgb(c.subtext)
+                        };
+
+                        let resp = egui::Frame::none()
+                            .fill(fill)
+                            .rounding(Rounding::same(CARD_ROUND))
+                            .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_PAD_Y))
+                            .stroke(Stroke::new(
+                                0.7,
+                                if is_active { *cat_color } else { rgb(c.border) },
+                            ))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(if is_active { "✓" } else { "○" })
+                                            .size(12.0)
+                                            .color(if is_active {
+                                                *cat_color
+                                            } else {
+                                                rgb(c.overlay)
+                                            }),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("{} {}", t.icon(), t.label()))
+                                            .size(11.5)
+                                            .color(text_col),
+                                    );
+                                    if t.is_ai() {
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new("AI")
+                                                        .size(9.5)
+                                                        .strong()
+                                                        .color(accent),
+                                                );
+                                            },
+                                        );
+                                    }
+                                });
+                            })
+                            .response;
+
+                        if ui
+                            .interact(
+                                resp.rect,
+                                egui::Id::new(("settings_transform", t.label())),
+                                egui::Sense::click(),
+                            )
+                            .clicked()
+                        {
+                            if is_active {
+                                self.paste_settings.active_transforms.retain(|x| x != t);
+                            } else {
+                                self.paste_settings.active_transforms.push((*t).clone());
+                            }
+                            save_paste_transform_settings(&self.paste_settings);
+                        }
+                        ui.add_space(2.0);
+                    }
+                }
+            });
+
+        egui::Frame::none()
+            .inner_margin(Margin::symmetric(0.0, 6.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.label(
-                    RichText::new("Excluded apps")
-                        .size(13.0)
+                    RichText::new("AI transform prompt")
+                        .size(12.0)
                         .strong()
-                        .color(rgb(c.accent)),
+                        .color(rgb(c.text)),
                 );
                 ui.label(
-                    RichText::new("Copies from these apps are never saved.")
-                        .size(11.0)
+                    RichText::new("Optional. Leave empty to keep smart paste fully rule-based.")
+                        .size(10.5)
                         .color(rgb(c.subtext)),
                 );
-                ui.add_space(6.0);
+                ui.add_space(4.0);
+                let resp = ui.add_sized(
+                    [ui.available_width(), 26.0],
+                    egui::TextEdit::singleline(&mut self.paste_settings.default_ai_prompt)
+                        .hint_text("e.g. Fix grammar, convert to table, summarize")
+                        .font(egui::TextStyle::Body),
+                );
+                if resp.changed() || resp.lost_focus() {
+                    save_paste_transform_settings(&self.paste_settings);
+                }
+            });
 
-                let mut remove_app: Option<usize> = None;
-                for (i, app_name) in self.privacy_config.excluded_apps.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(app_name).size(12.0).color(rgb(c.text)));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Remove").clicked() {
-                                remove_app = Some(i);
+        settings_caption(
+            ui,
+            c,
+            "CLIPBOARD MEMORY",
+            "Control what clipd remembers and how quickly you can recall it.",
+        );
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.remember_clipboard,
+            "Remember copied items automatically",
+            "Cmd+C stores items in clipd memory. Off means system copy only, no history.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.palette_enabled,
+            "Enable memory palette",
+            "Open a searchable palette to recall copied items by content, source, time, or alias.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+        egui::Frame::none()
+            .inner_margin(Margin::symmetric(0.0, 6.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Palette shortcut")
+                            .size(12.0)
+                            .color(rgb(c.text)),
+                    );
+                    let prev = self.paste_settings.palette_trigger;
+                    egui::ComboBox::from_id_salt("settings_palette_trigger")
+                        .selected_text(self.paste_settings.palette_trigger.label())
+                        .show_ui(ui, |ui| {
+                            for t in [
+                                PaletteTrigger::CmdShiftV,
+                                PaletteTrigger::CtrlOptSpace,
+                                PaletteTrigger::OptSpace,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.paste_settings.palette_trigger,
+                                    t,
+                                    t.label(),
+                                );
                             }
                         });
-                    });
-                }
-                if let Some(i) = remove_app {
-                    self.privacy_config.excluded_apps.remove(i);
-                    dirty = true;
-                }
-
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_excluded_app)
-                            .hint_text("App name…")
-                            .desired_width(200.0),
-                    );
-                    if ui.button("Add").clicked() && !self.new_excluded_app.trim().is_empty() {
-                        self.privacy_config
-                            .excluded_apps
-                            .push(self.new_excluded_app.trim().to_string());
-                        self.new_excluded_app.clear();
-                        dirty = true;
+                    if self.paste_settings.palette_trigger != prev {
+                        save_paste_transform_settings(&self.paste_settings);
                     }
                 });
-
-                if dirty {
-                    save_privacy_config(&self.privacy_config);
+                if self.paste_settings.palette_trigger == PaletteTrigger::OptSpace {
+                    ui.label(
+                        RichText::new(
+                            "Option+Space normally inserts a non-breaking space on macOS.",
+                        )
+                        .size(10.5)
+                        .color(Color32::from_rgb(230, 170, 60)),
+                    );
                 }
+            });
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.palette_aliases_enabled,
+            "Letter aliases in palette",
+            "Show letter slots as @A rows so you can recall them without memorizing chords.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+
+        settings_caption(
+            ui,
+            c,
+            "SHORTCUTS & FEEDBACK",
+            "Power-user paste modes. Keep these off if you only want normal copy/paste plus search.",
+        );
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.hud_enabled,
+            "HUD notifications",
+            "Show a floating overlay when copying or pasting to slots.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.copy_on_select,
+            "Copy when selecting a row",
+            "Single-clicking a history row copies it immediately. Turn off for select-only rows; double-click and Enter still copy.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.multi_slot_enabled,
+            "Multi-slot copy/paste",
+            "Cmd+C x2 copies to slot 2, Cmd+V x2 pastes it, and so on.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.extended_slots_enabled,
+            "Extended slots 11-30",
+            "Option+C/V multi-tap reaches higher-numbered slots.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.letter_slots_enabled,
+            "Letter slots A-Z",
+            "Adds letter slots for faster named recall.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.quick_letter_slots_enabled,
+            "Quick letter save",
+            "Double-tap Cmd+C then a letter to save to that letter slot.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.direct_letter_shortcuts_enabled,
+            "Direct A-Z shortcuts",
+            "Enable global Ctrl+Option+C/V then A-Z chords.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.batch_drain_enabled,
+            "Batch-drain paste",
+            "Cmd+Option+V pastes collected clips one at a time in order.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.copy_multi_tap_restore,
+            "Restore clipboard after multi-tap copy",
+            "After Cmd+C x N, restore the clipboard to slot 1's content.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+    }
+
+    fn render_settings_panel(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        egui::Frame::none()
+            .inner_margin(Margin {
+                left: SETTINGS_GUTTER_X,
+                right: SETTINGS_GUTTER_X,
+                top: SETTINGS_GUTTER_Y,
+                bottom: SETTINGS_GUTTER_Y,
+            })
+            .show(ui, |ui| {
+                ui.set_max_width(SETTINGS_MAX_WIDTH);
+                ui.label(
+                    RichText::new("Settings")
+                        .size(18.0)
+                        .strong()
+                        .color(rgb(c.text)),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Appearance, privacy, and clipboard behavior.")
+                        .size(12.0)
+                        .color(rgb(c.subtext)),
+                );
+                ui.add_space(8.0);
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(SETTINGS_MAX_WIDTH);
+                        let mut dirty = false;
+
+                        settings_caption(
+                            ui,
+                            c,
+                            "APPEARANCE",
+                            "Use System to follow macOS, or choose an explicit Light/Dark theme.",
+                        );
+                        egui::Frame::none()
+                            .inner_margin(Margin::symmetric(0.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Theme").size(12.0).color(rgb(c.text)));
+                                    let prev = self.theme;
+                                    egui::ComboBox::from_id_salt("theme_selector")
+                                        .selected_text(self.theme.label())
+                                        .show_ui(ui, |ui| {
+                                            for theme in Theme::ALL {
+                                                ui.selectable_value(
+                                                    &mut self.theme,
+                                                    theme,
+                                                    theme.label(),
+                                                );
+                                            }
+                                        });
+                                    if self.theme != prev {
+                                        save_theme(self.theme);
+                                        apply_theme(ui.ctx(), self.theme);
+                                    }
+                                });
+                                ui.label(
+                                    RichText::new(
+                                        "Shortcut: ⌘T cycles System, Light, Dark, and named themes.",
+                                    )
+                                    .size(10.5)
+                                    .color(rgb(c.subtext)),
+                                );
+                            });
+
+                        self.render_clipboard_behavior_settings(ui, c);
+
+                        settings_caption(
+                            ui,
+                            c,
+                            "PRIVACY",
+                            "Control what clipd saves and how sensitive content is handled.",
+                        );
+                        if settings_toggle(
+                            ui,
+                            c,
+                            &mut self.privacy_config.enabled,
+                            "Enable privacy protection",
+                            "Detect secrets and prevent excluded apps from being stored.",
+                        ) {
+                            dirty = true;
+                        }
+
+                        ui.label(
+                            RichText::new("Detection rules")
+                                .size(13.0)
+                                .strong()
+                                .color(rgb(c.accent)),
+                        );
+                        ui.add_space(6.0);
+
+                        ui.add_enabled_ui(self.privacy_config.enabled, |ui| {
+                            if ui
+                                .checkbox(
+                                    &mut self.privacy_config.detect_api_keys,
+                                    "API keys (OpenAI, AWS, GitHub, Stripe, Slack…)",
+                                )
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                            if ui
+                                .checkbox(
+                                    &mut self.privacy_config.detect_credentials,
+                                    "Passwords, secrets & database URLs",
+                                )
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                            if ui
+                                .checkbox(
+                                    &mut self.privacy_config.detect_credit_cards,
+                                    "Credit card numbers",
+                                )
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                            if ui
+                                .checkbox(
+                                    &mut self.privacy_config.detect_ssn,
+                                    "Social Security numbers",
+                                )
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                        });
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        ui.label(
+                            RichText::new("Excluded apps")
+                                .size(13.0)
+                                .strong()
+                                .color(rgb(c.accent)),
+                        );
+                        ui.label(
+                            RichText::new("Copies from these apps are never saved.")
+                                .size(11.0)
+                                .color(rgb(c.subtext)),
+                        );
+                        ui.add_space(6.0);
+
+                        let mut remove_app: Option<usize> = None;
+                        for (i, app_name) in self.privacy_config.excluded_apps.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(app_name).size(12.0).color(rgb(c.text)));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("Remove").clicked() {
+                                            remove_app = Some(i);
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                        if let Some(i) = remove_app {
+                            self.privacy_config.excluded_apps.remove(i);
+                            dirty = true;
+                        }
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_excluded_app)
+                                    .hint_text("App name…")
+                                    .desired_width(200.0),
+                            );
+                            if ui.button("Add").clicked()
+                                && !self.new_excluded_app.trim().is_empty()
+                            {
+                                self.privacy_config
+                                    .excluded_apps
+                                    .push(self.new_excluded_app.trim().to_string());
+                                self.new_excluded_app.clear();
+                                dirty = true;
+                            }
+                        });
+
+                        if dirty {
+                            save_privacy_config(&self.privacy_config);
+                        }
+                    });
             });
     }
 }
@@ -2676,8 +3214,8 @@ impl ClipdGui {
                             .show(ui, |ui| {
                                 egui::Frame::none()
                                     .fill(rgb(c.bg_surface))
-                                    .rounding(Rounding::same(8.0))
-                                    .inner_margin(Margin::symmetric(10.0, 7.0))
+                                    .rounding(Rounding::same(CARD_ROUND))
+                                    .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_PAD_Y))
                                     .stroke(Stroke::new(0.5, rgb(c.border)))
                                     .show(ui, |ui| {
                                         ui.set_width(ui.available_width());
@@ -2780,6 +3318,7 @@ impl ClipdGui {
 fn render_preview(
     ui: &mut egui::Ui,
     clip: &ClipEntry,
+    is_starred: bool,
     action: &mut Action,
     c: &clipd_core::ThemeColors,
 ) {
@@ -2792,70 +3331,89 @@ fn render_preview(
     };
 
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        tag_pill(ui, clip.content_type.as_str(), type_color, c);
-        if let Some(ref app) = clip.source_app {
-            tag_pill(ui, app, rgb(c.bg_elevated), c);
-        }
-        tag_pill(ui, &format!("id:{}", clip.id), rgb(c.bg_elevated), c);
-        if let Some(slot) = clip.slot {
-            tag_pill(ui, &format!("slot {}", slot), rgb(c.accent), c);
-        }
-        tag_pill(ui, &relative_time(&clip.timestamp), rgb(c.bg_elevated), c);
-
+        ui.label(
+            RichText::new("Preview")
+                .size(13.0)
+                .strong()
+                .color(rgb(c.text)),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.spacing_mut().item_spacing.x = 6.0;
             if outline_button(ui, "Copy", rgb(c.text), c).clicked() {
                 *action = Action::Copy;
             }
-            if outline_button(ui, "Paste Settings", rgb(c.accent), c).clicked() {
-                *action = Action::ToggleTransform;
+            if star_button(ui, is_starred, c).clicked() {
+                *action = Action::ToggleStar(clip.id);
             }
         });
     });
 
-    ui.add_space(14.0);
+    ui.add_space(5.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        ui.label(
+            RichText::new(clip.content_type.as_str())
+                .size(10.5)
+                .color(type_color)
+                .strong(),
+        );
+        if let Some(ref app) = clip.source_app {
+            ui.label(
+                RichText::new(format!("· {}", app))
+                    .size(10.5)
+                    .color(rgb(c.overlay)),
+            );
+        }
+        ui.label(
+            RichText::new(format!("· {}", relative_time(&clip.timestamp)))
+                .size(10.5)
+                .color(rgb(c.overlay)),
+        );
+        if let Some(slot) = clip.slot {
+            ui.label(
+                RichText::new(format!("· slot {}", slot))
+                    .size(10.5)
+                    .color(rgb(c.accent)),
+            );
+        }
+    });
 
-    egui::Frame::none()
-        .fill(rgb(c.bg_surface))
-        .rounding(Rounding::same(10.0))
-        .inner_margin(Margin::same(18.0))
-        .stroke(Stroke::new(1.0, rgb(c.border)))
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
         .show(ui, |ui| {
-            egui::ScrollArea::both()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    let font = if clip.content_type == ContentType::Code {
-                        FontId::monospace(13.5)
-                    } else {
-                        FontId::proportional(14.0)
-                    };
-                    ui.label(
-                        RichText::new(&clip.content)
-                            .font(font)
-                            .color(rgb(c.text))
-                            .line_height(Some(20.0)),
-                    );
-                });
+            ui.set_width(ui.available_width());
+            let font = if clip.content_type == ContentType::Code {
+                FontId::monospace(13.5)
+            } else {
+                FontId::proportional(14.0)
+            };
+            ui.label(
+                RichText::new(&clip.content)
+                    .font(font)
+                    .color(rgb(c.text))
+                    .line_height(Some(20.0)),
+            );
         });
 }
 
 fn render_empty_preview(ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
     ui.centered_and_justified(|ui| {
         ui.vertical_centered(|ui| {
-            ui.add_space(100.0);
-            ui.label(RichText::new("📋").size(56.0));
-            ui.add_space(16.0);
+            ui.add_space(96.0);
             ui.label(
                 RichText::new("Select a clip to preview")
-                    .size(16.0)
+                    .size(13.0)
+                    .strong()
                     .color(rgb(c.overlay)),
             );
             ui.add_space(4.0);
             ui.label(
                 RichText::new("Use ↑↓ arrows or click from the list")
-                    .size(12.0)
+                    .size(11.0)
                     .color(rgb(c.overlay)),
             );
         });

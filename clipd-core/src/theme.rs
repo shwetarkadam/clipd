@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Theme {
+    System,
+    Light,
     Catppuccin,
     Monokai,
     Dark,
@@ -11,16 +13,20 @@ pub enum Theme {
 }
 
 impl Theme {
-    pub const ALL: [Theme; 5] = [
+    pub const ALL: [Theme; 7] = [
+        Theme::System,
+        Theme::Light,
+        Theme::Dark,
         Theme::Catppuccin,
         Theme::Monokai,
-        Theme::Dark,
         Theme::Nord,
         Theme::Dracula,
     ];
 
     pub fn label(&self) -> &'static str {
         match self {
+            Theme::System => "System",
+            Theme::Light => "Light",
             Theme::Catppuccin => "Catppuccin",
             Theme::Monokai => "Monokai",
             Theme::Dark => "Dark",
@@ -31,16 +37,20 @@ impl Theme {
 
     pub fn next(&self) -> Theme {
         match self {
+            Theme::System => Theme::Light,
+            Theme::Light => Theme::Dark,
+            Theme::Dark => Theme::Catppuccin,
             Theme::Catppuccin => Theme::Monokai,
-            Theme::Monokai => Theme::Dark,
-            Theme::Dark => Theme::Nord,
+            Theme::Monokai => Theme::Nord,
             Theme::Nord => Theme::Dracula,
-            Theme::Dracula => Theme::Catppuccin,
+            Theme::Dracula => Theme::System,
         }
     }
 
     pub fn colors(&self) -> ThemeColors {
         match self {
+            Theme::System => DARK,
+            Theme::Light => LIGHT,
             Theme::Catppuccin => CATPPUCCIN,
             Theme::Monokai => MONOKAI,
             Theme::Dark => DARK,
@@ -48,11 +58,15 @@ impl Theme {
             Theme::Dracula => DRACULA,
         }
     }
+
+    pub fn is_light(&self) -> bool {
+        matches!(self, Theme::Light)
+    }
 }
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme::Catppuccin
+        Theme::System
     }
 }
 
@@ -79,6 +93,25 @@ pub struct ThemeColors {
     pub email: Rgb,
     pub path: Rgb,
 }
+
+const LIGHT: ThemeColors = ThemeColors {
+    bg_base: Rgb(244, 246, 250),
+    bg_surface: Rgb(235, 238, 245),
+    bg_elevated: Rgb(255, 255, 255),
+    bg_selected: Rgb(220, 229, 245),
+    bg_hover: Rgb(229, 234, 243),
+    accent: Rgb(55, 113, 200),
+    accent2: Rgb(118, 87, 180),
+    text: Rgb(28, 34, 45),
+    subtext: Rgb(72, 82, 100),
+    overlay: Rgb(116, 126, 145),
+    green: Rgb(34, 139, 84),
+    border: Rgb(205, 212, 224),
+    code: Rgb(33, 130, 80),
+    url: Rgb(37, 128, 190),
+    email: Rgb(172, 112, 0),
+    path: Rgb(118, 87, 180),
+};
 
 const CATPPUCCIN: ThemeColors = ThemeColors {
     bg_base: Rgb(30, 30, 46),

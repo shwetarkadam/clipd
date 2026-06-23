@@ -284,6 +284,11 @@ pub struct PasteTransformSettings {
     #[serde(default = "default_true_val")]
     pub batch_drain_enabled: bool,
 
+    /// GUI behavior: clicking a row copies it immediately. When disabled,
+    /// clicking only selects; double-click and Enter still copy.
+    #[serde(default = "default_true_val")]
+    pub copy_on_select: bool,
+
     /// Warn in the GUI before assigning a conflicting/risky shortcut.
     #[serde(default = "default_true_val")]
     pub warn_conflicting_shortcuts: bool,
@@ -317,6 +322,7 @@ impl Default for PasteTransformSettings {
             quick_letter_slots_enabled: true,
             palette_aliases_enabled: false,
             batch_drain_enabled: true,
+            copy_on_select: true,
             warn_conflicting_shortcuts: true,
         }
     }
