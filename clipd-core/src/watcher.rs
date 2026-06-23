@@ -54,7 +54,10 @@ impl ClipWatcher {
             }
         };
 
-        log::info!("Clipboard watcher started (polling every {:?})", self.poll_interval);
+        log::info!(
+            "Clipboard watcher started (polling every {:?})",
+            self.poll_interval
+        );
 
         loop {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -92,11 +95,9 @@ impl ClipWatcher {
 
                         let source_app = Self::get_frontmost_app();
 
-                        if let Some(reason) = should_skip_clip(
-                            &text,
-                            source_app.as_deref(),
-                            &privacy_config,
-                        ) {
+                        if let Some(reason) =
+                            should_skip_clip(&text, source_app.as_deref(), &privacy_config)
+                        {
                             log::info!("🔒 Clip skipped ({})", reason);
                             std::thread::sleep(self.poll_interval);
                             continue;

@@ -1,4 +1,5 @@
 #![allow(clippy::upper_case_acronyms)]
+#![allow(improper_ctypes_definitions)]
 use crate::macos::keyboard::Keyboard;
 use crate::rdev::{Button, Event, EventType};
 use cocoa::base::id;

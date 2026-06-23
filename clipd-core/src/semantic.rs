@@ -100,7 +100,11 @@ impl TfIdfIndex {
             .filter(|r| r.score > 0.001)
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(max_results);
         results
     }
@@ -163,12 +167,12 @@ fn tokenize(text: &str) -> Vec<String> {
 
 const STOP_WORDS: &[&str] = &[
     "the", "is", "at", "which", "on", "a", "an", "and", "or", "but", "in", "with", "to", "for",
-    "of", "not", "no", "can", "had", "has", "have", "it", "be", "was", "were", "been", "are",
-    "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "this",
-    "that", "these", "those", "he", "she", "we", "they", "you", "me", "him", "her", "us",
-    "them", "my", "your", "his", "its", "our", "their", "what", "where", "when", "how", "why",
-    "if", "then", "else", "from", "up", "out", "so", "as", "by", "about", "into", "just",
-    "also", "than", "very", "too", "only",
+    "of", "not", "no", "can", "had", "has", "have", "it", "be", "was", "were", "been", "are", "do",
+    "does", "did", "will", "would", "could", "should", "may", "might", "shall", "this", "that",
+    "these", "those", "he", "she", "we", "they", "you", "me", "him", "her", "us", "them", "my",
+    "your", "his", "its", "our", "their", "what", "where", "when", "how", "why", "if", "then",
+    "else", "from", "up", "out", "so", "as", "by", "about", "into", "just", "also", "than", "very",
+    "too", "only",
 ];
 
 #[cfg(test)]

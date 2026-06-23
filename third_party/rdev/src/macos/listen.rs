@@ -1,4 +1,5 @@
 #![allow(improper_ctypes_definitions)]
+#![allow(static_mut_refs)]
 use crate::macos::common::*;
 use crate::rdev::{Event, ListenError};
 use cocoa::base::nil;

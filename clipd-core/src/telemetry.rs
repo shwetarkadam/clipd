@@ -69,7 +69,10 @@ fn get_or_create_install_id() -> String {
     if let Some(parent) = telemetry_json_path().parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap_or_default());
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&json).unwrap_or_default(),
+    );
     id
 }
 
@@ -104,7 +107,10 @@ fn is_telemetry_enabled() -> bool {
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
             // Absent or null → default true
-            return json.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            return json
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
         }
     }
     true

@@ -1,0 +1,4 @@
+{
+  "framework": "nextjs-api-only",
+  "regions": ["iad1"]
+}

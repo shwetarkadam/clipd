@@ -165,6 +165,7 @@ mod tests {
             source_app: Some(app.into()),
             timestamp: Utc::now() - Duration::minutes(mins_ago),
             preview: format!("clip {}", id),
+            slot: None,
         }
     }
 

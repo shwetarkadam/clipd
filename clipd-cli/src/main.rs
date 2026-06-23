@@ -84,8 +84,46 @@ enum Commands {
         before: Option<String>,
     },
 
+    /// Manage collections — named buckets of clips (e.g. your Cursor prompts)
+    Collections {
+        #[command(subcommand)]
+        action: CollectionsAction,
+    },
+
     /// Check for updates (or update in-place)
     Update,
+}
+
+#[derive(Subcommand)]
+enum CollectionsAction {
+    /// Create a collection; --app auto-routes copies made while that app is frontmost
+    New {
+        name: String,
+        #[arg(long)]
+        app: Option<String>,
+    },
+    /// List collections
+    List,
+    /// Show a collection's items
+    Show { name: String },
+    /// Add a clip to a collection (defaults to the most recent clip)
+    Add {
+        name: String,
+        #[arg(long)]
+        id: Option<i64>,
+    },
+    /// Remove a clip from a collection by clip id
+    Remove { name: String, id: i64 },
+    /// Export a collection to Markdown (stdout)
+    Export { name: String },
+    /// Delete a collection (clips themselves are kept)
+    Delete { name: String },
+    /// AI: print an improved version of a saved prompt (needs API key)
+    Refine { name: String, id: i64 },
+    /// AI: turn a saved prompt into a reusable {variable} template (needs API key)
+    Template { name: String, id: i64 },
+    /// AI: summarize what a collection is about (needs API key)
+    Summarize { name: String },
 }
 
 fn main() {
@@ -157,6 +195,10 @@ fn main() {
             cmd_clear(slot, all, before);
         }
 
+        Some(Commands::Collections { action }) => {
+            cmd_collections(action);
+        }
+
         Some(Commands::Update) => {
             cmd_update();
         }
@@ -185,6 +227,139 @@ fn open_store() -> ClipStore {
             eprintln!("❌ Failed to open database: {}", e);
             eprintln!("   Path: {}", db_path.display());
             std::process::exit(1);
+        }
+    }
+}
+
+fn resolve_collection(store: &ClipStore, name: &str) -> Option<clipd_core::Collection> {
+    match store.get_collection_by_name(name) {
+        Ok(Some(c)) => Some(c),
+        Ok(None) => {
+            eprintln!("  ❌ No collection named '{}'.", name);
+            None
+        }
+        Err(e) => {
+            eprintln!("  ❌ {}", e);
+            None
+        }
+    }
+}
+
+fn ai_on_item(
+    store: &ClipStore,
+    name: &str,
+    id: i64,
+    label: &str,
+    f: fn(&str, &clipd_core::TransformConfig) -> Result<String, String>,
+) {
+    let Some(c) = resolve_collection(store, name) else {
+        return;
+    };
+    let items = store.collection_items(c.id).unwrap_or_default();
+    let Some(item) = items.iter().find(|it| it.clip_id == id) else {
+        eprintln!("  ❌ Clip #{} is not in '{}'.", id, name);
+        return;
+    };
+    let cfg = clipd_core::load_transform_config();
+    match f(&item.content, &cfg) {
+        Ok(out) => println!("\n── {} ──\n{}\n", label, out),
+        Err(e) => eprintln!("  ❌ {}", e),
+    }
+}
+
+fn cmd_collections(action: CollectionsAction) {
+    let store = open_store();
+    match action {
+        CollectionsAction::New { name, app } => match store.create_collection(&name, app.as_deref())
+        {
+            Ok(_) => match app {
+                Some(a) => println!(
+                    "  ✅ Created '{}' — copies made while {} is frontmost auto-file here",
+                    name, a
+                ),
+                None => println!("  ✅ Created collection '{}'", name),
+            },
+            Err(e) => eprintln!("  ❌ Could not create (name taken?): {}", e),
+        },
+        CollectionsAction::List => match store.list_collections() {
+            Ok(cs) if cs.is_empty() => println!(
+                "  📂 No collections yet. Try: clipd collections new \"Cursor prompts\" --app Cursor"
+            ),
+            Ok(cs) => {
+                println!("  📂 Collections:");
+                for c in cs {
+                    let app = c
+                        .source_app
+                        .map(|a| format!("  ⟲ {}", a))
+                        .unwrap_or_default();
+                    println!("    {} — {} items{}", c.name, c.item_count, app);
+                }
+            }
+            Err(e) => eprintln!("  ❌ {}", e),
+        },
+        CollectionsAction::Show { name } => {
+            if let Some(c) = resolve_collection(&store, &name) {
+                let items = store.collection_items(c.id).unwrap_or_default();
+                println!("  📂 {} ({} items)", c.name, items.len());
+                for (i, it) in items.iter().enumerate() {
+                    println!("    {:>3}. [#{}] {}", i + 1, it.clip_id, it.preview);
+                }
+            }
+        }
+        CollectionsAction::Add { name, id } => {
+            if let Some(c) = resolve_collection(&store, &name) {
+                let clip_id = match id {
+                    Some(i) => i,
+                    None => match store.get_recent(1) {
+                        Ok(v) if !v.is_empty() => v[0].id,
+                        _ => {
+                            eprintln!("  ❌ No recent clip to add.");
+                            return;
+                        }
+                    },
+                };
+                match store.add_clip_to_collection(c.id, clip_id) {
+                    Ok(_) => println!("  ✅ Added clip #{} to '{}'", clip_id, c.name),
+                    Err(e) => eprintln!("  ❌ {}", e),
+                }
+            }
+        }
+        CollectionsAction::Remove { name, id } => {
+            if let Some(c) = resolve_collection(&store, &name) {
+                let _ = store.remove_collection_item(c.id, id);
+                println!("  ✅ Removed clip #{} from '{}'", id, c.name);
+            }
+        }
+        CollectionsAction::Export { name } => {
+            if let Some(c) = resolve_collection(&store, &name) {
+                let items = store.collection_items(c.id).unwrap_or_default();
+                println!("# {}\n", c.name);
+                for it in &items {
+                    println!("- {}\n", it.content.replace('\n', "\n  "));
+                }
+            }
+        }
+        CollectionsAction::Delete { name } => {
+            if let Some(c) = resolve_collection(&store, &name) {
+                let _ = store.delete_collection(c.id);
+                println!("  ✅ Deleted collection '{}'", c.name);
+            }
+        }
+        CollectionsAction::Refine { name, id } => {
+            ai_on_item(&store, &name, id, "Refined prompt", clipd_core::refine_prompt);
+        }
+        CollectionsAction::Template { name, id } => {
+            ai_on_item(&store, &name, id, "Template", clipd_core::make_template);
+        }
+        CollectionsAction::Summarize { name } => {
+            if let Some(c) = resolve_collection(&store, &name) {
+                let items = store.collection_items(c.id).unwrap_or_default();
+                let cfg = clipd_core::load_transform_config();
+                match clipd_core::summarize_collection(&items, &cfg) {
+                    Ok(s) => println!("\n{}\n", s),
+                    Err(e) => eprintln!("  ❌ {}", e),
+                }
+            }
         }
     }
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// Highest slot index (0 is the OS mirror; numbered slots are 1..=MAX_CLIP_SLOT).
-pub const MAX_CLIP_SLOT: u8 = 30;
+pub const MAX_CLIP_SLOT: u8 = 56;
 
 /// Multi-slot clipboard manager. Slots 0..=MAX_CLIP_SLOT hold text content.
 /// Slot 0 is the "default" slot (mirrors OS clipboard).
@@ -41,16 +41,15 @@ impl SlotManager {
     /// Returns the slot number (if found).
     pub fn find_slot(&self, content: &str) -> Option<u8> {
         let slots = self.slots.read().ok()?;
-        slots.iter().find_map(|(k, v)| if v == content { Some(*k) } else { None })
+        slots
+            .iter()
+            .find_map(|(k, v)| if v == content { Some(*k) } else { None })
     }
 
     /// List all non-empty slots, sorted by slot number.
     pub fn list_slots(&self) -> Result<Vec<(u8, String)>, String> {
         let slots = self.slots.read().map_err(|e| e.to_string())?;
-        let mut list: Vec<(u8, String)> = slots
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
+        let mut list: Vec<(u8, String)> = slots.iter().map(|(k, v)| (*k, v.clone())).collect();
         list.sort_by_key(|(k, _)| *k);
         Ok(list)
     }

@@ -199,7 +199,9 @@ fn detect_api_keys(content: &str, matches: &mut Vec<SensitiveMatch>) {
             let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
             if trimmed.starts_with(prefix)
                 && trimmed.len() >= prefix.len() + min_suffix_len
-                && trimmed[prefix.len()..].chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                && trimmed[prefix.len()..]
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
             {
                 matches.push(SensitiveMatch {
                     kind: SensitiveKind::ApiKey(provider),
@@ -210,7 +212,9 @@ fn detect_api_keys(content: &str, matches: &mut Vec<SensitiveMatch>) {
         }
     }
 
-    if content.contains("-----BEGIN") && (content.contains("PRIVATE KEY") || content.contains("RSA PRIVATE")) {
+    if content.contains("-----BEGIN")
+        && (content.contains("PRIVATE KEY") || content.contains("RSA PRIVATE"))
+    {
         matches.push(SensitiveMatch {
             kind: SensitiveKind::PrivateKey,
             redacted_preview: "-----BEGIN ***PRIVATE KEY***-----".into(),
@@ -252,14 +256,18 @@ fn detect_credentials(content: &str, matches: &mut Vec<SensitiveMatch>) {
 
     for pat in &secret_patterns {
         if lower.contains(pat) {
-            let has_value = content
-                .to_lowercase()
-                .find(pat)
-                .and_then(|pos| {
-                    let after = &content[pos + pat.len()..];
-                    let value: String = after.chars().take_while(|c| !c.is_whitespace() && *c != '\n').collect();
-                    if value.len() > 3 { Some(value) } else { None }
-                });
+            let has_value = content.to_lowercase().find(pat).and_then(|pos| {
+                let after = &content[pos + pat.len()..];
+                let value: String = after
+                    .chars()
+                    .take_while(|c| !c.is_whitespace() && *c != '\n')
+                    .collect();
+                if value.len() > 3 {
+                    Some(value)
+                } else {
+                    None
+                }
+            });
 
             if has_value.is_some() {
                 matches.push(SensitiveMatch {
@@ -287,7 +295,10 @@ fn detect_credit_cards(content: &str, matches: &mut Vec<SensitiveMatch>) {
     if luhn_check(&digits) {
         matches.push(SensitiveMatch {
             kind: SensitiveKind::CreditCard,
-            redacted_preview: format!("****-****-****-{}", &digits[digits.len().saturating_sub(4)..]),
+            redacted_preview: format!(
+                "****-****-****-{}",
+                &digits[digits.len().saturating_sub(4)..]
+            ),
         });
     }
 }
@@ -403,13 +414,19 @@ mod tests {
 
     #[test]
     fn test_normal_text_not_flagged() {
-        let m = detect_sensitive("Hello, this is a normal sentence about programming.", &cfg());
+        let m = detect_sensitive(
+            "Hello, this is a normal sentence about programming.",
+            &cfg(),
+        );
         assert!(m.is_empty());
     }
 
     #[test]
     fn test_private_key_detection() {
-        let m = detect_sensitive("-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----", &cfg());
+        let m = detect_sensitive(
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----",
+            &cfg(),
+        );
         assert!(!m.is_empty());
         assert_eq!(m[0].kind, SensitiveKind::PrivateKey);
     }

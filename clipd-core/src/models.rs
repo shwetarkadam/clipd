@@ -38,32 +38,62 @@ impl ContentType {
         if trimmed.starts_with('/')
             || trimmed.starts_with("~/")
             || trimmed.starts_with("./")
-            || (trimmed.len() > 2 && trimmed.chars().nth(1) == Some(':') && trimmed.chars().nth(2) == Some('\\'))
+            || (trimmed.len() > 2
+                && trimmed.chars().nth(1) == Some(':')
+                && trimmed.chars().nth(2) == Some('\\'))
         {
             return ContentType::Path;
         }
 
         // Code detection heuristics
         let code_indicators = [
-            "fn ", "pub ", "let ", "const ", "impl ", "struct ", "enum ",  // Rust
-            "def ", "class ", "import ", "from ",                          // Python
-            "function ", "var ", "=>", "const ", "async ",                 // JS/TS
-            "func ", "package ", "type ",                                  // Go
-            "if (", "for (", "while (", "switch (",                       // C-style
-            "{", "}", "();", "->", "::",                                  // General
-            "#include", "#define", "#ifdef",                              // C/C++
+            "fn ",
+            "pub ",
+            "let ",
+            "const ",
+            "impl ",
+            "struct ",
+            "enum ", // Rust
+            "def ",
+            "class ",
+            "import ",
+            "from ", // Python
+            "function ",
+            "var ",
+            "=>",
+            "const ",
+            "async ", // JS/TS
+            "func ",
+            "package ",
+            "type ", // Go
+            "if (",
+            "for (",
+            "while (",
+            "switch (", // C-style
+            "{",
+            "}",
+            "();",
+            "->",
+            "::", // General
+            "#include",
+            "#define",
+            "#ifdef", // C/C++
         ];
 
         let line_count = trimmed.lines().count();
         let has_code_indicator = code_indicators.iter().any(|ind| trimmed.contains(ind));
-        let has_indentation = trimmed.lines().any(|l| l.starts_with("  ") || l.starts_with('\t'));
+        let has_indentation = trimmed
+            .lines()
+            .any(|l| l.starts_with("  ") || l.starts_with('\t'));
 
         if has_code_indicator && (line_count > 1 || has_indentation) {
             return ContentType::Code;
         }
 
         // If single line with braces/parens/semicolons, likely code
-        if line_count == 1 && (trimmed.contains(';') || trimmed.contains("()") || trimmed.contains("{}")) {
+        if line_count == 1
+            && (trimmed.contains(';') || trimmed.contains("()") || trimmed.contains("{}"))
+        {
             return ContentType::Code;
         }
 
@@ -185,7 +215,10 @@ mod tests {
 
     #[test]
     fn test_detect_url() {
-        assert_eq!(ContentType::detect("https://github.com/foo"), ContentType::Url);
+        assert_eq!(
+            ContentType::detect("https://github.com/foo"),
+            ContentType::Url
+        );
         assert_eq!(ContentType::detect("http://example.com"), ContentType::Url);
     }
 
@@ -196,19 +229,34 @@ mod tests {
 
     #[test]
     fn test_detect_code() {
-        assert_eq!(ContentType::detect("fn main() {\n    println!(\"hello\");\n}"), ContentType::Code);
-        assert_eq!(ContentType::detect("def foo():\n    return 42"), ContentType::Code);
+        assert_eq!(
+            ContentType::detect("fn main() {\n    println!(\"hello\");\n}"),
+            ContentType::Code
+        );
+        assert_eq!(
+            ContentType::detect("def foo():\n    return 42"),
+            ContentType::Code
+        );
     }
 
     #[test]
     fn test_detect_path() {
-        assert_eq!(ContentType::detect("/usr/local/bin/clipd"), ContentType::Path);
-        assert_eq!(ContentType::detect("~/Documents/foo.txt"), ContentType::Path);
+        assert_eq!(
+            ContentType::detect("/usr/local/bin/clipd"),
+            ContentType::Path
+        );
+        assert_eq!(
+            ContentType::detect("~/Documents/foo.txt"),
+            ContentType::Path
+        );
     }
 
     #[test]
     fn test_detect_text() {
-        assert_eq!(ContentType::detect("Hello, this is some plain text"), ContentType::Text);
+        assert_eq!(
+            ContentType::detect("Hello, this is some plain text"),
+            ContentType::Text
+        );
     }
 
     #[test]

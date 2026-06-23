@@ -1,13 +1,11 @@
 use arboard::Clipboard;
 use clipd_core::{
     apply_transform, find_rules_for_app, generate_embedding, is_embedding_available,
-    load_paste_rules, load_paste_transform_settings, load_transform_config,
-    release_daemon_lock, suggest_smart_transform, try_acquire_daemon_lock, ClipEntry, ClipEvent,
-    ClipStore, ClipWatcher, PasteRulesConfig, PasteTransformSettings, SlotManager,
-    TransformConfig, TransformKind, MAX_CLIP_SLOT,
+    load_paste_rules, load_paste_transform_settings, load_transform_config, release_daemon_lock,
+    suggest_smart_transform, try_acquire_daemon_lock, ClipEntry, ClipEvent, ClipStore, ClipWatcher,
+    PasteRulesConfig, PasteTransformSettings, SlotManager, TransformConfig, TransformKind,
+    MAX_CLIP_SLOT,
 };
-#[cfg(target_os = "macos")]
-use std::collections::HashSet;
 #[cfg(not(target_os = "macos"))]
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 #[cfg(not(target_os = "macos"))]
@@ -15,15 +13,25 @@ use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager,
 };
+#[cfg(target_os = "macos")]
+use rdev::{grab, Event, EventType, Key as RKey};
+#[cfg(target_os = "macos")]
+use std::collections::HashSet;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
-use std::process::Stdio;
-#[cfg(target_os = "macos")]
-use rdev::{listen, EventType, Key as RKey};
 
 /// How long to wait after the last tap before deciding the final slot.
 const TAP_WINDOW: Duration = Duration::from_millis(350);
+/// How long Option+C / Option+V waits for a following A-Z letter slot.
+const LETTER_PREFIX_WINDOW: Duration = Duration::from_millis(900);
+/// Max gap between two Cmd+C presses to count as a double-tap (quick letter save).
+const QUICK_DOUBLE_WINDOW: Duration = Duration::from_millis(400);
+/// After a double Cmd+C, how long the numeric slot commit waits for a letter
+/// (which cancels it) before saving to the numeric slot. Keeps the letter and
+/// numeric paths from clashing.
+const QUICK_LETTER_GRACE: Duration = Duration::from_millis(500);
 /// Ignore duplicate key events faster than this (macOS key-repeat / missing KeyRelease on C/V).
 const TAP_DEBOUNCE: Duration = Duration::from_millis(65);
 
@@ -53,7 +61,10 @@ pub fn run_daemon_with_stop(
     }
 
     println!("  ╔═══════════════════════════════════════╗");
-    println!("  ║         clipd daemon v{}           ║", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  ║         clipd daemon v{}           ║",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("  ║   AI clipboard for developers         ║");
     println!("  ╚═══════════════════════════════════════╝");
     println!();
@@ -131,14 +142,41 @@ pub fn run_daemon_with_stop(
             }
             for event in clip_rx {
                 match event {
-                    ClipEvent::NewClip(entry) => {
+                    ClipEvent::NewClip(mut entry) => {
+                        // Slot 0 (the live OS-clipboard mirror) always tracks the
+                        // latest copy so paste works; persisting to searchable
+                        // history is what "Remember copied items" gates.
                         slot_writer.copy_to_slot(0, &entry.content).ok();
+                        if !load_paste_transform_settings().remember_clipboard {
+                            continue;
+                        }
+                        // Capture the frontmost app at copy time — used both to
+                        // tag the clip and to auto-route it into a collection.
+                        #[cfg(target_os = "macos")]
+                        if entry.source_app.is_none() {
+                            entry.source_app = get_frontmost_app_name();
+                        }
+                        let route_app = entry.source_app.clone();
                         let content_for_embed = entry.content.clone();
                         match store.insert(&entry) {
                             Ok(id) => {
+                                // Auto-route into any collection bound to this app.
+                                if let Some(app) = route_app {
+                                    if let Ok(Some(coll)) = store.collection_for_app(&app) {
+                                        let _ = store.add_clip_to_collection(coll.id, id);
+                                        log::info!(
+                                            "📂 Auto-added clip #{} to collection '{}' (from {})",
+                                            id,
+                                            coll.name,
+                                            app
+                                        );
+                                    }
+                                }
                                 log::info!(
                                     "Saved clip #{}: {} [{}] {}",
-                                    id, entry.content_type.icon(), entry.content_type.as_str(),
+                                    id,
+                                    entry.content_type.icon(),
+                                    entry.content_type.as_str(),
                                     truncate(&entry.preview, 60)
                                 );
                                 if embed_available {
@@ -147,7 +185,11 @@ pub fn run_daemon_with_stop(
                                             if let Err(e) = store.store_embedding(id, &emb) {
                                                 log::warn!("Failed to store embedding: {}", e);
                                             } else {
-                                                log::debug!("🧠 Embedded clip #{} ({} dims)", id, emb.len());
+                                                log::debug!(
+                                                    "🧠 Embedded clip #{} ({} dims)",
+                                                    id,
+                                                    emb.len()
+                                                );
                                             }
                                         }
                                         Err(e) => log::debug!("Embedding skipped: {}", e),
@@ -169,8 +211,15 @@ pub fn run_daemon_with_stop(
     #[cfg(not(target_os = "macos"))]
     {
         let digit_codes = [
-            Code::Digit1, Code::Digit2, Code::Digit3, Code::Digit4, Code::Digit5,
-            Code::Digit6, Code::Digit7, Code::Digit8, Code::Digit9,
+            Code::Digit1,
+            Code::Digit2,
+            Code::Digit3,
+            Code::Digit4,
+            Code::Digit5,
+            Code::Digit6,
+            Code::Digit7,
+            Code::Digit8,
+            Code::Digit9,
         ];
         for (i, code) in digit_codes.iter().enumerate() {
             let slot_num = (i + 1) as u8;
@@ -181,7 +230,8 @@ pub fn run_daemon_with_stop(
                 registered_hotkeys.push((copy_hk, FinalAction::CopyToSlot(slot_num)));
             }
             let paste_hk = HotKey::new(
-                Some(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT), *code,
+                Some(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT),
+                *code,
             );
             if let Err(e) = hotkey_manager.register(paste_hk) {
                 log::warn!("Failed to register Cmd+Ctrl+Option+{}: {}", slot_num, e);
@@ -227,10 +277,24 @@ pub fn run_daemon_with_stop(
     println!("       Ctrl+V × 1 → paste slot 1      Ctrl+C × 1 → save to slot 1");
     println!("       Ctrl+V × 2 → paste slot 2      Ctrl+C × 2 → save to slot 2");
     println!();
-    println!("     Multi-tap Cmd/Ctrl + C/V → slots 1..={} (after pause)", MAX_CLIP_SLOT);
+    println!("     Multi-tap Cmd/Ctrl + C/V → slots 1..9 (after pause)");
     println!();
     println!("     Ctrl+Shift+V  → smart paste (transform clipboard + paste)");
     println!("     Cmd+Option+V  → sequence paste (auto-increment through slots)");
+    println!("     Ctrl+Option+1..9 → paste slot directly");
+    println!("     Ctrl+Shift+Option+1..9 → save clipboard to slot directly");
+    println!(
+        "     Excel/developer mode: Cmd+C/V taps → slots 1..9, Option+C/V taps → slots 11..30"
+    );
+    println!("     Letter slots: Ctrl+Option+C then A..Z → copy slots 31..56");
+    println!("                   Ctrl+Option+V then A..Z → paste slots 31..56");
+    println!("                   Ctrl+Shift+Option+A..Z also copies directly");
+    println!("     Ctrl+Option+Space → show recent slot memory");
+    println!();
+    println!("     Collect mode (grab a batch, no slot picking):");
+    println!("       Ctrl+Option+`  → toggle on/off (also auto-starts on 2 quick copies)");
+    println!("       then just Cmd+C each item → stacks into slots 1..9");
+    println!("       Cmd+Shift+V    → pick one to paste from the visual list");
     println!();
     println!("     Ctrl+T → open TUI        Ctrl+G → open GUI");
     println!("     Ctrl+R → open search TUI");
@@ -267,20 +331,39 @@ pub fn run_daemon_with_stop(
         let mut ctrl_c_deadline: Option<Instant> = None;
         let mut ctrl_v_taps: u8 = 0;
         let mut ctrl_v_deadline: Option<Instant> = None;
+        let mut upper_c_taps: u8 = 0;
+        let mut upper_c_deadline: Option<Instant> = None;
+        let mut upper_v_taps: u8 = 0;
+        let mut upper_v_deadline: Option<Instant> = None;
 
         let mut last_cmd_c = Instant::now() - Duration::from_secs(10);
         let mut last_cmd_v = Instant::now() - Duration::from_secs(10);
         let mut last_ctrl_c = Instant::now() - Duration::from_secs(10);
         let mut last_ctrl_v = Instant::now() - Duration::from_secs(10);
+        let mut last_upper_c = Instant::now() - Duration::from_secs(10);
+        let mut last_upper_v = Instant::now() - Duration::from_secs(10);
 
         let mut sequence_slot: u8 = 1;
         let mut cmd_v_saved_clipboard: Option<String> = None;
+
+        // ── Collect mode ──
+        // When collecting, each plain Cmd+C lands in the next numbered slot
+        // (1,2,3…) instead of always overwriting slot 1 — so the user can grab
+        // a batch without choosing slots. Started explicitly (Ctrl+Option+`) or
+        // automatically when two quick single copies happen in a row.
+        let mut collecting = false;
+        let mut collect_next: u8 = 1;
+        let mut last_single_copy: Option<Instant> = None;
+        const COLLECT_BANK_MAX: u8 = 9;
+        const AUTO_COLLECT_WINDOW: Duration = Duration::from_millis(2500);
+        const COLLECT_IDLE_RESET: Duration = Duration::from_secs(30);
         let paste_rules = load_paste_rules();
         let transform_config = load_transform_config();
-        let paste_transform = load_paste_transform_settings();
+        let mut paste_transform = load_paste_transform_settings();
 
         while !stop_hotkey.load(Ordering::Relaxed) {
             if let Ok(tick) = hotkey_rx.recv_timeout(Duration::from_millis(50)) {
+                paste_transform = load_paste_transform_settings();
                 match tick {
                     HotkeyTick::CmdCTap => {
                         let now = Instant::now();
@@ -288,10 +371,20 @@ pub fn run_daemon_with_stop(
                             continue;
                         }
                         last_cmd_c = now;
-                        cmd_c_taps = (cmd_c_taps + 1).min(MAX_CLIP_SLOT);
-                        cmd_c_deadline = Some(now + TAP_WINDOW);
-                        if cmd_c_taps >= 2 {
-                            let slot = cmd_c_taps.min(MAX_CLIP_SLOT);
+                        cmd_c_taps = (cmd_c_taps + 1).min(primary_tap_slot_limit(&paste_transform));
+                        // When quick letter save is on, a 2nd+ tap could be a
+                        // letter save — hold the numeric commit slightly longer
+                        // so a following letter can cancel it (no slot-2 clash).
+                        let quick_letters = paste_transform.letter_slots_enabled
+                            && paste_transform.quick_letter_slots_enabled;
+                        let window = if cmd_c_taps >= 2 && quick_letters {
+                            QUICK_LETTER_GRACE
+                        } else {
+                            TAP_WINDOW
+                        };
+                        cmd_c_deadline = Some(now + window);
+                        if cmd_c_taps >= 1 {
+                            let slot = primary_slot_for_taps(cmd_c_taps, &paste_transform);
                             log::info!("⌨️  Cmd+C tap #{} → slot {}", cmd_c_taps, slot);
                             #[cfg(target_os = "macos")]
                             show_slot_notification("Copy", slot);
@@ -303,7 +396,7 @@ pub fn run_daemon_with_stop(
                             continue;
                         }
                         last_cmd_v = now;
-                        cmd_v_taps = (cmd_v_taps + 1).min(MAX_CLIP_SLOT);
+                        cmd_v_taps = (cmd_v_taps + 1).min(primary_tap_slot_limit(&paste_transform));
                         cmd_v_deadline = Some(now + TAP_WINDOW);
                         if cmd_v_taps == 1 {
                             // First tap: just save the clipboard content.
@@ -322,7 +415,7 @@ pub fn run_daemon_with_stop(
                             }
                         }
                         if cmd_v_taps >= 2 {
-                            let slot = cmd_v_taps.min(MAX_CLIP_SLOT);
+                            let slot = primary_slot_for_taps(cmd_v_taps, &paste_transform);
                             log::info!("⌨️  Cmd+V tap #{} → slot {}", cmd_v_taps, slot);
                             #[cfg(target_os = "macos")]
                             show_slot_notification("Paste", slot);
@@ -334,9 +427,10 @@ pub fn run_daemon_with_stop(
                             continue;
                         }
                         last_ctrl_c = now;
-                        ctrl_c_taps = (ctrl_c_taps + 1).min(MAX_CLIP_SLOT);
+                        ctrl_c_taps =
+                            (ctrl_c_taps + 1).min(primary_tap_slot_limit(&paste_transform));
                         ctrl_c_deadline = Some(now + TAP_WINDOW);
-                        let slot = ctrl_c_taps.min(MAX_CLIP_SLOT);
+                        let slot = primary_slot_for_taps(ctrl_c_taps, &paste_transform);
                         log::info!("⌨️  Ctrl+C tap #{} → slot {}", ctrl_c_taps, slot);
                         #[cfg(target_os = "macos")]
                         show_slot_notification("Copy", slot);
@@ -347,10 +441,37 @@ pub fn run_daemon_with_stop(
                             continue;
                         }
                         last_ctrl_v = now;
-                        ctrl_v_taps = (ctrl_v_taps + 1).min(MAX_CLIP_SLOT);
+                        ctrl_v_taps =
+                            (ctrl_v_taps + 1).min(primary_tap_slot_limit(&paste_transform));
                         ctrl_v_deadline = Some(now + TAP_WINDOW);
-                        let slot = ctrl_v_taps.min(MAX_CLIP_SLOT);
+                        let slot = primary_slot_for_taps(ctrl_v_taps, &paste_transform);
                         log::info!("⌨️  Ctrl+V tap #{} → slot {}", ctrl_v_taps, slot);
+                        #[cfg(target_os = "macos")]
+                        show_slot_notification("Paste", slot);
+                    }
+                    HotkeyTick::UpperCopyTap => {
+                        let now = Instant::now();
+                        if now.duration_since(last_upper_c) < TAP_DEBOUNCE {
+                            continue;
+                        }
+                        last_upper_c = now;
+                        upper_c_taps = (upper_c_taps + 1).min(20);
+                        upper_c_deadline = Some(now + TAP_WINDOW);
+                        let slot = upper_slot_for_taps(upper_c_taps);
+                        log::info!("⌨️  Option+C tap #{} → slot {}", upper_c_taps, slot);
+                        #[cfg(target_os = "macos")]
+                        show_slot_notification("Copy", slot);
+                    }
+                    HotkeyTick::UpperPasteTap => {
+                        let now = Instant::now();
+                        if now.duration_since(last_upper_v) < TAP_DEBOUNCE {
+                            continue;
+                        }
+                        last_upper_v = now;
+                        upper_v_taps = (upper_v_taps + 1).min(20);
+                        upper_v_deadline = Some(now + TAP_WINDOW);
+                        let slot = upper_slot_for_taps(upper_v_taps);
+                        log::info!("⌨️  Option+V tap #{} → slot {}", upper_v_taps, slot);
                         #[cfg(target_os = "macos")]
                         show_slot_notification("Paste", slot);
                     }
@@ -361,11 +482,71 @@ pub fn run_daemon_with_stop(
                         open_gui();
                     }
                     HotkeyTick::SmartPaste => {
-                        execute_smart_paste(
-                            &suppress,
-                            &transform_config,
-                            &paste_transform,
-                        );
+                        execute_smart_paste(&suppress, &transform_config, &paste_transform);
+                    }
+                    HotkeyTick::SlotPicker => {
+                        // The memory palette recalls from full history; the old
+                        // slot picker only lists current slots. Honor the toggle.
+                        #[cfg(target_os = "macos")]
+                        if paste_transform.palette_enabled {
+                            open_memory_palette(&hotkey_slot_mgr, &suppress);
+                        } else {
+                            open_slot_picker(&hotkey_slot_mgr, &suppress);
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        open_slot_picker(&hotkey_slot_mgr, &suppress);
+                    }
+                    HotkeyTick::CopySlotPicker => {
+                        open_copy_slot_picker(&hotkey_slot_mgr, &persist_tx);
+                    }
+                    HotkeyTick::CopyClipboardToSlot(slot) => {
+                        execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
+                    }
+                    HotkeyTick::CopySelectionToSlot(slot) => {
+                        if paste_transform.letter_slots_enabled {
+                            // A letter followed a double Cmd+C → cancel the pending
+                            // numeric slot commit so the content lands ONLY in the
+                            // letter slot, not also in slot 2.
+                            cmd_c_taps = 0;
+                            cmd_c_deadline = None;
+                            upper_c_taps = 0;
+                            upper_c_deadline = None;
+                            simulate_copy();
+                            execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
+                        }
+                    }
+                    HotkeyTick::PasteFromSlot(slot) => {
+                        if slot <= 30 || paste_transform.letter_slots_enabled {
+                            if slot >= 31 {
+                                upper_v_taps = 0;
+                                upper_v_deadline = None;
+                            }
+                            execute_direct_paste(
+                                slot,
+                                &hotkey_slot_mgr,
+                                &suppress,
+                                &transform_config,
+                                &paste_transform,
+                            );
+                        }
+                    }
+                    HotkeyTick::SlotMemoryHud => {
+                        #[cfg(target_os = "macos")]
+                        show_slot_memory_hud(&hotkey_slot_mgr);
+                    }
+                    HotkeyTick::ToggleCollect => {
+                        collecting = !collecting;
+                        collect_next = 1;
+                        last_single_copy = None;
+                        log::info!("📦 Collect mode {}", if collecting { "ON" } else { "OFF" });
+                        #[cfg(target_os = "macos")]
+                        {
+                            if collecting {
+                                show_collect_hud(&hotkey_slot_mgr, 0, true);
+                            } else {
+                                show_collect_done_hud();
+                            }
+                        }
                     }
                     HotkeyTick::SequencePaste => {
                         if hotkey_slot_mgr.has_content(sequence_slot) {
@@ -405,16 +586,61 @@ pub fn run_daemon_with_stop(
             let now = Instant::now();
 
             // Cmd+C: 1 tap → auto-save to slot 1 (most recent),
-            //        2+ taps → save to slot N, then restore clipboard to slot 1
+            //        2+ taps → save to slot N, optionally restore clipboard to slot 1
+            // While collecting, a long pause means the batch is over — drop
+            // back to normal slot-1 behavior so a much-later copy isn't appended.
+            if collecting {
+                if let Some(prev) = last_single_copy {
+                    if now.duration_since(prev) > COLLECT_IDLE_RESET {
+                        collecting = false;
+                        collect_next = 1;
+                        last_single_copy = None;
+                    }
+                }
+            }
+
             if let Some(dl) = cmd_c_deadline {
                 if now >= dl && cmd_c_taps > 0 {
                     if cmd_c_taps == 1 {
-                        execute_copy(1, &hotkey_slot_mgr, &persist_tx);
-                        log::info!("⌨️  Cmd+C → auto-saved to slot 1");
+                        let commit = Instant::now();
+                        // Auto-start: a second quick single copy turns collecting on.
+                        if !collecting {
+                            if let Some(prev) = last_single_copy {
+                                if commit.duration_since(prev) <= AUTO_COLLECT_WINDOW {
+                                    collecting = true;
+                                    // Copy #1 is already in slot 1; this one is #2.
+                                    collect_next = 2;
+                                }
+                            }
+                        }
+                        if collecting && collect_next <= COLLECT_BANK_MAX {
+                            let slot = collect_next;
+                            execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
+                            log::info!("📦 Collect → slot {}", slot);
+                            collect_next += 1;
+                            #[cfg(target_os = "macos")]
+                            show_collect_hud(&hotkey_slot_mgr, slot, false);
+                            if collect_next > COLLECT_BANK_MAX {
+                                // Bank full — stop collecting but keep the items.
+                                collecting = false;
+                            }
+                        } else {
+                            execute_copy(1, &hotkey_slot_mgr, &persist_tx);
+                            log::info!("⌨️  Cmd+C → auto-saved to slot 1");
+                        }
+                        last_single_copy = Some(commit);
                     } else {
-                        let slot = cmd_c_taps.min(MAX_CLIP_SLOT);
+                        let slot = primary_slot_for_taps(cmd_c_taps, &paste_transform);
                         execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
-                        restore_clipboard_to_slot(&hotkey_slot_mgr, &suppress, &refresh_hash, 1);
+                        // Only restore to slot 1 if the user wants that behavior
+                        if paste_transform.copy_multi_tap_restore {
+                            restore_clipboard_to_slot(
+                                &hotkey_slot_mgr,
+                                &suppress,
+                                &refresh_hash,
+                                1,
+                            );
+                        }
                     }
                     cmd_c_taps = 0;
                     cmd_c_deadline = None;
@@ -427,10 +653,8 @@ pub fn run_daemon_with_stop(
             if let Some(dl) = cmd_v_deadline {
                 if now >= dl && cmd_v_taps > 0 {
                     if cmd_v_taps >= 2 {
-                        let slot = cmd_v_taps.min(MAX_CLIP_SLOT);
-                        execute_undo_paste(
-                            slot, 2, &hotkey_slot_mgr, &suppress,
-                        );
+                        let slot = primary_slot_for_taps(cmd_v_taps, &paste_transform);
+                        execute_undo_paste(slot, cmd_v_taps.min(2), &hotkey_slot_mgr, &suppress);
                         // Restore original clipboard content
                         if let Some(ref orig) = cmd_v_saved_clipboard {
                             std::thread::sleep(Duration::from_millis(50));
@@ -450,7 +674,7 @@ pub fn run_daemon_with_stop(
             // Ctrl+C: 1+ taps → save to slot (taps)
             if let Some(dl) = ctrl_c_deadline {
                 if now >= dl && ctrl_c_taps > 0 {
-                    let slot = ctrl_c_taps.min(MAX_CLIP_SLOT);
+                    let slot = primary_slot_for_taps(ctrl_c_taps, &paste_transform);
                     execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
                     ctrl_c_taps = 0;
                     ctrl_c_deadline = None;
@@ -460,7 +684,7 @@ pub fn run_daemon_with_stop(
             // Ctrl+V: 1+ taps → directly paste from slot (taps), no undo needed
             if let Some(dl) = ctrl_v_deadline {
                 if now >= dl && ctrl_v_taps > 0 {
-                    let slot = ctrl_v_taps.min(MAX_CLIP_SLOT);
+                    let slot = primary_slot_for_taps(ctrl_v_taps, &paste_transform);
                     execute_direct_paste(
                         slot,
                         &hotkey_slot_mgr,
@@ -470,6 +694,31 @@ pub fn run_daemon_with_stop(
                     );
                     ctrl_v_taps = 0;
                     ctrl_v_deadline = None;
+                }
+            }
+
+            if let Some(dl) = upper_c_deadline {
+                if now >= dl && upper_c_taps > 0 {
+                    let slot = upper_slot_for_taps(upper_c_taps);
+                    simulate_copy();
+                    execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
+                    upper_c_taps = 0;
+                    upper_c_deadline = None;
+                }
+            }
+
+            if let Some(dl) = upper_v_deadline {
+                if now >= dl && upper_v_taps > 0 {
+                    let slot = upper_slot_for_taps(upper_v_taps);
+                    execute_direct_paste(
+                        slot,
+                        &hotkey_slot_mgr,
+                        &suppress,
+                        &transform_config,
+                        &paste_transform,
+                    );
+                    upper_v_taps = 0;
+                    upper_v_deadline = None;
                 }
             }
         }
@@ -501,10 +750,13 @@ pub fn run_daemon_with_stop(
             }
             if event.state == global_hotkey::HotKeyState::Pressed {
                 if let Some((_, action)) = registered_hotkeys
-                    .iter().find(|(hk, _)| hk.id() == event.id)
+                    .iter()
+                    .find(|(hk, _)| hk.id() == event.id)
                 {
                     match action {
-                        FinalAction::CopyToSlot(s) => execute_copy(*s, &hotkey_slot_mgr, &persist_tx),
+                        FinalAction::CopyToSlot(s) => {
+                            execute_copy(*s, &hotkey_slot_mgr, &persist_tx)
+                        }
                         FinalAction::PasteFromSlot(s) => execute_direct_paste(
                             *s,
                             &hotkey_slot_mgr,
@@ -514,11 +766,9 @@ pub fn run_daemon_with_stop(
                         ),
                         FinalAction::OpenTui => open_tui_search(),
                         FinalAction::OpenGui => open_gui(),
-                        FinalAction::SmartPaste => execute_smart_paste(
-                            &suppress,
-                            &transform_config,
-                            &paste_transform,
-                        ),
+                        FinalAction::SmartPaste => {
+                            execute_smart_paste(&suppress, &transform_config, &paste_transform)
+                        }
                     }
                 }
             }
@@ -539,14 +789,23 @@ pub fn run_daemon_with_stop(
 
 #[derive(Debug, Clone)]
 enum HotkeyTick {
-    CmdCTap,   // Cmd+C (system also copies)
-    CmdVTap,   // Cmd+V (system also pastes)
-    CtrlCTap,  // Ctrl+C only (no system side-effect on macOS GUI apps)
-    CtrlVTap,  // Ctrl+V only (no system side-effect on macOS GUI apps)
+    CmdCTap,  // Cmd+C (system also copies)
+    CmdVTap,  // Cmd+V (system also pastes)
+    CtrlCTap, // Ctrl+C only (no system side-effect on macOS GUI apps)
+    CtrlVTap, // Ctrl+V only (no system side-effect on macOS GUI apps)
+    UpperCopyTap,
+    UpperPasteTap,
     OpenTui,
     OpenGui,
-    SequencePaste, // Cmd+Option+V — paste next item in slot sequence
-    SmartPaste,    // Cmd+Shift+V — transform clipboard content and paste
+    SequencePaste,           // Cmd+Option+V — paste next item in slot sequence
+    SmartPaste,              // Ctrl+Shift+V — transform clipboard content and paste
+    SlotPicker,              // Cmd+Shift+V — open slot picker for paste
+    CopySlotPicker,          // Ctrl+Shift+Option+C — open slot picker for copy
+    CopyClipboardToSlot(u8), // Ctrl+Shift+Option+1..9 — save clipboard to slot
+    CopySelectionToSlot(u8), // Ctrl+Shift+Option+A..Z — copy selection to slot 31..56
+    PasteFromSlot(u8),       // Ctrl+Option+1..9 — paste slot
+    SlotMemoryHud,           // Ctrl+Option+Space — show recent slot memory
+    ToggleCollect,           // Ctrl+Option+` — toggle Collect mode on/off
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -585,7 +844,10 @@ fn restore_clipboard_to_slot(
 fn execute_copy(slot: u8, mgr: &SlotManager, persist_tx: &mpsc::SyncSender<ClipEvent>) {
     let mut cb = match Clipboard::new() {
         Ok(c) => c,
-        Err(e) => { log::warn!("Copy to slot {} failed: {}", slot, e); return; }
+        Err(e) => {
+            log::warn!("Copy to slot {} failed: {}", slot, e);
+            return;
+        }
     };
     // After multi-tap Cmd+C the OS can lag slightly before text is readable.
     let mut text: Option<String> = None;
@@ -603,28 +865,52 @@ fn execute_copy(slot: u8, mgr: &SlotManager, persist_tx: &mpsc::SyncSender<ClipE
         }
     }
     if let Some(ref text) = text {
-        mgr.copy_to_slot(slot, text).ok();
-        log::info!("📋 Saved to slot {}: {}", slot, truncate(text, 40));
-
-        // Persist slot copy to SQLite so it survives daemon restarts.
-        let entry = ClipEntry::new(text.clone(), None, Some(slot));
-        let _ = persist_tx.try_send(ClipEvent::NewClip(entry));
+        save_text_to_slot(slot, text, mgr, persist_tx);
     } else {
         log::info!("📋 Copy to slot {} skipped (clipboard empty)", slot);
     }
 }
 
-/// Cmd+V multi-tap path: system already pasted N times, so undo then re-paste slot content.
-/// Suppresses the watcher and restores the original clipboard afterwards.
-fn execute_undo_paste(slot: u8, tap_count: u8, mgr: &SlotManager, suppress: &Arc<AtomicBool>) {
+fn save_text_to_slot(
+    slot: u8,
+    text: &str,
+    mgr: &SlotManager,
+    persist_tx: &mpsc::SyncSender<ClipEvent>,
+) {
+    mgr.copy_to_slot(slot, text).ok();
+    log::info!("📋 Saved to slot {}: {}", slot, truncate(text, 40));
+    #[cfg(target_os = "macos")]
+    show_slot_content_notification("Copied", slot, text);
+
+    let entry = ClipEntry::new(text.to_string(), None, Some(slot));
+    let _ = persist_tx.try_send(ClipEvent::NewClip(entry));
+}
+
+/// Cmd+V multi-tap path: the foreground app already received the first one or two
+/// native Cmd+V events, so validate the slot, undo those native inserts, then paste
+/// the selected slot in one sequential operation.
+fn execute_undo_paste(
+    slot: u8,
+    native_paste_count: u8,
+    mgr: &SlotManager,
+    suppress: &Arc<AtomicBool>,
+) {
     if let Ok(Some(content)) = mgr.get_slot(slot) {
         let mut cb = match Clipboard::new() {
             Ok(c) => c,
-            Err(e) => { log::warn!("Paste from slot {} failed: {}", slot, e); return; }
+            Err(e) => {
+                log::warn!("Paste from slot {} failed: {}", slot, e);
+                return;
+            }
         };
 
         let original = cb.get_text().ok();
         suppress.store(true, Ordering::SeqCst);
+
+        for _ in 0..native_paste_count {
+            simulate_undo();
+            std::thread::sleep(Duration::from_millis(35));
+        }
 
         if let Err(e) = cb.set_text(&content) {
             suppress.store(false, Ordering::SeqCst);
@@ -632,35 +918,22 @@ fn execute_undo_paste(slot: u8, tap_count: u8, mgr: &SlotManager, suppress: &Arc
             return;
         }
 
-        // Each OS-level Cmd+V tap already pasted. We need to:
-        // 1. Undo ALL those pastes (tap_count of them)
-        // 2. Paste slot content once
-        // Use select-all-undo approach: Cmd+Z × tap_count, then Cmd+V.
-        // The first Cmd+V tap always registers; subsequent ones may batch.
-        // To be safe, undo tap_count times (matching what the OS did).
-        std::thread::sleep(Duration::from_millis(100));
-        if let Err(e) = undo_then_paste(tap_count) {
-            log::warn!("Auto-paste failed: {}", e);
-            #[cfg(target_os = "macos")]
-            log::warn!(
-                "If paste never works: grant Accessibility to the app running clipd \
-                 (System Settings → Privacy & Security → Accessibility), and ensure \
-                 Automation is allowed for System Events."
-            );
-            #[cfg(not(target_os = "macos"))]
-            log::warn!(
-                "If paste never works: run clipd as the same user as the foreground app; \
-                 on Windows, synthesized Ctrl+V may require running the terminal as administrator \
-                 in some setups."
-            );
-            log::info!("Slot {} content is on clipboard — paste manually if needed", slot);
-        } else {
-            log::info!("📋 Pasted from slot {}: {}", slot, truncate(&content, 40));
-        }
+        std::thread::sleep(Duration::from_millis(50));
+        simulate_paste();
+        log::info!(
+            "📋 Pasted from slot {} after {} undo(s): {}",
+            slot,
+            native_paste_count,
+            truncate(&content, 40)
+        );
+        #[cfg(target_os = "macos")]
+        show_slot_content_notification("Pasted", slot, &content);
 
         std::thread::sleep(Duration::from_millis(200));
 
-        let clipboard_unchanged = cb.get_text()
+        // Only restore if the user hasn't done Cmd+C during the paste window.
+        let clipboard_unchanged = cb
+            .get_text()
             .map(|current| current == content)
             .unwrap_or(false);
         if clipboard_unchanged {
@@ -697,8 +970,7 @@ fn execute_direct_paste(
 
             if paste_settings.smart_mode {
                 let ct = clipd_core::ContentType::detect(&content);
-                let suggestions =
-                    suggest_smart_transform(&content, &ct, dest_app.as_deref());
+                let suggestions = suggest_smart_transform(&content, &ct, dest_app.as_deref());
                 for t in &suggestions {
                     if let Ok(transformed) = apply_transform(t, &content, transform_cfg) {
                         log::info!("🧠 Smart transform (Ctrl+V slot {}): {}", slot, t.label());
@@ -716,8 +988,7 @@ fn execute_direct_paste(
             }
 
             if !paste_settings.default_ai_prompt.is_empty() {
-                let kind =
-                    TransformKind::CustomPrompt(paste_settings.default_ai_prompt.clone());
+                let kind = TransformKind::CustomPrompt(paste_settings.default_ai_prompt.clone());
                 if let Ok(transformed) = apply_transform(&kind, &content, transform_cfg) {
                     log::info!("✨ AI prompt transform (Ctrl+V slot {})", slot);
                     content = transformed;
@@ -727,7 +998,10 @@ fn execute_direct_paste(
 
         let mut cb = match Clipboard::new() {
             Ok(c) => c,
-            Err(e) => { log::warn!("Paste from slot {} failed: {}", slot, e); return; }
+            Err(e) => {
+                log::warn!("Paste from slot {} failed: {}", slot, e);
+                return;
+            }
         };
 
         let original = cb.get_text().ok();
@@ -741,13 +1015,16 @@ fn execute_direct_paste(
         std::thread::sleep(Duration::from_millis(50));
         simulate_paste();
         log::info!("📋 Pasted from slot {}: {}", slot, truncate(&content, 40));
+        #[cfg(target_os = "macos")]
+        show_slot_content_notification("Pasted", slot, &content);
 
         std::thread::sleep(Duration::from_millis(200));
 
         // Only restore if the user hasn't done Cmd+C during the paste window.
         // If the clipboard changed, someone else (the user) wrote new content
         // and we must not overwrite it.
-        let clipboard_unchanged = cb.get_text()
+        let clipboard_unchanged = cb
+            .get_text()
             .map(|current| current == content)
             .unwrap_or(false);
         if clipboard_unchanged {
@@ -811,8 +1088,7 @@ fn execute_smart_paste(
 
     if fresh_settings.smart_mode {
         let ct = clipd_core::ContentType::detect(&content);
-        let suggestions =
-            suggest_smart_transform(&content, &ct, dest_app.as_deref());
+        let suggestions = suggest_smart_transform(&content, &ct, dest_app.as_deref());
         for t in &suggestions {
             if let Ok(result) = apply_transform(t, &content, &fresh_transform_cfg) {
                 log::info!("🧠 Smart paste transform: {}", t.label());
@@ -832,8 +1108,7 @@ fn execute_smart_paste(
     }
 
     if !fresh_settings.default_ai_prompt.is_empty() {
-        let kind =
-            TransformKind::CustomPrompt(fresh_settings.default_ai_prompt.clone());
+        let kind = TransformKind::CustomPrompt(fresh_settings.default_ai_prompt.clone());
         if let Ok(result) = apply_transform(&kind, &content, &fresh_transform_cfg) {
             log::info!("✨ Smart paste AI prompt transform");
             content = result;
@@ -893,11 +1168,7 @@ fn execute_context_paste(
                     if let Ok(transformed) =
                         apply_transform(&rule.transform, &content, transform_cfg)
                     {
-                        log::info!(
-                            "🔄 Auto-transform for {}: {}",
-                            app,
-                            rule.description
-                        );
+                        log::info!("🔄 Auto-transform for {}: {}", app, rule.description);
                         content = transformed;
                     }
                     break;
@@ -910,8 +1181,7 @@ fn execute_context_paste(
             // Smart mode: auto-detect content and pick transforms
             if paste_settings.smart_mode {
                 let ct = clipd_core::ContentType::detect(&content);
-                let suggestions =
-                    suggest_smart_transform(&content, &ct, dest_app.as_deref());
+                let suggestions = suggest_smart_transform(&content, &ct, dest_app.as_deref());
                 for t in &suggestions {
                     if let Ok(transformed) = apply_transform(t, &content, transform_cfg) {
                         log::info!("🧠 Smart transform applied: {}", t.label());
@@ -931,8 +1201,7 @@ fn execute_context_paste(
 
             // Apply default AI prompt if set
             if !paste_settings.default_ai_prompt.is_empty() {
-                let kind =
-                    TransformKind::CustomPrompt(paste_settings.default_ai_prompt.clone());
+                let kind = TransformKind::CustomPrompt(paste_settings.default_ai_prompt.clone());
                 if let Ok(transformed) = apply_transform(&kind, &content, transform_cfg) {
                     log::info!("✨ AI prompt transform applied");
                     content = transformed;
@@ -976,6 +1245,17 @@ fn execute_context_paste(
 }
 
 #[cfg(target_os = "macos")]
+fn simulate_undo() {
+    let script = r#"tell application "System Events"
+  keystroke "z" using command down
+end tell"#;
+    let _ = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .output();
+}
+
+#[cfg(target_os = "macos")]
 fn simulate_paste() {
     let script = r#"tell application "System Events"
   keystroke "v" using command down
@@ -986,13 +1266,16 @@ end tell"#;
         .output();
 }
 
-#[cfg(not(target_os = "macos"))]
-fn simulate_paste() {
-    if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
-        let _ = enigo.key(Key::Control, Direction::Press);
-        let _ = enigo.key(Key::Unicode('v'), Direction::Click);
-        let _ = enigo.key(Key::Control, Direction::Release);
-    }
+#[cfg(target_os = "macos")]
+fn simulate_copy() {
+    let script = r#"tell application "System Events"
+  keystroke "c" using command down
+end tell"#;
+    let _ = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .output();
+    std::thread::sleep(Duration::from_millis(80));
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1000,6 +1283,25 @@ fn simulate_undo() {
     if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
         let _ = enigo.key(Key::Control, Direction::Press);
         let _ = enigo.key(Key::Unicode('z'), Direction::Click);
+        let _ = enigo.key(Key::Control, Direction::Release);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn simulate_copy() {
+    if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
+        let _ = enigo.key(Key::Control, Direction::Press);
+        let _ = enigo.key(Key::Unicode('c'), Direction::Click);
+        let _ = enigo.key(Key::Control, Direction::Release);
+    }
+    std::thread::sleep(Duration::from_millis(80));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn simulate_paste() {
+    if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
+        let _ = enigo.key(Key::Control, Direction::Press);
+        let _ = enigo.key(Key::Unicode('v'), Direction::Click);
         let _ = enigo.key(Key::Control, Direction::Release);
     }
 }
@@ -1013,7 +1315,11 @@ fn get_frontmost_app_name() -> Option<String> {
         .ok()?;
     if output.status.success() {
         let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if name.is_empty() { None } else { Some(name) }
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
     } else {
         None
     }
@@ -1131,7 +1437,249 @@ fn is_terminal_frontmost() -> bool {
 /// so rapid taps update the display instead of stacking.
 #[cfg(target_os = "macos")]
 fn show_slot_notification(action: &str, slot: u8) {
-    show_hud(&format!("📋 {} → Slot {}", action, slot));
+    let lines = vec![
+        "STYLE\ttoast".to_string(),
+        format!("BADGE\t{}", slot_badge(slot)),
+        format!("TITLE\t{}", toast_title(action, slot)),
+        format!("HINT\t{}", retrieve_hint(slot)),
+    ];
+    show_hud(&lines.join("\n"));
+}
+
+#[cfg(target_os = "macos")]
+fn show_slot_content_notification(action: &str, slot: u8, content: &str) {
+    remember_slot_for_hud(slot, content);
+    let lines = vec![
+        "STYLE\ttoast".to_string(),
+        format!("BADGE\t{}", slot_badge(slot)),
+        format!("TITLE\t{}", toast_title(action, slot)),
+        format!("PREVIEW\t{}\t{}", content_icon(content), truncate(content, 52)),
+        format!("HINT\t{}", retrieve_hint(slot)),
+    ];
+    show_hud(&lines.join("\n"));
+}
+
+/// Toast's first line: status + the slot it acted on, e.g. "Copied to Slot 3"
+/// or "Copied to Slot 31 (A)". Letter slots especially need the slot spelled
+/// out — a lone letter badge is easy to miss.
+#[cfg(target_os = "macos")]
+fn toast_title(action: &str, slot: u8) -> String {
+    match action {
+        "Copied" | "Copy" => format!("Copied to {}", slot_label(slot)),
+        "Pasted" | "Paste" => format!("Pasted from {}", slot_label(slot)),
+        other => format!("{} {}", other, slot_label(slot)),
+    }
+}
+
+/// The keystroke to paste a slot back, e.g. "⌘V ×3", "⌥V ×2", "⌃⌥V A".
+/// Shown muted on the toast so the next action is always obvious.
+#[cfg(target_os = "macos")]
+fn retrieve_hint(slot: u8) -> String {
+    match slot {
+        1..=9 => format!("⌘V ×{}", slot),
+        11..=30 => format!("⌥V ×{}", slot - 10),
+        31..=56 => format!("⌃⌥V {}", (b'A' + (slot - 31)) as char),
+        _ => "⌘V".to_string(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct HudSlotMemory {
+    slot: u8,
+    preview: String,
+}
+
+#[cfg(target_os = "macos")]
+fn remember_slot_for_hud(slot: u8, content: &str) {
+    if let Ok(mut items) = hud_slot_memory().lock() {
+        items.retain(|item| item.slot != slot);
+        items.insert(
+            0,
+            HudSlotMemory {
+                slot,
+                preview: truncate(content, 40),
+            },
+        );
+        items.truncate(8);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn hud_slot_memory() -> &'static std::sync::Mutex<Vec<HudSlotMemory>> {
+    use std::sync::{Mutex, OnceLock};
+
+    static RECENT: OnceLock<Mutex<Vec<HudSlotMemory>>> = OnceLock::new();
+    RECENT.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Build the tagged `ROW` lines for the HUD's "recent stack" — the vertical
+/// list of slots the user has touched this session, newest first. The slot
+/// matching `active` (if any) is flagged so the HUD highlights it.
+#[cfg(target_os = "macos")]
+fn slot_memory_rows(active: Option<u8>) -> Vec<String> {
+    hud_slot_memory()
+        .lock()
+        .map(|items| {
+            items
+                .iter()
+                .take(6)
+                .map(|item| {
+                    let is_active = if Some(item.slot) == active { "1" } else { "0" };
+                    format!(
+                        "ROW\t{}\t{}\t{}\t{}\t{}",
+                        item.slot,
+                        slot_badge(item.slot),
+                        content_icon(&item.preview),
+                        item.preview,
+                        is_active,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Short slot badge shown in the HUD's row list: letters for 31..=56, the
+/// number otherwise (e.g. `3`, `A`).
+#[cfg(target_os = "macos")]
+fn slot_badge(slot: u8) -> String {
+    if (31..=56).contains(&slot) {
+        ((b'A' + (slot - 31)) as char).to_string()
+    } else {
+        slot.to_string()
+    }
+}
+
+/// Classify a preview into an icon *kind* (mapped to an SF Symbol by the HUD)
+/// so the user recognizes *what* a slot holds at a glance — a link, an email,
+/// code… — rather than recalling where they put it.
+#[cfg(target_os = "macos")]
+fn content_icon(content: &str) -> &'static str {
+    let t = content.trim();
+    let lower = t.to_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") {
+        "link"
+    } else if t.contains('@') && t.contains('.') && !t.contains(' ') {
+        "mail"
+    } else if t.contains("=>")
+        || t.contains("();")
+        || t.contains("){")
+        || t.contains(") {")
+        || lower.starts_with("fn ")
+        || lower.starts_with("def ")
+        || lower.starts_with("function ")
+        || lower.starts_with("const ")
+        || lower.starts_with("import ")
+        || lower.starts_with("$ ")
+    {
+        "code"
+    } else if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || "+-() .".contains(c)) {
+        "number"
+    } else {
+        "text"
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn show_slot_memory_hud(mgr: &SlotManager) {
+    let mut rows = slot_memory_rows(None);
+    if rows.is_empty() {
+        // Nothing touched this session yet — fall back to whatever the
+        // SlotManager persisted, newest slot first.
+        if let Ok(slots) = mgr.list_slots() {
+            rows = slots
+                .into_iter()
+                .filter(|(slot, content)| *slot > 0 && !content.trim().is_empty())
+                .rev()
+                .take(6)
+                .map(|(slot, content)| {
+                    let preview = truncate(&content, 40);
+                    format!(
+                        "ROW\t{}\t{}\t{}\t{}\t0",
+                        slot,
+                        slot_badge(slot),
+                        content_icon(&preview),
+                        preview,
+                    )
+                })
+                .collect();
+        }
+    }
+
+    let mut lines = vec![
+        "STYLE\tlist".to_string(),
+        "TITLE\tRecent slots".to_string(),
+        "HINT\t⌃⌥Space".to_string(),
+    ];
+    if rows.is_empty() {
+        lines.push("PREVIEW\tempty\tNo slots saved yet — copy something to begin".to_string());
+    } else {
+        lines.extend(rows);
+    }
+    lines.push("FOOT\tCmd 1-9 · ⌥ 11-30 · Letters A-Z".to_string());
+    show_hud(&lines.join("\n"));
+}
+
+/// The Collect-mode panel: the growing stack of slots 1..=9 captured this
+/// batch, newest highlighted. Replaces the per-copy toast while collecting so
+/// the user sees the whole batch, not just the last item.
+#[cfg(target_os = "macos")]
+fn show_collect_hud(mgr: &SlotManager, active_slot: u8, just_started: bool) {
+    let mut rows = Vec::new();
+    let mut count = 0;
+    if let Ok(slots) = mgr.list_slots() {
+        for (slot, content) in slots.into_iter() {
+            if (1..=9).contains(&slot) && !content.trim().is_empty() {
+                count += 1;
+                let preview = truncate(&content, 40);
+                let active = if slot == active_slot { "1" } else { "0" };
+                rows.push(format!(
+                    "ROW\t{}\t{}\t{}\t{}\t{}",
+                    slot,
+                    slot_badge(slot),
+                    content_icon(&preview),
+                    preview,
+                    active,
+                ));
+            }
+        }
+    }
+
+    let title = if just_started || count == 0 {
+        "Collecting — just press ⌘C".to_string()
+    } else {
+        format!("Collecting · {} item{}", count, if count == 1 { "" } else { "s" })
+    };
+
+    let mut lines = vec![
+        "STYLE\tlist".to_string(),
+        format!("TITLE\t{}", title),
+        "HINT\t⌃⌥` done".to_string(),
+    ];
+    if rows.is_empty() {
+        lines.push("PREVIEW\tempty\tCopy anything — it stacks here automatically".to_string());
+    } else {
+        lines.extend(rows);
+    }
+    lines.push("FOOT\t⌘⇧V to pick one when pasting".to_string());
+    show_hud(&lines.join("\n"));
+}
+
+/// Brief confirmation toast when Collect mode is turned off.
+#[cfg(target_os = "macos")]
+fn show_collect_done_hud() {
+    show_hud("STYLE\ttoast\nBADGE\t✓\nTITLE\tCollect mode off\nHINT\t⌘⇧V to pick");
+}
+
+#[cfg(target_os = "macos")]
+fn slot_label(slot: u8) -> String {
+    if (31..=56).contains(&slot) {
+        let letter = (b'A' + (slot - 31)) as char;
+        format!("Slot {} ({})", slot, letter)
+    } else {
+        format!("Slot {}", slot)
+    }
 }
 
 /// Show a brief HUD overlay with arbitrary text.
@@ -1152,24 +1700,27 @@ fn show_hud(text: &str) {
 
     if let Ok(mut prev) = pid_lock.lock() {
         if let Some(pid) = prev.take() {
-            let _ = std::process::Command::new("kill").arg(pid.to_string()).output();
+            let _ = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .output();
         }
     }
 
     let hud_bin = find_hud_binary();
     log::info!("HUD: launching {} with text {:?}", hud_bin.display(), text);
 
-    match std::process::Command::new(&hud_bin)
-        .arg(text)
-        .spawn()
-    {
+    match std::process::Command::new(&hud_bin).arg(text).spawn() {
         Ok(child) => {
             log::info!("HUD: spawned pid {}", child.id());
             if let Ok(mut prev) = pid_lock.lock() {
                 *prev = Some(child.id());
             }
         }
-        Err(e) => log::warn!("HUD overlay failed: {} (looked for {})", e, hud_bin.display()),
+        Err(e) => log::warn!(
+            "HUD overlay failed: {} (looked for {})",
+            e,
+            hud_bin.display()
+        ),
     }
 }
 
@@ -1213,44 +1764,6 @@ fn find_hud_binary() -> std::path::PathBuf {
 
     // Fallback: search PATH
     std::path::PathBuf::from("clipd-hud")
-}
-
-#[cfg(target_os = "macos")]
-fn undo_then_paste(undo_count: u8) -> Result<(), Box<dyn std::error::Error>> {
-    // Send undos one at a time with enough delay for the app to process each.
-    let undos: String = (0..undo_count)
-        .map(|_| "  keystroke \"z\" using command down\n  delay 0.12")
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let script = format!(
-        r#"tell application "System Events"
-{}
-  delay 0.15
-  keystroke "v" using command down
-end tell"#,
-        undos
-    );
-    let output = std::process::Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("osascript undo+paste failed: {}", err).into());
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn undo_then_paste(undo_count: u8) -> Result<(), Box<dyn std::error::Error>> {
-    for _ in 0..undo_count {
-        simulate_undo();
-        std::thread::sleep(Duration::from_millis(120));
-    }
-    std::thread::sleep(Duration::from_millis(150));
-    simulate_paste();
-    Ok(())
 }
 
 fn open_tui_search() {
@@ -1381,16 +1894,392 @@ fn open_gui() {
     log::warn!("clipd-gui binary not found — build it with: cargo build --release -p clipd-gui");
 }
 
+/// Open a macOS native dialog to pick a slot, then paste its content at cursor.
+/// Shows all non-empty slots with truncated previews.
+#[cfg(target_os = "macos")]
+fn open_slot_picker(mgr: &SlotManager, suppress: &Arc<AtomicBool>) {
+    // Collect non-empty slots
+    let mut slots: Vec<(u8, String)> = Vec::new();
+    for slot_id in 1..=MAX_CLIP_SLOT {
+        if let Ok(Some(content)) = mgr.get_slot(slot_id) {
+            if !content.trim().is_empty() {
+                let preview = content
+                    .chars()
+                    .take(50)
+                    .collect::<String>()
+                    .replace('\n', " ")
+                    .replace('"', "'");
+                slots.push((slot_id, preview));
+            }
+        }
+    }
+
+    if slots.is_empty() {
+        log::info!("📋 Slot picker: no non-empty slots");
+        let script = r#"display dialog "No slots saved yet. Copy something with Cmd+C first!" buttons {"OK"} with title "clipd""#;
+        let _ = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(script)
+            .output();
+        return;
+    }
+
+    // Build osascript list items
+    let items: Vec<String> = slots
+        .iter()
+        .map(|(id, preview)| format!("\"{}: {}\"", id, preview))
+        .collect();
+
+    let items_list = items.join(", ");
+    let script = format!(
+        r#"set chosen to choose from list {{{}}} with prompt "📋 clipd — Select slot to paste:" with title "clipd slot picker" OK button name "Paste" cancel button name "Cancel"
+if chosen is false then
+  return ""
+end if
+set AppleScript's text item delimiters to ": "
+set slot_num to text item 1 of (item 1 of chosen)
+return slot_num"#,
+        items_list
+    );
+
+    let output = match std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!("Slot picker osascript failed: {}", e);
+            return;
+        }
+    };
+
+    let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if chosen.is_empty() {
+        log::info!("📋 Slot picker cancelled");
+        return;
+    }
+
+    let slot: u8 = match chosen.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            log::warn!("Slot picker: could not parse slot number '{}'", chosen);
+            return;
+        }
+    };
+
+    log::info!("📋 Slot picker: selected slot {}", slot);
+    suppress.store(true, Ordering::SeqCst);
+
+    if let Ok(Some(content)) = mgr.get_slot(slot) {
+        if let Ok(mut cb) = Clipboard::new() {
+            let original = cb.get_text().ok();
+            if cb.set_text(&content).is_ok() {
+                std::thread::sleep(Duration::from_millis(50));
+                simulate_paste();
+                std::thread::sleep(Duration::from_millis(200));
+
+                // Restore original clipboard
+                if let Some(ref orig) = original {
+                    let _ = cb.set_text(orig);
+                }
+            }
+        }
+    } else {
+        log::info!("📋 Slot {} is empty", slot);
+    }
+
+    suppress.store(false, Ordering::SeqCst);
+}
+
+/// The memory palette: a fast "type → Enter → paste the exact clip" overlay
+/// over the full clipboard history (not just current slots). Type to filter,
+/// Enter pastes the verbatim clip at the cursor. This replaces the slot picker
+/// when the palette is enabled.
+#[cfg(target_os = "macos")]
+fn open_memory_palette(mgr: &SlotManager, suppress: &Arc<AtomicBool>) {
+    let store = match ClipStore::new(&ClipStore::default_path()) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Memory palette: cannot open store: {}", e);
+            return;
+        }
+    };
+    let clips = store.get_recent(150).unwrap_or_default();
+    if clips.is_empty() {
+        let script = r#"display dialog "No clips yet — copy something with Cmd+C first." buttons {"OK"} with title "clipd memory palette""#;
+        let _ = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(script)
+            .output();
+        return;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // Each row is "<token>: <label>". osascript filters as you type; the leading
+    // token maps the selection back to the exact source. History rows use the
+    // clip id (a number); alias rows use "@<LETTER>" so typing "@a" jumps to
+    // letter slot A without single-letter search noise.
+    let mut items: Vec<String> = Vec::new();
+
+    // Secondary alias system: letter slots A-Z, listed first so a typed @letter
+    // surfaces them at the top.
+    if palette_aliases_enabled() {
+        for slot in 31u8..=MAX_CLIP_SLOT {
+            if let Ok(Some(content)) = mgr.get_slot(slot) {
+                if !content.trim().is_empty() {
+                    let letter = (b'A' + (slot - 31)) as char;
+                    let preview = truncate(&content.replace('"', "'"), 52);
+                    let label =
+                        format!("@{}: ⭐ {}  —  alias", letter, preview).replace('"', "'");
+                    items.push(format!("\"{}\"", label));
+                }
+            }
+        }
+    }
+
+    items.extend(clips.iter().map(|c| {
+        let preview = truncate(&c.preview.replace('"', "'"), 56);
+        let when = relative_time(now, c.timestamp.timestamp());
+        let meta = match c.source_app.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(app) => format!("{} · {}", app, when),
+            None => when,
+        };
+        let label = format!("{}: {} {}  —  {}", c.id, c.content_type.icon(), preview, meta)
+            .replace('"', "'");
+        format!("\"{}\"", label)
+    }));
+
+    let script = format!(
+        r#"set chosen to choose from list {{{}}} with prompt "🔎 clipd — type to recall, Enter to paste:" with title "clipd memory palette" OK button name "Paste" cancel button name "Cancel"
+if chosen is false then
+  return ""
+end if
+set AppleScript's text item delimiters to ": "
+set clip_id to text item 1 of (item 1 of chosen)
+return clip_id"#,
+        items.join(", ")
+    );
+
+    let output = match std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!("Memory palette osascript failed: {}", e);
+            return;
+        }
+    };
+
+    let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if chosen.is_empty() {
+        log::info!("🔎 Memory palette cancelled");
+        return;
+    }
+
+    // An "@<LETTER>" token is an alias row → paste from that letter slot.
+    let content = if let Some(letter) = chosen.strip_prefix('@').and_then(|s| s.chars().next()) {
+        let up = letter.to_ascii_uppercase();
+        if !up.is_ascii_uppercase() {
+            log::warn!("Memory palette: bad alias '{}'", chosen);
+            return;
+        }
+        let slot = 31 + (up as u8 - b'A');
+        match mgr.get_slot(slot) {
+            Ok(Some(c)) if !c.trim().is_empty() => {
+                log::info!("🔎 Memory palette: pasting alias {} (slot {})", up, slot);
+                c
+            }
+            _ => {
+                log::warn!("Memory palette: alias {} is empty", up);
+                return;
+            }
+        }
+    } else {
+        let id: i64 = match chosen.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                log::warn!("Memory palette: could not parse selection '{}'", chosen);
+                return;
+            }
+        };
+        match clips.iter().find(|c| c.id == id) {
+            Some(c) => {
+                log::info!("🔎 Memory palette: pasting clip #{}", id);
+                c.content.clone()
+            }
+            None => {
+                log::warn!("Memory palette: clip {} not in loaded set", id);
+                return;
+            }
+        }
+    };
+
+    suppress.store(true, Ordering::SeqCst);
+    if let Ok(mut cb) = Clipboard::new() {
+        let original = cb.get_text().ok();
+        if cb.set_text(&content).is_ok() {
+            std::thread::sleep(Duration::from_millis(50));
+            simulate_paste();
+            std::thread::sleep(Duration::from_millis(200));
+            // Restore the prior clipboard so a one-off recall doesn't clobber it.
+            if let Some(ref orig) = original {
+                let _ = cb.set_text(orig);
+            }
+        }
+    }
+    suppress.store(false, Ordering::SeqCst);
+}
+
+/// Human-friendly "2h ago" style label from two unix-second timestamps.
+#[cfg(target_os = "macos")]
+fn relative_time(now_secs: i64, then_secs: i64) -> String {
+    let s = (now_secs - then_secs).max(0);
+    if s < 45 {
+        "just now".to_string()
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86_400 {
+        format!("{}h ago", s / 3600)
+    } else {
+        format!("{}d ago", s / 86_400)
+    }
+}
+
 // ── Helpers ──
 
 fn truncate(s: &str, max: usize) -> String {
-    let trimmed = s.trim().replace('\n', " ");
+    let trimmed = s.trim().replace(['\n', '\t', '\r'], " ");
     let char_count: usize = trimmed.chars().count();
     if char_count > max {
         let end: String = trimmed.chars().take(max).collect();
         format!("{}…", end)
     } else {
         trimmed
+    }
+}
+
+/// Non-macOS stub for slot picker — falls back to TUI search.
+#[cfg(not(target_os = "macos"))]
+fn open_slot_picker(mgr: &SlotManager, suppress: &Arc<AtomicBool>) {
+    log::info!("📋 Slot picker not yet available on this platform — try Ctrl+R for TUI search");
+    let _ = (mgr, suppress);
+}
+
+/// Non-macOS stub for copy slot picker.
+#[cfg(not(target_os = "macos"))]
+fn open_copy_slot_picker(_mgr: &SlotManager, _persist_tx: &mpsc::SyncSender<ClipEvent>) {
+    log::info!(
+        "📋 Copy slot picker not yet available on this platform — try Ctrl+R for TUI search"
+    );
+}
+
+/// Open a macOS native dialog to pick a slot, then copy the current clipboard to that slot.
+#[cfg(target_os = "macos")]
+fn open_copy_slot_picker(mgr: &SlotManager, persist_tx: &mpsc::SyncSender<ClipEvent>) {
+    // First, get the current clipboard content
+    let clipboard_content = match Clipboard::new() {
+        Ok(mut cb) => cb.get_text().ok(),
+        Err(_) => None,
+    };
+
+    let clipboard_preview = clipboard_content
+        .as_ref()
+        .map(|c| {
+            c.chars()
+                .take(50)
+                .collect::<String>()
+                .replace('\n', " ")
+                .replace('"', "'")
+        })
+        .unwrap_or_else(|| "".to_string());
+
+    // Build osascript list items for all slots
+    let mut items: Vec<String> = Vec::new();
+    for slot_id in 1..=MAX_CLIP_SLOT {
+        if let Ok(Some(content)) = mgr.get_slot(slot_id) {
+            if !content.trim().is_empty() {
+                let preview = content
+                    .chars()
+                    .take(40)
+                    .collect::<String>()
+                    .replace('\n', " ")
+                    .replace('"', "'");
+                items.push(format!("\"{}: {} (in slot)\"", slot_id, preview));
+            } else {
+                items.push(format!("\"{}: (empty)\"", slot_id));
+            }
+        } else {
+            items.push(format!("\"{}: (empty)\"", slot_id));
+        }
+    }
+
+    // Add "Save to new slot" option at the top if clipboard has content
+    let mut prompt = "📋 clipd — Select slot to COPY current clipboard to:".to_string();
+    if !clipboard_preview.is_empty() {
+        prompt = format!(
+            "📋 clipd — Copy to slot (clipboard: \"{}\"):",
+            clipboard_preview
+        );
+    }
+
+    let items_list = items.join(", ");
+    let script = format!(
+        r#"set chosen to choose from list {{{}}} with prompt "{}" with title "clipd — Copy to Slot" OK button name "Copy" cancel button name "Cancel"
+if chosen is false then
+  return ""
+end if
+set AppleScript's text item delimiters to ": "
+set slot_num to text item 1 of (item 1 of chosen)
+return slot_num"#,
+        items_list, prompt
+    );
+
+    let output = match std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!("Copy slot picker osascript failed: {}", e);
+            return;
+        }
+    };
+
+    let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if chosen.is_empty() {
+        log::info!("📋 Copy slot picker cancelled");
+        return;
+    }
+
+    let slot: u8 = match chosen.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            log::warn!("Copy slot picker: could not parse slot number '{}'", chosen);
+            return;
+        }
+    };
+
+    if let Some(content) = clipboard_content {
+        if content.trim().is_empty() {
+            log::info!("📋 Copy slot picker: clipboard is empty, nothing to copy");
+            return;
+        }
+
+        save_text_to_slot(slot, &content, mgr, persist_tx);
+        #[cfg(target_os = "macos")]
+        show_slot_notification("Copy", slot);
+    } else {
+        log::info!("📋 Copy slot picker: could not read clipboard");
     }
 }
 
@@ -1409,185 +2298,439 @@ fn start_macos_hotkey_listener(
     tx: mpsc::Sender<HotkeyTick>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut pressed_mods: HashSet<RKey> = HashSet::new();
-    let mut event_count: u64 = 0;
-    // macOS key-repeat sends many KeyPress events while V/C is held. Count one tap per
-    // physical press→release, not per repeat tick (otherwise tap #16 → wrong slot / empty).
-    let mut latch_cmd_shift_v = false;
-    let mut latch_cmd_opt_v = false;
-    let mut latch_ctrl_r = false;
-    let mut latch_ctrl_t = false;
-    let mut latch_ctrl_g = false;
-    let mut latch_cmd_ctrl_c = false;
-    let mut latch_cmd_ctrl_v = false;
-    let mut latch_cmd_c = false;
-    let mut latch_cmd_v = false;
-    let mut latch_ctrl_c = false;
-    let mut latch_ctrl_v = false;
+    struct State {
+        pressed_mods: HashSet<RKey>,
+        event_count: u64,
+        // macOS key-repeat sends many KeyPress events while V/C is held. Count one tap per
+        // physical press→release, not per repeat tick (otherwise tap #16 → wrong slot / empty).
+        latch_ctrl_shift_v: bool,
+        latch_cmd_shift_v: bool,
+        latch_ctrl_shift_opt_c: bool,
+        latch_cmd_opt_v: bool,
+        latch_shift_opt_c: bool,
+        latch_shift_opt_v: bool,
+        latch_ctrl_opt_slot: [bool; 10],
+        latch_ctrl_shift_opt_slot: [bool; 10],
+        latch_ctrl_opt_letter_slot: [bool; 26],
+        latch_ctrl_shift_opt_letter_slot: [bool; 26],
+        letter_copy_prefix_until: Option<Instant>,
+        letter_paste_prefix_until: Option<Instant>,
+        latch_ctrl_r: bool,
+        latch_ctrl_t: bool,
+        latch_ctrl_g: bool,
+        latch_ctrl_opt_space: bool,
+        latch_ctrl_opt_backquote: bool,
+        latch_cmd_ctrl_c: bool,
+        latch_cmd_ctrl_v: bool,
+        latch_cmd_c: bool,
+        latch_cmd_v: bool,
+        latch_ctrl_c: bool,
+        latch_ctrl_v: bool,
+        /// Time of the last plain Cmd+C press — for double-tap quick letter save.
+        cmd_c_last_press: Option<Instant>,
+    }
 
-    listen(move |event| {
+    let state = std::cell::RefCell::new(State {
+        pressed_mods: HashSet::new(),
+        event_count: 0,
+        latch_ctrl_shift_v: false,
+        latch_cmd_shift_v: false,
+        latch_ctrl_shift_opt_c: false,
+        latch_cmd_opt_v: false,
+        latch_shift_opt_c: false,
+        latch_shift_opt_v: false,
+        latch_ctrl_opt_slot: [false; 10],
+        latch_ctrl_shift_opt_slot: [false; 10],
+        latch_ctrl_opt_letter_slot: [false; 26],
+        latch_ctrl_shift_opt_letter_slot: [false; 26],
+        letter_copy_prefix_until: None,
+        letter_paste_prefix_until: None,
+        latch_ctrl_r: false,
+        latch_ctrl_t: false,
+        latch_ctrl_g: false,
+        latch_ctrl_opt_space: false,
+        latch_ctrl_opt_backquote: false,
+        latch_cmd_ctrl_c: false,
+        latch_cmd_ctrl_v: false,
+        latch_cmd_c: false,
+        latch_cmd_v: false,
+        latch_ctrl_c: false,
+        latch_ctrl_v: false,
+        cmd_c_last_press: None,
+    });
+
+    grab(move |event: Event| {
         if stop.load(Ordering::Relaxed) {
-            return;
+            return Some(event);
         }
 
-        event_count += 1;
-        if event_count == 1 {
+        let mut s = state.borrow_mut();
+        s.event_count += 1;
+        if s.event_count == 1 {
             log::info!("🎹 rdev: first event received — Input Monitoring permissions OK");
         }
 
-        match event.event_type {
+        match event.event_type.clone() {
             EventType::KeyPress(key) => {
                 if is_modifier_key(key) {
-                    pressed_mods.insert(key);
-                    return;
+                    s.pressed_mods.insert(key);
+                    return Some(event);
+                }
+
+                if letter_capture_active() && is_bare_letter(&s.pressed_mods) {
+                    let now = Instant::now();
+                    if let Some(until) = s.letter_copy_prefix_until {
+                        if now <= until {
+                            if let Some((slot, _idx, letter)) = key_to_letter_slot(key) {
+                                s.letter_copy_prefix_until = None;
+                                s.letter_paste_prefix_until = None;
+                                log::info!(
+                                    "⌨️  Ctrl+Option+C then {} → copy to slot {}",
+                                    letter,
+                                    slot
+                                );
+                                let _ = tx.send(HotkeyTick::CopySelectionToSlot(slot));
+                                return None;
+                            }
+                        } else {
+                            s.letter_copy_prefix_until = None;
+                        }
+                    }
+                    if let Some(until) = s.letter_paste_prefix_until {
+                        if now <= until {
+                            if let Some((slot, _idx, letter)) = key_to_letter_slot(key) {
+                                s.letter_copy_prefix_until = None;
+                                s.letter_paste_prefix_until = None;
+                                log::info!(
+                                    "⌨️  Ctrl+Option+V then {} → paste slot {}",
+                                    letter,
+                                    slot
+                                );
+                                let _ = tx.send(HotkeyTick::PasteFromSlot(slot));
+                                return None;
+                            }
+                        } else {
+                            s.letter_paste_prefix_until = None;
+                        }
+                    }
                 }
 
                 // Ctrl+Shift+V → smart paste (transform clipboard + paste)
-                if is_ctrl_shift(&pressed_mods) && key == RKey::KeyV {
-                    if !latch_cmd_shift_v {
-                        latch_cmd_shift_v = true;
+                if is_ctrl_shift(&s.pressed_mods) && key == RKey::KeyV {
+                    if !s.latch_ctrl_shift_v {
+                        s.latch_ctrl_shift_v = true;
                         log::info!("⌨️  Ctrl+Shift+V → smart paste");
                         let _ = tx.send(HotkeyTick::SmartPaste);
                     }
-                    return;
+                    return Some(event);
+                }
+
+                // Cmd+Shift+V → slot picker HUD
+                if is_cmd_shift(&s.pressed_mods) && key == RKey::KeyV {
+                    if !s.latch_cmd_shift_v {
+                        s.latch_cmd_shift_v = true;
+                        log::info!("⌨️  Cmd+Shift+V → slot picker");
+                        let _ = tx.send(HotkeyTick::SlotPicker);
+                    }
+                    return Some(event);
+                }
+
+                // Ctrl+Shift+Option+A..Z → copy selected text to letter slots 31..56.
+                // This takes precedence over the old Ctrl+Shift+Option+C picker so every
+                // letter maps cleanly to a slot.
+                if is_ctrl_shift_opt(&s.pressed_mods) && direct_letter_shortcuts_enabled() {
+                    if let Some((slot, idx, letter)) = key_to_letter_slot(key) {
+                        if !s.latch_ctrl_shift_opt_letter_slot[idx] {
+                            s.latch_ctrl_shift_opt_letter_slot[idx] = true;
+                            log::info!("⌨️  Ctrl+Shift+Option+{} → copy to slot {}", letter, slot);
+                            let _ = tx.send(HotkeyTick::CopySelectionToSlot(slot));
+                        }
+                        return None;
+                    }
+                }
+
+                // Ctrl+Shift+Option+C → copy slot picker
+                if is_ctrl_shift_opt(&s.pressed_mods) && key == RKey::KeyC {
+                    if !s.latch_ctrl_shift_opt_c {
+                        s.latch_ctrl_shift_opt_c = true;
+                        log::info!("⌨️  Ctrl+Shift+Option+C → copy slot picker");
+                        let _ = tx.send(HotkeyTick::CopySlotPicker);
+                    }
+                    return Some(event);
+                }
+
+                // Option+C/V → upper slot bank in Excel/developer mode.
+                // Suppress these events so Option+C does not type into Excel.
+                if extended_slots_enabled() && is_opt_only(&s.pressed_mods) && key == RKey::KeyC {
+                    if !s.latch_shift_opt_c {
+                        s.latch_shift_opt_c = true;
+                        let _ = tx.send(HotkeyTick::UpperCopyTap);
+                    }
+                    return None;
+                }
+                if extended_slots_enabled() && is_opt_only(&s.pressed_mods) && key == RKey::KeyV {
+                    if !s.latch_shift_opt_v {
+                        s.latch_shift_opt_v = true;
+                        let _ = tx.send(HotkeyTick::UpperPasteTap);
+                    }
+                    return None;
+                }
+
+                // Ctrl+Shift+Option+1..9 → save current clipboard to slot directly
+                if is_ctrl_shift_opt(&s.pressed_mods) {
+                    if let Some(slot) = key_to_digit_slot(key) {
+                        let idx = slot as usize;
+                        if !s.latch_ctrl_shift_opt_slot[idx] {
+                            s.latch_ctrl_shift_opt_slot[idx] = true;
+                            log::info!("⌨️  Ctrl+Shift+Option+{} → save to slot", slot);
+                            let _ = tx.send(HotkeyTick::CopyClipboardToSlot(slot));
+                        }
+                        return Some(event);
+                    }
+                    if direct_letter_shortcuts_enabled() {
+                        if let Some((slot, idx, letter)) = key_to_letter_slot(key) {
+                            if !s.latch_ctrl_shift_opt_letter_slot[idx] {
+                                s.latch_ctrl_shift_opt_letter_slot[idx] = true;
+                                log::info!(
+                                    "⌨️  Ctrl+Shift+Option+{} → copy to slot {}",
+                                    letter,
+                                    slot
+                                );
+                                let _ = tx.send(HotkeyTick::CopySelectionToSlot(slot));
+                            }
+                            return None;
+                        }
+                    }
+                }
+
+                // Ctrl+Option+1..9 → paste from slot directly
+                if is_ctrl_opt(&s.pressed_mods) {
+                    if key == RKey::Space {
+                        if !s.latch_ctrl_opt_space {
+                            s.latch_ctrl_opt_space = true;
+                            log::info!("⌨️  Ctrl+Option+Space → slot memory HUD");
+                            let _ = tx.send(HotkeyTick::SlotMemoryHud);
+                        }
+                        return None;
+                    }
+                    if key == RKey::BackQuote {
+                        if !s.latch_ctrl_opt_backquote {
+                            s.latch_ctrl_opt_backquote = true;
+                            log::info!("⌨️  Ctrl+Option+` → toggle collect mode");
+                            let _ = tx.send(HotkeyTick::ToggleCollect);
+                        }
+                        return None;
+                    }
+                    if direct_letter_shortcuts_enabled() && key == RKey::KeyC {
+                        s.letter_copy_prefix_until = Some(Instant::now() + LETTER_PREFIX_WINDOW);
+                        s.letter_paste_prefix_until = None;
+                        log::info!("⌨️  Ctrl+Option+C → letter copy prefix");
+                        return None;
+                    }
+                    if direct_letter_shortcuts_enabled() && key == RKey::KeyV {
+                        s.letter_paste_prefix_until = Some(Instant::now() + LETTER_PREFIX_WINDOW);
+                        s.letter_copy_prefix_until = None;
+                        log::info!("⌨️  Ctrl+Option+V → letter paste prefix");
+                        return None;
+                    }
+                    if let Some(slot) = key_to_digit_slot(key) {
+                        let idx = slot as usize;
+                        if !s.latch_ctrl_opt_slot[idx] {
+                            s.latch_ctrl_opt_slot[idx] = true;
+                            log::info!("⌨️  Ctrl+Option+{} → paste slot", slot);
+                            let _ = tx.send(HotkeyTick::PasteFromSlot(slot));
+                        }
+                        return Some(event);
+                    }
+                    if direct_letter_shortcuts_enabled() {
+                        if let Some((slot, idx, letter)) = key_to_letter_slot(key) {
+                            if !s.latch_ctrl_opt_letter_slot[idx] {
+                                s.latch_ctrl_opt_letter_slot[idx] = true;
+                                log::info!("⌨️  Ctrl+Option+{} → paste slot {}", letter, slot);
+                                let _ = tx.send(HotkeyTick::PasteFromSlot(slot));
+                            }
+                            return None;
+                        }
+                    }
                 }
 
                 // Cmd+Option+V → sequence paste
-                if is_cmd_opt(&pressed_mods) && key == RKey::KeyV {
-                    if !latch_cmd_opt_v {
-                        latch_cmd_opt_v = true;
-                        log::info!("⌨️  Cmd+Option+V → sequence paste");
+                if batch_drain_enabled() && is_cmd_opt(&s.pressed_mods) && key == RKey::KeyV {
+                    if !s.latch_cmd_opt_v {
+                        s.latch_cmd_opt_v = true;
+                        log::info!("⌨️  Cmd+Option+V → sequence paste (batch-drain)");
                         let _ = tx.send(HotkeyTick::SequencePaste);
                     }
-                    return;
+                    return Some(event);
                 }
 
                 // Ctrl+R → open search TUI (check before Ctrl+C/V)
-                if is_ctrl_only(&pressed_mods) && key == RKey::KeyR {
-                    if !latch_ctrl_r {
-                        latch_ctrl_r = true;
+                if is_ctrl_only(&s.pressed_mods) && key == RKey::KeyR {
+                    if !s.latch_ctrl_r {
+                        s.latch_ctrl_r = true;
                         log::info!("⌨️  Ctrl+R → open search");
                         let _ = tx.send(HotkeyTick::OpenTui);
                     }
-                    return;
+                    return Some(event);
                 }
 
                 // Ctrl+T → open TUI
-                if is_ctrl_only(&pressed_mods) && key == RKey::KeyT {
-                    if !latch_ctrl_t {
-                        latch_ctrl_t = true;
+                if is_ctrl_only(&s.pressed_mods) && key == RKey::KeyT {
+                    if !s.latch_ctrl_t {
+                        s.latch_ctrl_t = true;
                         log::info!("⌨️  Ctrl+T → open TUI");
                         let _ = tx.send(HotkeyTick::OpenTui);
                     }
-                    return;
+                    return Some(event);
                 }
 
                 // Ctrl+G → open GUI
-                if is_ctrl_only(&pressed_mods) && key == RKey::KeyG {
-                    if !latch_ctrl_g {
-                        latch_ctrl_g = true;
+                if is_ctrl_only(&s.pressed_mods) && key == RKey::KeyG {
+                    if !s.latch_ctrl_g {
+                        s.latch_ctrl_g = true;
                         log::info!("⌨️  Ctrl+G → open GUI");
                         let _ = tx.send(HotkeyTick::OpenGui);
                     }
-                    return;
+                    return Some(event);
                 }
 
                 // Cmd+Ctrl+C → treat as Ctrl+C (user transitioning from Cmd+C to save slot)
-                if has_cmd(&pressed_mods) && has_ctrl(&pressed_mods) && key == RKey::KeyC {
-                    if !latch_cmd_ctrl_c {
-                        latch_cmd_ctrl_c = true;
-                        let _ = tx.send(HotkeyTick::CtrlCTap);
-                    }
-                    return;
+                if has_cmd(&s.pressed_mods) && has_ctrl(&s.pressed_mods) && key == RKey::KeyC {
+                    let _ = tx.send(HotkeyTick::CtrlCTap);
+                    return Some(event);
                 }
                 // Cmd+Ctrl+V → treat as Ctrl+V (user transitioning from Cmd+V)
-                if has_cmd(&pressed_mods) && has_ctrl(&pressed_mods) && key == RKey::KeyV {
-                    if !latch_cmd_ctrl_v {
-                        latch_cmd_ctrl_v = true;
-                        let _ = tx.send(HotkeyTick::CtrlVTap);
-                    }
-                    return;
+                if has_cmd(&s.pressed_mods) && has_ctrl(&s.pressed_mods) && key == RKey::KeyV {
+                    let _ = tx.send(HotkeyTick::CtrlVTap);
+                    return Some(event);
                 }
 
                 // Cmd+C (just Cmd, no Ctrl/Shift/Option)
-                if is_cmd_only(&pressed_mods) && key == RKey::KeyC {
-                    if !latch_cmd_c {
-                        latch_cmd_c = true;
-                        let _ = tx.send(HotkeyTick::CmdCTap);
+                if is_cmd_only(&s.pressed_mods) && key == RKey::KeyC {
+                    // Quick letter save: a deliberate double-tap of Cmd+C arms
+                    // the letter prefix, so the next letter saves to that slot.
+                    // A single Cmd+C is unaffected — normal copy isn't hampered.
+                    let now = Instant::now();
+                    if quick_letter_slots_enabled() {
+                        if let Some(prev) = s.cmd_c_last_press {
+                            if now.duration_since(prev) < QUICK_DOUBLE_WINDOW {
+                                // Match the numeric grace: a letter only counts
+                                // (and cancels slot 2) within the same window.
+                                s.letter_copy_prefix_until = Some(now + QUICK_LETTER_GRACE);
+                                s.letter_paste_prefix_until = None;
+                                log::info!("⌨️  Cmd+C ×2 → quick letter save armed");
+                            }
+                        }
+                        s.cmd_c_last_press = Some(now);
                     }
-                    return;
+                    let _ = tx.send(HotkeyTick::CmdCTap);
+                    return Some(event);
                 }
                 // Cmd+V (just Cmd, no Ctrl/Shift/Option)
-                if is_cmd_only(&pressed_mods) && key == RKey::KeyV {
-                    if !latch_cmd_v {
-                        latch_cmd_v = true;
-                        let _ = tx.send(HotkeyTick::CmdVTap);
-                    }
-                    return;
+                if is_cmd_only(&s.pressed_mods) && key == RKey::KeyV {
+                    let _ = tx.send(HotkeyTick::CmdVTap);
+                    return Some(event);
                 }
 
                 // Ctrl+C (just Ctrl, no Cmd/Shift/Option)
-                if is_ctrl_only(&pressed_mods) && key == RKey::KeyC {
-                    if !latch_ctrl_c {
-                        latch_ctrl_c = true;
-                        // In terminal apps Ctrl+C is interrupt — don't treat as slot copy / HUD.
-                        if !is_terminal_frontmost() {
-                            let _ = tx.send(HotkeyTick::CtrlCTap);
-                        }
+                if is_ctrl_only(&s.pressed_mods) && key == RKey::KeyC {
+                    // In terminal apps Ctrl+C is interrupt — don't treat as slot copy / HUD.
+                    if !is_terminal_frontmost() {
+                        let _ = tx.send(HotkeyTick::CtrlCTap);
                     }
-                    return;
+                    return Some(event);
                 }
                 // Ctrl+V (just Ctrl, no Cmd/Shift/Option)
-                if is_ctrl_only(&pressed_mods) && key == RKey::KeyV {
-                    if !latch_ctrl_v {
-                        latch_ctrl_v = true;
-                        let _ = tx.send(HotkeyTick::CtrlVTap);
-                    }
-                    return;
+                if is_ctrl_only(&s.pressed_mods) && key == RKey::KeyV {
+                    let _ = tx.send(HotkeyTick::CtrlVTap);
+                    return Some(event);
                 }
             }
             EventType::KeyRelease(key) => {
                 if is_modifier_key(key) {
-                    pressed_mods.remove(&key);
+                    s.pressed_mods.remove(&key);
                     // After Cmd+C the OS often never delivers KeyRelease for C; releasing Command
                     // must arm the next Cmd+C / Cmd+V chord.
                     if matches!(key, RKey::MetaLeft | RKey::MetaRight) {
-                        latch_cmd_c = false;
-                        latch_cmd_v = false;
-                        latch_cmd_shift_v = false;
-                        latch_cmd_ctrl_c = false;
-                        latch_cmd_ctrl_v = false;
+                        s.latch_cmd_c = false;
+                        s.latch_cmd_v = false;
+                        s.latch_cmd_shift_v = false;
+                        s.latch_cmd_ctrl_c = false;
+                        s.latch_cmd_ctrl_v = false;
                     }
                     if matches!(key, RKey::ControlLeft | RKey::ControlRight) {
-                        latch_ctrl_c = false;
-                        latch_ctrl_v = false;
-                        latch_ctrl_t = false;
-                        latch_ctrl_g = false;
+                        s.latch_ctrl_c = false;
+                        s.latch_ctrl_v = false;
+                        s.latch_ctrl_t = false;
+                        s.latch_ctrl_g = false;
+                        s.latch_ctrl_opt_space = false;
+                    }
+                    if matches!(
+                        key,
+                        RKey::ControlLeft
+                            | RKey::ControlRight
+                            | RKey::ShiftLeft
+                            | RKey::ShiftRight
+                            | RKey::Alt
+                            | RKey::AltGr
+                    ) {
+                        s.latch_shift_opt_c = false;
+                        s.latch_shift_opt_v = false;
+                        s.latch_ctrl_opt_slot = [false; 10];
+                        s.latch_ctrl_shift_opt_slot = [false; 10];
+                        s.latch_ctrl_opt_letter_slot = [false; 26];
+                        s.latch_ctrl_shift_opt_letter_slot = [false; 26];
                     }
                 }
                 match key {
                     RKey::KeyV => {
-                        latch_cmd_shift_v = false;
-                        latch_cmd_opt_v = false;
-                        latch_cmd_ctrl_v = false;
-                        latch_cmd_v = false;
-                        latch_ctrl_v = false;
+                        s.latch_ctrl_shift_v = false;
+                        s.latch_cmd_shift_v = false;
+                        s.latch_cmd_opt_v = false;
+                        s.latch_shift_opt_v = false;
+                        s.latch_cmd_ctrl_v = false;
+                        s.latch_cmd_v = false;
+                        s.latch_ctrl_v = false;
                     }
                     RKey::KeyC => {
-                        latch_cmd_ctrl_c = false;
-                        latch_cmd_c = false;
-                        latch_ctrl_c = false;
+                        s.latch_ctrl_shift_opt_c = false;
+                        s.latch_shift_opt_c = false;
+                        s.latch_cmd_ctrl_c = false;
+                        s.latch_cmd_c = false;
+                        s.latch_ctrl_c = false;
                     }
-                    RKey::KeyR => latch_ctrl_r = false,
-                    RKey::KeyT => latch_ctrl_t = false,
-                    RKey::KeyG => latch_ctrl_g = false,
-                    _ => {}
+                    RKey::KeyR => s.latch_ctrl_r = false,
+                    RKey::KeyT => s.latch_ctrl_t = false,
+                    RKey::KeyG => s.latch_ctrl_g = false,
+                    RKey::Space => s.latch_ctrl_opt_space = false,
+                    RKey::BackQuote => s.latch_ctrl_opt_backquote = false,
+                    RKey::Num1
+                    | RKey::Num2
+                    | RKey::Num3
+                    | RKey::Num4
+                    | RKey::Num5
+                    | RKey::Num6
+                    | RKey::Num7
+                    | RKey::Num8
+                    | RKey::Num9 => {
+                        if let Some(slot) = key_to_digit_slot(key) {
+                            s.latch_ctrl_opt_slot[slot as usize] = false;
+                            s.latch_ctrl_shift_opt_slot[slot as usize] = false;
+                        }
+                    }
+                    _ => {
+                        if let Some((_slot, idx, _letter)) = key_to_letter_slot(key) {
+                            s.latch_ctrl_opt_letter_slot[idx] = false;
+                            s.latch_ctrl_shift_opt_letter_slot[idx] = false;
+                        }
+                    }
                 }
             }
             _ => {}
         }
+        Some(event)
     })
-    .map_err(|e| format!("rdev listen error: {:?}", e))?;
+    .map_err(|e| format!("rdev grab error: {:?}", e))?;
     Ok(())
 }
 
@@ -1595,10 +2738,14 @@ fn start_macos_hotkey_listener(
 fn is_modifier_key(key: RKey) -> bool {
     matches!(
         key,
-        RKey::MetaLeft | RKey::MetaRight
-            | RKey::ShiftLeft | RKey::ShiftRight
-            | RKey::ControlLeft | RKey::ControlRight
-            | RKey::Alt | RKey::AltGr
+        RKey::MetaLeft
+            | RKey::MetaRight
+            | RKey::ShiftLeft
+            | RKey::ShiftRight
+            | RKey::ControlLeft
+            | RKey::ControlRight
+            | RKey::Alt
+            | RKey::AltGr
     )
 }
 
@@ -1647,6 +2794,40 @@ fn is_ctrl_shift(pressed_mods: &HashSet<RKey>) -> bool {
         && !pressed_mods.contains(&RKey::AltGr)
 }
 
+/// Ctrl+Option held (no Cmd, no Shift)
+#[cfg(target_os = "macos")]
+fn is_ctrl_opt(pressed_mods: &HashSet<RKey>) -> bool {
+    has_ctrl(pressed_mods)
+        && (pressed_mods.contains(&RKey::Alt) || pressed_mods.contains(&RKey::AltGr))
+        && !pressed_mods.contains(&RKey::MetaLeft)
+        && !pressed_mods.contains(&RKey::MetaRight)
+        && !pressed_mods.contains(&RKey::ShiftLeft)
+        && !pressed_mods.contains(&RKey::ShiftRight)
+}
+
+/// A bare letter press — no Cmd/Ctrl/Option held (Shift is allowed). The
+/// letter-slot prefix only captures these, so holding Cmd and tapping a letter
+/// stays a Cmd+<key> chord (e.g. Cmd-held C×3 = numeric slot 3, not letter C).
+#[cfg(target_os = "macos")]
+fn is_bare_letter(pressed_mods: &HashSet<RKey>) -> bool {
+    !has_cmd(pressed_mods)
+        && !has_ctrl(pressed_mods)
+        && !pressed_mods.contains(&RKey::Alt)
+        && !pressed_mods.contains(&RKey::AltGr)
+}
+
+/// Option held alone (no Cmd, no Ctrl, no Shift)
+#[cfg(target_os = "macos")]
+fn is_opt_only(pressed_mods: &HashSet<RKey>) -> bool {
+    (pressed_mods.contains(&RKey::Alt) || pressed_mods.contains(&RKey::AltGr))
+        && !pressed_mods.contains(&RKey::MetaLeft)
+        && !pressed_mods.contains(&RKey::MetaRight)
+        && !pressed_mods.contains(&RKey::ControlLeft)
+        && !pressed_mods.contains(&RKey::ControlRight)
+        && !pressed_mods.contains(&RKey::ShiftLeft)
+        && !pressed_mods.contains(&RKey::ShiftRight)
+}
+
 /// Cmd+Option held (no Ctrl, no Shift)
 #[cfg(target_os = "macos")]
 fn is_cmd_opt(pressed_mods: &HashSet<RKey>) -> bool {
@@ -1656,6 +2837,134 @@ fn is_cmd_opt(pressed_mods: &HashSet<RKey>) -> bool {
         && !pressed_mods.contains(&RKey::ShiftRight)
         && !pressed_mods.contains(&RKey::ControlLeft)
         && !pressed_mods.contains(&RKey::ControlRight)
+}
+
+/// Cmd+Shift held (no Ctrl, no Option)
+#[cfg(target_os = "macos")]
+fn is_cmd_shift(pressed_mods: &HashSet<RKey>) -> bool {
+    has_cmd(pressed_mods)
+        && (pressed_mods.contains(&RKey::ShiftLeft) || pressed_mods.contains(&RKey::ShiftRight))
+        && !pressed_mods.contains(&RKey::ControlLeft)
+        && !pressed_mods.contains(&RKey::ControlRight)
+        && !pressed_mods.contains(&RKey::Alt)
+        && !pressed_mods.contains(&RKey::AltGr)
+}
+
+/// Ctrl+Shift+Option held (no Cmd)
+#[cfg(target_os = "macos")]
+fn is_ctrl_shift_opt(pressed_mods: &HashSet<RKey>) -> bool {
+    has_ctrl(pressed_mods)
+        && (pressed_mods.contains(&RKey::ShiftLeft) || pressed_mods.contains(&RKey::ShiftRight))
+        && (pressed_mods.contains(&RKey::Alt) || pressed_mods.contains(&RKey::AltGr))
+        && !pressed_mods.contains(&RKey::MetaLeft)
+        && !pressed_mods.contains(&RKey::MetaRight)
+}
+
+#[cfg(target_os = "macos")]
+fn key_to_digit_slot(key: RKey) -> Option<u8> {
+    match key {
+        RKey::Num1 => Some(1),
+        RKey::Num2 => Some(2),
+        RKey::Num3 => Some(3),
+        RKey::Num4 => Some(4),
+        RKey::Num5 => Some(5),
+        RKey::Num6 => Some(6),
+        RKey::Num7 => Some(7),
+        RKey::Num8 => Some(8),
+        RKey::Num9 => Some(9),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn key_to_letter_slot(key: RKey) -> Option<(u8, usize, char)> {
+    let idx = match key {
+        RKey::KeyA => 0,
+        RKey::KeyB => 1,
+        RKey::KeyC => 2,
+        RKey::KeyD => 3,
+        RKey::KeyE => 4,
+        RKey::KeyF => 5,
+        RKey::KeyG => 6,
+        RKey::KeyH => 7,
+        RKey::KeyI => 8,
+        RKey::KeyJ => 9,
+        RKey::KeyK => 10,
+        RKey::KeyL => 11,
+        RKey::KeyM => 12,
+        RKey::KeyN => 13,
+        RKey::KeyO => 14,
+        RKey::KeyP => 15,
+        RKey::KeyQ => 16,
+        RKey::KeyR => 17,
+        RKey::KeyS => 18,
+        RKey::KeyT => 19,
+        RKey::KeyU => 20,
+        RKey::KeyV => 21,
+        RKey::KeyW => 22,
+        RKey::KeyX => 23,
+        RKey::KeyY => 24,
+        RKey::KeyZ => 25,
+        _ => return None,
+    };
+    Some((31 + idx as u8, idx, (b'A' + idx as u8) as char))
+}
+
+#[cfg(target_os = "macos")]
+/// The global Ctrl+Option letter-slot chords are gated separately from the
+/// letter-slot feature itself, so aliases can stay usable via the palette
+/// without forcing the chords on everyone (Paste Settings → Advanced).
+fn direct_letter_shortcuts_enabled() -> bool {
+    let s = load_paste_transform_settings();
+    s.letter_slots_enabled && s.direct_letter_shortcuts_enabled
+}
+
+/// Excel/developer extended slots 11-30 (Option+C/V multi-tap).
+fn extended_slots_enabled() -> bool {
+    load_paste_transform_settings().extended_slots_enabled
+}
+
+/// Batch-drain / sequence paste (Cmd+Option+V drains collected slots in order).
+fn batch_drain_enabled() -> bool {
+    load_paste_transform_settings().batch_drain_enabled
+}
+
+/// Lighter letter-slot save: a deliberate double-tap of Cmd+C arms the letter
+/// prefix (single Cmd+C stays normal copy, so typing after a copy isn't eaten).
+fn quick_letter_slots_enabled() -> bool {
+    let s = load_paste_transform_settings();
+    s.letter_slots_enabled && s.quick_letter_slots_enabled
+}
+
+/// Whether a pending letter prefix may capture the next letter into a slot —
+/// true if either the Ctrl+Option chords or the quick double-tap path is on.
+fn letter_capture_active() -> bool {
+    let s = load_paste_transform_settings();
+    s.letter_slots_enabled && (s.direct_letter_shortcuts_enabled || s.quick_letter_slots_enabled)
+}
+
+/// Secondary alias system: surface letter slots in the memory palette as @A rows.
+#[cfg(target_os = "macos")]
+fn palette_aliases_enabled() -> bool {
+    load_paste_transform_settings().palette_aliases_enabled
+}
+
+fn upper_slot_for_taps(taps: u8) -> u8 {
+    (taps + 10).min(MAX_CLIP_SLOT)
+}
+
+/// Highest slot a Cmd/Ctrl multi-tap can reach. When multi-slot is disabled
+/// every tap collapses to slot 1, so Cmd+C/Cmd+V behave like normal copy/paste.
+fn primary_tap_slot_limit(settings: &PasteTransformSettings) -> u8 {
+    if settings.multi_slot_enabled {
+        9
+    } else {
+        1
+    }
+}
+
+fn primary_slot_for_taps(taps: u8, settings: &PasteTransformSettings) -> u8 {
+    taps.min(primary_tap_slot_limit(settings))
 }
 
 /// Backfill embeddings for clips that don't have them yet.

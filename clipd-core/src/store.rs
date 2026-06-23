@@ -1,3 +1,4 @@
+use crate::collections::{Collection, CollectionItem};
 use crate::embedding::{embedding_from_bytes, embedding_to_bytes, Embedding};
 use crate::models::{ClipEntry, ClipStats, ContentType, SearchFilters};
 use chrono::{DateTime, Utc};
@@ -69,8 +70,14 @@ impl ClipStore {
 
         // Add slot column if upgrading from schema before slot support.
         // Must run before creating idx_clips_slot index.
-        if let Err(e) = self.conn.execute("ALTER TABLE clips ADD COLUMN slot INTEGER", []) {
-            log::debug!("slot column migration (expected on fresh DB or if already present): {}", e);
+        if let Err(e) = self
+            .conn
+            .execute("ALTER TABLE clips ADD COLUMN slot INTEGER", [])
+        {
+            log::debug!(
+                "slot column migration (expected on fresh DB or if already present): {}",
+                e
+            );
         }
 
         // Now safe to create the slot index (column guaranteed to exist).
@@ -85,6 +92,28 @@ impl ClipStore {
                 clip_id   INTEGER PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
                 embedding BLOB NOT NULL
             );
+            ",
+        )?;
+
+        // Collections: named, persistent buckets of clips.
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS collections (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL UNIQUE,
+                source_app  TEXT,
+                created_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS collection_items (
+                collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+                clip_id       INTEGER NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+                position      INTEGER NOT NULL,
+                added_at      TEXT NOT NULL,
+                PRIMARY KEY (collection_id, clip_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_coll_items ON collection_items(collection_id, position);
             ",
         )?;
 
@@ -137,7 +166,12 @@ impl ClipStore {
             // Update timestamp to move it to the top
             self.conn.execute(
                 "UPDATE clips SET timestamp = ?1, source_app = ?2, slot = ?3 WHERE id = ?4",
-                params![entry.timestamp.to_rfc3339(), entry.source_app, entry.slot, existing_id],
+                params![
+                    entry.timestamp.to_rfc3339(),
+                    entry.source_app,
+                    entry.slot,
+                    existing_id
+                ],
             )?;
             return Ok(existing_id);
         }
@@ -192,7 +226,7 @@ impl ClipStore {
         if let Some(ref query) = filters.query {
             let fts_query = format!("\"{}\"", query.replace('"', "\"\""));
             let mut sql = String::from(
-                "SELECT c.id, c.content, c.content_type, c.content_hash, c.source_app, c.timestamp, c.preview
+                "SELECT c.id, c.content, c.content_type, c.content_hash, c.source_app, c.timestamp, c.preview, c.slot
                  FROM clips c
                  JOIN clips_fts f ON c.id = f.rowid
                  WHERE clips_fts MATCH ?1",
@@ -235,7 +269,7 @@ impl ClipStore {
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
                     preview: row.get(6)?,
-                slot: row.get(7)?,
+                    slot: row.get(7)?,
                 })
             })?;
 
@@ -283,7 +317,7 @@ impl ClipStore {
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
                     preview: row.get(6)?,
-                slot: row.get(7)?,
+                    slot: row.get(7)?,
                 })
             })?;
 
@@ -308,7 +342,7 @@ impl ClipStore {
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
                     preview: row.get(6)?,
-                slot: row.get(7)?,
+                    slot: row.get(7)?,
                 })
             },
         )
@@ -316,7 +350,9 @@ impl ClipStore {
 
     /// Delete a clip by ID.
     pub fn delete(&self, id: i64) -> SqlResult<bool> {
-        let count = self.conn.execute("DELETE FROM clips WHERE id = ?1", params![id])?;
+        let count = self
+            .conn
+            .execute("DELETE FROM clips WHERE id = ?1", params![id])?;
         Ok(count > 0)
     }
 
@@ -374,10 +410,7 @@ impl ClipStore {
     /// Get embeddings only for the given clip IDs. Useful when only a subset of clips
     /// are loaded into memory (e.g., the 200 most recent), avoiding loading all embeddings.
     /// Uses a single SQL query with an IN clause rather than one query per ID.
-    pub fn get_embeddings_for_clip_ids(
-        &self,
-        ids: &[i64],
-    ) -> SqlResult<Vec<(i64, Embedding)>> {
+    pub fn get_embeddings_for_clip_ids(&self, ids: &[i64]) -> SqlResult<Vec<(i64, Embedding)>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -390,8 +423,10 @@ impl ClipStore {
 
         // Build owned Box<dyn ToSql> params and keep them alive for the query call.
         use rusqlite::ToSql;
-        let params: Vec<Box<dyn ToSql>> =
-            ids.iter().map(|&id| Box::new(id) as Box<dyn ToSql>).collect();
+        let params: Vec<Box<dyn ToSql>> = ids
+            .iter()
+            .map(|&id| Box::new(id) as Box<dyn ToSql>)
+            .collect();
         let params_refs: Vec<&dyn ToSql> =
             params.iter().map(|b| b.as_ref() as &dyn ToSql).collect();
 
@@ -420,17 +455,16 @@ impl ClipStore {
 
     /// Count how many clips have embeddings.
     pub fn embedding_count(&self) -> SqlResult<usize> {
-        self.conn.query_row(
-            "SELECT COUNT(*) FROM clip_embeddings",
-            [],
-            |row| row.get(0),
-        )
+        self.conn
+            .query_row("SELECT COUNT(*) FROM clip_embeddings", [], |row| row.get(0))
     }
 
     /// Delete clips beyond `max_clips` (keeps most recent). Removes their embeddings too.
     /// Call this periodically to prevent unbounded DB growth.
     pub fn prune_old_clips(&self, max_clips: usize) -> SqlResult<usize> {
-        let count: usize = self.conn.query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))?;
+        let count: usize = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))?;
         if count <= max_clips {
             return Ok(0);
         }
@@ -465,21 +499,17 @@ impl ClipStore {
 
         let oldest_clip: Option<DateTime<Utc>> = self
             .conn
-            .query_row(
-                "SELECT MIN(timestamp) FROM clips",
-                [],
-                |row| row.get::<_, Option<String>>(0),
-            )?
+            .query_row("SELECT MIN(timestamp) FROM clips", [], |row| {
+                row.get::<_, Option<String>>(0)
+            })?
             .and_then(|ts| DateTime::parse_from_rfc3339(&ts).ok())
             .map(|dt| dt.with_timezone(&Utc));
 
         let newest_clip: Option<DateTime<Utc>> = self
             .conn
-            .query_row(
-                "SELECT MAX(timestamp) FROM clips",
-                [],
-                |row| row.get::<_, Option<String>>(0),
-            )?
+            .query_row("SELECT MAX(timestamp) FROM clips", [], |row| {
+                row.get::<_, Option<String>>(0)
+            })?
             .and_then(|ts| DateTime::parse_from_rfc3339(&ts).ok())
             .map(|dt| dt.with_timezone(&Utc));
 
@@ -518,6 +548,147 @@ impl ClipStore {
             type_counts,
         })
     }
+
+    // ── Collections ──
+
+    /// Create a collection. `source_app` (optional) auto-routes clips copied
+    /// while that app is frontmost. Returns the new collection id; errors if
+    /// the name already exists.
+    pub fn create_collection(&self, name: &str, source_app: Option<&str>) -> SqlResult<i64> {
+        self.conn.execute(
+            "INSERT INTO collections (name, source_app, created_at) VALUES (?1, ?2, ?3)",
+            params![name, source_app, Utc::now().to_rfc3339()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn row_to_collection(row: &rusqlite::Row, count: usize) -> SqlResult<Collection> {
+        Ok(Collection {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            source_app: row.get(2)?,
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            item_count: count,
+        })
+    }
+
+    /// List collections, newest first, with item counts.
+    pub fn list_collections(&self) -> SqlResult<Vec<Collection>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.name, c.source_app, c.created_at,
+                    (SELECT COUNT(*) FROM collection_items ci WHERE ci.collection_id = c.id)
+             FROM collections c ORDER BY c.created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let count: i64 = row.get(4)?;
+            Self::row_to_collection(row, count as usize)
+        })?;
+        rows.collect()
+    }
+
+    /// Look up a collection by exact name.
+    pub fn get_collection_by_name(&self, name: &str) -> SqlResult<Option<Collection>> {
+        let result = self.conn.query_row(
+            "SELECT id, name, source_app, created_at FROM collections WHERE name = ?1",
+            params![name],
+            |row| Self::row_to_collection(row, 0),
+        );
+        match result {
+            Ok(c) => Ok(Some(c)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Find a collection whose `source_app` matches the given frontmost app
+    /// (case-insensitive substring), for auto-routing copies.
+    pub fn collection_for_app(&self, app: &str) -> SqlResult<Option<Collection>> {
+        let app_lower = app.to_lowercase();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, source_app, created_at FROM collections
+             WHERE source_app IS NOT NULL AND source_app != ''",
+        )?;
+        let rows = stmt.query_map([], |row| Self::row_to_collection(row, 0))?;
+        for c in rows {
+            let c = c?;
+            if let Some(ref src) = c.source_app {
+                if app_lower.contains(&src.to_lowercase()) {
+                    return Ok(Some(c));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Add a clip to a collection (deduplicated; no-op if already present).
+    pub fn add_clip_to_collection(&self, collection_id: i64, clip_id: i64) -> SqlResult<()> {
+        let next_pos: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(position), 0) + 1 FROM collection_items WHERE collection_id = ?1",
+                params![collection_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(1);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO collection_items (collection_id, clip_id, position, added_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![collection_id, clip_id, next_pos, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Items in a collection, in saved order, with content joined in.
+    pub fn collection_items(&self, collection_id: i64) -> SqlResult<Vec<CollectionItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ci.clip_id, c.content, c.preview, ci.position, ci.added_at
+             FROM collection_items ci JOIN clips c ON c.id = ci.clip_id
+             WHERE ci.collection_id = ?1 ORDER BY ci.position ASC",
+        )?;
+        let rows = stmt.query_map(params![collection_id], |row| {
+            Ok(CollectionItem {
+                clip_id: row.get(0)?,
+                content: row.get(1)?,
+                preview: row.get(2)?,
+                position: row.get(3)?,
+                added_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Remove one clip from a collection.
+    pub fn remove_collection_item(&self, collection_id: i64, clip_id: i64) -> SqlResult<()> {
+        self.conn.execute(
+            "DELETE FROM collection_items WHERE collection_id = ?1 AND clip_id = ?2",
+            params![collection_id, clip_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a collection and its membership rows (clips themselves stay).
+    pub fn delete_collection(&self, collection_id: i64) -> SqlResult<()> {
+        self.conn
+            .execute("DELETE FROM collections WHERE id = ?1", params![collection_id])?;
+        Ok(())
+    }
+
+    /// Set or clear a collection's auto-route source app.
+    pub fn set_collection_source_app(
+        &self,
+        collection_id: i64,
+        source_app: Option<&str>,
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE collections SET source_app = ?1 WHERE id = ?2",
+            params![source_app, collection_id],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -526,7 +697,7 @@ mod tests {
     use crate::models::ClipEntry;
 
     fn make_entry(content: &str) -> ClipEntry {
-        ClipEntry::new(content.to_string(), Some("test_app".to_string()))
+        ClipEntry::new(content.to_string(), Some("test_app".to_string()), None)
     }
 
     #[test]
@@ -585,5 +756,36 @@ mod tests {
 
         let stats = store.stats().unwrap();
         assert_eq!(stats.total_clips, 2);
+    }
+
+    #[test]
+    fn test_collections() {
+        let store = ClipStore::in_memory().unwrap();
+        let c1 = store.insert(&make_entry("prompt one")).unwrap();
+        let c2 = store.insert(&make_entry("prompt two")).unwrap();
+
+        let coll = store.create_collection("Cursor prompts", Some("Cursor")).unwrap();
+        store.add_clip_to_collection(coll, c1).unwrap();
+        store.add_clip_to_collection(coll, c2).unwrap();
+        store.add_clip_to_collection(coll, c1).unwrap(); // dedup — no-op
+
+        let items = store.collection_items(coll).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].position, 1);
+
+        let list = store.list_collections().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].item_count, 2);
+
+        // Auto-route lookup by frontmost app (substring, case-insensitive).
+        assert!(store.collection_for_app("Cursor").unwrap().is_some());
+        assert!(store.collection_for_app("com.todesktop.cursor").unwrap().is_some());
+        assert!(store.collection_for_app("Safari").unwrap().is_none());
+
+        store.remove_collection_item(coll, c1).unwrap();
+        assert_eq!(store.collection_items(coll).unwrap().len(), 1);
+
+        store.delete_collection(coll).unwrap();
+        assert_eq!(store.list_collections().unwrap().len(), 0);
     }
 }

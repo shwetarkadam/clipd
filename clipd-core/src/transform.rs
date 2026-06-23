@@ -75,14 +75,26 @@ impl TransformKind {
 
     pub fn category(&self) -> &'static str {
         match self {
-            Self::PrettyJson | Self::MinifyJson | Self::SortLines | Self::UniqueLines
-            | Self::ReverseLines | Self::TrimWhitespace | Self::AddLineNumbers
+            Self::PrettyJson
+            | Self::MinifyJson
+            | Self::SortLines
+            | Self::UniqueLines
+            | Self::ReverseLines
+            | Self::TrimWhitespace
+            | Self::AddLineNumbers
             | Self::RemoveLineNumbers => "FORMAT",
 
-            Self::HtmlToMarkdown | Self::StripHtml | Self::Base64Encode | Self::Base64Decode
-            | Self::UrlEncode | Self::UrlDecode => "CONVERT",
+            Self::HtmlToMarkdown
+            | Self::StripHtml
+            | Self::Base64Encode
+            | Self::Base64Decode
+            | Self::UrlEncode
+            | Self::UrlDecode => "CONVERT",
 
-            Self::Uppercase | Self::Lowercase | Self::TitleCase | Self::CamelToSnake
+            Self::Uppercase
+            | Self::Lowercase
+            | Self::TitleCase
+            | Self::CamelToSnake
             | Self::SnakeToCamel => "CASE",
 
             _ => "AI ✨",
@@ -155,6 +167,46 @@ pub fn paste_transforms() -> Vec<TransformKind> {
 
 // ── Transform on Paste Settings ──
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SlotInputMode {
+    #[serde(alias = "LegacyMultiTap")]
+    ExcelDeveloper,
+}
+
+impl Default for SlotInputMode {
+    fn default() -> Self {
+        Self::ExcelDeveloper
+    }
+}
+
+/// Global shortcut that opens the memory palette. A small preset list for now
+/// (a free-form custom binding can come later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaletteTrigger {
+    /// Cmd+Shift+V — the familiar "paste special" gesture (recommended default).
+    CmdShiftV,
+    /// Ctrl+Option+Space — no character conflict, three keys.
+    CtrlOptSpace,
+    /// Option+Space — two keys, but normally inserts a non-breaking space.
+    OptSpace,
+}
+
+impl Default for PaletteTrigger {
+    fn default() -> Self {
+        Self::CmdShiftV
+    }
+}
+
+impl PaletteTrigger {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::CmdShiftV => "Cmd+Shift+V",
+            Self::CtrlOptSpace => "Ctrl+Option+Space",
+            Self::OptSpace => "Option+Space",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PasteTransformSettings {
     #[serde(default = "default_false")]
@@ -174,6 +226,67 @@ pub struct PasteTransformSettings {
 
     #[serde(default = "default_true_val")]
     pub hud_enabled: bool,
+
+    /// After multi-tap copy (Cmd+C × N), restore clipboard to slot 1's content.
+    /// When false, the clipboard keeps the original copied content after multi-tap.
+    #[serde(default = "default_true_val")]
+    pub copy_multi_tap_restore: bool,
+
+    /// Enables direct A-Z letter slots in addition to Excel/developer numeric slots.
+    /// In Paste Settings this is surfaced as "Enable A-Z aliases".
+    #[serde(default = "default_true_val")]
+    pub letter_slots_enabled: bool,
+
+    #[serde(default)]
+    pub slot_input_mode: SlotInputMode,
+
+    // ── Configurable Paste Settings (see SPEC-tier1-ai-memory) ──
+    /// Remember copied items in clipd history. Palette recall depends on this.
+    #[serde(default = "default_true_val")]
+    pub remember_clipboard: bool,
+
+    /// Memory palette (recall over history by content/source/time/alias).
+    #[serde(default = "default_true_val")]
+    pub palette_enabled: bool,
+
+    /// Which global shortcut opens the memory palette.
+    #[serde(default)]
+    pub palette_trigger: PaletteTrigger,
+
+    /// Multi-slot copy/paste via Cmd/Ctrl multi-tap (slots 1-9).
+    /// On by default — this is clipd's core "multi-slot clipboard" behavior.
+    #[serde(default = "default_true_val")]
+    pub multi_slot_enabled: bool,
+
+    /// Extended Excel/developer slots 11-30 via Option+C/V multi-tap.
+    #[serde(default = "default_false")]
+    pub extended_slots_enabled: bool,
+
+    /// Direct global A-Z letter-slot chords (Ctrl+Option+C/V then a letter).
+    /// Letter slots themselves are governed by `letter_slots_enabled`; this only
+    /// gates the keyboard chords. On by default so existing letter-slot users
+    /// keep their workflow; turn it off to free the chords once palette-based
+    /// alias paste lands.
+    #[serde(default = "default_true_val")]
+    pub direct_letter_shortcuts_enabled: bool,
+
+    /// Lighter letter-slot save: double-tap Cmd+C then a letter saves to that
+    /// letter slot (single Cmd+C is untouched, so normal copy isn't hampered).
+    #[serde(default = "default_true_val")]
+    pub quick_letter_slots_enabled: bool,
+
+    /// Secondary alias system: the memory palette lists letter slots as @A rows
+    /// so you can recall a letter slot by typing it — no chord.
+    #[serde(default = "default_false")]
+    pub palette_aliases_enabled: bool,
+
+    /// Batch-drain (sequence) paste: Cmd+Option+V pastes collected slots in order.
+    #[serde(default = "default_true_val")]
+    pub batch_drain_enabled: bool,
+
+    /// Warn in the GUI before assigning a conflicting/risky shortcut.
+    #[serde(default = "default_true_val")]
+    pub warn_conflicting_shortcuts: bool,
 }
 
 fn default_false() -> bool {
@@ -188,13 +301,23 @@ impl Default for PasteTransformSettings {
         Self {
             enabled: false,
             smart_mode: true,
-            active_transforms: vec![
-                TransformKind::TrimWhitespace,
-                TransformKind::PrettyJson,
-            ],
+            active_transforms: vec![TransformKind::TrimWhitespace, TransformKind::PrettyJson],
             default_ai_prompt: String::new(),
             onboarding_seen: false,
             hud_enabled: true,
+            copy_multi_tap_restore: true,
+            letter_slots_enabled: true,
+            slot_input_mode: SlotInputMode::default(),
+            remember_clipboard: true,
+            palette_enabled: true,
+            palette_trigger: PaletteTrigger::default(),
+            multi_slot_enabled: true,
+            extended_slots_enabled: false,
+            direct_letter_shortcuts_enabled: true,
+            quick_letter_slots_enabled: true,
+            palette_aliases_enabled: false,
+            batch_drain_enabled: true,
+            warn_conflicting_shortcuts: true,
         }
     }
 }
@@ -354,11 +477,7 @@ fn unique_lines(input: &str) -> String {
 }
 
 fn reverse_lines(input: &str) -> String {
-    input
-        .lines()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
+    input.lines().rev().collect::<Vec<_>>().join("\n")
 }
 
 fn trim_whitespace(input: &str) -> String {
@@ -395,9 +514,7 @@ fn remove_line_numbers(input: &str) -> String {
         .lines()
         .map(|line| {
             let trimmed = line.trim_start();
-            let digit_end = trimmed
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(0);
+            let digit_end = trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
             if digit_end > 0 {
                 let rest = &trimmed[digit_end..];
                 for sep in ["│ ", "| ", ". ", ": ", ") "] {

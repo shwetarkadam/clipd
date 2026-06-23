@@ -161,7 +161,11 @@ pub fn search_embeddings(
         .filter(|r| r.score >= min_score)
         .collect();
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.truncate(max_results);
     results
 }
@@ -197,17 +201,15 @@ fn embedding_url_from_config(config: &TransformConfig) -> String {
     } else {
         format!(
             "{}/embeddings",
-            base.trim_end_matches('/').trim_end_matches("/chat/completions")
+            base.trim_end_matches('/')
+                .trim_end_matches("/chat/completions")
         )
     }
 }
 
 /// Check if embedding API is available (API key configured).
 pub fn is_embedding_available(config: &TransformConfig) -> bool {
-    config
-        .api_key
-        .as_deref()
-        .map_or(false, |k| !k.is_empty())
+    config.api_key.as_deref().map_or(false, |k| !k.is_empty())
 }
 
 #[cfg(test)]

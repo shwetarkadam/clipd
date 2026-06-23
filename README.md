@@ -94,6 +94,21 @@ Normal clipboard:         clipd:
 
 clipd supports two hotkey styles — pick whichever feels natural:
 
+**Excel / developer mode:**
+
+Enable this in **Paste Settings → Slot Input Mode**.
+
+| Action | Hotkey |
+|--------|--------|
+| Copy to slots 1–9 | `Cmd+C` × N |
+| Paste slot 1 | `Cmd+V` |
+| Paste from slots 2–9 | `Cmd+V` × N |
+| Copy to slots 11–30 | `Option+C` × N |
+| Paste from slots 11–30 | `Option+V` × N |
+| Paste next queued slot | `Cmd+Option+V` |
+
+The HUD shows the active slot bank while tapping, so you can stop when the target slot is highlighted.
+
 **Option A — Cmd multi-tap:**
 
 | Action | Hotkey |

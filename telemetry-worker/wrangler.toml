@@ -4,6 +4,11 @@ compatibility_date = "2024-01-01"
 
 # Create a KV namespace in Cloudflare Dashboard → Workers & Pages → KV Namespaces
 # Then paste the namespace ID below and uncomment the line.
-# kv_namespaces = [
-#   { binding = "PING_COUNT", id = "YOUR_KV_NAMESPACE_ID" }
-# ]
+kv_namespaces = [
+  { binding = "PING_COUNT", id = "b4ce5b39f6c04df181d54f44e268f6f8" }
+]
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
+# GET /ping?v=0.1.0&os=macos&arch=arm64   → increment counter, return count
+# GET /count?v=0.1.0&os=macos&arch=arm64  → read count without incrementing
+# GET /stats                              → aggregated stats as JSON

@@ -143,10 +143,7 @@ pub fn suggest_smart_transform(
 
     if let Some(app) = dest_app {
         let lower = app.to_lowercase();
-        if lower.contains("slack")
-            || lower.contains("discord")
-            || lower.contains("teams")
-        {
+        if lower.contains("slack") || lower.contains("discord") || lower.contains("teams") {
             if content.contains('<') && content.contains('>') {
                 suggestions.push(TransformKind::StripHtml);
             }
