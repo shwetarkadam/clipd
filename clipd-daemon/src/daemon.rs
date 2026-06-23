@@ -730,7 +730,6 @@ pub fn run_daemon_with_stop(
         use std::time::Duration;
         let receiver = GlobalHotKeyEvent::receiver();
         let hotkey_slot_mgr = slot_manager.clone();
-        let persist_tx = clip_tx.clone();
         let transform_config = load_transform_config();
         let paste_transform = load_paste_transform_settings();
         loop {
