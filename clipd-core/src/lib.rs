@@ -7,10 +7,12 @@ pub mod privacy;
 pub mod semantic;
 pub mod session;
 pub mod slots;
+pub mod snippets;
 pub mod store;
 pub mod telemetry;
 pub mod theme;
 pub mod transform;
+pub mod vault;
 pub mod watcher;
 
 pub use collections::{
@@ -27,19 +29,22 @@ pub use paste_rules::{
     PasteRulesConfig,
 };
 pub use privacy::{
-    detect_sensitive, is_excluded_app, load_privacy_config, save_privacy_config, should_skip_clip,
-    PrivacyConfig, SensitiveKind, SensitiveMatch,
+    detect_sensitive, is_excluded_app, load_privacy_config, looks_like_password,
+    save_privacy_config, should_skip_clip, PrivacyConfig, SensitiveKind, SensitiveMatch,
 };
 pub use semantic::{SemanticResult, TfIdfIndex};
 pub use session::{compute_sessions, Session, SessionConfig};
 pub use slots::{SlotManager, MAX_CLIP_SLOT};
+pub use snippets::Snippet;
 pub use store::ClipStore;
 pub use theme::{load_theme, save_theme, Rgb, Theme, ThemeColors};
 pub use transform::{
-    all_transforms, apply_transform, load_paste_transform_settings, load_transform_config,
-    paste_transforms, save_paste_transform_settings, save_transform_config, PaletteTrigger,
-    PasteTransformSettings, SlotInputMode, TransformConfig, TransformKind,
+    all_transforms, apply_transform, load_last_active_app, load_paste_transform_settings,
+    load_transform_config, paste_transforms, save_last_active_app, save_paste_transform_settings,
+    save_transform_config, OpenGuiHotkey, PaletteTrigger, PasteTransformSettings, SlotInputMode,
+    TransformConfig, TransformKind,
 };
+pub use vault::{available_targets, save_secret, SecretEntry, VaultTarget};
 pub use watcher::{ClipEvent, ClipWatcher};
 
 /// Fire the anonymous telemetry ping (noop if telemetry is disabled or no endpoint is configured).

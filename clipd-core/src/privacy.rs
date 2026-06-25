@@ -50,6 +50,10 @@ pub struct PrivacyConfig {
     pub detect_ssn: bool,
     #[serde(default)]
     pub custom_skip_patterns: Vec<String>,
+    /// When a copied password/secret is detected (and dropped from history),
+    /// offer to save it into a vault (1Password / Bitwarden / Keychain).
+    #[serde(default = "default_true")]
+    pub offer_vault_on_secret: bool,
 }
 
 fn default_true() -> bool {
@@ -75,6 +79,7 @@ impl Default for PrivacyConfig {
             detect_credit_cards: true,
             detect_ssn: true,
             custom_skip_patterns: Vec::new(),
+            offer_vault_on_secret: true,
         }
     }
 }
@@ -109,6 +114,58 @@ pub fn is_excluded_app(app: &str, config: &PrivacyConfig) -> bool {
         .excluded_apps
         .iter()
         .any(|ex| app_lower.contains(&ex.to_lowercase()))
+}
+
+/// Heuristic guess that a clipboard payload is a *bare* password — a single
+/// high-entropy token with no surrounding context. This is intentionally NOT
+/// part of [`detect_sensitive`]: it is fuzzy, so it never drops a clip from
+/// history — it only widens the optional "save to a vault?" offer to catch
+/// generated passwords that have no recognizable prefix.
+///
+/// To keep false positives low it requires the WHOLE clipboard to be one token
+/// (no whitespace), of password-ish length, mixing ≥3 character classes, and it
+/// excludes the common high-entropy non-passwords (hex hashes, UUIDs).
+pub fn looks_like_password(content: &str) -> bool {
+    let t = content.trim();
+    if t.is_empty() || t.chars().any(|c| c.is_whitespace()) {
+        return false;
+    }
+    let len = t.chars().count();
+    if !(10..=64).contains(&len) {
+        return false;
+    }
+    if is_all_hex(t) || is_uuid(t) {
+        return false;
+    }
+    let has_lower = t.chars().any(|c| c.is_ascii_lowercase());
+    let has_upper = t.chars().any(|c| c.is_ascii_uppercase());
+    let has_digit = t.chars().any(|c| c.is_ascii_digit());
+    let has_symbol = t.chars().any(|c| c.is_ascii() && !c.is_ascii_alphanumeric());
+    let classes = [has_lower, has_upper, has_digit, has_symbol]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    // ≥3 of {lower, upper, digit, symbol} → mixed enough to be a generated
+    // password, while plain words, numbers, and slugs stay out.
+    classes >= 3
+}
+
+fn is_all_hex(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_uuid(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    s.chars().enumerate().all(|(i, c)| {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            c == '-'
+        } else {
+            c.is_ascii_hexdigit()
+        }
+    })
 }
 
 pub fn detect_sensitive(content: &str, config: &PrivacyConfig) -> Vec<SensitiveMatch> {
@@ -359,6 +416,30 @@ mod tests {
 
     fn cfg() -> PrivacyConfig {
         PrivacyConfig::default()
+    }
+
+    #[test]
+    fn test_looks_like_password_positives() {
+        assert!(looks_like_password("Tr0ub4dour&3xyz"));
+        assert!(looks_like_password("Hunter2024!Pass"));
+        assert!(looks_like_password("xK9$mPq2vLw8nZ"));
+    }
+
+    #[test]
+    fn test_looks_like_password_negatives() {
+        // Prose / multi-token
+        assert!(!looks_like_password("the quick brown fox"));
+        // Too short
+        assert!(!looks_like_password("ab1!"));
+        // Single class
+        assert!(!looks_like_password("correcthorsebattery"));
+        assert!(!looks_like_password("1234567890123"));
+        // git SHA-1 (all hex)
+        assert!(!looks_like_password("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"));
+        // UUID
+        assert!(!looks_like_password("550e8400-e29b-41d4-a716-446655440000"));
+        // Too long (likely a token/blob, caught by prefix detectors if a key)
+        assert!(!looks_like_password(&"Aa1!".repeat(20)));
     }
 
     #[test]

@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use std::fs::OpenOptions;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -9,8 +9,8 @@ use std::thread::JoinHandle;
 use clipd_core::{load_paste_transform_settings, save_paste_transform_settings};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoop};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, CheckMenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIconBuilder, MouseButtonState, TrayIconEvent};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
 const MENU_ID_START: &str = "start";
 const MENU_ID_STOP: &str = "stop";
@@ -69,6 +69,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_tooltip("clipd ui")
         .with_menu(Box::new(menu))
         .with_icon(make_icon())
+        // Show the gold tile in color (not a monochrome template) so it matches
+        // the clipboard icon in the GUI window header.
+        .with_icon_as_template(false)
         .build()?;
 
     let menu_channel = MenuEvent::receiver();
@@ -80,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     item_stop.set_enabled(true);
 
     // Open main window when not in developer (TUI) mode — matches “GUI + tray” expectation.
-    if !load_tui_mode() {
+    if !load_tui_mode() && std::env::var("CLIPD_NO_AUTO_OPEN_GUI").ok().as_deref() != Some("1") {
         open_gui_search();
     }
 
@@ -243,13 +246,11 @@ fn init_logging() {
         .append(true)
         .open(daemon_log_path())
     {
-        let _ = env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info"),
-        )
-        .format_timestamp(None)
-        .format_target(false)
-        .target(env_logger::Target::Pipe(Box::new(file)))
-        .try_init();
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format_timestamp(None)
+            .format_target(false)
+            .target(env_logger::Target::Pipe(Box::new(file)))
+            .try_init();
     }
 }
 
@@ -398,21 +399,55 @@ fn daemon_log_path() -> PathBuf {
 }
 
 fn make_icon() -> Icon {
-    let width = 16u32;
-    let height = 16u32;
-    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    // Gold rounded tile with a white clipboard.
+    let s = 32u32;
+    let mut rgba = vec![0u8; (s * s * 4) as usize];
+    let set = |x: i32, y: i32, col: (u8, u8, u8, u8), rgba: &mut Vec<u8>| {
+        if (0..s as i32).contains(&x) && (0..s as i32).contains(&y) {
+            let i = ((y as u32 * s + x as u32) * 4) as usize;
+            rgba[i] = col.0;
+            rgba[i + 1] = col.1;
+            rgba[i + 2] = col.2;
+            rgba[i + 3] = col.3;
+        }
+    };
+    let gold = (255u8, 160, 50, 255);
+    let white = (255u8, 255, 255, 255);
 
-    for y in 3..13 {
-        for x in 6..10 {
-            if x == 6 || x == 9 || y == 3 || y == 12 {
-                let idx = ((y * width + x) * 4) as usize;
-                rgba[idx] = 255;
-                rgba[idx + 1] = 255;
-                rgba[idx + 2] = 255;
-                rgba[idx + 3] = 255;
+    let (lo, hi, r) = (3i32, 28i32, 7i32);
+    let outside_corner =
+        |x: i32, y: i32, cx: i32, cy: i32| (x - cx) * (x - cx) + (y - cy) * (y - cy) > r * r;
+    for y in lo..=hi {
+        for x in lo..=hi {
+            let skip = (x < lo + r && y < lo + r && outside_corner(x, y, lo + r, lo + r))
+                || (x > hi - r && y < lo + r && outside_corner(x, y, hi - r, lo + r))
+                || (x < lo + r && y > hi - r && outside_corner(x, y, lo + r, hi - r))
+                || (x > hi - r && y > hi - r && outside_corner(x, y, hi - r, hi - r));
+            if !skip {
+                set(x, y, gold, &mut rgba);
             }
         }
     }
+    for x in 11..=20 {
+        set(x, 10, white, &mut rgba);
+        set(x, 23, white, &mut rgba);
+    }
+    for y in 10..=23 {
+        set(11, y, white, &mut rgba);
+        set(20, y, white, &mut rgba);
+    }
+    for x in 13..=18 {
+        set(x, 7, white, &mut rgba);
+        set(x, 10, white, &mut rgba);
+    }
+    set(13, 8, white, &mut rgba);
+    set(13, 9, white, &mut rgba);
+    set(18, 8, white, &mut rgba);
+    set(18, 9, white, &mut rgba);
+    for x in 13..=18 {
+        set(x, 15, white, &mut rgba);
+        set(x, 19, white, &mut rgba);
+    }
 
-    Icon::from_rgba(rgba, width, height).expect("failed to create tray icon")
+    Icon::from_rgba(rgba, s, s).expect("failed to create tray icon")
 }

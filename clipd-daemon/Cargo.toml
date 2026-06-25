@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 clipd-core = { workspace = true }
 arboard = { workspace = true }
+chrono = { workspace = true }
 global-hotkey = "0.6"
 enigo = "0.2"
 ctrlc = "3"
@@ -15,6 +16,11 @@ env_logger = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rdev = { version = "0.5", features = ["unstable_grab"] }
+
+# Windows: rdev *listen* only (passive — observes keys, never suppresses them),
+# used for the multi-tap copy gesture so a bug can't break typing.
+[target.'cfg(target_os = "windows")'.dependencies]
+rdev = "0.5"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 notify-rust = "4"

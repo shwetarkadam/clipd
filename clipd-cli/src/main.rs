@@ -90,8 +90,60 @@ enum Commands {
         action: CollectionsAction,
     },
 
+    /// Securely save a password to a vault (1Password, Bitwarden, or Keychain)
+    Vault {
+        #[command(subcommand)]
+        action: VaultAction,
+    },
+
+    /// Manage reusable text snippets (recalled by trigger in the search palette)
+    Snippet {
+        #[command(subcommand)]
+        action: SnippetAction,
+    },
+
     /// Check for updates (or update in-place)
     Update,
+}
+
+#[derive(Subcommand)]
+enum SnippetAction {
+    /// Add or update a snippet. Body comes from --body or stdin.
+    Add {
+        /// Short trigger keyword (e.g. "sig")
+        trigger: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// List all snippets
+    List,
+    /// Remove a snippet by trigger
+    Rm { trigger: String },
+}
+
+#[derive(Subcommand)]
+enum VaultAction {
+    /// List which vault backends are usable on this machine
+    Targets,
+    /// Save a password to a vault. Reads the password from stdin if --password is omitted.
+    Save {
+        /// Which vault: 1password | bitwarden | keychain
+        #[arg(long, default_value = "keychain")]
+        to: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        /// The password. If omitted, read from stdin (safer — keeps it out of shell history).
+        #[arg(long)]
+        password: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -199,6 +251,14 @@ fn main() {
             cmd_collections(action);
         }
 
+        Some(Commands::Vault { action }) => {
+            cmd_vault(action);
+        }
+
+        Some(Commands::Snippet { action }) => {
+            cmd_snippet(action);
+        }
+
         Some(Commands::Update) => {
             cmd_update();
         }
@@ -264,6 +324,115 @@ fn ai_on_item(
     match f(&item.content, &cfg) {
         Ok(out) => println!("\n── {} ──\n{}\n", label, out),
         Err(e) => eprintln!("  ❌ {}", e),
+    }
+}
+
+fn cmd_snippet(action: SnippetAction) {
+    use std::io::Read;
+    let store = open_store();
+    match action {
+        SnippetAction::Add {
+            trigger,
+            name,
+            body,
+        } => {
+            let body = match body {
+                Some(b) => b,
+                None => {
+                    let mut buf = String::new();
+                    let _ = std::io::stdin().read_to_string(&mut buf);
+                    buf.trim_end_matches(['\n', '\r']).to_string()
+                }
+            };
+            if body.trim().is_empty() {
+                eprintln!("  ❌ Snippet body is empty (pass --body or pipe via stdin).");
+                std::process::exit(1);
+            }
+            match store.upsert_snippet(trigger.trim(), name.as_deref().unwrap_or("").trim(), &body) {
+                Ok(_) => println!("  ✅ Saved snippet ‘{}’", trigger.trim()),
+                Err(e) => eprintln!("  ❌ {}", e),
+            }
+        }
+        SnippetAction::List => match store.list_snippets() {
+            Ok(s) if s.is_empty() => println!("  ✂️  No snippets yet. Add one: clipd snippet add sig --body \"…\""),
+            Ok(snippets) => {
+                println!("  ✂️  Snippets:");
+                for s in snippets {
+                    println!("     {:<12} {}", s.trigger, s.preview());
+                }
+            }
+            Err(e) => eprintln!("  ❌ {}", e),
+        },
+        SnippetAction::Rm { trigger } => match store.delete_snippet_by_trigger(trigger.trim()) {
+            Ok(true) => println!("  ✅ Removed snippet ‘{}’", trigger.trim()),
+            Ok(false) => println!("  (no snippet with trigger ‘{}’)", trigger.trim()),
+            Err(e) => eprintln!("  ❌ {}", e),
+        },
+    }
+}
+
+fn cmd_vault(action: VaultAction) {
+    use clipd_core::{available_targets, save_secret, SecretEntry, VaultTarget};
+    use std::io::Read;
+
+    match action {
+        VaultAction::Targets => {
+            let available = available_targets();
+            println!("  🔐 Vault backends:");
+            for t in VaultTarget::ALL {
+                let mark = if available.contains(&t) { "✅" } else { "—" };
+                println!("     {} {}", mark, t.label());
+            }
+            if available.is_empty() {
+                println!("\n  No vault CLIs found. Install `op` (1Password) or `bw` (Bitwarden);");
+                println!("  the macOS Keychain works out of the box on macOS.");
+            }
+        }
+        VaultAction::Save {
+            to,
+            title,
+            username,
+            url,
+            notes,
+            password,
+        } => {
+            let target = match VaultTarget::from_id(&to) {
+                Some(t) => t,
+                None => {
+                    eprintln!("  ❌ Unknown vault '{}'. Use: 1password | bitwarden | keychain", to);
+                    std::process::exit(1);
+                }
+            };
+            // Read the password from stdin when not passed as a flag — keeps it
+            // out of shell history and the process table.
+            let password = match password {
+                Some(p) => p,
+                None => {
+                    let mut buf = String::new();
+                    if std::io::stdin().read_to_string(&mut buf).is_err() {
+                        eprintln!("  ❌ Failed to read password from stdin.");
+                        std::process::exit(1);
+                    }
+                    buf.trim_end_matches(['\n', '\r']).to_string()
+                }
+            };
+
+            let entry = SecretEntry {
+                title: title.unwrap_or_default(),
+                username: username.unwrap_or_default(),
+                password,
+                url: url.unwrap_or_default(),
+                notes: notes.unwrap_or_default(),
+            };
+
+            match save_secret(target, &entry) {
+                Ok(msg) => println!("  ✅ {}", msg),
+                Err(e) => {
+                    eprintln!("  ❌ {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 

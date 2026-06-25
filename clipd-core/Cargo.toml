@@ -25,5 +25,9 @@ ureq = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Native macOS Keychain access (no `security` CLI, no terminal prompt, no argv).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2"
+
 [dev-dependencies]
 tempfile = "3"

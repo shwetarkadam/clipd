@@ -197,7 +197,7 @@ jobs:
           $ZipName = "Clipd-windows-x86_64-${Version}"
           $Dir = "target/release/${ZipName}"
           New-Item -ItemType Directory -Path $Dir -Force
-          foreach ($bin in @("clipd.exe", "clipd-ui.exe", "clipd-gui.exe", "clipd-mcp.exe")) {
+          foreach ($bin in @("clipd.exe", "clipd-ui.exe", "clipd-gui.exe", "clipd-overlay.exe", "clipd-mcp.exe")) {
             $src = "target/release/$bin"
             if (Test-Path $src) { Copy-Item $src $Dir }
           }

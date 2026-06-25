@@ -1,4 +1,5 @@
 use crate::collections::{Collection, CollectionItem};
+use crate::snippets::Snippet;
 use crate::embedding::{embedding_from_bytes, embedding_to_bytes, Embedding};
 use crate::models::{ClipEntry, ClipStats, ContentType, SearchFilters};
 use chrono::{DateTime, Utc};
@@ -114,6 +115,14 @@ impl ClipStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_coll_items ON collection_items(collection_id, position);
+
+            CREATE TABLE IF NOT EXISTS snippets (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                trigger     TEXT NOT NULL UNIQUE,
+                name        TEXT NOT NULL DEFAULT '',
+                body        TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
             ",
         )?;
 
@@ -688,6 +697,53 @@ impl ClipStore {
             params![source_app, collection_id],
         )?;
         Ok(())
+    }
+
+    // ── Snippets ──
+
+    /// Create or update a snippet (upsert on its unique trigger).
+    pub fn upsert_snippet(&self, trigger: &str, name: &str, body: &str) -> SqlResult<i64> {
+        self.conn.execute(
+            "INSERT INTO snippets (trigger, name, body, created_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(trigger) DO UPDATE SET name = excluded.name, body = excluded.body",
+            params![trigger, name, body, Utc::now().to_rfc3339()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn row_to_snippet(row: &rusqlite::Row) -> SqlResult<Snippet> {
+        Ok(Snippet {
+            id: row.get(0)?,
+            trigger: row.get(1)?,
+            name: row.get(2)?,
+            body: row.get(3)?,
+            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        })
+    }
+
+    /// All snippets, ordered by trigger.
+    pub fn list_snippets(&self) -> SqlResult<Vec<Snippet>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, trigger, name, body, created_at FROM snippets ORDER BY trigger ASC",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_snippet)?;
+        rows.collect()
+    }
+
+    pub fn delete_snippet(&self, id: i64) -> SqlResult<()> {
+        self.conn
+            .execute("DELETE FROM snippets WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Delete by trigger; returns true if a row was removed.
+    pub fn delete_snippet_by_trigger(&self, trigger: &str) -> SqlResult<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM snippets WHERE trigger = ?1", params![trigger])?;
+        Ok(n > 0)
     }
 }
 

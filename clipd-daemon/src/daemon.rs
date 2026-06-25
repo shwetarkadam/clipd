@@ -6,6 +6,8 @@ use clipd_core::{
     PasteRulesConfig, PasteTransformSettings, SlotManager, TransformConfig, TransformKind,
     MAX_CLIP_SLOT,
 };
+#[cfg(target_os = "macos")]
+use clipd_core::{available_targets, load_privacy_config, save_secret, OpenGuiHotkey, SecretEntry};
 #[cfg(not(target_os = "macos"))]
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 #[cfg(not(target_os = "macos"))]
@@ -15,6 +17,8 @@ use global_hotkey::{
 };
 #[cfg(target_os = "macos")]
 use rdev::{grab, Event, EventType, Key as RKey};
+#[cfg(target_os = "windows")]
+use rdev::{listen, Event, EventType, Key as RKey};
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
 use std::process::Stdio;
@@ -199,6 +203,13 @@ pub fn run_daemon_with_stop(
                             Err(e) => log::error!("Failed to save clip: {}", e),
                         }
                     }
+                    ClipEvent::SensitiveClip { kinds, stored } => {
+                        log::info!("🔐 Password detected ({}) — offering vault save", kinds);
+                        #[cfg(target_os = "macos")]
+                        offer_vault_save(&kinds, stored);
+                        #[cfg(not(target_os = "macos"))]
+                        let _ = stored;
+                    }
                 }
             }
         })?;
@@ -239,6 +250,68 @@ pub fn run_daemon_with_stop(
                 registered_hotkeys.push((paste_hk, FinalAction::PasteFromSlot(slot_num)));
             }
         }
+        // Windows letter slots A–Z (modifier chords so the letter isn't typed):
+        //   copy  → Win+Ctrl+<letter>      paste → Win+Ctrl+Alt+<letter>
+        // Mirrors the numeric scheme. Some combos may be reserved by Windows and
+        // simply won't register (logged) — the rest still work.
+        #[cfg(target_os = "windows")]
+        {
+            let letter_codes = [
+                Code::KeyA,
+                Code::KeyB,
+                Code::KeyC,
+                Code::KeyD,
+                Code::KeyE,
+                Code::KeyF,
+                Code::KeyG,
+                Code::KeyH,
+                Code::KeyI,
+                Code::KeyJ,
+                Code::KeyK,
+                Code::KeyL,
+                Code::KeyM,
+                Code::KeyN,
+                Code::KeyO,
+                Code::KeyP,
+                Code::KeyQ,
+                Code::KeyR,
+                Code::KeyS,
+                Code::KeyT,
+                Code::KeyU,
+                Code::KeyV,
+                Code::KeyW,
+                Code::KeyX,
+                Code::KeyY,
+                Code::KeyZ,
+            ];
+            for (i, code) in letter_codes.iter().enumerate() {
+                let slot = 31u8 + i as u8; // letter slots A=31 … Z=56
+                let copy_hk = HotKey::new(Some(Modifiers::SUPER | Modifiers::CONTROL), *code);
+                if let Err(e) = hotkey_manager.register(copy_hk) {
+                    log::warn!(
+                        "Letter-slot copy {:?} not registered (conflict?): {}",
+                        code,
+                        e
+                    );
+                } else {
+                    registered_hotkeys.push((copy_hk, FinalAction::CopyToSlot(slot)));
+                }
+                let paste_hk = HotKey::new(
+                    Some(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT),
+                    *code,
+                );
+                if let Err(e) = hotkey_manager.register(paste_hk) {
+                    log::warn!(
+                        "Letter-slot paste {:?} not registered (conflict?): {}",
+                        code,
+                        e
+                    );
+                } else {
+                    registered_hotkeys.push((paste_hk, FinalAction::PasteFromSlot(slot)));
+                }
+            }
+        }
+
         let smart_hk = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
         if let Err(e) = hotkey_manager.register(smart_hk) {
             log::warn!("Failed to register Ctrl+Shift+V: {}", e);
@@ -309,12 +382,14 @@ pub fn run_daemon_with_stop(
         println!("  🪄 Starting rdev hotkey listener...");
         let (hotkey_tx, hotkey_rx) = mpsc::channel::<HotkeyTick>();
         let stop_listener = stop.clone();
+        let stop_on_hotkey_error = stop.clone();
 
         std::thread::Builder::new()
             .name("clipd-hotkey-listener".into())
             .spawn(move || {
                 if let Err(e) = start_macos_hotkey_listener(hotkey_tx, stop_listener) {
                     log::error!("Hotkey listener failed: {}", e);
+                    stop_on_hotkey_error.store(true, Ordering::Relaxed);
                 }
             })?;
 
@@ -485,11 +560,11 @@ pub fn run_daemon_with_stop(
                         execute_smart_paste(&suppress, &transform_config, &paste_transform);
                     }
                     HotkeyTick::SlotPicker => {
-                        // The memory palette recalls from full history; the old
-                        // slot picker only lists current slots. Honor the toggle.
+                        // The palette is the GUI's real type-to-filter search
+                        // (recall by content or "from <app>"), not a slot list.
                         #[cfg(target_os = "macos")]
                         if paste_transform.palette_enabled {
-                            open_memory_palette(&hotkey_slot_mgr, &suppress);
+                            open_gui();
                         } else {
                             open_slot_picker(&hotkey_slot_mgr, &suppress);
                         }
@@ -728,9 +803,15 @@ pub fn run_daemon_with_stop(
     #[cfg(not(target_os = "macos"))]
     {
         use std::time::Duration;
+        // Windows: add the passive multi-tap copy gesture (Ctrl+C ×N → slot N)
+        // alongside the fixed-chord hotkeys.
+        #[cfg(target_os = "windows")]
+        spawn_ctrl_c_multitap(slot_manager.clone(), persist_tx.clone());
+
         let receiver = GlobalHotKeyEvent::receiver();
         let hotkey_slot_mgr = slot_manager.clone();
-        let persist_tx = clip_tx.clone();
+        // `persist_tx` (cloned above the watcher move) is used only by the macOS
+        // event loop; reuse it here so the non-macOS loop can persist slot copies.
         let transform_config = load_transform_config();
         let paste_transform = load_paste_transform_settings();
         loop {
@@ -839,6 +920,111 @@ fn restore_clipboard_to_slot(
         suppress.store(false, Ordering::SeqCst);
         log::debug!("Clipboard restored to slot {} content", slot);
     }
+}
+
+/// Windows multi-tap copy: passively *listen* (never suppress) for Ctrl+C and
+/// route `Ctrl+C ×N` (within TAP_WINDOW) to numeric slot N — the macOS Cmd+C ×N
+/// gesture. Letter slots use modifier chords instead (see hotkey registration),
+/// because a bare letter can't be intercepted without suppressing it (which
+/// would type it into your document). Listening only — can't block typing.
+#[cfg(target_os = "windows")]
+fn spawn_ctrl_c_multitap(slot_mgr: SlotManager, persist_tx: mpsc::SyncSender<ClipEvent>) {
+    std::thread::spawn(move || {
+        let mut ctrl_down = false;
+        let mut alt_down = false;
+        let mut meta_down = false;
+        let mut last_tap: Option<std::time::Instant> = None;
+        let mut tap_count: u8 = 0;
+        let callback = move |event: Event| match event.event_type {
+            EventType::KeyPress(RKey::ControlLeft) | EventType::KeyPress(RKey::ControlRight) => {
+                ctrl_down = true;
+            }
+            EventType::KeyRelease(RKey::ControlLeft)
+            | EventType::KeyRelease(RKey::ControlRight) => {
+                ctrl_down = false;
+            }
+            EventType::KeyPress(RKey::Alt) | EventType::KeyPress(RKey::AltGr) => alt_down = true,
+            EventType::KeyRelease(RKey::Alt) | EventType::KeyRelease(RKey::AltGr) => {
+                alt_down = false
+            }
+            EventType::KeyPress(RKey::MetaLeft) | EventType::KeyPress(RKey::MetaRight) => {
+                meta_down = true
+            }
+            EventType::KeyRelease(RKey::MetaLeft) | EventType::KeyRelease(RKey::MetaRight) => {
+                meta_down = false
+            }
+            // Plain Ctrl+C (no Alt/Meta) — count taps, save to numeric slot N.
+            EventType::KeyPress(RKey::KeyC) if ctrl_down && !alt_down && !meta_down => {
+                let now = std::time::Instant::now();
+                tap_count = match last_tap {
+                    Some(prev) if now.duration_since(prev) < TAP_WINDOW => {
+                        tap_count.saturating_add(1)
+                    }
+                    _ => 1,
+                };
+                last_tap = Some(now);
+                // Only a deliberate multi-tap (2+) saves to a slot. A single
+                // Ctrl+C is a normal copy (already captured by history) — no
+                // thread, no clipboard read, no toast on every copy.
+                if tap_count >= 2 {
+                    let slot = tap_count.min(MAX_CLIP_SLOT);
+                    let mgr = slot_mgr.clone();
+                    let tx = persist_tx.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(60));
+                        execute_copy(slot, &mgr, &tx);
+                        notify_slot_saved(slot);
+                    });
+                }
+            }
+            _ => {}
+        };
+        if let Err(e) = listen(callback) {
+            log::warn!("Windows multi-tap listener stopped: {:?}", e);
+        }
+    });
+}
+
+/// Slot-save feedback on Windows: prefer clipd's own styled corner overlay
+/// (matches the macOS HUD); fall back to a system toast if the overlay binary
+/// isn't alongside the daemon.
+#[cfg(target_os = "windows")]
+fn notify_slot_saved(slot: u8) {
+    let label = if (31..=56).contains(&slot) {
+        format!("slot {}", (b'A' + (slot - 31)) as char)
+    } else {
+        format!("slot {}", slot)
+    };
+    let msg = format!("Saved to {}", label);
+    if !spawn_overlay(&msg) {
+        let _ = notify_rust::Notification::new()
+            .summary("clipd")
+            .body(&format!("📋 {}", msg))
+            .timeout(notify_rust::Timeout::Milliseconds(1200))
+            .show();
+    }
+}
+
+/// Spawn the `clipd-overlay` toast window next to the daemon binary. Returns
+/// false if it isn't found, so the caller can fall back to an OS toast.
+#[cfg(target_os = "windows")]
+fn spawn_overlay(msg: &str) -> bool {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in ["clipd-overlay.exe", "clipd-overlay"] {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    return std::process::Command::new(&candidate)
+                        .arg(msg)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .is_ok();
+                }
+            }
+        }
+    }
+    false
 }
 
 fn execute_copy(slot: u8, mgr: &SlotManager, persist_tx: &mpsc::SyncSender<ClipEvent>) {
@@ -1453,7 +1639,11 @@ fn show_slot_content_notification(action: &str, slot: u8, content: &str) {
         "STYLE\ttoast".to_string(),
         format!("BADGE\t{}", slot_badge(slot)),
         format!("TITLE\t{}", toast_title(action, slot)),
-        format!("PREVIEW\t{}\t{}", content_icon(content), truncate(content, 52)),
+        format!(
+            "PREVIEW\t{}\t{}",
+            content_icon(content),
+            truncate(content, 52)
+        ),
         format!("HINT\t{}", retrieve_hint(slot)),
     ];
     show_hud(&lines.join("\n"));
@@ -1574,7 +1764,10 @@ fn content_icon(content: &str) -> &'static str {
         || lower.starts_with("$ ")
     {
         "code"
-    } else if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || "+-() .".contains(c)) {
+    } else if !t.is_empty()
+        && t.chars()
+            .all(|c| c.is_ascii_digit() || "+-() .".contains(c))
+    {
         "number"
     } else {
         "text"
@@ -1649,7 +1842,11 @@ fn show_collect_hud(mgr: &SlotManager, active_slot: u8, just_started: bool) {
     let title = if just_started || count == 0 {
         "Collecting — just press ⌘C".to_string()
     } else {
-        format!("Collecting · {} item{}", count, if count == 1 { "" } else { "s" })
+        format!(
+            "Collecting · {} item{}",
+            count,
+            if count == 1 { "" } else { "s" }
+        )
     };
 
     let mut lines = vec![
@@ -1825,8 +2022,125 @@ end tell"#,
     }
 }
 
+/// A password was just copied and dropped from history. Offer to file it into a
+/// vault. Runs the modal off the persist thread so clip persistence isn't blocked.
+#[cfg(target_os = "macos")]
+fn offer_vault_save(kinds: &str, stored: bool) {
+    let config = load_privacy_config();
+    if !config.offer_vault_on_secret {
+        return;
+    }
+    let targets = available_targets();
+    if targets.is_empty() {
+        log::info!(
+            "🔐 Password detected but no vault backend available (install `op`/`bw`; Keychain is built in on macOS)"
+        );
+        return;
+    }
+    let _ = stored;
+    // Prefer the native system store (Keychain on macOS) — instant, no prompt,
+    // no terminal. No centered modal: we save automatically and confirm with a
+    // passive top-right notification banner.
+    let target = targets
+        .iter()
+        .copied()
+        .find(|t| t.id() == "keychain")
+        .unwrap_or(targets[0]);
+    let kinds = kinds.to_string();
+    std::thread::spawn(move || {
+        // Re-read the secret from the live clipboard at save time — it was never
+        // carried through the event channel.
+        let password = match Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(p) if !p.trim().is_empty() => p,
+            _ => return,
+        };
+        // A unique, readable title per save so distinct passwords become
+        // distinct Keychain entries instead of overwriting one another.
+        let stamp = chrono::Local::now().format("%b %d %H:%M:%S");
+        let entry = SecretEntry {
+            title: format!("clipd password — {}", stamp),
+            username: String::new(),
+            password,
+            url: String::new(),
+            notes: format!("Saved from clipd ({})", kinds),
+        };
+        match save_secret(target, &entry) {
+            Ok(_) => {
+                log::info!("🔐 Auto-saved detected password to {}", target.label());
+                // clipd's own corner HUD — reliable from the daemon, unlike
+                // osascript notifications. Also fire a system banner as a backup.
+                show_hud(&format!(
+                    "STYLE\ttoast\nBADGE\t🔐\nTITLE\tPassword saved\nHINT\t{}",
+                    target.label()
+                ));
+                notify("clipd", &format!("🔐 Password saved to {}", target.label()));
+            }
+            Err(e) => {
+                log::warn!("🔐 Vault save failed: {}", e);
+                show_hud(
+                    "STYLE\ttoast\nBADGE\t⚠️\nTITLE\tCouldn't save password\nHINT\tsee clipd logs",
+                );
+                notify("clipd — couldn't save password", &e);
+            }
+        }
+    });
+}
+
+/// Non-modal macOS notification banner.
+#[cfg(target_os = "macos")]
+fn notify(title: &str, body: &str) {
+    let body = body.replace('"', "'");
+    let title = title.replace('"', "'");
+    let script = format!(r#"display notification "{}" with title "{}""#, body, title);
+    let _ = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&script)
+        .output();
+}
+
+/// Bring an already-running clipd window to the front. Tries the names the
+/// eframe app may register under and never errors if none match (background
+/// daemon processes aren't in the System Events list, so this can't hit them).
+/// Returns true if a window was focused.
+#[cfg(target_os = "macos")]
+fn focus_existing_gui() -> bool {
+    let script = r#"tell application "System Events"
+  repeat with n in {"clipd-gui", "Clipd", "clipd"}
+    set matches to (every process whose name is (n as string))
+    if (count of matches) > 0 then
+      set frontmost of (item 1 of matches) to true
+      return "ok"
+    end if
+  end repeat
+end tell
+return """#;
+    std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "ok")
+        .unwrap_or(false)
+}
+
 fn open_gui() {
     log::info!("🖥️  Opening GUI...");
+
+    // Remember which app the user was in (before clipd steals focus) so the GUI
+    // can hand focus back after a copy.
+    #[cfg(target_os = "macos")]
+    if let Some(app) = get_frontmost_app_name() {
+        if app != "clipd-gui" && app != "Clipd" && app != "clipd" {
+            clipd_core::save_last_active_app(&app);
+        }
+    }
+
+    // If the GUI is already running, bring its window to the front instead of
+    // spawning a second instance.
+    #[cfg(target_os = "macos")]
+    if focus_existing_gui() {
+        return;
+    }
+
     // Look for clipd-gui next to the current binary
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -1991,166 +2305,6 @@ return slot_num"#,
     }
 
     suppress.store(false, Ordering::SeqCst);
-}
-
-/// The memory palette: a fast "type → Enter → paste the exact clip" overlay
-/// over the full clipboard history (not just current slots). Type to filter,
-/// Enter pastes the verbatim clip at the cursor. This replaces the slot picker
-/// when the palette is enabled.
-#[cfg(target_os = "macos")]
-fn open_memory_palette(mgr: &SlotManager, suppress: &Arc<AtomicBool>) {
-    let store = match ClipStore::new(&ClipStore::default_path()) {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("Memory palette: cannot open store: {}", e);
-            return;
-        }
-    };
-    let clips = store.get_recent(150).unwrap_or_default();
-    if clips.is_empty() {
-        let script = r#"display dialog "No clips yet — copy something with Cmd+C first." buttons {"OK"} with title "clipd memory palette""#;
-        let _ = std::process::Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(script)
-            .output();
-        return;
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    // Each row is "<token>: <label>". osascript filters as you type; the leading
-    // token maps the selection back to the exact source. History rows use the
-    // clip id (a number); alias rows use "@<LETTER>" so typing "@a" jumps to
-    // letter slot A without single-letter search noise.
-    let mut items: Vec<String> = Vec::new();
-
-    // Secondary alias system: letter slots A-Z, listed first so a typed @letter
-    // surfaces them at the top.
-    if palette_aliases_enabled() {
-        for slot in 31u8..=MAX_CLIP_SLOT {
-            if let Ok(Some(content)) = mgr.get_slot(slot) {
-                if !content.trim().is_empty() {
-                    let letter = (b'A' + (slot - 31)) as char;
-                    let preview = truncate(&content.replace('"', "'"), 52);
-                    let label =
-                        format!("@{}: ⭐ {}  —  alias", letter, preview).replace('"', "'");
-                    items.push(format!("\"{}\"", label));
-                }
-            }
-        }
-    }
-
-    items.extend(clips.iter().map(|c| {
-        let preview = truncate(&c.preview.replace('"', "'"), 56);
-        let when = relative_time(now, c.timestamp.timestamp());
-        let meta = match c.source_app.as_deref().filter(|s| !s.trim().is_empty()) {
-            Some(app) => format!("{} · {}", app, when),
-            None => when,
-        };
-        let label = format!("{}: {} {}  —  {}", c.id, c.content_type.icon(), preview, meta)
-            .replace('"', "'");
-        format!("\"{}\"", label)
-    }));
-
-    let script = format!(
-        r#"set chosen to choose from list {{{}}} with prompt "🔎 clipd — type to recall, Enter to paste:" with title "clipd memory palette" OK button name "Paste" cancel button name "Cancel"
-if chosen is false then
-  return ""
-end if
-set AppleScript's text item delimiters to ": "
-set clip_id to text item 1 of (item 1 of chosen)
-return clip_id"#,
-        items.join(", ")
-    );
-
-    let output = match std::process::Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
-            log::warn!("Memory palette osascript failed: {}", e);
-            return;
-        }
-    };
-
-    let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if chosen.is_empty() {
-        log::info!("🔎 Memory palette cancelled");
-        return;
-    }
-
-    // An "@<LETTER>" token is an alias row → paste from that letter slot.
-    let content = if let Some(letter) = chosen.strip_prefix('@').and_then(|s| s.chars().next()) {
-        let up = letter.to_ascii_uppercase();
-        if !up.is_ascii_uppercase() {
-            log::warn!("Memory palette: bad alias '{}'", chosen);
-            return;
-        }
-        let slot = 31 + (up as u8 - b'A');
-        match mgr.get_slot(slot) {
-            Ok(Some(c)) if !c.trim().is_empty() => {
-                log::info!("🔎 Memory palette: pasting alias {} (slot {})", up, slot);
-                c
-            }
-            _ => {
-                log::warn!("Memory palette: alias {} is empty", up);
-                return;
-            }
-        }
-    } else {
-        let id: i64 = match chosen.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                log::warn!("Memory palette: could not parse selection '{}'", chosen);
-                return;
-            }
-        };
-        match clips.iter().find(|c| c.id == id) {
-            Some(c) => {
-                log::info!("🔎 Memory palette: pasting clip #{}", id);
-                c.content.clone()
-            }
-            None => {
-                log::warn!("Memory palette: clip {} not in loaded set", id);
-                return;
-            }
-        }
-    };
-
-    suppress.store(true, Ordering::SeqCst);
-    if let Ok(mut cb) = Clipboard::new() {
-        let original = cb.get_text().ok();
-        if cb.set_text(&content).is_ok() {
-            std::thread::sleep(Duration::from_millis(50));
-            simulate_paste();
-            std::thread::sleep(Duration::from_millis(200));
-            // Restore the prior clipboard so a one-off recall doesn't clobber it.
-            if let Some(ref orig) = original {
-                let _ = cb.set_text(orig);
-            }
-        }
-    }
-    suppress.store(false, Ordering::SeqCst);
-}
-
-/// Human-friendly "2h ago" style label from two unix-second timestamps.
-#[cfg(target_os = "macos")]
-fn relative_time(now_secs: i64, then_secs: i64) -> String {
-    let s = (now_secs - then_secs).max(0);
-    if s < 45 {
-        "just now".to_string()
-    } else if s < 3600 {
-        format!("{}m ago", s / 60)
-    } else if s < 86_400 {
-        format!("{}h ago", s / 3600)
-    } else {
-        format!("{}d ago", s / 86_400)
-    }
 }
 
 // ── Helpers ──
@@ -2584,14 +2738,25 @@ fn start_macos_hotkey_listener(
                     return Some(event);
                 }
 
-                // Ctrl+G → open GUI
-                if is_ctrl_only(&s.pressed_mods) && key == RKey::KeyG {
-                    if !s.latch_ctrl_g {
+                // Open GUI — configurable chord, all on the G key. Only read the
+                // setting when G is pressed with a modifier (never on bare typing).
+                if key == RKey::KeyG
+                    && (has_cmd(&s.pressed_mods) || has_ctrl(&s.pressed_mods))
+                    && !s.latch_ctrl_g
+                {
+                    let hk = load_paste_transform_settings().open_gui_hotkey;
+                    let matched = match hk {
+                        OpenGuiHotkey::CtrlG => is_ctrl_only(&s.pressed_mods),
+                        OpenGuiHotkey::CmdShiftG => is_cmd_shift(&s.pressed_mods),
+                        OpenGuiHotkey::CtrlShiftG => is_ctrl_shift(&s.pressed_mods),
+                        OpenGuiHotkey::Disabled => false,
+                    };
+                    if matched {
                         s.latch_ctrl_g = true;
-                        log::info!("⌨️  Ctrl+G → open GUI");
+                        log::info!("⌨️  {} → open GUI", hk.label());
                         let _ = tx.send(HotkeyTick::OpenGui);
+                        return Some(event);
                     }
-                    return Some(event);
                 }
 
                 // Cmd+Ctrl+C → treat as Ctrl+C (user transitioning from Cmd+C to save slot)
@@ -2941,12 +3106,6 @@ fn quick_letter_slots_enabled() -> bool {
 fn letter_capture_active() -> bool {
     let s = load_paste_transform_settings();
     s.letter_slots_enabled && (s.direct_letter_shortcuts_enabled || s.quick_letter_slots_enabled)
-}
-
-/// Secondary alias system: surface letter slots in the memory palette as @A rows.
-#[cfg(target_os = "macos")]
-fn palette_aliases_enabled() -> bool {
-    load_paste_transform_settings().palette_aliases_enabled
 }
 
 fn upper_slot_for_taps(taps: u8) -> u8 {

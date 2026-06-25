@@ -1,5 +1,5 @@
 use crate::models::ClipEntry;
-use crate::privacy::{load_privacy_config, should_skip_clip};
+use crate::privacy::{detect_sensitive, is_excluded_app, load_privacy_config, looks_like_password};
 use crate::slots::SlotManager;
 use sha2::{Digest, Sha256};
 use std::sync::mpsc;
@@ -10,6 +10,12 @@ use std::time::Duration;
 pub enum ClipEvent {
     /// New content detected on the clipboard.
     NewClip(ClipEntry),
+    /// A password/secret was detected, so the daemon can offer to save it to a
+    /// vault. Carries only the human label(s) — never the secret itself; it is
+    /// re-read from the live clipboard at save time. `stored` is false for
+    /// confidently-detected secrets (dropped from history) and true for fuzzy
+    /// heuristic matches (kept in history, just offered).
+    SensitiveClip { kinds: String, stored: bool },
 }
 
 /// Watches the OS clipboard for changes by polling.
@@ -95,13 +101,42 @@ impl ClipWatcher {
 
                         let source_app = Self::get_frontmost_app();
 
-                        if let Some(reason) =
-                            should_skip_clip(&text, source_app.as_deref(), &privacy_config)
-                        {
-                            log::info!("🔒 Clip skipped ({})", reason);
+                        // Copies made from a password manager are already vaulted
+                        // — drop silently, nothing to offer.
+                        if privacy_config.enabled {
+                            if let Some(app) = source_app.as_deref() {
+                                if is_excluded_app(app, &privacy_config) {
+                                    log::info!("🔒 Clip skipped (excluded app: {})", app);
+                                    std::thread::sleep(self.poll_interval);
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // A confidently-detected secret is never stored in
+                        // history; we surface it so the user can vault it.
+                        let matches = detect_sensitive(&text, &privacy_config);
+                        if !matches.is_empty() {
+                            let kinds = matches
+                                .iter()
+                                .map(|m| m.kind.label())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            log::info!("🔒 Sensitive clip not stored ({})", kinds);
+                            let _ = sender.send(ClipEvent::SensitiveClip {
+                                kinds,
+                                stored: false,
+                            });
                             std::thread::sleep(self.poll_interval);
                             continue;
                         }
+
+                        // A fuzzy "looks like a generated password" guess does
+                        // NOT remove the clip from history (avoids losing tokens
+                        // on a false positive) — it only adds a vault offer.
+                        let heuristic_password = privacy_config.enabled
+                            && privacy_config.offer_vault_on_secret
+                            && looks_like_password(&text);
 
                         // Look up which slot this content is in (if any).
                         let slot = slot_manager.as_ref().and_then(|mgr| mgr.find_slot(&text));
@@ -118,6 +153,14 @@ impl ClipWatcher {
                         if sender.send(ClipEvent::NewClip(entry)).is_err() {
                             log::error!("Clip event channel closed, stopping watcher");
                             break;
+                        }
+
+                        if heuristic_password {
+                            log::info!("🔐 Clip looks like a password — offering to vault it");
+                            let _ = sender.send(ClipEvent::SensitiveClip {
+                                kinds: "possible password".to_string(),
+                                stored: true,
+                            });
                         }
                     }
                 }

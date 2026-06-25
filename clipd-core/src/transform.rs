@@ -207,6 +207,40 @@ impl PaletteTrigger {
     }
 }
 
+/// Global hotkey that opens the clipd window. All options use the `G` key with
+/// different modifiers so they never collide with the letter-slot chords.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenGuiHotkey {
+    CtrlG,
+    CmdShiftG,
+    CtrlShiftG,
+    Disabled,
+}
+
+impl Default for OpenGuiHotkey {
+    fn default() -> Self {
+        Self::CtrlG
+    }
+}
+
+impl OpenGuiHotkey {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::CtrlG => "Ctrl+G",
+            Self::CmdShiftG => "Cmd+Shift+G",
+            Self::CtrlShiftG => "Ctrl+Shift+G",
+            Self::Disabled => "Disabled",
+        }
+    }
+
+    pub const ALL: [OpenGuiHotkey; 4] = [
+        Self::CtrlG,
+        Self::CmdShiftG,
+        Self::CtrlShiftG,
+        Self::Disabled,
+    ];
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PasteTransformSettings {
     #[serde(default = "default_false")]
@@ -292,6 +326,15 @@ pub struct PasteTransformSettings {
     /// Warn in the GUI before assigning a conflicting/risky shortcut.
     #[serde(default = "default_true_val")]
     pub warn_conflicting_shortcuts: bool,
+
+    /// Global hotkey that opens the clipd window (default Ctrl+G).
+    #[serde(default)]
+    pub open_gui_hotkey: OpenGuiHotkey,
+
+    /// After copying a clip from the GUI, return focus to the app you were in
+    /// (the one focused when you summoned clipd), so you can paste right away.
+    #[serde(default = "default_true_val")]
+    pub return_focus_after_copy: bool,
 }
 
 fn default_false() -> bool {
@@ -324,6 +367,8 @@ impl Default for PasteTransformSettings {
             batch_drain_enabled: true,
             copy_on_select: true,
             warn_conflicting_shortcuts: true,
+            open_gui_hotkey: OpenGuiHotkey::default(),
+            return_focus_after_copy: true,
         }
     }
 }
@@ -350,6 +395,30 @@ pub fn save_paste_transform_settings(settings: &PasteTransformSettings) {
     if let Ok(json) = serde_json::to_string_pretty(settings) {
         let _ = std::fs::write(path, json);
     }
+}
+
+fn last_active_app_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("clipd")
+        .join("last_active_app.txt")
+}
+
+/// Record the app that was frontmost when clipd was summoned, so the GUI can
+/// hand focus back to it after a copy.
+pub fn save_last_active_app(name: &str) {
+    let path = last_active_app_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, name.trim());
+}
+
+pub fn load_last_active_app() -> Option<String> {
+    std::fs::read_to_string(last_active_app_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 // ── Config ──

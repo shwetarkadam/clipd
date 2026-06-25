@@ -1,12 +1,11 @@
 use arboard::Clipboard;
 use chrono::{DateTime, Utc};
 use clipd_core::{
-    compute_sessions, detect_sensitive, generate_embedding, is_embedding_available,
-    load_paste_transform_settings, load_privacy_config, load_theme, load_transform_config,
-    paste_transforms, save_paste_transform_settings, save_privacy_config, save_theme,
-    search_embeddings, ClipEntry, ClipStore, ContentType, Embedding, PaletteTrigger,
-    PasteTransformSettings, PrivacyConfig, Rgb, Session, SessionConfig, TfIdfIndex, Theme,
-    TransformConfig, TransformKind,
+    available_targets, compute_sessions, detect_sensitive, load_paste_transform_settings,
+    load_privacy_config, load_theme, load_transform_config, paste_transforms,
+    save_paste_transform_settings, save_privacy_config, save_secret, save_theme, ClipEntry,
+    ClipStore, ContentType, OpenGuiHotkey, PaletteTrigger, PasteTransformSettings, PrivacyConfig,
+    Rgb, SecretEntry, Session, SessionConfig, TfIdfIndex, Theme, TransformKind, VaultTarget,
 };
 use eframe::egui::{self, Color32, FontId, Margin, RichText, Rounding, Stroke};
 use std::collections::HashSet;
@@ -16,18 +15,24 @@ use std::time::{Duration, Instant};
 /// Maximum clips to keep in memory in the GUI. Reduces RAM vs showing all clips.
 const MAX_LOADED_CLIPS: usize = 200;
 
-/// Compact UI spacing used by rows, pills, and controls.
-const CARD_ROUND: f32 = 4.0;
-const CARD_PAD_X: f32 = 9.0;
-const CARD_PAD_Y: f32 = 5.0;
+/// Liquid-glass spacing: roomy rows, big rounding, a leading icon tile.
+const CARD_ROUND: f32 = 14.0;
+const CARD_PAD_X: f32 = 13.0;
+const CARD_PAD_Y: f32 = 10.0;
+/// Leading type-icon tile shown on each row.
+const ROW_ICON_TILE: f32 = 34.0;
+const ROW_ICON_ROUND: f32 = 10.0;
+/// Gap between rows in the list.
+const ROW_GAP: f32 = 7.0;
 /// Pill (tag) corner radius and padding.
-const PILL_ROUND: f32 = 4.0;
-const PILL_PAD_X: f32 = 6.0;
-const PILL_PAD_Y: f32 = 1.0;
-const SETTINGS_MAX_WIDTH: f32 = 920.0;
-const SETTINGS_GUTTER_X: f32 = 28.0;
-const SETTINGS_GUTTER_Y: f32 = 18.0;
-const STARRED_COLLECTION_NAME: &str = "Starred";
+const PILL_ROUND: f32 = 6.0;
+const PILL_PAD_X: f32 = 7.0;
+const PILL_PAD_Y: f32 = 2.0;
+const SETTINGS_MAX_WIDTH: f32 = 640.0;
+const SETTINGS_GUTTER_X: f32 = 16.0;
+const SETTINGS_GUTTER_Y: f32 = 14.0;
+const PINNED_COLLECTION_NAME: &str = "Pinned";
+const LEGACY_STARRED_COLLECTION_NAME: &str = "Starred";
 fn rgb(c: Rgb) -> Color32 {
     Color32::from_rgb(c.0, c.1, c.2)
 }
@@ -127,6 +132,17 @@ fn tag_pill(ui: &mut egui::Ui, label: &str, col: Color32, c: &clipd_core::ThemeC
         });
 }
 
+/// A compact, calm pill button used for row actions (Copy / Refine / Remove …).
+fn pill_button(ui: &mut egui::Ui, label: &str, c: &clipd_core::ThemeColors) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(label).size(11.5).color(rgb(c.text)))
+            .fill(rgb(c.bg_surface))
+            .rounding(Rounding::same(PILL_ROUND))
+            .stroke(Stroke::new(0.5, rgb(c.border)))
+            .min_size(egui::vec2(0.0, 23.0)),
+    )
+}
+
 fn outline_button(
     ui: &mut egui::Ui,
     label: &str,
@@ -144,9 +160,9 @@ fn outline_button(
 
 fn star_button(ui: &mut egui::Ui, starred: bool, c: &clipd_core::ThemeColors) -> egui::Response {
     let (label, hover) = if starred {
-        ("★", "Remove from Starred")
+        ("📌", "Unpin clip")
     } else {
-        ("☆", "Save to Starred")
+        ("📌", "Pin clip")
     };
     let col = if starred {
         rgb(c.accent)
@@ -154,16 +170,32 @@ fn star_button(ui: &mut egui::Ui, starred: bool, c: &clipd_core::ThemeColors) ->
         rgb(c.overlay)
     };
     ui.add(
-        egui::Button::new(RichText::new(label).size(15.0).color(col))
-            .fill(Color32::TRANSPARENT)
-            .rounding(Rounding::same(5.0))
+        egui::Button::new(RichText::new(label).size(14.0).color(col))
+            .fill(if starred {
+                rgb(c.accent).gamma_multiply(0.12)
+            } else {
+                Color32::TRANSPARENT
+            })
+            .rounding(Rounding::same(6.0))
             .stroke(Stroke::new(
-                if starred { 0.7 } else { 0.0 },
+                if starred { 0.8 } else { 0.0 },
                 rgb(c.accent).gamma_multiply(0.7),
             ))
-            .min_size(egui::vec2(28.0, 24.0)),
+            .min_size(egui::vec2(30.0, 28.0)),
     )
     .on_hover_text(hover)
+}
+
+fn row_star_button(
+    ui: &mut egui::Ui,
+    starred: bool,
+    c: &clipd_core::ThemeColors,
+) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(4.0, 4.0);
+        star_button(ui, starred, c)
+    })
+    .inner
 }
 
 fn tab_chip(ui: &mut egui::Ui, label: &str, active: bool, c: &clipd_core::ThemeColors) -> bool {
@@ -187,7 +219,10 @@ fn tab_chip(ui: &mut egui::Ui, label: &str, active: bool, c: &clipd_core::ThemeC
 
 enum Action {
     None,
+    /// Copy to the clipboard only — clipd stays in front (single-click select).
     Copy,
+    /// Copy, return focus to the previous app, and paste (Enter / double-click).
+    Paste,
     Delete,
     ToggleStar(i64),
 }
@@ -207,14 +242,26 @@ fn main() -> eframe::Result {
         .format_target(false)
         .init();
 
+    // Single instance: if a clipd-gui window is already open, focus it and
+    // exit instead of spawning a duplicate. This backstops the daemon's own
+    // focus-existing logic against rapid Ctrl+G presses (where a second launch
+    // can race before the first window registers).
+    if focus_existing_instance() {
+        log::info!("clipd-gui already running — focused existing window, exiting");
+        return Ok(());
+    }
+
     // Spawn daemon as a child process (rdev's keyboard hook conflicts with
     // eframe's event loop if both run in the same process on macOS).
     let daemon_child = spawn_daemon_process();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 640.0])
-            .with_min_inner_size([640.0, 420.0])
+            // Compact, borderless floating-palette card (like the mockup).
+            .with_inner_size([520.0, 600.0])
+            .with_min_inner_size([420.0, 360.0])
+            .with_decorations(false)
+            .with_resizable(true)
             .with_transparent(true),
         ..Default::default()
     };
@@ -239,6 +286,95 @@ fn main() -> eframe::Result {
     result
 }
 
+/// Returns true if another clipd-gui process is already running. On macOS it
+/// also raises that instance's window to the front before returning.
+#[cfg(target_os = "macos")]
+fn focus_existing_instance() -> bool {
+    // At this point (before run_native) this process is not yet a UI app, so it
+    // isn't in the System Events process list — any match is a prior instance.
+    // Tries every name the eframe app may register under; never errors.
+    let script = r#"tell application "System Events"
+  repeat with n in {"clipd-gui", "Clipd", "clipd"}
+    set matches to (every process whose name is (n as string))
+    if (count of matches) > 0 then
+      set frontmost of (item 1 of matches) to true
+      return "ok"
+    end if
+  end repeat
+end tell
+return """#;
+    std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "ok")
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn focus_existing_instance() -> bool {
+    false
+}
+
+/// Bring the app the user came from back to the front (recorded by the daemon
+/// when clipd was summoned) and paste — so picking a clip lands it where they
+/// were typing. The Cmd+V keystroke needs Accessibility permission for clipd;
+/// without it the app still gets focus and the clip is on the clipboard, so a
+/// manual Cmd+V still works.
+#[cfg(target_os = "macos")]
+fn return_focus_to_previous_app() {
+    let Some(app) = clipd_core::load_last_active_app() else {
+        return;
+    };
+    let app = app.replace('"', "'");
+    let script = format!(
+        r#"tell application "System Events"
+  set ps to (every process whose name is "{app}")
+  if (count of ps) > 0 then
+    set frontmost of (item 1 of ps) to true
+    delay 0.12
+    keystroke "v" using command down
+  end if
+end tell"#,
+        app = app
+    );
+    let _ = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn return_focus_to_previous_app() {}
+
+#[cfg(target_os = "macos")]
+fn spawn_daemon_process() -> Option<std::process::Child> {
+    if clipd_core::is_daemon_running() {
+        log::info!("Daemon already running — skipping hotkey host launch");
+        return None;
+    }
+
+    let Some(ui_bin) = find_ui_binary() else {
+        log::warn!("clipd-ui binary not found — Ctrl+G hotkey host was not started");
+        return None;
+    };
+
+    log::info!("Starting macOS hotkey host: {}", ui_bin.display());
+    let _ = std::process::Command::new(&ui_bin)
+        .env("CLIPD_NO_AUTO_OPEN_GUI", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| log::warn!("Failed to start clipd-ui hotkey host: {}", e));
+
+    // Do not return the child. The tray/hotkey host should survive this search
+    // window closing; otherwise Ctrl+G works only while a GUI window is open.
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
 fn spawn_daemon_process() -> Option<std::process::Child> {
     if clipd_core::is_daemon_running() {
         log::info!("Daemon already running — skipping spawn");
@@ -258,6 +394,46 @@ fn spawn_daemon_process() -> Option<std::process::Child> {
         .ok()
 }
 
+#[cfg(target_os = "macos")]
+fn find_ui_binary() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("clipd-ui");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    for candidate in [
+        workspace_root.join("target/debug/clipd-ui"),
+        workspace_root.join("target/release/clipd-ui"),
+    ] {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    if let Ok(output) = std::process::Command::new("which").arg("clipd-ui").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
 fn find_cli_binary() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
 
@@ -308,6 +484,26 @@ fn find_cli_binary() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Split a recall query into (content terms, source-app filter). Supports
+/// "from chrome", "json from chrome", and "app:chrome" so users recall by where
+/// a clip came from instead of memorizing slots.
+fn split_from_query(raw: &str) -> (String, String) {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix("from ") {
+        return (String::new(), rest.trim().to_string());
+    }
+    if let Some(rest) = raw.strip_prefix("app:") {
+        return (String::new(), rest.trim().to_string());
+    }
+    if let Some(idx) = raw.find(" from ") {
+        return (
+            raw[..idx].trim().to_string(),
+            raw[idx + 6..].trim().to_string(),
+        );
+    }
+    (raw.to_string(), String::new())
+}
+
 fn resolved_theme(ctx: &egui::Context, theme: Theme) -> Theme {
     if theme != Theme::System {
         return theme;
@@ -354,8 +550,8 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
         egui::Visuals::dark()
     };
     v.override_text_color = Some(rgb(c.text));
-    v.panel_fill = rgba(c.bg_base, 235);
-    v.window_fill = rgba(c.bg_base, 238);
+    v.panel_fill = rgba(c.bg_base, 198);
+    v.window_fill = rgba(c.bg_base, 205);
     v.window_stroke = Stroke::new(1.0, rgb(c.border));
     v.window_shadow = egui::epaint::Shadow {
         offset: egui::vec2(0.0, 4.0),
@@ -364,9 +560,9 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
         color: Color32::from_black_alpha(60),
     };
     v.window_rounding = Rounding::same(12.0);
-    v.extreme_bg_color = rgba(c.bg_base, 235);
-    v.faint_bg_color = rgba(c.bg_surface, 225);
-    v.widgets.noninteractive.bg_fill = rgba(c.bg_surface, 232);
+    v.extreme_bg_color = rgba(c.bg_base, 198);
+    v.faint_bg_color = rgba(c.bg_surface, 190);
+    v.widgets.noninteractive.bg_fill = rgba(c.bg_surface, 198);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, rgb(c.text));
     v.widgets.noninteractive.bg_stroke = Stroke::NONE;
     v.widgets.noninteractive.rounding = Rounding::same(8.0);
@@ -396,12 +592,27 @@ struct ClipdGui {
     theme: Theme,
 
     show_transforms: bool,
+    /// On-demand preview pane (Space toggles it). Off = clean single column.
+    show_preview: bool,
+    /// Tracks window focus so summoning clipd lands the cursor in search.
+    was_focused: bool,
+    /// Vault (1Password / Bitwarden / Keychain) "save clipboard as a password" form.
+    vault_targets: Vec<VaultTarget>,
+    vault_selected: Option<VaultTarget>,
+    vault_title: String,
+    vault_username: String,
+    vault_url: String,
+    /// (is_success, message) of the last vault save attempt.
+    vault_status: Option<(bool, String)>,
+    /// Reusable text snippets and the ones matching the current search.
+    snippets: Vec<clipd_core::Snippet>,
+    matched_snippets: Vec<clipd_core::Snippet>,
+    new_snippet_trigger: String,
+    new_snippet_name: String,
+    new_snippet_body: String,
     transforms: Vec<TransformKind>,
     paste_settings: PasteTransformSettings,
 
-    semantic_mode: bool,
-    transform_config: TransformConfig,
-    cached_embeddings: Vec<(i64, Embedding)>,
     cached_tfidf: Option<TfIdfIndex>, // built lazily once per refresh, reused for all searches
     privacy_config: PrivacyConfig,
     sessions: Vec<Session>,
@@ -442,11 +653,21 @@ impl ClipdGui {
             focus_search: true,
             theme,
             show_transforms: false,
+            show_preview: false,
+            was_focused: true,
+            vault_targets: available_targets(),
+            vault_selected: available_targets().first().copied(),
+            vault_title: String::new(),
+            vault_username: String::new(),
+            vault_url: String::new(),
+            vault_status: None,
+            snippets: Vec::new(),
+            matched_snippets: Vec::new(),
+            new_snippet_trigger: String::new(),
+            new_snippet_name: String::new(),
+            new_snippet_body: String::new(),
             transforms: paste_transforms(),
             paste_settings: load_paste_transform_settings(),
-            semantic_mode: false,
-            transform_config: load_transform_config(),
-            cached_embeddings: Vec::new(),
             cached_tfidf: None,
             privacy_config: load_privacy_config(),
             sessions,
@@ -478,9 +699,15 @@ impl ClipdGui {
         self.starred_clip_ids.clear();
         self.starred_collection_id = self
             .store
-            .get_collection_by_name(STARRED_COLLECTION_NAME)
+            .get_collection_by_name(PINNED_COLLECTION_NAME)
             .ok()
             .flatten()
+            .or_else(|| {
+                self.store
+                    .get_collection_by_name(LEGACY_STARRED_COLLECTION_NAME)
+                    .ok()
+                    .flatten()
+            })
             .map(|collection| collection.id);
         if let Some(collection_id) = self.starred_collection_id {
             self.starred_clip_ids = self
@@ -497,12 +724,18 @@ impl ClipdGui {
         if let Some(id) = self.starred_collection_id {
             return Some(id);
         }
-        let id = match self.store.get_collection_by_name(STARRED_COLLECTION_NAME) {
+        let id = match self.store.get_collection_by_name(PINNED_COLLECTION_NAME) {
             Ok(Some(collection)) => Some(collection.id),
-            Ok(None) => self
+            Ok(None) => match self
                 .store
-                .create_collection(STARRED_COLLECTION_NAME, None)
-                .ok(),
+                .get_collection_by_name(LEGACY_STARRED_COLLECTION_NAME)
+            {
+                Ok(Some(collection)) => Some(collection.id),
+                _ => self
+                    .store
+                    .create_collection(PINNED_COLLECTION_NAME, None)
+                    .ok(),
+            },
             Err(_) => None,
         }?;
         self.starred_collection_id = Some(id);
@@ -527,20 +760,18 @@ impl ClipdGui {
         self.clips = self.store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
         self.sessions = compute_sessions(&self.clips, self.session_config.window_minutes);
         self.cached_tfidf = None; // invalidate — will be rebuilt lazily on next search
-        if self.semantic_mode {
-            let clip_ids: Vec<i64> = self.clips.iter().map(|c| c.id).collect();
-            self.cached_embeddings = self
-                .store
-                .get_embeddings_for_clip_ids(&clip_ids)
-                .unwrap_or_default();
-        }
+        self.refresh_snippets();
         self.apply_filter();
         self.last_refresh = Instant::now();
     }
 
+    fn refresh_snippets(&mut self) {
+        self.snippets = self.store.list_snippets().unwrap_or_default();
+    }
+
     fn apply_filter(&mut self) {
         // ── Slot filter: only show clips saved to a slot ──
-        let base_indices: Vec<usize> = if self.show_active_slots_only {
+        let mut base_indices: Vec<usize> = if self.show_active_slots_only {
             self.clips
                 .iter()
                 .enumerate()
@@ -550,95 +781,90 @@ impl ClipdGui {
         } else {
             (0..self.clips.len()).collect()
         };
-        if self.search_query.is_empty() {
-            self.filtered = base_indices.clone();
-        } else if self.semantic_mode {
-            // Try vector embeddings first, fall back to cached TF-IDF
-            if !self.cached_embeddings.is_empty()
-                && is_embedding_available(&self.transform_config)
-                && self.search_query.len() >= 3
-            {
-                if let Ok(query_emb) =
-                    generate_embedding(&self.search_query, &self.transform_config)
-                {
-                    let results = search_embeddings(&query_emb, &self.cached_embeddings, 50, 0.3);
-                    if !results.is_empty() {
-                        let id_to_idx: std::collections::HashMap<i64, usize> = self
-                            .clips
-                            .iter()
-                            .enumerate()
-                            .filter(|&(_, c)| !self.show_active_slots_only || c.slot.is_some())
-                            .map(|(i, c)| (c.id, i))
-                            .collect();
-                        self.filtered = results
-                            .iter()
-                            .filter_map(|r| id_to_idx.get(&r.clip_id).copied())
-                            .collect();
-                        // If vectors returned results, we're done
-                        return;
-                    }
+
+        // Recall-by-source: "from chrome", "json from chrome", or "app:chrome"
+        // filter to clips copied from that app — so you never need a slot number.
+        let (content_q, app_q) = split_from_query(&self.search_query.to_lowercase());
+        if !app_q.is_empty() {
+            base_indices.retain(|&i| {
+                self.clips[i]
+                    .source_app
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&app_q)
+            });
+        }
+
+        if content_q.is_empty() {
+            self.filtered = base_indices;
+        } else {
+            // Hybrid search by default — exact keyword matches first, then local
+            // semantic (TF-IDF) matches appended. Both are instant and offline
+            // (no per-keystroke network calls), so search "just works".
+            let base_set: HashSet<usize> = base_indices.iter().copied().collect();
+            let q = content_q.clone();
+            let mut ordered: Vec<usize> = Vec::new();
+            let mut seen: HashSet<usize> = HashSet::new();
+
+            // 1) Exact keyword matches (content / preview / source app), in order.
+            for &i in &base_indices {
+                let c = &self.clips[i];
+                let hit = c.content.to_lowercase().contains(&q)
+                    || c.preview.to_lowercase().contains(&q)
+                    || c.source_app
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&q);
+                if hit && seen.insert(i) {
+                    ordered.push(i);
                 }
             }
 
-            // Build TF-IDF index lazily once (on first search after a refresh), then reuse
-            if self.cached_tfidf.is_none() {
-                let docs: Vec<&str> = self.clips.iter().map(|c| c.content.as_str()).collect();
-                self.cached_tfidf = Some(TfIdfIndex::build(&docs));
-            }
-            if let Some(ref index) = self.cached_tfidf {
-                let results = index.search(&self.search_query, 50);
-                let tfidf_indices: std::collections::HashSet<usize> =
-                    results.iter().map(|r| r.clip_index).collect();
-                self.filtered = base_indices
-                    .iter()
-                    .filter(|&&i| tfidf_indices.contains(&i))
-                    .copied()
-                    .collect();
-            }
-        } else {
-            // Plain text search — lowercase the query once, pre-lowercase each clip's
-            // searchable fields once, then match. Avoids 3× to_lowercase() per clip per keystroke.
-            let q = self.search_query.to_lowercase();
-            let mut results: Vec<usize> = self
-                .clips
-                .iter()
-                .enumerate()
-                .filter_map(|(i, c)| {
-                    // Compute each lowercased field once per clip (not 3× per field per keystroke)
-                    let content_lower = c.content.to_lowercase();
-                    let preview_lower = c.preview.to_lowercase();
-                    let app_lower = c.source_app.as_deref().unwrap_or("").to_lowercase();
-                    if content_lower.contains(&q)
-                        || preview_lower.contains(&q)
-                        || app_lower.contains(&q)
-                    {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if results.is_empty() && self.search_query.len() >= 3 {
-                // Build TF-IDF index lazily once and reuse for all subsequent searches
+            // 2) Semantic (meaning-based) matches via TF-IDF, appended.
+            if content_q.len() >= 2 {
                 if self.cached_tfidf.is_none() {
                     let docs: Vec<&str> = self.clips.iter().map(|c| c.content.as_str()).collect();
                     self.cached_tfidf = Some(TfIdfIndex::build(&docs));
                 }
                 if let Some(ref index) = self.cached_tfidf {
-                    let sem = index.search(&self.search_query, 50);
-                    results = sem.iter().map(|r| r.clip_index).collect();
+                    for r in index.search(&content_q, 50) {
+                        let i = r.clip_index;
+                        if base_set.contains(&i) && seen.insert(i) {
+                            ordered.push(i);
+                        }
+                    }
                 }
             }
-            let base_set: std::collections::HashSet<usize> = base_indices.iter().copied().collect();
-            self.filtered = results
-                .into_iter()
-                .filter(|i| base_set.contains(i))
-                .collect();
+
+            self.filtered = ordered;
         }
+        // Top result is selected so Enter pastes the best match immediately.
+        self.selected = 0;
         if self.selected >= self.filtered.len() {
             self.selected = self.filtered.len().saturating_sub(1);
         }
+
+        // Snippet recall: a snippet whose trigger/name matches the typed query
+        // surfaces at the top of the palette (Enter pastes its body). Exact
+        // trigger matches rank first.
+        let q = content_q.trim().to_lowercase();
+        self.matched_snippets = if q.is_empty() {
+            Vec::new()
+        } else {
+            let mut hits: Vec<clipd_core::Snippet> = self
+                .snippets
+                .iter()
+                .filter(|s| {
+                    let t = s.trigger.to_lowercase();
+                    t.contains(&q) || s.name.to_lowercase().contains(&q)
+                })
+                .cloned()
+                .collect();
+            hits.sort_by_key(|s| s.trigger.to_lowercase() != q); // exact trigger first
+            hits
+        };
     }
 
     fn selected_clip(&self) -> Option<&ClipEntry> {
@@ -647,13 +873,35 @@ impl ClipdGui {
             .and_then(|&i| self.clips.get(i))
     }
 
-    fn do_copy(&mut self) {
-        if let Some(clip) = self.selected_clip() {
-            if let Ok(mut cb) = Clipboard::new() {
-                if cb.set_text(&clip.content).is_ok() {
-                    self.copied_at = Some(Instant::now());
-                }
+    /// Copy the selected clip to the clipboard. clipd stays in front.
+    fn set_clipboard(&mut self, text: &str) -> bool {
+        if let Ok(mut cb) = Clipboard::new() {
+            if cb.set_text(text).is_ok() {
+                self.copied_at = Some(Instant::now());
+                return true;
             }
+        }
+        false
+    }
+
+    fn do_copy(&mut self) -> bool {
+        if let Some(content) = self.selected_clip().map(|c| c.content.clone()) {
+            return self.set_clipboard(&content);
+        }
+        false
+    }
+
+    /// Copy, then hand focus back to the app the user came from and paste there.
+    /// This is the deliberate "pick" gesture (Enter / double-click). A snippet
+    /// matching the current search wins over the selected clip.
+    fn do_paste(&mut self) {
+        let pasted = if let Some(body) = self.matched_snippets.first().map(|s| s.body.clone()) {
+            self.set_clipboard(&body)
+        } else {
+            self.do_copy()
+        };
+        if pasted && self.paste_settings.return_focus_after_copy {
+            return_focus_to_previous_app();
         }
     }
 
@@ -663,6 +911,43 @@ impl ClipdGui {
             if self.store.delete(id).unwrap_or(false) {
                 self.refresh();
             }
+        }
+    }
+
+    /// Read the live clipboard and save it as a password to the selected vault.
+    /// clipd stores nothing — the secret goes straight to the vault backend.
+    fn save_clipboard_to_vault(&mut self) {
+        let Some(target) = self.vault_selected else {
+            self.vault_status = Some((false, "No vault backend available.".into()));
+            return;
+        };
+        let password = match Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(t) if !t.trim().is_empty() => t,
+            Ok(_) => {
+                self.vault_status =
+                    Some((false, "Clipboard is empty — copy a password first.".into()));
+                return;
+            }
+            Err(e) => {
+                self.vault_status = Some((false, format!("Couldn't read clipboard: {e}")));
+                return;
+            }
+        };
+        let entry = SecretEntry {
+            title: self.vault_title.clone(),
+            username: self.vault_username.clone(),
+            password,
+            url: self.vault_url.clone(),
+            notes: "Saved from clipd".into(),
+        };
+        match save_secret(target, &entry) {
+            Ok(msg) => {
+                self.vault_status = Some((true, msg));
+                self.vault_title.clear();
+                self.vault_username.clear();
+                self.vault_url.clear();
+            }
+            Err(e) => self.vault_status = Some((false, e)),
         }
     }
 
@@ -676,18 +961,10 @@ impl ClipdGui {
 // ── Rendering ──
 
 impl eframe::App for ClipdGui {
-    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        let effective = if self.theme == Theme::System {
-            if visuals.dark_mode {
-                Theme::Dark
-            } else {
-                Theme::Light
-            }
-        } else {
-            self.theme
-        };
-        let bg = effective.colors().bg_base;
-        Color32::from_rgba_unmultiplied(bg.0, bg.1, bg.2, 210).to_normalized_gamma_f32()
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Fully transparent so the rounded card corners show the desktop behind
+        // (the card surface is painted by the panels).
+        [0.0, 0.0, 0.0, 0.0]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -698,6 +975,16 @@ impl eframe::App for ClipdGui {
             self.refresh();
         }
         ctx.request_repaint_after(Duration::from_secs(3));
+
+        // When the window is summoned (gains focus), drop the cursor into search
+        // with a clean query — so the palette is "type to recall" every time.
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if focused && !self.was_focused {
+            self.focus_search = true;
+            self.search_query.clear();
+            self.apply_filter();
+        }
+        self.was_focused = focused;
 
         let c = resolved_theme(ctx, self.theme).colors();
         let mut action = Action::None;
@@ -723,7 +1010,11 @@ impl eframe::App for ClipdGui {
                 self.scroll_to_selected = true;
             }
             if i.key_pressed(egui::Key::Enter) && !search_has_focus {
-                action = Action::Copy;
+                action = Action::Paste;
+            }
+            // Space toggles the on-demand preview pane (single column stays clean by default).
+            if i.key_pressed(egui::Key::Space) && !search_has_focus {
+                self.show_preview = !self.show_preview;
             }
             if i.key_pressed(egui::Key::Delete)
                 || (i.key_pressed(egui::Key::D) && i.modifiers.command)
@@ -732,6 +1023,12 @@ impl eframe::App for ClipdGui {
             }
             if i.key_pressed(egui::Key::T) && i.modifiers.command {
                 should_cycle_theme = true;
+            }
+            // P pins/unpins the selected clip.
+            if i.key_pressed(egui::Key::P) && !search_has_focus {
+                if let Some(clip) = self.selected_clip() {
+                    action = Action::ToggleStar(clip.id);
+                }
             }
         });
         if should_cycle_theme {
@@ -742,34 +1039,115 @@ impl eframe::App for ClipdGui {
         egui::TopBottomPanel::top("top_bar")
             .frame(
                 egui::Frame::none()
-                    .fill(rgba(c.bg_surface, 238))
-                    .inner_margin(Margin::symmetric(12.0, 7.0))
-                    .stroke(Stroke::new(0.7, rgb(c.border).gamma_multiply(0.65))),
+                    .fill(rgba(c.bg_surface, 236))
+                    .rounding(egui::Rounding {
+                        nw: 18.0,
+                        ne: 18.0,
+                        sw: 0.0,
+                        se: 0.0,
+                    })
+                    .inner_margin(Margin {
+                        left: 14.0,
+                        right: 14.0,
+                        top: 13.0,
+                        bottom: 10.0,
+                    }),
             )
             .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 9.0;
+
+                // The header doubles as the window drag handle (borderless window).
+                let bar_rect = ui.max_rect();
+                let drag = ui.interact(
+                    bar_rect,
+                    egui::Id::new("titlebar_drag"),
+                    egui::Sense::drag(),
+                );
+                if drag.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+
+                // ── Row 1: clipboard tile · clipd · tabs · count · gear ──
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
+                    let (tile, _) =
+                        ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        tile,
+                        Rounding::same(8.0),
+                        rgb(c.accent).gamma_multiply(0.18),
+                    );
+                    ui.painter().text(
+                        tile.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "📋",
+                        egui::FontId::proportional(13.0),
+                        rgb(c.accent),
+                    );
                     ui.label(
                         RichText::new("clipd")
-                            .size(12.5)
+                            .size(14.0)
                             .strong()
-                            .color(rgb(c.subtext)),
+                            .color(rgb(c.text)),
                     );
 
-                    let search_w = (ui.available_width() * 0.34).clamp(260.0, 460.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let gear_col = if self.active_tab == MainTab::Settings {
+                            rgb(c.accent)
+                        } else {
+                            rgb(c.overlay)
+                        };
+                        let gear = ui.add(
+                            egui::Button::new(RichText::new("⚙").size(15.0).color(gear_col))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE),
+                        );
+                        if gear.clicked() {
+                            self.active_tab = if self.active_tab == MainTab::Settings {
+                                MainTab::Text
+                            } else {
+                                MainTab::Settings
+                            };
+                        }
+                        gear.on_hover_text("Settings");
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!("{} clips", self.filtered.len()))
+                                .size(11.0)
+                                .color(rgb(c.overlay)),
+                        );
+                        ui.add_space(10.0);
+                        if tab_chip(
+                            ui,
+                            "Collections",
+                            self.active_tab == MainTab::Collections,
+                            &c,
+                        ) {
+                            self.active_tab = MainTab::Collections;
+                            self.refresh_collections();
+                        }
+                        if tab_chip(ui, "Text", self.active_tab == MainTab::Text, &c) {
+                            self.active_tab = MainTab::Text;
+                        }
+                    });
+                });
+
+                // ── Row 2: full-width search (the hero) ──
+                if self.active_tab == MainTab::Text {
                     egui::Frame::none()
                         .fill(rgb(c.bg_elevated))
-                        .rounding(Rounding::same(6.0))
-                        .inner_margin(Margin::symmetric(8.0, 3.0))
+                        .rounding(Rounding::same(12.0))
+                        .inner_margin(Margin::symmetric(12.0, 7.0))
                         .stroke(Stroke::new(0.7, rgb(c.border).gamma_multiply(0.8)))
                         .show(ui, |ui| {
-                            ui.set_width(search_w);
                             ui.horizontal(|ui| {
+                                ui.label(RichText::new("🔍").size(12.0).color(rgb(c.overlay)));
+                                ui.add_space(7.0);
                                 let search = ui.add_sized(
-                                    [ui.available_width(), 18.0],
+                                    [ui.available_width(), 19.0],
                                     egui::TextEdit::singleline(&mut self.search_query)
                                         .id(egui::Id::new("clip_search"))
-                                        .hint_text("Search clips…")
+                                        .hint_text("Search, or type ‘from chrome’…")
                                         .frame(false)
                                         .font(egui::TextStyle::Body),
                                 );
@@ -780,131 +1158,28 @@ impl eframe::App for ClipdGui {
                                 if search.changed() {
                                     self.apply_filter();
                                 }
+                                // Enter pastes the top match — the palette gesture.
+                                if search.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                    && !self.filtered.is_empty()
+                                {
+                                    action = Action::Paste;
+                                }
                             });
                         });
-
-                    if tab_chip(ui, "Text", self.active_tab == MainTab::Text, &c) {
-                        self.active_tab = MainTab::Text;
-                    }
-                    if tab_chip(
-                        ui,
-                        "Collections",
-                        self.active_tab == MainTab::Collections,
-                        &c,
-                    ) {
-                        self.active_tab = MainTab::Collections;
-                        self.refresh_collections();
-                    }
-
-                    if self.active_tab == MainTab::Text {
-                        ui.add_space(4.0);
-                        let sem = if self.semantic_mode {
-                            "Semantic"
-                        } else {
-                            "Keyword"
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(sem).size(10.5).color(rgb(c.overlay)),
-                                )
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE),
-                            )
-                            .on_hover_text("Toggle semantic search")
-                            .clicked()
-                        {
-                            self.semantic_mode = !self.semantic_mode;
-                            if self.semantic_mode && self.cached_embeddings.is_empty() {
-                                self.cached_embeddings =
-                                    self.store.get_all_embeddings().unwrap_or_default();
-                            }
-                            self.apply_filter();
-                        }
-
-                        ui.add_space(2.0);
-                        let slot_label = if self.show_active_slots_only {
-                            "Slots"
-                        } else {
-                            "All"
-                        };
-                        let slot_text = if self.show_active_slots_only {
-                            rgb(c.accent)
-                        } else {
-                            rgb(c.overlay)
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(slot_label).size(10.5).color(slot_text),
-                                )
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE),
-                            )
-                            .on_hover_text("Show only clips saved to slots")
-                            .clicked()
-                        {
-                            self.show_active_slots_only = !self.show_active_slots_only;
-                            self.apply_filter();
-                        }
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let settings_active = self.active_tab == MainTab::Settings;
-                        let settings_btn = ui.add(
-                            egui::Button::new(RichText::new("Settings").size(10.5).color(
-                                if settings_active {
-                                    rgb(c.accent)
-                                } else {
-                                    rgb(c.text)
-                                },
-                            ))
-                            .fill(if settings_active {
-                                rgb(c.bg_selected).gamma_multiply(0.55)
-                            } else {
-                                rgb(c.bg_elevated)
-                            })
-                            .rounding(Rounding::same(5.0))
-                            .stroke(Stroke::new(0.7, rgb(c.border)))
-                            .min_size(egui::vec2(72.0, 22.0)),
-                        );
-                        if settings_btn.clicked() {
-                            self.active_tab = MainTab::Settings;
-                        }
-                        settings_btn.on_hover_text("Theme, privacy, and app behavior");
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(format!("{} clips", self.filtered.len()))
-                                .size(10.5)
-                                .color(rgb(c.overlay)),
-                        );
-                        if let Some(t) = self.copied_at {
-                            if t.elapsed() < Duration::from_secs(2) {
-                                ui.add_space(8.0);
-                                ui.label(
-                                    RichText::new("Copied")
-                                        .size(10.5)
-                                        .color(rgb(c.green))
-                                        .strong(),
-                                );
-                            } else {
-                                self.copied_at = None;
-                            }
-                        }
-                    });
-                });
+                }
             });
 
         let preview_data = self.selected_clip().cloned();
 
-        // ── Right inspector: selected clip details (Text tab only) ──
-        if self.active_tab == MainTab::Text {
+        // ── Right inspector: on-demand preview (Text tab, toggled with Space) ──
+        if self.active_tab == MainTab::Text && self.show_preview {
             egui::SidePanel::right("clip_inspector")
                 .resizable(false)
                 .exact_width(380.0)
                 .frame(
                     egui::Frame::none()
-                        .fill(rgba(c.bg_surface, 232))
+                        .fill(rgba(c.bg_surface, 198))
                         .inner_margin(Margin::symmetric(16.0, 14.0))
                         .stroke(Stroke::new(0.7, rgb(c.border).gamma_multiply(0.65))),
                 )
@@ -918,23 +1193,57 @@ impl eframe::App for ClipdGui {
                 });
         }
 
-        // ── Center panel ──
+        // ── Footer bar — always rendered so the card's bottom corners stay
+        // rounded on every tab; gesture hints only show on the Text list. ──
+        egui::TopBottomPanel::bottom("footer_hints")
+            .frame(
+                egui::Frame::none()
+                    .fill(rgba(c.bg_surface, 236))
+                    .rounding(egui::Rounding {
+                        nw: 0.0,
+                        ne: 0.0,
+                        sw: 18.0,
+                        se: 18.0,
+                    })
+                    .inner_margin(Margin::symmetric(14.0, 8.0)),
+            )
+            .show(ctx, |ui| {
+                if self.active_tab == MainTab::Text {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 16.0;
+                        let hint = |ui: &mut egui::Ui, text: &str| {
+                            ui.label(RichText::new(text).size(11.0).color(rgb(c.overlay)));
+                        };
+                        hint(ui, "Enter  paste into app");
+                        hint(ui, "Arrows  move");
+                        hint(ui, "P  pin");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            hint(ui, "type  ‘from chrome’  to recall by app");
+                        });
+                    });
+                } else {
+                    // Keep the rounded strip with a small, stable height.
+                    ui.allocate_space(egui::vec2(ui.available_width(), 4.0));
+                }
+            });
+
+        // ── Center panel (same surface as header/footer = one seamless card) ──
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
-                    .fill(rgba(c.bg_base, 224))
+                    .fill(rgba(c.bg_surface, 236))
                     .inner_margin(Margin::symmetric(
                         if self.active_tab == MainTab::Text {
-                            18.0
+                            14.0
                         } else {
                             0.0
                         },
-                        12.0,
+                        10.0,
                     )),
             )
             .show(ctx, |ui| match self.active_tab {
                 MainTab::Text => {
-                    if self.filtered.is_empty() {
+                    if self.filtered.is_empty() && self.matched_snippets.is_empty() {
                         self.render_empty_list(ui, &c);
                     } else {
                         self.render_clip_list(ui, &mut action, &c);
@@ -953,7 +1262,10 @@ impl eframe::App for ClipdGui {
         }
 
         match action {
-            Action::Copy => self.do_copy(),
+            Action::Copy => {
+                self.do_copy();
+            }
+            Action::Paste => self.do_paste(),
             Action::Delete => self.do_delete(),
             Action::ToggleStar(clip_id) => {
                 self.toggle_starred(clip_id);
@@ -1048,33 +1360,55 @@ impl ClipdGui {
         action: &mut Action,
         c: &clipd_core::ThemeColors,
     ) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("History")
-                    .size(13.0)
-                    .strong()
-                    .color(rgb(c.text)),
-            );
-            ui.label(
-                RichText::new(format!("{} visible", self.filtered.len()))
-                    .size(10.5)
-                    .color(rgb(c.overlay)),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let hint = if self.paste_settings.copy_on_select {
-                    "Click copies · double-click copies"
-                } else {
-                    "Click selects · double-click copies"
-                };
-                ui.label(RichText::new(hint).size(10.5).color(rgb(c.overlay)));
-            });
-        });
-        ui.add_space(8.0);
+        // Header labels removed for a cleaner, search-first list (clip count
+        // lives in the top bar; the click hint is in the footer).
+        ui.add_space(4.0);
 
         let visible_indices = self.filtered.clone();
+        let snippets = self.matched_snippets.clone();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Matched snippets first — typing a trigger recalls one to paste.
+                for (si, snip) in snippets.iter().enumerate() {
+                    let fr = egui::Frame::none()
+                        .fill(rgb(c.accent).gamma_multiply(0.14))
+                        .rounding(Rounding::same(CARD_ROUND))
+                        .stroke(Stroke::new(1.0, rgb(c.accent).gamma_multiply(0.45)))
+                        .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_PAD_Y))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                tag_pill(
+                                    ui,
+                                    &format!("snippet · {}", snip.trigger),
+                                    rgb(c.accent),
+                                    c,
+                                );
+                                ui.add_space(8.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(snip.preview()).size(14.0).color(rgb(c.text)),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                        });
+                    let resp = ui.interact(
+                        fr.response.rect,
+                        egui::Id::new(("snippet", si)),
+                        egui::Sense::click(),
+                    );
+                    if resp.clicked() || resp.double_clicked() {
+                        if self.set_clipboard(&snip.body)
+                            && self.paste_settings.return_focus_after_copy
+                        {
+                            return_focus_to_previous_app();
+                        }
+                    }
+                    ui.add_space(ROW_GAP);
+                }
+
                 for (display_idx, &clip_idx) in visible_indices.iter().enumerate() {
                     let clip = &self.clips[clip_idx];
                     let clip_id_value = clip.id;
@@ -1091,115 +1425,133 @@ impl ClipdGui {
                         _ => rgb(c.overlay),
                     };
 
-                    let bg = if is_selected {
-                        rgb(c.bg_selected).gamma_multiply(0.65)
+                    // Selected row reads as a soft accent-tinted glass card.
+                    let (bg, border) = if is_selected {
+                        (
+                            rgb(c.accent).gamma_multiply(0.20),
+                            Stroke::new(1.0, rgb(c.accent).gamma_multiply(0.5)),
+                        )
                     } else {
-                        Color32::TRANSPARENT
+                        (Color32::TRANSPARENT, Stroke::NONE)
                     };
 
                     let preview = clip.preview.trim().replace('\n', " ");
-                    let truncated: String = preview.chars().take(120).collect();
-                    let suffix = if preview.chars().count() > 120 {
+                    let truncated: String = preview.chars().take(160).collect();
+                    let suffix = if preview.chars().count() > 160 {
                         "…"
                     } else {
                         ""
                     };
                     let time = relative_time(&clip.timestamp);
                     let source = clip.source_app.as_deref().unwrap_or("Unknown");
-                    let source_short: String = source.chars().take(18).collect();
-                    let source_suffix = if source.chars().count() > 18 {
+                    let source_short: String = source.chars().take(20).collect();
+                    let source_suffix = if source.chars().count() > 20 {
                         "…"
                     } else {
                         ""
                     };
+                    let is_sensitive =
+                        !detect_sensitive(&clip.content, &self.privacy_config).is_empty();
 
                     let frame_resp = egui::Frame::none()
                         .fill(bg)
                         .rounding(Rounding::same(CARD_ROUND))
-                        .inner_margin(Margin::symmetric(12.0, 8.0))
+                        .stroke(border)
+                        .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_PAD_Y))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.vertical(|ui| {
-                                ui.set_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if star_button(ui, is_starred, c).clicked() {
-                                                star_clicked = true;
-                                            }
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+
+                                // Leading type-icon tile (the visual anchor).
+                                let (tile, _) = ui.allocate_exact_size(
+                                    egui::vec2(ROW_ICON_TILE, ROW_ICON_TILE),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    tile,
+                                    Rounding::same(ROW_ICON_ROUND),
+                                    type_color.gamma_multiply(0.20),
+                                );
+                                ui.painter().text(
+                                    tile.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    clip.content_type.icon(),
+                                    egui::FontId::proportional(16.0),
+                                    type_color,
+                                );
+                                ui.add_space(12.0);
+
+                                // Reserve the right edge for the pin / ⏎ glyph.
+                                let pin_zone = 34.0;
+                                let content_w = (ui.available_width() - pin_zone).max(40.0);
+                                ui.allocate_ui(egui::vec2(content_w, ROW_ICON_TILE), |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(format!("{}{}", truncated, suffix))
+                                                    .size(14.5)
+                                                    .color(rgb(c.text)),
+                                            )
+                                            .truncate(),
+                                        );
+                                        ui.add_space(2.0);
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 5.0;
                                             ui.label(
-                                                RichText::new(&time)
-                                                    .size(10.0)
+                                                RichText::new(format!(
+                                                    "{}{}",
+                                                    source_short, source_suffix
+                                                ))
+                                                .size(11.5)
+                                                .color(rgb(c.overlay)),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!("· {}", time))
+                                                    .size(11.5)
                                                     .color(rgb(c.overlay)),
                                             );
-                                            ui.with_layout(
-                                                egui::Layout::left_to_right(egui::Align::Center),
-                                                |ui| {
-                                                    ui.add(
-                                                        egui::Label::new(
-                                                            RichText::new(format!(
-                                                                "{}{}",
-                                                                truncated, suffix
-                                                            ))
-                                                            .size(12.5)
-                                                            .color(rgb(c.text)),
-                                                        )
-                                                        .truncate(),
-                                                    );
-                                                },
-                                            );
-                                        },
-                                    );
+                                            if let Some(slot) = clip.slot {
+                                                ui.label(
+                                                    RichText::new(format!("· slot {}", slot))
+                                                        .size(11.5)
+                                                        .color(rgb(c.accent)),
+                                                );
+                                            }
+                                            if is_sensitive {
+                                                tag_pill(ui, "sensitive", rgb(c.accent2), c);
+                                            }
+                                        });
+                                    });
                                 });
 
-                                ui.add_space(1.0);
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 5.0;
-                                    ui.label(
-                                        RichText::new(clip.content_type.as_str())
-                                            .size(9.5)
-                                            .color(type_color),
-                                    );
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "· {}{}",
-                                            source_short, source_suffix
-                                        ))
-                                        .size(9.5)
-                                        .color(rgb(c.overlay)),
-                                    );
-                                    if let Some(slot) = clip.slot {
-                                        ui.label(
-                                            RichText::new(format!("· slot {}", slot))
-                                                .size(9.5)
-                                                .color(rgb(c.accent)),
-                                        );
-                                    }
-                                    if !detect_sensitive(&clip.content, &self.privacy_config)
-                                        .is_empty()
-                                    {
-                                        tag_pill(ui, "sensitive", rgb(c.accent2), c);
-                                    }
-                                });
+                                // Right edge: pin, with a ⏎ hint on the selected row.
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if row_star_button(ui, is_starred, c).clicked() {
+                                            star_clicked = true;
+                                        }
+                                    },
+                                );
                             });
-                        })
-                        .response;
+                        });
 
                     if star_clicked {
+                        self.selected = display_idx;
                         *action = Action::ToggleStar(clip_id_value);
                     }
 
-                    let resp = ui.interact(frame_resp.rect, clip_id, egui::Sense::click());
-                    if is_selected {
-                        let rail = egui::Rect::from_min_max(
-                            frame_resp.rect.left_top(),
-                            egui::pos2(frame_resp.rect.left() + 2.0, frame_resp.rect.bottom()),
-                        );
-                        ui.painter()
-                            .rect_filled(rail, Rounding::same(1.0), rgb(c.accent));
-                    }
+                    // Whole row (minus the pin zone on the right) is clickable.
+                    let full = frame_resp.response.rect;
+                    let row_rect = egui::Rect::from_min_max(
+                        full.min,
+                        egui::pos2(full.max.x - 34.0, full.max.y),
+                    );
+                    let resp = ui.interact(row_rect, clip_id, egui::Sense::click());
 
+                    // Single click selects + copies (clipd stays in front);
+                    // double-click is the deliberate "paste into my app" gesture.
                     if resp.clicked() && !star_clicked {
                         self.selected = display_idx;
                         if self.paste_settings.copy_on_select {
@@ -1208,22 +1560,13 @@ impl ClipdGui {
                     }
                     if resp.double_clicked() && !star_clicked {
                         self.selected = display_idx;
-                        *action = Action::Copy;
+                        *action = Action::Paste;
                     }
                     if is_selected && self.scroll_to_selected {
                         resp.scroll_to_me(Some(egui::Align::Center));
                     }
 
-                    let sep = egui::Rect::from_min_size(
-                        ui.cursor().min,
-                        egui::vec2(ui.available_width(), 1.0),
-                    );
-                    ui.painter().hline(
-                        sep.x_range(),
-                        sep.max.y,
-                        Stroke::new(0.7, rgb(c.border).gamma_multiply(0.35)),
-                    );
-                    ui.allocate_space(egui::vec2(ui.available_width(), 1.0));
+                    ui.add_space(ROW_GAP);
                 }
                 self.scroll_to_selected = false;
             });
@@ -1586,6 +1929,39 @@ impl ClipdGui {
                     );
                 }
             });
+        egui::Frame::none()
+            .inner_margin(Margin::symmetric(0.0, 6.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Open clipd shortcut")
+                            .size(12.0)
+                            .color(rgb(c.text)),
+                    );
+                    let prev = self.paste_settings.open_gui_hotkey;
+                    egui::ComboBox::from_id_salt("settings_open_gui_hotkey")
+                        .selected_text(self.paste_settings.open_gui_hotkey.label())
+                        .show_ui(ui, |ui| {
+                            for hk in OpenGuiHotkey::ALL {
+                                ui.selectable_value(
+                                    &mut self.paste_settings.open_gui_hotkey,
+                                    hk,
+                                    hk.label(),
+                                );
+                            }
+                        });
+                    if self.paste_settings.open_gui_hotkey != prev {
+                        save_paste_transform_settings(&self.paste_settings);
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Global hotkey to summon this window from anywhere. Takes effect immediately.",
+                    )
+                    .size(10.5)
+                    .color(rgb(c.subtext)),
+                );
+            });
         if settings_toggle(
             ui,
             c,
@@ -1617,6 +1993,15 @@ impl ClipdGui {
             &mut self.paste_settings.copy_on_select,
             "Copy when selecting a row",
             "Single-clicking a history row copies it immediately. Turn off for select-only rows; double-click and Enter still copy.",
+        ) {
+            save_paste_transform_settings(&self.paste_settings);
+        }
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.paste_settings.return_focus_after_copy,
+            "Paste into previous app on select",
+            "After you pick a clip, jump back to the app you summoned clipd from (e.g. Cursor) and paste it. Needs Accessibility permission for clipd; otherwise it just returns focus and you press Cmd+V.",
         ) {
             save_paste_transform_settings(&self.paste_settings);
         }
@@ -1685,6 +2070,219 @@ impl ClipdGui {
         }
     }
 
+    fn render_snippets_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        settings_caption(
+            ui,
+            c,
+            "SNIPPETS",
+            "Reusable text. Type its trigger in search, then Enter to paste it.",
+        );
+        egui::Frame::none()
+            .inner_margin(Margin::symmetric(0.0, 6.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_snippet_trigger)
+                            .hint_text("trigger (e.g. sig)")
+                            .desired_width(130.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_snippet_name)
+                            .hint_text("name (optional)")
+                            .desired_width(ui.available_width()),
+                    );
+                });
+                ui.add_space(5.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.new_snippet_body)
+                        .hint_text("Snippet text…")
+                        .desired_rows(2)
+                        .desired_width(ui.available_width()),
+                );
+                ui.add_space(5.0);
+                let can_save = !self.new_snippet_trigger.trim().is_empty()
+                    && !self.new_snippet_body.trim().is_empty();
+                if ui
+                    .add_enabled(
+                        can_save,
+                        egui::Button::new(
+                            RichText::new("Save snippet")
+                                .size(12.0)
+                                .color(rgb(c.bg_base)),
+                        )
+                        .fill(rgb(c.accent))
+                        .rounding(Rounding::same(8.0)),
+                    )
+                    .clicked()
+                {
+                    let _ = self.store.upsert_snippet(
+                        self.new_snippet_trigger.trim(),
+                        self.new_snippet_name.trim(),
+                        self.new_snippet_body.trim_end(),
+                    );
+                    self.new_snippet_trigger.clear();
+                    self.new_snippet_name.clear();
+                    self.new_snippet_body.clear();
+                    self.refresh_snippets();
+                }
+            });
+
+        let snippets = self.snippets.clone();
+        if snippets.is_empty() {
+            ui.label(
+                RichText::new("No snippets yet.")
+                    .size(11.0)
+                    .color(rgb(c.subtext)),
+            );
+        } else {
+            for s in &snippets {
+                egui::Frame::none()
+                    .inner_margin(Margin::symmetric(0.0, 3.0))
+                    .show(ui, |ui| {
+                        egui::Frame::none()
+                            .fill(rgb(c.bg_surface))
+                            .rounding(Rounding::same(CARD_ROUND))
+                            .inner_margin(Margin::symmetric(12.0, 8.0))
+                            .stroke(Stroke::new(0.5, rgb(c.border)))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    tag_pill(ui, &s.trigger, rgb(c.accent), c);
+                                    ui.add_space(6.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(s.preview())
+                                                .size(12.0)
+                                                .color(rgb(c.subtext)),
+                                        )
+                                        .truncate(),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if pill_button(ui, "Delete", c).clicked() {
+                                                let _ = self.store.delete_snippet(s.id);
+                                                self.refresh_snippets();
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                    });
+            }
+        }
+    }
+
+    fn render_vault_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        settings_caption(
+            ui,
+            c,
+            "PASSWORD VAULT",
+            "clipd never stores passwords. Save a copied password straight into a real vault instead.",
+        );
+
+        if settings_toggle(
+            ui,
+            c,
+            &mut self.privacy_config.offer_vault_on_secret,
+            "Offer to vault detected passwords",
+            "When clipd detects a copied password, pop a prompt to save it to a vault.",
+        ) {
+            save_privacy_config(&self.privacy_config);
+        }
+
+        if self.vault_targets.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No vault backend found. Install the 1Password CLI (`op`) or Bitwarden CLI (`bw`). The macOS Keychain is available on macOS.",
+                )
+                .size(11.5)
+                .color(rgb(c.subtext)),
+            );
+            return;
+        }
+
+        egui::Frame::none()
+            .inner_margin(Margin::symmetric(0.0, 6.0))
+            .show(ui, |ui| {
+                // Backend picker (only those usable on this machine).
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Save to").size(12.0).color(rgb(c.text)));
+                    let selected_label = self
+                        .vault_selected
+                        .map(|t| t.label())
+                        .unwrap_or("Pick one");
+                    egui::ComboBox::from_id_salt("vault_target")
+                        .selected_text(selected_label)
+                        .show_ui(ui, |ui| {
+                            for t in self.vault_targets.clone() {
+                                ui.selectable_value(&mut self.vault_selected, Some(t), t.label());
+                            }
+                        });
+                });
+
+                ui.add_space(4.0);
+                // Optional metadata — the password itself comes from the clipboard.
+                let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [70.0, 18.0],
+                            egui::Label::new(RichText::new(label).size(11.5).color(rgb(c.subtext))),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(value)
+                                .desired_width(220.0)
+                                .hint_text(hint),
+                        );
+                    });
+                };
+                field(ui, "Title", &mut self.vault_title, "e.g. GitHub");
+                field(ui, "Username", &mut self.vault_username, "e.g. me@example.com");
+                field(ui, "URL", &mut self.vault_url, "optional");
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let save = ui.add(
+                        egui::Button::new(
+                            RichText::new("🔐 Save clipboard to vault")
+                                .size(12.0)
+                                .color(rgb(c.bg_base)),
+                        )
+                        .fill(rgb(c.accent))
+                        .rounding(Rounding::same(6.0)),
+                    );
+                    if save.clicked() {
+                        self.save_clipboard_to_vault();
+                    }
+                    save.on_hover_text(
+                        "Reads the current clipboard and stores it as a login in the selected vault.",
+                    );
+                });
+
+                if let Some((ok, msg)) = &self.vault_status {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(if *ok {
+                            format!("✓ {msg}")
+                        } else {
+                            format!("✗ {msg}")
+                        })
+                        .size(11.0)
+                        .color(if *ok { rgb(c.green) } else { rgb(c.accent2) }),
+                    );
+                }
+
+                ui.label(
+                    RichText::new(
+                        "The password is read from the clipboard at save time — it is never written to clipd's history.",
+                    )
+                    .size(10.5)
+                    .color(rgb(c.subtext)),
+                );
+            });
+    }
+
     fn render_settings_panel(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         egui::Frame::none()
             .inner_margin(Margin {
@@ -1694,7 +2292,10 @@ impl ClipdGui {
                 bottom: SETTINGS_GUTTER_Y,
             })
             .show(ui, |ui| {
-                ui.set_max_width(SETTINGS_MAX_WIDTH);
+                // Clamp to the *actual* available width (never wider than the
+                // window) so the compact window doesn't clip cards on the right.
+                let content_w = ui.available_width().min(SETTINGS_MAX_WIDTH);
+                ui.set_max_width(content_w);
                 ui.label(
                     RichText::new("Settings")
                         .size(18.0)
@@ -1712,7 +2313,8 @@ impl ClipdGui {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.set_max_width(SETTINGS_MAX_WIDTH);
+                        let content_w = ui.available_width().min(SETTINGS_MAX_WIDTH);
+                        ui.set_max_width(content_w);
                         let mut dirty = false;
 
                         settings_caption(
@@ -1753,6 +2355,10 @@ impl ClipdGui {
                             });
 
                         self.render_clipboard_behavior_settings(ui, c);
+
+                        self.render_snippets_settings(ui, c);
+
+                        self.render_vault_settings(ui, c);
 
                         settings_caption(
                             ui,
@@ -3081,237 +3687,600 @@ impl ClipdGui {
 impl ClipdGui {
     /// Inline panel: your clips grouped under each collection, in the main view.
     fn render_collections_panel(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
-        egui::Frame::none()
-            .inner_margin(Margin::symmetric(16.0, 10.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-
-                // Create a collection.
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_collection_name)
-                            .hint_text("New collection name…")
-                            .desired_width(170.0),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_collection_app)
-                            .hint_text("Auto-collect from app (e.g. Cursor)")
-                            .desired_width(190.0),
-                    );
-                    if ui.button("➕ Create").clicked()
-                        && !self.new_collection_name.trim().is_empty()
-                    {
-                        let app = self.new_collection_app.trim().to_string();
-                        let app_opt = if app.is_empty() {
-                            None
-                        } else {
-                            Some(app.as_str())
-                        };
-                        let _ = self
-                            .store
-                            .create_collection(self.new_collection_name.trim(), app_opt);
-                        self.new_collection_name.clear();
-                        self.new_collection_app.clear();
-                        self.refresh_collections();
-                    }
-                });
-                ui.label(
-                    RichText::new("Bind an app and every copy made there files in automatically.")
-                        .size(11.0)
-                        .color(rgb(c.subtext)),
-                );
-                ui.add_space(6.0);
-            });
-
         let collections = self.collections.clone();
-        if collections.is_empty() {
-            egui::Frame::none()
-                .inner_margin(Margin::symmetric(16.0, 6.0))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(
-                            "No collections yet — create one above, then copy in that app.",
-                        )
-                        .color(rgb(c.subtext)),
-                    );
-                });
-            return;
+        let query = self.search_query.trim().to_lowercase();
+
+        let mut pinned_collection_id = None;
+        let mut pinned_items = Vec::new();
+        let mut other_collections = Vec::new();
+
+        for coll in &collections {
+            let items = self.store.collection_items(coll.id).unwrap_or_default();
+            if is_pinned_collection_name(&coll.name) {
+                pinned_collection_id = Some(coll.id);
+                pinned_items.extend(items);
+            } else {
+                other_collections.push((coll.clone(), items));
+            }
         }
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for coll in &collections {
-                    let items = self.store.collection_items(coll.id).unwrap_or_default();
+                ui.add_space(4.0);
+                let visible_pins: Vec<_> = pinned_items
+                    .iter()
+                    .filter(|it| query.is_empty() || collection_item_matches(it, &query))
+                    .cloned()
+                    .collect();
+                self.render_pin_shelf(
+                    ui,
+                    pinned_collection_id,
+                    &pinned_items,
+                    &visible_pins,
+                    &query,
+                    c,
+                );
 
-                    // Group header.
-                    egui::Frame::none()
-                        .inner_margin(Margin::symmetric(16.0, 6.0))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                let app = coll
-                                    .source_app
-                                    .as_ref()
-                                    .map(|a| format!("  ⟲ {}", a))
-                                    .unwrap_or_default();
-                                ui.label(
-                                    RichText::new(format!("📂 {}", coll.name))
-                                        .strong()
-                                        .size(14.0)
-                                        .color(rgb(c.text)),
-                                );
-                                ui.label(
-                                    RichText::new(format!("{} items{}", items.len(), app))
-                                        .size(11.5)
-                                        .color(rgb(c.subtext)),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.small_button("🗑").on_hover_text("Delete").clicked()
-                                        {
-                                            let _ = self.store.delete_collection(coll.id);
-                                            self.refresh_collections();
-                                        }
-                                        if ui.small_button("✦ Summarize").clicked() {
-                                            let cfg = load_transform_config();
-                                            self.ai_result = Some(
-                                                match clipd_core::summarize_collection(&items, &cfg)
-                                                {
-                                                    Ok(s) => s,
-                                                    Err(e) => format!("⚠ {}", e),
-                                                },
-                                            );
-                                        }
-                                    },
-                                );
-                            });
-                        });
+                ui.add_space(10.0);
 
-                    if items.is_empty() {
-                        egui::Frame::none()
-                            .inner_margin(Margin::symmetric(28.0, 2.0))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("(empty — copy something in this app)")
-                                        .size(11.0)
-                                        .italics()
-                                        .color(rgb(c.subtext)),
-                                );
-                            });
-                    }
-
-                    // Clips grouped under this collection.
-                    for it in &items {
-                        egui::Frame::none()
-                            .inner_margin(Margin {
-                                left: 28.0,
-                                right: 16.0,
-                                top: 2.0,
-                                bottom: 2.0,
-                            })
-                            .show(ui, |ui| {
-                                egui::Frame::none()
-                                    .fill(rgb(c.bg_surface))
-                                    .rounding(Rounding::same(CARD_ROUND))
-                                    .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_PAD_Y))
-                                    .stroke(Stroke::new(0.5, rgb(c.border)))
-                                    .show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
-                                        ui.label(
-                                            RichText::new(&it.preview)
-                                                .size(12.5)
-                                                .color(rgb(c.text)),
-                                        );
-                                        ui.horizontal(|ui| {
-                                            if ui.small_button("Copy").clicked() {
-                                                if let Ok(mut cb) = Clipboard::new() {
-                                                    let _ = cb.set_text(&it.content);
-                                                }
-                                            }
-                                            if ui.small_button("Refine").clicked() {
-                                                let cfg = load_transform_config();
-                                                self.ai_result = Some(
-                                                    match clipd_core::refine_prompt(
-                                                        &it.content,
-                                                        &cfg,
-                                                    ) {
-                                                        Ok(s) => s,
-                                                        Err(e) => format!("⚠ {}", e),
-                                                    },
-                                                );
-                                            }
-                                            if ui.small_button("Template").clicked() {
-                                                let cfg = load_transform_config();
-                                                self.ai_result = Some(
-                                                    match clipd_core::make_template(
-                                                        &it.content,
-                                                        &cfg,
-                                                    ) {
-                                                        Ok(s) => s,
-                                                        Err(e) => format!("⚠ {}", e),
-                                                    },
-                                                );
-                                            }
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if ui
-                                                        .small_button("✕")
-                                                        .on_hover_text("Remove")
-                                                        .clicked()
-                                                    {
-                                                        let _ = self.store.remove_collection_item(
-                                                            coll.id, it.clip_id,
-                                                        );
-                                                        self.refresh_collections();
-                                                    }
-                                                },
-                                            );
-                                        });
-                                    });
-                            });
-                    }
+                egui::CollapsingHeader::new(
+                    RichText::new("Other collections")
+                        .size(12.0)
+                        .color(rgb(c.subtext)),
+                )
+                .default_open(!query.is_empty())
+                .show(ui, |ui| {
+                    self.render_secondary_collections(ui, &other_collections, &query, c);
                     ui.add_space(8.0);
+                    self.render_new_collection_form(ui, c);
+                });
+
+                if !query.is_empty()
+                    && visible_pins.is_empty()
+                    && !other_collections.iter().any(|(coll, items)| {
+                        collection_matches_query(coll, items, &query)
+                            || items.iter().any(|it| collection_item_matches(it, &query))
+                    })
+                {
+                    egui::Frame::none()
+                        .inner_margin(Margin::symmetric(14.0, 8.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("No collections match this search.")
+                                    .size(12.0)
+                                    .color(rgb(c.subtext)),
+                            );
+                        });
                 }
 
-                // AI result, shown below the groups.
+                // ── AI result ──
                 if let Some(result) = self.ai_result.clone() {
                     egui::Frame::none()
-                        .inner_margin(Margin::symmetric(16.0, 6.0))
+                        .inner_margin(Margin::symmetric(14.0, 6.0))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("✦ AI result").strong().color(rgb(c.accent)),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.small_button("Dismiss").clicked() {
-                                            self.ai_result = None;
-                                        }
-                                        if ui.small_button("Copy").clicked() {
-                                            if let Ok(mut cb) = Clipboard::new() {
-                                                let _ = cb.set_text(&result);
-                                            }
-                                        }
-                                    },
-                                );
-                            });
                             egui::Frame::none()
                                 .fill(rgb(c.bg_elevated))
-                                .rounding(Rounding::same(8.0))
-                                .inner_margin(Margin::symmetric(10.0, 8.0))
+                                .rounding(Rounding::same(CARD_ROUND))
+                                .inner_margin(Margin::symmetric(12.0, 10.0))
+                                .stroke(Stroke::new(0.7, rgb(c.accent).gamma_multiply(0.4)))
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new("AI result")
+                                                .strong()
+                                                .size(12.5)
+                                                .color(rgb(c.accent)),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if pill_button(ui, "Dismiss", c).clicked() {
+                                                    self.ai_result = None;
+                                                }
+                                                if pill_button(ui, "Copy", c).clicked() {
+                                                    if let Ok(mut cb) = Clipboard::new() {
+                                                        let _ = cb.set_text(&result);
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(7.0);
                                     ui.label(RichText::new(&result).size(12.5).color(rgb(c.text)));
                                 });
                         });
                 }
             });
+    }
+
+    fn render_pin_shelf(
+        &mut self,
+        ui: &mut egui::Ui,
+        collection_id: Option<i64>,
+        all_items: &[clipd_core::CollectionItem],
+        visible_items: &[clipd_core::CollectionItem],
+        query: &str,
+        c: &clipd_core::ThemeColors,
+    ) {
+        egui::Frame::none()
+            .inner_margin(Margin::symmetric(14.0, 8.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Pinned")
+                            .strong()
+                            .size(16.0)
+                            .color(rgb(c.text)),
+                    );
+                    let meta = if query.is_empty() {
+                        format!("{} saved", all_items.len())
+                    } else {
+                        format!("{} of {} saved", visible_items.len(), all_items.len())
+                    };
+                    ui.label(RichText::new(meta).size(11.5).color(rgb(c.subtext)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("search filters pins")
+                                .size(10.5)
+                                .color(rgb(c.overlay)),
+                        );
+                    });
+                });
+            });
+
+        if collection_id.is_none() || visible_items.is_empty() {
+            egui::Frame::none()
+                .inner_margin(Margin::symmetric(14.0, 4.0))
+                .show(ui, |ui| {
+                    egui::Frame::none()
+                        .fill(rgba(c.bg_elevated, 88))
+                        .rounding(Rounding::same(12.0))
+                        .inner_margin(Margin::symmetric(14.0, 12.0))
+                        .stroke(Stroke::new(0.5, rgb(c.border).gamma_multiply(0.45)))
+                        .show(ui, |ui| {
+                            let text = if query.is_empty() {
+                                "Pin important clips from the Text tab. They will appear here grouped by type."
+                            } else {
+                                "No pinned clips match this search."
+                            };
+                            ui.label(RichText::new(text).size(12.0).color(rgb(c.subtext)));
+                        });
+                });
+            return;
+        }
+
+        let collection_id = collection_id.unwrap();
+        for group in 0..PIN_GROUP_COUNT {
+            let group_items: Vec<_> = visible_items
+                .iter()
+                .filter(|it| pin_group_index(&it.content) == group)
+                .collect();
+            if group_items.is_empty() {
+                continue;
+            }
+
+            egui::Frame::none()
+                .inner_margin(Margin {
+                    left: 14.0,
+                    right: 14.0,
+                    top: 8.0,
+                    bottom: 2.0,
+                })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(pin_group_label(group))
+                                .size(11.0)
+                                .strong()
+                                .color(rgb(c.accent)),
+                        );
+                        ui.label(
+                            RichText::new(format!("{}", group_items.len()))
+                                .size(10.5)
+                                .color(rgb(c.overlay)),
+                        );
+                    });
+                });
+
+            for item in group_items {
+                self.render_collection_item_row(ui, collection_id, item, true, c);
+            }
+        }
+    }
+
+    fn render_secondary_collections(
+        &mut self,
+        ui: &mut egui::Ui,
+        collections: &[(clipd_core::Collection, Vec<clipd_core::CollectionItem>)],
+        query: &str,
+        c: &clipd_core::ThemeColors,
+    ) {
+        if collections.is_empty() {
+            ui.label(
+                RichText::new("No extra collections.")
+                    .size(11.5)
+                    .color(rgb(c.overlay)),
+            );
+            return;
+        }
+
+        let mut rendered = false;
+        for (coll, items) in collections {
+            let collection_match = collection_matches_query(coll, items, query);
+            let visible_items: Vec<_> = if query.is_empty() || collection_match {
+                items.clone()
+            } else {
+                items
+                    .iter()
+                    .filter(|it| collection_item_matches(it, query))
+                    .cloned()
+                    .collect()
+            };
+            if !query.is_empty() && visible_items.is_empty() && !collection_match {
+                continue;
+            }
+            if query.is_empty() && items.is_empty() {
+                continue;
+            }
+            rendered = true;
+
+            egui::Frame::none()
+                .inner_margin(Margin {
+                    left: 10.0,
+                    right: 10.0,
+                    top: 6.0,
+                    bottom: 2.0,
+                })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(&coll.name)
+                                .strong()
+                                .size(12.5)
+                                .color(rgb(c.text)),
+                        );
+                        let unit = if items.len() == 1 { "item" } else { "items" };
+                        let meta = if let Some(app) = &coll.source_app {
+                            format!("{} {} · from {}", items.len(), unit, app)
+                        } else {
+                            format!("{} {}", items.len(), unit)
+                        };
+                        ui.label(RichText::new(meta).size(10.5).color(rgb(c.overlay)));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new("Delete").size(10.5))
+                                        .fill(Color32::TRANSPARENT)
+                                        .stroke(Stroke::NONE),
+                                )
+                                .clicked()
+                            {
+                                let _ = self.store.delete_collection(coll.id);
+                                self.refresh_collections();
+                            }
+                            if !items.is_empty() {
+                                ui.menu_button(
+                                    RichText::new("AI").size(10.5).color(rgb(c.subtext)),
+                                    |ui| {
+                                        if ui.button("Summarize collection").clicked() {
+                                            let cfg = load_transform_config();
+                                            self.ai_result = Some(
+                                                match clipd_core::summarize_collection(items, &cfg)
+                                                {
+                                                    Ok(s) => s,
+                                                    Err(e) => format!("⚠ {}", e),
+                                                },
+                                            );
+                                            ui.close_menu();
+                                        }
+                                    },
+                                );
+                            }
+                        });
+                    });
+                });
+
+            if visible_items.is_empty() {
+                ui.label(
+                    RichText::new("Empty.")
+                        .size(11.0)
+                        .italics()
+                        .color(rgb(c.overlay)),
+                );
+            } else {
+                for item in &visible_items {
+                    self.render_collection_item_row(ui, coll.id, item, false, c);
+                }
+            }
+        }
+
+        if !rendered {
+            ui.label(
+                RichText::new(if query.is_empty() {
+                    "Only pinned clips are active right now."
+                } else {
+                    "No other collections match."
+                })
+                .size(11.5)
+                .color(rgb(c.overlay)),
+            );
+        }
+    }
+
+    fn render_new_collection_form(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        egui::CollapsingHeader::new(
+            RichText::new("+ New collection")
+                .size(12.0)
+                .color(rgb(c.subtext)),
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_collection_name)
+                    .hint_text("Collection name")
+                    .desired_width(ui.available_width()),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let btn_w = 88.0;
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_collection_app)
+                        .hint_text("Auto-collect app")
+                        .desired_width((ui.available_width() - btn_w).max(80.0)),
+                );
+                let create = ui.add_sized(
+                    [ui.available_width(), 26.0],
+                    egui::Button::new(RichText::new("Create").size(12.0).color(rgb(c.bg_base)))
+                        .fill(rgb(c.accent))
+                        .rounding(Rounding::same(8.0)),
+                );
+                if create.clicked() && !self.new_collection_name.trim().is_empty() {
+                    let app = self.new_collection_app.trim().to_string();
+                    let app_opt = if app.is_empty() {
+                        None
+                    } else {
+                        Some(app.as_str())
+                    };
+                    let _ = self
+                        .store
+                        .create_collection(self.new_collection_name.trim(), app_opt);
+                    self.new_collection_name.clear();
+                    self.new_collection_app.clear();
+                    self.refresh_collections();
+                }
+            });
+        });
+    }
+
+    fn render_collection_item_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        collection_id: i64,
+        item: &clipd_core::CollectionItem,
+        pinned: bool,
+        c: &clipd_core::ThemeColors,
+    ) {
+        let kind = ContentType::detect(&item.content);
+        let type_color = match kind {
+            ContentType::Code => rgb(c.code),
+            ContentType::Url => rgb(c.url),
+            ContentType::Email => rgb(c.email),
+            ContentType::Path => rgb(c.path),
+            _ => rgb(c.overlay),
+        };
+
+        egui::Frame::none()
+            .inner_margin(Margin {
+                left: 14.0,
+                right: 14.0,
+                top: 2.0,
+                bottom: 2.0,
+            })
+            .show(ui, |ui| {
+                egui::Frame::none()
+                    .fill(rgba(c.bg_elevated, 106))
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(Margin::symmetric(10.0, 7.0))
+                    .stroke(Stroke::new(0.5, rgb(c.border).gamma_multiply(0.42)))
+                    .show(ui, |ui| {
+                        let row_width = ui.available_width();
+                        let row_height = 40.0;
+                        let badge_width = 46.0;
+                        let action_width = if pinned { 116.0 } else { 126.0 };
+                        let gap = 8.0;
+                        let text_width =
+                            (row_width - badge_width - action_width - (gap * 2.0)).max(120.0);
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(row_width, row_height),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(badge_width, 26.0),
+                                    egui::Layout::top_down(egui::Align::Center),
+                                    |ui| {
+                                        egui::Frame::none()
+                                            .fill(pill_bg(type_color).gamma_multiply(0.8))
+                                            .rounding(Rounding::same(7.0))
+                                            .inner_margin(Margin::symmetric(6.0, 4.0))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    RichText::new(collection_item_icon(&kind))
+                                                        .size(12.0)
+                                                        .color(type_color),
+                                                );
+                                            });
+                                    },
+                                );
+                                ui.add_space(gap);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(text_width, row_height),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.y = 1.0;
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(collection_item_title(item))
+                                                    .size(12.5)
+                                                    .color(rgb(c.text)),
+                                            )
+                                            .truncate(),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 5.0;
+                                            ui.label(
+                                                RichText::new(kind.as_str())
+                                                    .size(10.0)
+                                                    .color(type_color),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "· {}",
+                                                    relative_time(&item.added_at)
+                                                ))
+                                                .size(10.0)
+                                                .color(rgb(c.overlay)),
+                                            );
+                                        });
+                                    },
+                                );
+                                ui.add_space(gap);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(action_width, 28.0),
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        let remove_label = if pinned { "Unpin" } else { "Remove" };
+                                        if pill_button(ui, remove_label, c).clicked() {
+                                            let _ = self.store.remove_collection_item(
+                                                collection_id,
+                                                item.clip_id,
+                                            );
+                                            self.refresh_collections();
+                                        }
+                                        if pill_button(ui, "Copy", c).clicked() {
+                                            if let Ok(mut cb) = Clipboard::new() {
+                                                let _ = cb.set_text(&item.content);
+                                            }
+                                        }
+                                    },
+                                );
+                            },
+                        );
+                    });
+            });
+    }
+}
+
+const PIN_GROUP_COUNT: usize = 6;
+
+fn is_pinned_collection_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(PINNED_COLLECTION_NAME)
+        || name.eq_ignore_ascii_case(LEGACY_STARRED_COLLECTION_NAME)
+}
+
+fn collection_matches_query(
+    coll: &clipd_core::Collection,
+    items: &[clipd_core::CollectionItem],
+    query: &str,
+) -> bool {
+    query.is_empty()
+        || coll.name.to_lowercase().contains(query)
+        || coll
+            .source_app
+            .as_deref()
+            .map(|app| app.to_lowercase().contains(query))
+            .unwrap_or(false)
+        || items.iter().any(|it| collection_item_matches(it, query))
+}
+
+fn collection_item_matches(item: &clipd_core::CollectionItem, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let q = query.to_lowercase();
+    item.preview.to_lowercase().contains(&q)
+        || item.content.to_lowercase().contains(&q)
+        || collection_item_title(item).to_lowercase().contains(&q)
+        || ContentType::detect(&item.content).as_str().contains(&q)
+}
+
+fn pin_group_index(content: &str) -> usize {
+    match ContentType::detect(content) {
+        ContentType::Url => 0,
+        ContentType::Code => 1,
+        ContentType::Text => 2,
+        ContentType::Path => 3,
+        ContentType::Email => 4,
+        ContentType::Unknown => 5,
+    }
+}
+
+fn pin_group_label(group: usize) -> &'static str {
+    match group {
+        0 => "Links",
+        1 => "Code",
+        2 => "Text",
+        3 => "Files",
+        4 => "Emails",
+        _ => "Other",
+    }
+}
+
+fn collection_item_icon(kind: &ContentType) -> &'static str {
+    match kind {
+        ContentType::Url => "URL",
+        ContentType::Code => "{ }",
+        ContentType::Email => "@",
+        ContentType::Path => "PATH",
+        ContentType::Text => "TXT",
+        ContentType::Unknown => "...",
+    }
+}
+
+fn collection_item_title(item: &clipd_core::CollectionItem) -> String {
+    let content = item.content.trim();
+    let title = match ContentType::detect(content) {
+        ContentType::Url => compact_url_title(content),
+        ContentType::Path => content
+            .rsplit(['/', '\\'])
+            .find(|part| !part.is_empty())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+    .unwrap_or_else(|| item.preview.trim().to_string());
+
+    if title.is_empty() {
+        "Untitled clip".to_string()
+    } else {
+        title
+    }
+}
+
+fn compact_url_title(url: &str) -> Option<String> {
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let without_www = without_scheme
+        .strip_prefix("www.")
+        .unwrap_or(without_scheme);
+    let without_query = without_www.split(['?', '#']).next().unwrap_or(without_www);
+    let mut parts = without_query.split('/').filter(|part| !part.is_empty());
+    let host = parts.next()?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let path = parts.next().unwrap_or("").trim();
+    if path.is_empty() {
+        Some(host.to_string())
+    } else {
+        Some(format!("{}/{}", host, path))
     }
 }
 
