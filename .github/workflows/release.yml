@@ -16,7 +16,9 @@ env:
 
 jobs:
   build-macos:
+    timeout-minutes: 40
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: macos-14
@@ -110,6 +112,7 @@ jobs:
           path: target/release/Clipd-macos-*.dmg
 
   build-linux:
+    timeout-minutes: 40
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -177,6 +180,7 @@ jobs:
           path: target/release/clipd_*.deb
 
   build-windows:
+    timeout-minutes: 40
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -215,6 +219,9 @@ jobs:
 
   create-release:
     needs: [build-macos, build-linux, build-windows]
+    # Publish whatever built — don't let one stuck/failed platform (e.g. a hung
+    # macOS Intel runner) block releasing the Windows/Linux/arm64 artifacts.
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
