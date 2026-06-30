@@ -40,7 +40,7 @@ $Stage = "target\release\$PkgName"
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
 New-Item -ItemType Directory -Path $Stage -Force | Out-Null
 
-foreach ($bin in @("clipd.exe", "clipd-ui.exe", "clipd-gui.exe", "clipd-mcp.exe")) {
+foreach ($bin in @("clipd.exe", "clipd-ui.exe", "clipd-gui.exe", "clipd-mcp.exe", "clipd-overlay.exe")) {
     $src = "target\release\$bin"
     if (Test-Path $src) {
         Copy-Item $src $Stage

@@ -8,6 +8,7 @@ members = [
     "clipd-ui",
     "clipd-gui",
     "clipd-overlay",
+    "clipd-picker",
     "clipd-mcp",
 ]
 exclude = ["third_party/rdev"]
@@ -19,7 +20,7 @@ exclude = ["third_party/rdev"]
 rdev = { path = "third_party/rdev" }
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 license = "MIT"
 description = "AI clipboard daemon for developers — multi-slot copy, searchable history, editor-native"

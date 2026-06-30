@@ -38,6 +38,50 @@ enum TuiMode {
 }
 
 #[derive(PartialEq, Clone, Copy)]
+enum QuickFilter {
+    All,
+    Code,
+    Links,
+    Slots,
+    Text,
+}
+
+impl QuickFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Code,
+            Self::Code => Self::Links,
+            Self::Links => Self::Slots,
+            Self::Slots => Self::Text,
+            Self::Text => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Code => "Code",
+            Self::Links => "Links",
+            Self::Slots => "Slots",
+            Self::Text => "Text",
+        }
+    }
+
+    fn matches(self, clip: &ClipEntry) -> bool {
+        match self {
+            Self::All => true,
+            Self::Code => clip.content_type == ContentType::Code,
+            Self::Links => matches!(
+                clip.content_type,
+                ContentType::Url | ContentType::Email | ContentType::Path
+            ),
+            Self::Slots => clip.slot.is_some(),
+            Self::Text => clip.content_type == ContentType::Text,
+        }
+    }
+}
+
+#[derive(PartialEq, Clone, Copy)]
 enum SettingsRow {
     Enabled,
     DetectApiKeys,
@@ -92,6 +136,8 @@ struct App {
     result_scroll: u16,
 
     semantic_mode: bool,
+    quick_filter: QuickFilter,
+    source_filter: Option<String>,
     cached_embeddings: Vec<(i64, Embedding)>,
     privacy_config: PrivacyConfig,
     sessions: Vec<Session>,
@@ -139,6 +185,8 @@ impl App {
             custom_prompt_input: String::new(),
             result_scroll: 0,
             semantic_mode: false,
+            quick_filter: QuickFilter::All,
+            source_filter: None,
             cached_embeddings: Vec::new(),
             privacy_config,
             sessions,
@@ -152,10 +200,11 @@ impl App {
     }
 
     fn filter_clips(&mut self) {
-        if self.search_input.is_empty() {
-            self.filtered = (0..self.clips.len()).collect();
+        let mut filtered = if self.search_input.is_empty() {
+            (0..self.clips.len()).collect()
         } else if self.semantic_mode {
             let mut used_vectors = false;
+            let mut semantic_matches: Vec<usize> = Vec::new();
 
             if !self.cached_embeddings.is_empty()
                 && is_embedding_available(&self.transform_config)
@@ -173,7 +222,7 @@ impl App {
                             .enumerate()
                             .map(|(i, c)| (c.id, i))
                             .collect();
-                        self.filtered = results
+                        semantic_matches = results
                             .iter()
                             .filter_map(|r| id_to_idx.get(&r.clip_id).copied())
                             .collect();
@@ -187,8 +236,10 @@ impl App {
                     self.clips.iter().map(|c| c.content.as_str()).collect();
                 let index = TfIdfIndex::build(&docs);
                 let results = index.search(&self.search_input, 50);
-                self.filtered = results.iter().map(|r| r.clip_index).collect();
+                semantic_matches = results.iter().map(|r| r.clip_index).collect();
             }
+
+            semantic_matches
         } else {
             let mut fuzzy: Vec<usize> = self
                 .clips
@@ -213,8 +264,18 @@ impl App {
                 fuzzy = results.iter().map(|r| r.clip_index).collect();
             }
 
-            self.filtered = fuzzy;
-        }
+            fuzzy
+        };
+
+        filtered.retain(|&idx| {
+            let clip = &self.clips[idx];
+            self.quick_filter.matches(clip)
+                && self
+                    .source_filter
+                    .as_deref()
+                    .map_or(true, |app| clip.source_app.as_deref() == Some(app))
+        });
+        self.filtered = filtered;
 
         if !self.filtered.is_empty() {
             self.list_state.select(Some(0));
@@ -222,6 +283,93 @@ impl App {
         } else {
             self.list_state.select(None);
             self.selected_clip = None;
+        }
+    }
+
+    fn select_visible(&mut self, visible_index: usize) -> bool {
+        if visible_index >= self.filtered.len() {
+            return false;
+        }
+        self.list_state.select(Some(visible_index));
+        self.sync_selection();
+        self.copy_selected()
+    }
+
+    fn jump_to_start(&mut self) {
+        if !self.filtered.is_empty() {
+            self.list_state.select(Some(0));
+            self.sync_selection();
+        }
+    }
+
+    fn jump_to_end(&mut self) {
+        if !self.filtered.is_empty() {
+            self.list_state.select(Some(self.filtered.len() - 1));
+            self.sync_selection();
+        }
+    }
+
+    fn cycle_quick_filter(&mut self) {
+        self.quick_filter = self.quick_filter.next();
+        self.filter_clips();
+        self.status_message = Some((
+            format!("Filter: {}", self.quick_filter.label()),
+            color(self.theme.colors().accent),
+        ));
+    }
+
+    fn cycle_source_filter(&mut self) {
+        let sources = self.top_sources();
+        if sources.is_empty() {
+            self.source_filter = None;
+            return;
+        }
+
+        self.source_filter = match self.source_filter.as_deref() {
+            None => sources.first().cloned(),
+            Some(current) => {
+                let next = sources
+                    .iter()
+                    .position(|s| s == current)
+                    .map(|idx| idx + 1)
+                    .unwrap_or(0);
+                sources.get(next).cloned()
+            }
+        };
+        self.filter_clips();
+        self.status_message = Some((
+            format!(
+                "Source: {}",
+                self.source_filter.as_deref().unwrap_or("All apps")
+            ),
+            color(self.theme.colors().accent),
+        ));
+    }
+
+    fn top_sources(&self) -> Vec<String> {
+        let mut sources: Vec<String> = Vec::new();
+        for clip in &self.clips {
+            let Some(app) = clip.source_app.as_deref() else {
+                continue;
+            };
+            if app.trim().is_empty() || sources.iter().any(|s| s == app) {
+                continue;
+            }
+            sources.push(app.to_string());
+            if sources.len() >= 12 {
+                break;
+            }
+        }
+        sources
+    }
+
+    fn active_filter_label(&self) -> String {
+        match self.source_filter.as_deref() {
+            Some(app) if self.quick_filter != QuickFilter::All => {
+                format!("{} · {}", self.quick_filter.label(), app)
+            }
+            Some(app) => app.to_string(),
+            None => self.quick_filter.label().to_string(),
         }
     }
 
@@ -384,8 +532,20 @@ fn handle_normal_keys(app: &mut App, key: crossterm::event::KeyEvent) {
             }
         }
         KeyCode::Up => app.move_selection(-1),
+        KeyCode::Char('k') if key.modifiers.is_empty() => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
-        KeyCode::Tab => app.cycle_theme(),
+        KeyCode::Char('j') if key.modifiers.is_empty() => app.move_selection(1),
+        KeyCode::PageUp => app.move_selection(-10),
+        KeyCode::PageDown => app.move_selection(10),
+        KeyCode::Home => app.jump_to_start(),
+        KeyCode::Char('g') if key.modifiers.is_empty() => app.jump_to_start(),
+        KeyCode::End => app.jump_to_end(),
+        KeyCode::Char('G') if key.modifiers.is_empty() => app.jump_to_end(),
+        KeyCode::Tab => app.cycle_quick_filter(),
+        KeyCode::BackTab => app.cycle_source_filter(),
+        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.cycle_theme();
+        }
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.enter_transform_mode();
         }
@@ -421,6 +581,15 @@ fn handle_normal_keys(app: &mut App, key: crossterm::event::KeyEvent) {
             ));
             app.filter_clips();
         }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.quick_filter = QuickFilter::All;
+            app.source_filter = None;
+            app.filter_clips();
+            app.status_message = Some((
+                "Filters cleared".into(),
+                color(app.theme.colors().accent),
+            ));
+        }
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.settings_cursor = 0;
             app.settings_editing = false;
@@ -431,6 +600,18 @@ fn handle_normal_keys(app: &mut App, key: crossterm::event::KeyEvent) {
         KeyCode::Backspace => {
             app.search_input.pop();
             app.filter_clips();
+        }
+        KeyCode::Char(c)
+            if app.search_input.is_empty()
+                && c.is_ascii_digit()
+                && c != '0'
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            let visible_index = (c as u8 - b'1') as usize;
+            if app.select_visible(visible_index) {
+                app.should_quit = true;
+            }
         }
         KeyCode::Char(c) => {
             app.search_input.push(c);
@@ -770,34 +951,36 @@ fn draw_search(f: &mut Frame, app: &App, area: Rect) {
     let c = app.theme.colors();
     let cursor = "│";
     let mode_badge = if app.semantic_mode { " 🧠 Semantic " } else { " 🔍 Fuzzy " };
-    let title = format!("{} Search clips ", mode_badge);
+    let title = format!("{} clipd ", mode_badge);
 
-    // Build inline slot badges: [1] [2] [3] ... shown after the search input.
-    let max_slots = 5.min(app.clips.len());
-    let mut slot_spans: Vec<Span> = vec![
-        Span::styled(format!(" {}{}", app.search_input, cursor), Style::default().fg(color(c.text))),
-        Span::raw("   "),
+    let query = if app.search_input.is_empty() {
+        " type to search".to_string()
+    } else {
+        format!(" {}", app.search_input)
+    };
+    let query_style = if app.search_input.is_empty() {
+        Style::default().fg(color(c.overlay))
+    } else {
+        Style::default().fg(color(c.text))
+    };
+    let filter_label = app.active_filter_label();
+    let spans: Vec<Span> = vec![
+        Span::styled(format!("{}{}", query, cursor), query_style),
+        Span::raw("  "),
+        Span::styled(" Tab ", Style::default().fg(color(c.bg_base)).bg(color(c.accent))),
+        Span::styled("type", Style::default().fg(color(c.subtext))),
+        Span::raw("  "),
+        Span::styled(" S-Tab ", Style::default().fg(color(c.bg_base)).bg(color(c.accent2))),
+        Span::styled("app", Style::default().fg(color(c.subtext))),
+        Span::raw("  "),
+        Span::styled(
+            format!(" {} ", filter_label),
+            Style::default()
+                .fg(color(c.bg_base))
+                .bg(color(c.green))
+                .add_modifier(Modifier::BOLD),
+        ),
     ];
-    for i in 0..max_slots {
-        let badge_style = if i == 0 {
-            Style::default()
-                .fg(color(c.bg_base))
-                .bg(color(c.accent))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(color(c.bg_base))
-                .bg(color(c.subtext))
-        };
-        slot_spans.push(Span::styled(format!(" {} ", i + 1), badge_style));
-        slot_spans.push(Span::raw(" "));
-    }
-    if max_slots == 0 {
-        slot_spans.push(Span::styled(
-            "no slots",
-            Style::default().fg(color(c.overlay)),
-        ));
-    }
 
     let block = Block::default()
         .title(title)
@@ -805,7 +988,7 @@ fn draw_search(f: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(color(c.accent)));
 
-    let widget = Paragraph::new(Line::from(slot_spans)).block(block);
+    let widget = Paragraph::new(Line::from(spans)).block(block);
 
     f.render_widget(widget, area);
 }
@@ -817,7 +1000,8 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app
         .filtered
         .iter()
-        .map(|&idx| {
+        .enumerate()
+        .map(|(visible_idx, &idx)| {
             let clip = &app.clips[idx];
             let icon = clip.content_type.icon();
             let time = relative_time(&clip.timestamp);
@@ -827,12 +1011,23 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
 
             let time_w = time.chars().count();
             let badge_w = if sensitive { 3 } else { 0 };
-            let max_preview = inner_w.saturating_sub(time_w + badge_w + 4);
+            let pick_w = if visible_idx < 9 { 4 } else { 2 };
+            let max_preview = inner_w.saturating_sub(time_w + badge_w + pick_w + 4);
             let preview = truncate(&clip.preview, max_preview);
             let preview_w = preview.chars().count();
-            let gap = inner_w.saturating_sub(preview_w + time_w + badge_w + 2);
+            let gap = inner_w.saturating_sub(preview_w + time_w + badge_w + pick_w + 2);
+
+            let pick = if visible_idx < 9 {
+                Span::styled(
+                    format!("{} ", visible_idx + 1),
+                    Style::default().fg(color(c.accent)),
+                )
+            } else {
+                Span::raw("  ")
+            };
 
             let mut spans = vec![
+                pick,
                 Span::styled(format!("{} ", icon), Style::default()),
                 Span::styled(preview, Style::default().fg(color(c.text))),
             ];
@@ -936,23 +1131,29 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         Line::from(vec![
-            Span::styled(" ↑↓ ", Style::default().fg(accent)),
+            Span::styled(" j/k↑↓ ", Style::default().fg(accent)),
             Span::styled("Nav", Style::default().fg(sub)),
+            Span::styled("  ", Style::default()),
+            Span::styled("1-9 ", Style::default().fg(accent)),
+            Span::styled("Copy row", Style::default().fg(sub)),
             Span::styled("  ", Style::default()),
             Span::styled("⏎ ", Style::default().fg(accent)),
             Span::styled("Copy", Style::default().fg(sub)),
             Span::styled("  ", Style::default()),
+            Span::styled("Tab ", Style::default().fg(accent)),
+            Span::styled("Type filter", Style::default().fg(sub)),
+            Span::styled("  ", Style::default()),
+            Span::styled("S-Tab ", Style::default().fg(accent)),
+            Span::styled("App", Style::default().fg(sub)),
+            Span::styled("  ", Style::default()),
+            Span::styled("^A ", Style::default().fg(accent)),
+            Span::styled("All", Style::default().fg(sub)),
+            Span::styled("  ", Style::default()),
             Span::styled("^T ", Style::default().fg(accent)),
             Span::styled("Transform", Style::default().fg(sub)),
             Span::styled("  ", Style::default()),
-            Span::styled("^S ", Style::default().fg(accent)),
-            Span::styled("Sessions", Style::default().fg(sub)),
-            Span::styled("  ", Style::default()),
             Span::styled("^G ", Style::default().fg(accent)),
             Span::styled("Semantic", Style::default().fg(sub)),
-            Span::styled("  ", Style::default()),
-            Span::styled("^P ", Style::default().fg(accent)),
-            Span::styled("Privacy", Style::default().fg(sub)),
             Span::styled("  ", Style::default()),
             Span::styled("^D ", Style::default().fg(accent)),
             Span::styled("Del", Style::default().fg(sub)),

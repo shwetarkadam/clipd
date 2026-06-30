@@ -70,6 +70,7 @@ Section "MainSection" SEC01
   File "clipd-ui.exe"
   File "clipd-gui.exe"
   File "clipd-mcp.exe"
+  File "clipd-overlay.exe"
 
   CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
   CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\clipd-ui.exe"
@@ -103,6 +104,7 @@ Section Uninstall
   Delete "$INSTDIR\clipd-ui.exe"
   Delete "$INSTDIR\clipd-gui.exe"
   Delete "$INSTDIR\clipd-mcp.exe"
+  Delete "$INSTDIR\clipd-overlay.exe"
   Delete "$INSTDIR\uninstall.exe"
 
   RMDir "$INSTDIR"

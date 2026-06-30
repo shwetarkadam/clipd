@@ -75,7 +75,7 @@ try {
     # ── Install binaries ──
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 
-    foreach ($Bin in @("clipd.exe", "clipd-ui.exe", "clipd-gui.exe", "clipd-mcp.exe")) {
+    foreach ($Bin in @("clipd.exe", "clipd-ui.exe", "clipd-gui.exe", "clipd-mcp.exe", "clipd-overlay.exe")) {
         $Src = Join-Path $SrcDir $Bin
         if (Test-Path $Src) {
             Copy-Item -Path $Src -Destination (Join-Path $InstallDir $Bin) -Force

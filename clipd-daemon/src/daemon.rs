@@ -18,11 +18,13 @@ use global_hotkey::{
 #[cfg(target_os = "macos")]
 use rdev::{grab, Event, EventType, Key as RKey};
 #[cfg(target_os = "windows")]
-use rdev::{listen, Event, EventType, Key as RKey};
+use rdev::{grab, Event, EventType, Key as RKey};
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "windows")]
+use std::sync::Mutex;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -221,94 +223,62 @@ pub fn run_daemon_with_stop(
     let mut registered_hotkeys: Vec<(HotKey, FinalAction)> = Vec::new();
     #[cfg(not(target_os = "macos"))]
     {
-        let digit_codes = [
-            Code::Digit1,
-            Code::Digit2,
-            Code::Digit3,
-            Code::Digit4,
-            Code::Digit5,
-            Code::Digit6,
-            Code::Digit7,
-            Code::Digit8,
-            Code::Digit9,
-        ];
-        for (i, code) in digit_codes.iter().enumerate() {
-            let slot_num = (i + 1) as u8;
-            let copy_hk = HotKey::new(Some(Modifiers::SUPER | Modifiers::CONTROL), *code);
-            if let Err(e) = hotkey_manager.register(copy_hk) {
-                log::warn!("Failed to register Cmd+Ctrl+{}: {}", slot_num, e);
-            } else {
-                registered_hotkeys.push((copy_hk, FinalAction::CopyToSlot(slot_num)));
-            }
-            let paste_hk = HotKey::new(
-                Some(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT),
-                *code,
-            );
-            if let Err(e) = hotkey_manager.register(paste_hk) {
-                log::warn!("Failed to register Cmd+Ctrl+Option+{}: {}", slot_num, e);
-            } else {
-                registered_hotkeys.push((paste_hk, FinalAction::PasteFromSlot(slot_num)));
+        #[cfg(not(target_os = "windows"))]
+        {
+            let digit_codes = [
+                (Code::Digit1, Code::Numpad1),
+                (Code::Digit2, Code::Numpad2),
+                (Code::Digit3, Code::Numpad3),
+                (Code::Digit4, Code::Numpad4),
+                (Code::Digit5, Code::Numpad5),
+                (Code::Digit6, Code::Numpad6),
+                (Code::Digit7, Code::Numpad7),
+                (Code::Digit8, Code::Numpad8),
+                (Code::Digit9, Code::Numpad9),
+            ];
+            for (i, (top_code, numpad_code)) in digit_codes.iter().enumerate() {
+                let slot_num = (i + 1) as u8;
+                for code in [*top_code, *numpad_code] {
+                    let copy_hk = HotKey::new(Some(Modifiers::SUPER | Modifiers::CONTROL), code);
+                    if let Err(e) = hotkey_manager.register(copy_hk) {
+                        log::warn!(
+                            "Failed to register Super+Ctrl+{} ({:?}): {}",
+                            slot_num,
+                            code,
+                            e
+                        );
+                    } else {
+                        registered_hotkeys.push((copy_hk, FinalAction::CopyToSlot(slot_num)));
+                    }
+                    let paste_hk = HotKey::new(
+                        Some(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT),
+                        code,
+                    );
+                    if let Err(e) = hotkey_manager.register(paste_hk) {
+                        log::warn!(
+                            "Failed to register Super+Ctrl+Alt+{} ({:?}): {}",
+                            slot_num,
+                            code,
+                            e
+                        );
+                    } else {
+                        registered_hotkeys.push((paste_hk, FinalAction::PasteFromSlot(slot_num)));
+                    }
+                }
             }
         }
-        // Windows letter slots A–Z (modifier chords so the letter isn't typed):
-        //   copy  → Win+Ctrl+<letter>      paste → Win+Ctrl+Alt+<letter>
-        // Mirrors the numeric scheme. Some combos may be reserved by Windows and
-        // simply won't register (logged) — the rest still work.
+
+        // Windows deliberately avoids direct Win/Ctrl/Alt letter-slot chords.
+        // They collide with OS shortcuts, browser menus, AltGr keyboard layouts,
+        // and app accelerators. Numeric slots use Ctrl+C/Ctrl+V multi-tap; A-Z
+        // slots should be addressed through a Clipd-owned palette/prefix UI.
         #[cfg(target_os = "windows")]
         {
-            let letter_codes = [
-                Code::KeyA,
-                Code::KeyB,
-                Code::KeyC,
-                Code::KeyD,
-                Code::KeyE,
-                Code::KeyF,
-                Code::KeyG,
-                Code::KeyH,
-                Code::KeyI,
-                Code::KeyJ,
-                Code::KeyK,
-                Code::KeyL,
-                Code::KeyM,
-                Code::KeyN,
-                Code::KeyO,
-                Code::KeyP,
-                Code::KeyQ,
-                Code::KeyR,
-                Code::KeyS,
-                Code::KeyT,
-                Code::KeyU,
-                Code::KeyV,
-                Code::KeyW,
-                Code::KeyX,
-                Code::KeyY,
-                Code::KeyZ,
-            ];
-            for (i, code) in letter_codes.iter().enumerate() {
-                let slot = 31u8 + i as u8; // letter slots A=31 … Z=56
-                let copy_hk = HotKey::new(Some(Modifiers::SUPER | Modifiers::CONTROL), *code);
-                if let Err(e) = hotkey_manager.register(copy_hk) {
-                    log::warn!(
-                        "Letter-slot copy {:?} not registered (conflict?): {}",
-                        code,
-                        e
-                    );
-                } else {
-                    registered_hotkeys.push((copy_hk, FinalAction::CopyToSlot(slot)));
-                }
-                let paste_hk = HotKey::new(
-                    Some(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT),
-                    *code,
-                );
-                if let Err(e) = hotkey_manager.register(paste_hk) {
-                    log::warn!(
-                        "Letter-slot paste {:?} not registered (conflict?): {}",
-                        code,
-                        e
-                    );
-                } else {
-                    registered_hotkeys.push((paste_hk, FinalAction::PasteFromSlot(slot)));
-                }
+            let ctrl_v_hk = HotKey::new(Some(Modifiers::CONTROL), Code::KeyV);
+            if let Err(e) = hotkey_manager.register(ctrl_v_hk) {
+                log::warn!("Failed to register Ctrl+V multi-slot paste: {}", e);
+            } else {
+                registered_hotkeys.push((ctrl_v_hk, FinalAction::CtrlVPasteTap));
             }
         }
 
@@ -335,6 +305,19 @@ pub fn run_daemon_with_stop(
             log::warn!("Failed to register Ctrl+G: {}", e);
         } else {
             registered_hotkeys.push((gui_hk, FinalAction::OpenGui));
+        }
+
+        // Conflict-free slot picker (the "Clipd-owned palette" letter slots want):
+        // one safe leader — Ctrl+` — opens the popup; press a slot key (1-9 / A-Z)
+        // to paste it. No Win/Alt chord conflicts, scales to all 35 slots.
+        #[cfg(target_os = "windows")]
+        {
+            let picker_hk = HotKey::new(Some(Modifiers::CONTROL), Code::Backquote);
+            if let Err(e) = hotkey_manager.register(picker_hk) {
+                log::warn!("Failed to register Ctrl+` slot picker: {}", e);
+            } else {
+                registered_hotkeys.push((picker_hk, FinalAction::OpenPicker));
+            }
         }
     }
 
@@ -803,17 +786,33 @@ pub fn run_daemon_with_stop(
     #[cfg(not(target_os = "macos"))]
     {
         use std::time::Duration;
-        // Windows: add the passive multi-tap copy gesture (Ctrl+C ×N → slot N)
-        // alongside the fixed-chord hotkeys.
-        #[cfg(target_os = "windows")]
-        spawn_ctrl_c_multitap(slot_manager.clone(), persist_tx.clone());
-
         let receiver = GlobalHotKeyEvent::receiver();
         let hotkey_slot_mgr = slot_manager.clone();
         // `persist_tx` (cloned above the watcher move) is used only by the macOS
         // event loop; reuse it here so the non-macOS loop can persist slot copies.
         let transform_config = load_transform_config();
         let paste_transform = load_paste_transform_settings();
+        #[cfg(target_os = "windows")]
+        let sequence_slot = Arc::new(Mutex::new(1u8));
+        #[cfg(target_os = "windows")]
+        let ctrl_v_tap_state = Arc::new(Mutex::new(WindowsTapState::default()));
+        #[cfg(not(target_os = "windows"))]
+        let mut sequence_slot: u8 = 1;
+
+        // Windows: a suppressing grab hook drives multi-tap copy (Ctrl+C ×N → slot
+        // N) and letter slots (Ctrl+C ×2 / Ctrl+V ×2, then a letter). It only ever
+        // suppresses the single armed letter — everything else passes through, so
+        // it can't disrupt typing. Numeric Ctrl+V paste stays on its existing
+        // path; a letter cancels the pending slot-N paste via the shared tap state.
+        #[cfg(target_os = "windows")]
+        spawn_windows_grab(
+            slot_manager.clone(),
+            persist_tx.clone(),
+            suppress.clone(),
+            transform_config.clone(),
+            paste_transform.clone(),
+            ctrl_v_tap_state.clone(),
+        );
         loop {
             // Blocking recv — no CPU polling. Wake every 200ms to check stop flag.
             let event = match receiver.recv_timeout(Duration::from_millis(200)) {
@@ -829,26 +828,83 @@ pub fn run_daemon_with_stop(
             if stop_hotkey.load(Ordering::Relaxed) {
                 break;
             }
-            if event.state == global_hotkey::HotKeyState::Pressed {
-                if let Some((_, action)) = registered_hotkeys
-                    .iter()
-                    .find(|(hk, _)| hk.id() == event.id)
+            if let Some(action) = registered_hotkeys
+                .iter()
+                .find(|(hk, _)| hk.id() == event.id)
+                .map(|(_, action)| *action)
+            {
+                #[cfg(target_os = "windows")]
                 {
-                    match action {
-                        FinalAction::CopyToSlot(s) => {
-                            execute_copy(*s, &hotkey_slot_mgr, &persist_tx)
+                    match (event.state, action) {
+                        (global_hotkey::HotKeyState::Pressed, FinalAction::OpenTui) => {
+                            open_tui_search()
                         }
-                        FinalAction::PasteFromSlot(s) => execute_direct_paste(
-                            *s,
-                            &hotkey_slot_mgr,
-                            &suppress,
-                            &transform_config,
-                            &paste_transform,
+                        (global_hotkey::HotKeyState::Pressed, FinalAction::OpenGui) => open_gui(),
+                        (global_hotkey::HotKeyState::Pressed, FinalAction::OpenPicker) => {
+                            spawn_picker()
+                        }
+                        // Windows hotkeys fire while their modifiers are still down. If we paste
+                        // immediately, the target app can receive the original hotkey modifiers
+                        // plus Ctrl+V instead of a clean paste. Run copy/paste only after release,
+                        // then add a small delay so the user can release the modifiers too.
+                        (
+                            global_hotkey::HotKeyState::Released,
+                            FinalAction::CopyToSlot(_)
+                            | FinalAction::PasteFromSlot(_)
+                            | FinalAction::SmartPaste
+                            | FinalAction::SequencePaste,
+                        ) => execute_windows_deferred_action(
+                            action,
+                            hotkey_slot_mgr.clone(),
+                            persist_tx.clone(),
+                            suppress.clone(),
+                            transform_config.clone(),
+                            paste_transform.clone(),
+                            sequence_slot.clone(),
                         ),
-                        FinalAction::OpenTui => open_tui_search(),
-                        FinalAction::OpenGui => open_gui(),
-                        FinalAction::SmartPaste => {
-                            execute_smart_paste(&suppress, &transform_config, &paste_transform)
+                        (global_hotkey::HotKeyState::Pressed, FinalAction::CtrlVPasteTap) => {
+                            execute_windows_ctrl_v_tap(
+                                ctrl_v_tap_state.clone(),
+                                hotkey_slot_mgr.clone(),
+                                suppress.clone(),
+                                transform_config.clone(),
+                                paste_transform.clone(),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+
+                #[cfg(not(target_os = "windows"))]
+                {
+                    if event.state == global_hotkey::HotKeyState::Pressed {
+                        match action {
+                            FinalAction::CopyToSlot(s) => {
+                                execute_copy(s, &hotkey_slot_mgr, &persist_tx)
+                            }
+                            FinalAction::PasteFromSlot(s) => execute_direct_paste(
+                                s,
+                                &hotkey_slot_mgr,
+                                &suppress,
+                                &transform_config,
+                                &paste_transform,
+                            ),
+                            FinalAction::OpenTui => open_tui_search(),
+                            FinalAction::OpenGui => open_gui(),
+                            FinalAction::OpenPicker => {}
+                            FinalAction::SmartPaste => {
+                                execute_smart_paste(&suppress, &transform_config, &paste_transform)
+                            }
+                            FinalAction::CtrlVPasteTap => {}
+                            FinalAction::SequencePaste => {
+                                execute_sequence_paste(
+                                    &mut sequence_slot,
+                                    &hotkey_slot_mgr,
+                                    &suppress,
+                                    &transform_config,
+                                    &paste_transform,
+                                );
+                            }
                         }
                     }
                 }
@@ -890,16 +946,117 @@ enum HotkeyTick {
 }
 
 #[cfg(not(target_os = "macos"))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum FinalAction {
     CopyToSlot(u8),
     PasteFromSlot(u8),
+    CtrlVPasteTap,
     OpenTui,
     OpenGui,
+    OpenPicker,
     SmartPaste,
+    SequencePaste,
 }
 
 // ── Action executors ──
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct WindowsTapState {
+    last_tap: Option<Instant>,
+    tap_count: u8,
+    generation: u64,
+}
+
+#[cfg(target_os = "windows")]
+fn execute_windows_ctrl_v_tap(
+    state: Arc<Mutex<WindowsTapState>>,
+    mgr: SlotManager,
+    suppress: Arc<AtomicBool>,
+    transform_cfg: TransformConfig,
+    paste_settings: PasteTransformSettings,
+) {
+    let now = Instant::now();
+    let generation = {
+        let Ok(mut s) = state.lock() else {
+            return;
+        };
+        s.tap_count = match s.last_tap {
+            Some(prev) if now.duration_since(prev) < TAP_WINDOW => s.tap_count.saturating_add(1),
+            _ => 1,
+        };
+        s.last_tap = Some(now);
+        s.generation = s.generation.wrapping_add(1);
+        log::info!("⌨️  Windows Ctrl+V tap #{}", s.tap_count);
+        s.generation
+    };
+
+    std::thread::spawn(move || {
+        std::thread::sleep(TAP_WINDOW + Duration::from_millis(80));
+        let slot = {
+            let Ok(mut s) = state.lock() else {
+                return;
+            };
+            if s.generation != generation {
+                return;
+            }
+            if s.last_tap.map_or(true, |prev| {
+                Instant::now().duration_since(prev) < TAP_WINDOW
+            }) {
+                return;
+            }
+            let slot = s.tap_count.clamp(1, 9);
+            s.tap_count = 0;
+            s.last_tap = None;
+            slot
+        };
+        log::info!("⌨️  Windows Ctrl+V final → slot {}", slot);
+        execute_direct_paste(slot, &mgr, &suppress, &transform_cfg, &paste_settings);
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn execute_windows_deferred_action(
+    action: FinalAction,
+    mgr: SlotManager,
+    persist_tx: mpsc::SyncSender<ClipEvent>,
+    suppress: Arc<AtomicBool>,
+    transform_cfg: TransformConfig,
+    paste_settings: PasteTransformSettings,
+    sequence_slot: Arc<Mutex<u8>>,
+) {
+    std::thread::spawn(move || {
+        // Let the user release Win/Alt/Ctrl before Clipd injects Ctrl+C/Ctrl+V.
+        std::thread::sleep(Duration::from_millis(160));
+        log::info!("⌨️  Windows hotkey action after release: {:?}", action);
+        match action {
+            FinalAction::CopyToSlot(slot) => {
+                execute_selection_copy_to_slot(slot, &mgr, &persist_tx);
+            }
+            FinalAction::PasteFromSlot(slot) => {
+                execute_direct_paste(slot, &mgr, &suppress, &transform_cfg, &paste_settings);
+            }
+            FinalAction::SmartPaste => {
+                execute_smart_paste(&suppress, &transform_cfg, &paste_settings);
+            }
+            FinalAction::SequencePaste => {
+                if let Ok(mut slot) = sequence_slot.lock() {
+                    execute_sequence_paste(
+                        &mut *slot,
+                        &mgr,
+                        &suppress,
+                        &transform_cfg,
+                        &paste_settings,
+                    );
+                }
+            }
+            FinalAction::CtrlVPasteTap
+            | FinalAction::OpenTui
+            | FinalAction::OpenGui
+            | FinalAction::OpenPicker => {}
+        }
+    });
+}
 
 /// After a multi-tap copy, restore the OS clipboard to the given slot's content
 /// so that a normal Cmd+V pastes the "first" copy rather than the multi-tap content.
@@ -922,65 +1079,230 @@ fn restore_clipboard_to_slot(
     }
 }
 
-/// Windows multi-tap copy: passively *listen* (never suppress) for Ctrl+C and
-/// route `Ctrl+C ×N` (within TAP_WINDOW) to numeric slot N — the macOS Cmd+C ×N
-/// gesture. Letter slots use modifier chords instead (see hotkey registration),
-/// because a bare letter can't be intercepted without suppressing it (which
-/// would type it into your document). Listening only — can't block typing.
+/// Letter-slot index (0-25) for an rdev letter key, else None.
 #[cfg(target_os = "windows")]
-fn spawn_ctrl_c_multitap(slot_mgr: SlotManager, persist_tx: mpsc::SyncSender<ClipEvent>) {
+fn rkey_letter_index(key: RKey) -> Option<u8> {
+    use RKey::*;
+    Some(match key {
+        KeyA => 0, KeyB => 1, KeyC => 2, KeyD => 3, KeyE => 4, KeyF => 5, KeyG => 6,
+        KeyH => 7, KeyI => 8, KeyJ => 9, KeyK => 10, KeyL => 11, KeyM => 12, KeyN => 13,
+        KeyO => 14, KeyP => 15, KeyQ => 16, KeyR => 17, KeyS => 18, KeyT => 19, KeyU => 20,
+        KeyV => 21, KeyW => 22, KeyX => 23, KeyY => 24, KeyZ => 25,
+        _ => return None,
+    })
+}
+
+/// Windows suppressing-grab keyboard handler. It passes EVERY key straight
+/// through except the single "armed" letter after `Ctrl+C x2` (-> copy to that
+/// letter slot) or `Ctrl+V x2` (-> paste that letter slot). Numeric `Ctrl+C xN`
+/// is saved here; numeric `Ctrl+V xN` stays on its own path, and a letter cancels
+/// the pending slot-N paste via the shared tap state -- so a double-tap never
+/// clashes with slot 2.
+#[cfg(target_os = "windows")]
+fn spawn_windows_grab(
+    slot_mgr: SlotManager,
+    persist_tx: mpsc::SyncSender<ClipEvent>,
+    suppress: Arc<AtomicBool>,
+    transform_cfg: TransformConfig,
+    paste_settings: PasteTransformSettings,
+    ctrl_v_tap_state: Arc<Mutex<WindowsTapState>>,
+) {
+    // Letter must arrive within the grace; paste grace is < the numeric-paste
+    // commit (~430ms) so a letter reliably cancels slot N before it fires.
+    const COPY_LETTER_GRACE: Duration = Duration::from_millis(500);
+    const PASTE_LETTER_GRACE: Duration = Duration::from_millis(350);
     std::thread::spawn(move || {
-        let mut ctrl_down = false;
-        let mut alt_down = false;
-        let mut meta_down = false;
-        let mut last_tap: Option<std::time::Instant> = None;
-        let mut tap_count: u8 = 0;
-        let callback = move |event: Event| match event.event_type {
-            EventType::KeyPress(RKey::ControlLeft) | EventType::KeyPress(RKey::ControlRight) => {
-                ctrl_down = true;
+        #[derive(Default)]
+        struct GrabState {
+            ctrl: bool,
+            alt: bool,
+            meta: bool,
+            c_last_tap: Option<Instant>,
+            c_last_press: Option<Instant>,
+            c_taps: u8,
+            c_gen: u64,
+            copy_letter_until: Option<Instant>,
+            v_last_tap: Option<Instant>,
+            v_taps: u8,
+            paste_letter_until: Option<Instant>,
+        }
+        let state = Arc::new(Mutex::new(GrabState::default()));
+
+        let callback = move |event: Event| -> Option<Event> {
+            // Let our own synthetic paste keystrokes pass through untouched.
+            if suppress.load(Ordering::SeqCst) {
+                return Some(event);
             }
-            EventType::KeyRelease(RKey::ControlLeft)
-            | EventType::KeyRelease(RKey::ControlRight) => {
-                ctrl_down = false;
-            }
-            EventType::KeyPress(RKey::Alt) | EventType::KeyPress(RKey::AltGr) => alt_down = true,
-            EventType::KeyRelease(RKey::Alt) | EventType::KeyRelease(RKey::AltGr) => {
-                alt_down = false
-            }
-            EventType::KeyPress(RKey::MetaLeft) | EventType::KeyPress(RKey::MetaRight) => {
-                meta_down = true
-            }
-            EventType::KeyRelease(RKey::MetaLeft) | EventType::KeyRelease(RKey::MetaRight) => {
-                meta_down = false
-            }
-            // Plain Ctrl+C (no Alt/Meta) — count taps, save to numeric slot N.
-            EventType::KeyPress(RKey::KeyC) if ctrl_down && !alt_down && !meta_down => {
-                let now = std::time::Instant::now();
-                tap_count = match last_tap {
-                    Some(prev) if now.duration_since(prev) < TAP_WINDOW => {
-                        tap_count.saturating_add(1)
+            match event.event_type {
+                EventType::KeyRelease(RKey::ControlLeft)
+                | EventType::KeyRelease(RKey::ControlRight) => {
+                    if let Ok(mut s) = state.lock() {
+                        s.ctrl = false;
                     }
-                    _ => 1,
-                };
-                last_tap = Some(now);
-                // Only a deliberate multi-tap (2+) saves to a slot. A single
-                // Ctrl+C is a normal copy (already captured by history) — no
-                // thread, no clipboard read, no toast on every copy.
-                if tap_count >= 2 {
-                    let slot = tap_count.min(MAX_CLIP_SLOT);
+                    Some(event)
+                }
+                EventType::KeyRelease(RKey::Alt) | EventType::KeyRelease(RKey::AltGr) => {
+                    if let Ok(mut s) = state.lock() {
+                        s.alt = false;
+                    }
+                    Some(event)
+                }
+                EventType::KeyRelease(RKey::MetaLeft) | EventType::KeyRelease(RKey::MetaRight) => {
+                    if let Ok(mut s) = state.lock() {
+                        s.meta = false;
+                    }
+                    Some(event)
+                }
+                EventType::KeyPress(RKey::ControlLeft) | EventType::KeyPress(RKey::ControlRight) => {
+                    if let Ok(mut s) = state.lock() {
+                        s.ctrl = true;
+                    }
+                    Some(event)
+                }
+                EventType::KeyPress(RKey::Alt) | EventType::KeyPress(RKey::AltGr) => {
+                    if let Ok(mut s) = state.lock() {
+                        s.alt = true;
+                    }
+                    Some(event)
+                }
+                EventType::KeyPress(RKey::MetaLeft) | EventType::KeyPress(RKey::MetaRight) => {
+                    if let Ok(mut s) = state.lock() {
+                        s.meta = true;
+                    }
+                    Some(event)
+                }
+                // Ctrl+C: numeric copy multi-tap (passes through); arm letter on x2.
+                EventType::KeyPress(RKey::KeyC) => {
+                    let now = Instant::now();
+                    let gen = {
+                        let Ok(mut s) = state.lock() else {
+                            return Some(event);
+                        };
+                        if !s.ctrl || s.alt || s.meta {
+                            return Some(event);
+                        }
+                        if s.c_last_press
+                            .map_or(false, |p| now.duration_since(p) < TAP_DEBOUNCE)
+                        {
+                            return Some(event);
+                        }
+                        s.c_last_press = Some(now);
+                        s.c_taps = match s.c_last_tap {
+                            Some(p) if now.duration_since(p) < TAP_WINDOW => s.c_taps.saturating_add(1),
+                            _ => 1,
+                        };
+                        s.c_last_tap = Some(now);
+                        s.c_gen = s.c_gen.wrapping_add(1);
+                        if s.c_taps == 2 {
+                            s.copy_letter_until = Some(now + COPY_LETTER_GRACE);
+                        }
+                        s.c_gen
+                    };
+                    let st = state.clone();
                     let mgr = slot_mgr.clone();
                     let tx = persist_tx.clone();
                     std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_millis(60));
+                        std::thread::sleep(COPY_LETTER_GRACE + Duration::from_millis(120));
+                        let slot = {
+                            let Ok(mut s) = st.lock() else {
+                                return;
+                            };
+                            if s.c_gen != gen {
+                                return;
+                            }
+                            let slot = s.c_taps.clamp(1, 9);
+                            s.c_taps = 0;
+                            s.c_last_tap = None;
+                            s.copy_letter_until = None;
+                            slot
+                        };
                         execute_copy(slot, &mgr, &tx);
                         notify_slot_saved(slot);
                     });
+                    Some(event)
                 }
+                // Ctrl+V: pass through (numeric paste handled elsewhere); arm letter on x2.
+                EventType::KeyPress(RKey::KeyV) => {
+                    if let Ok(mut s) = state.lock() {
+                        if s.ctrl && !s.alt && !s.meta {
+                            let now = Instant::now();
+                            s.v_taps = match s.v_last_tap {
+                                Some(p) if now.duration_since(p) < TAP_WINDOW => s.v_taps.saturating_add(1),
+                                _ => 1,
+                            };
+                            s.v_last_tap = Some(now);
+                            if s.v_taps == 2 {
+                                s.paste_letter_until = Some(now + PASTE_LETTER_GRACE);
+                            }
+                        }
+                    }
+                    Some(event)
+                }
+                // A bare letter while armed -> letter copy/paste; SUPPRESS it.
+                EventType::KeyPress(key) => {
+                    let Some(idx) = rkey_letter_index(key) else {
+                        return Some(event);
+                    };
+                    let action = {
+                        let Ok(mut s) = state.lock() else {
+                            return Some(event);
+                        };
+                        if s.ctrl || s.alt || s.meta {
+                            None
+                        } else {
+                            let now = Instant::now();
+                            if s.copy_letter_until.map_or(false, |u| now <= u) {
+                                s.copy_letter_until = None;
+                                s.c_gen = s.c_gen.wrapping_add(1);
+                                s.c_taps = 0;
+                                s.c_last_tap = None;
+                                Some(true)
+                            } else if s.paste_letter_until.map_or(false, |u| now <= u) {
+                                s.paste_letter_until = None;
+                                s.v_taps = 0;
+                                s.v_last_tap = None;
+                                Some(false)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    match action {
+                        Some(true) => {
+                            let slot = 31 + idx;
+                            let mgr = slot_mgr.clone();
+                            let tx = persist_tx.clone();
+                            std::thread::spawn(move || {
+                                execute_copy(slot, &mgr, &tx);
+                                notify_slot_saved(slot);
+                            });
+                            None
+                        }
+                        Some(false) => {
+                            if let Ok(mut cv) = ctrl_v_tap_state.lock() {
+                                cv.generation = cv.generation.wrapping_add(1);
+                                cv.tap_count = 0;
+                                cv.last_tap = None;
+                            }
+                            let slot = 31 + idx;
+                            let mgr = slot_mgr.clone();
+                            let supp = suppress.clone();
+                            let tcfg = transform_cfg.clone();
+                            let pset = paste_settings.clone();
+                            std::thread::spawn(move || {
+                                execute_direct_paste(slot, &mgr, &supp, &tcfg, &pset);
+                                notify_slot_pasted(slot);
+                            });
+                            None
+                        }
+                        None => Some(event),
+                    }
+                }
+                _ => Some(event),
             }
-            _ => {}
         };
-        if let Err(e) = listen(callback) {
-            log::warn!("Windows multi-tap listener stopped: {:?}", e);
+        if let Err(e) = grab(callback) {
+            log::warn!("Windows grab keyboard handler stopped: {:?}", e);
         }
     });
 }
@@ -990,12 +1312,22 @@ fn spawn_ctrl_c_multitap(slot_mgr: SlotManager, persist_tx: mpsc::SyncSender<Cli
 /// isn't alongside the daemon.
 #[cfg(target_os = "windows")]
 fn notify_slot_saved(slot: u8) {
+    notify_slot_action("Saved to", slot);
+}
+
+#[cfg(target_os = "windows")]
+fn notify_slot_pasted(slot: u8) {
+    notify_slot_action("Pasted from", slot);
+}
+
+#[cfg(target_os = "windows")]
+fn notify_slot_action(action: &str, slot: u8) {
     let label = if (31..=56).contains(&slot) {
         format!("slot {}", (b'A' + (slot - 31)) as char)
     } else {
         format!("slot {}", slot)
     };
-    let msg = format!("Saved to {}", label);
+    let msg = format!("{} {}", action, label);
     if !spawn_overlay(&msg) {
         let _ = notify_rust::Notification::new()
             .summary("clipd")
@@ -1057,6 +1389,18 @@ fn execute_copy(slot: u8, mgr: &SlotManager, persist_tx: &mpsc::SyncSender<ClipE
     }
 }
 
+#[cfg(target_os = "windows")]
+fn execute_selection_copy_to_slot(
+    slot: u8,
+    mgr: &SlotManager,
+    persist_tx: &mpsc::SyncSender<ClipEvent>,
+) {
+    // Direct slot hotkeys have no native copy side effect, so copy the current
+    // selection first, then save whatever the foreground app put on the clipboard.
+    simulate_copy();
+    execute_copy(slot, mgr, persist_tx);
+}
+
 fn save_text_to_slot(
     slot: u8,
     text: &str,
@@ -1067,6 +1411,8 @@ fn save_text_to_slot(
     log::info!("📋 Saved to slot {}: {}", slot, truncate(text, 40));
     #[cfg(target_os = "macos")]
     show_slot_content_notification("Copied", slot, text);
+    #[cfg(target_os = "windows")]
+    notify_slot_saved(slot);
 
     let entry = ClipEntry::new(text.to_string(), None, Some(slot));
     let _ = persist_tx.try_send(ClipEvent::NewClip(entry));
@@ -1198,11 +1544,13 @@ fn execute_direct_paste(
             log::warn!("Paste from slot {} failed: {}", slot, e);
             return;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        sleep_before_injected_paste();
         simulate_paste();
         log::info!("📋 Pasted from slot {}: {}", slot, truncate(&content, 40));
         #[cfg(target_os = "macos")]
         show_slot_content_notification("Pasted", slot, &content);
+        #[cfg(target_os = "windows")]
+        notify_slot_pasted(slot);
 
         std::thread::sleep(Duration::from_millis(200));
 
@@ -1224,6 +1572,33 @@ fn execute_direct_paste(
         suppress.store(false, Ordering::SeqCst);
     } else {
         log::info!("📋 Slot {} is empty", slot);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn execute_sequence_paste(
+    sequence_slot: &mut u8,
+    mgr: &SlotManager,
+    suppress: &Arc<AtomicBool>,
+    transform_cfg: &TransformConfig,
+    paste_settings: &PasteTransformSettings,
+) {
+    if mgr.has_content(*sequence_slot) {
+        execute_direct_paste(*sequence_slot, mgr, suppress, transform_cfg, paste_settings);
+        log::info!(
+            "📋 Sequence paste: slot {} (next: {})",
+            *sequence_slot,
+            *sequence_slot + 1
+        );
+        *sequence_slot += 1;
+        return;
+    }
+
+    log::info!("📋 Sequence complete — resetting to slot 1");
+    *sequence_slot = 1;
+    if mgr.has_content(1) {
+        execute_direct_paste(1, mgr, suppress, transform_cfg, paste_settings);
+        *sequence_slot = 2;
     }
 }
 
@@ -1321,7 +1696,7 @@ fn execute_smart_paste(
         return;
     }
 
-    std::thread::sleep(Duration::from_millis(50));
+    sleep_before_injected_paste();
 
     simulate_paste();
     log::info!("📋 Smart pasted: {}", truncate(&content, 60));
@@ -1464,11 +1839,51 @@ end tell"#;
     std::thread::sleep(Duration::from_millis(80));
 }
 
+#[cfg(target_os = "macos")]
+fn sleep_before_injected_paste() {
+    std::thread::sleep(Duration::from_millis(50));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sleep_before_injected_paste() {
+    #[cfg(target_os = "windows")]
+    std::thread::sleep(Duration::from_millis(120));
+    #[cfg(not(target_os = "windows"))]
+    std::thread::sleep(Duration::from_millis(50));
+}
+
+#[cfg(target_os = "windows")]
+fn release_windows_shortcut_modifiers(enigo: &mut Enigo) {
+    // Global hotkey callbacks can run while Win/Alt/Ctrl/Shift are still logically
+    // down. Release them before injecting Ctrl+C/Ctrl+V so target apps receive
+    // the plain shortcut, not the original hotkey modifiers plus Ctrl+V.
+    for key in [
+        Key::LWin,
+        Key::RWin,
+        Key::Alt,
+        Key::Control,
+        Key::LControl,
+        Key::RControl,
+        Key::Shift,
+        Key::LShift,
+        Key::RShift,
+    ] {
+        let _ = enigo.key(key, Direction::Release);
+    }
+    std::thread::sleep(Duration::from_millis(20));
+}
+
 #[cfg(not(target_os = "macos"))]
 fn simulate_undo() {
     if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
+        #[cfg(target_os = "windows")]
+        release_windows_shortcut_modifiers(&mut enigo);
+        #[cfg(target_os = "windows")]
+        let z_key = Key::Z;
+        #[cfg(not(target_os = "windows"))]
+        let z_key = Key::Unicode('z');
         let _ = enigo.key(Key::Control, Direction::Press);
-        let _ = enigo.key(Key::Unicode('z'), Direction::Click);
+        let _ = enigo.key(z_key, Direction::Click);
         let _ = enigo.key(Key::Control, Direction::Release);
     }
 }
@@ -1476,8 +1891,14 @@ fn simulate_undo() {
 #[cfg(not(target_os = "macos"))]
 fn simulate_copy() {
     if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
+        #[cfg(target_os = "windows")]
+        release_windows_shortcut_modifiers(&mut enigo);
+        #[cfg(target_os = "windows")]
+        let c_key = Key::C;
+        #[cfg(not(target_os = "windows"))]
+        let c_key = Key::Unicode('c');
         let _ = enigo.key(Key::Control, Direction::Press);
-        let _ = enigo.key(Key::Unicode('c'), Direction::Click);
+        let _ = enigo.key(c_key, Direction::Click);
         let _ = enigo.key(Key::Control, Direction::Release);
     }
     std::thread::sleep(Duration::from_millis(80));
@@ -1486,8 +1907,14 @@ fn simulate_copy() {
 #[cfg(not(target_os = "macos"))]
 fn simulate_paste() {
     if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
+        #[cfg(target_os = "windows")]
+        release_windows_shortcut_modifiers(&mut enigo);
+        #[cfg(target_os = "windows")]
+        let v_key = Key::V;
+        #[cfg(not(target_os = "windows"))]
+        let v_key = Key::Unicode('v');
         let _ = enigo.key(Key::Control, Direction::Press);
-        let _ = enigo.key(Key::Unicode('v'), Direction::Click);
+        let _ = enigo.key(v_key, Direction::Click);
         let _ = enigo.key(Key::Control, Direction::Release);
     }
 }
@@ -1965,10 +2392,7 @@ fn find_hud_binary() -> std::path::PathBuf {
 
 fn open_tui_search() {
     log::info!("🔍 Opening TUI search...");
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+    let exe = resolve_clipd_cli_exe();
 
     #[cfg(target_os = "macos")]
     {
@@ -2020,6 +2444,68 @@ end tell"#,
     {
         let _ = std::process::Command::new(&exe).arg("search").spawn();
     }
+}
+
+/// Resolve the user-facing `clipd` CLI binary, not necessarily `current_exe`.
+///
+/// On macOS the daemon is commonly hosted in-process by `clipd-ui` so the
+/// keyboard tap inherits the app's Input Monitoring permission. In that case
+/// `current_exe()` is `clipd-ui`, but Ctrl+R must run `clipd search` in a
+/// terminal.
+fn resolve_clipd_cli_exe() -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    let names = ["clipd.exe", "clipd"];
+    #[cfg(not(target_os = "windows"))]
+    let names = ["clipd"];
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in names {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let suffix = if cfg!(target_os = "windows") {
+        "clipd.exe"
+    } else {
+        "clipd"
+    };
+    for candidate in [
+        workspace_root.join("target/debug").join(suffix),
+        workspace_root.join("target/release").join(suffix),
+    ] {
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    for path in [
+        std::path::PathBuf::from("/usr/local/bin").join(suffix),
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(".local/bin")
+            .join(suffix),
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(".cargo/bin")
+            .join(suffix),
+    ] {
+        if path.is_file() {
+            return path;
+        }
+    }
+
+    std::path::PathBuf::from(suffix)
 }
 
 /// A password was just copied and dropped from history. Offer to file it into a
@@ -2120,6 +2606,29 @@ return """#;
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "ok")
         .unwrap_or(false)
+}
+
+/// Launch the quick slot picker popup (next to the daemon binary), detached.
+#[cfg(target_os = "windows")]
+fn spawn_picker() {
+    use std::os::windows::process::CommandExt;
+    const DETACHED: u32 = 0x0000_0008;
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in ["clipd-picker.exe", "clipd-picker"] {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    let _ = std::process::Command::new(&candidate)
+                        .creation_flags(DETACHED)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn();
+                    return;
+                }
+            }
+        }
+    }
+    log::warn!("clipd-picker binary not found next to the daemon");
 }
 
 fn open_gui() {

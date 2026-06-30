@@ -1,0 +1,11 @@
+[package]
+name = "clipd-picker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe = "0.30"
+clipd-core = { workspace = true }
+arboard = { workspace = true }
+enigo = "0.2"

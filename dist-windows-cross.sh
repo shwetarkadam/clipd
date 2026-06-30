@@ -32,7 +32,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 rm -rf "$STAGE" "target/release/${PKG}.zip"
 mkdir -p "$STAGE"
 
-for bin in clipd.exe clipd-ui.exe clipd-gui.exe clipd-mcp.exe; do
+for bin in clipd.exe clipd-ui.exe clipd-gui.exe clipd-mcp.exe clipd-overlay.exe; do
   if [[ ! -f "$GNU/$bin" ]]; then
     echo "Missing $GNU/$bin"
     exit 1
@@ -40,7 +40,8 @@ for bin in clipd.exe clipd-ui.exe clipd-gui.exe clipd-mcp.exe; do
   cp -f "$GNU/$bin" "$STAGE/"
 done
 
-cp -f install.ps1 README.md "$STAGE/" 2>/dev/null || true
+cp -f install.ps1 "$STAGE/" 2>/dev/null || true
+cp -f packaging/windows/README.md "$STAGE/README.md" 2>/dev/null || true
 cp -f packaging/windows/Clipd.bat packaging/windows/ClipdTray.vbs "$STAGE/" 2>/dev/null || true
 cp -f packaging/windows/ClipdDebug.bat "$STAGE/" 2>/dev/null || true
 
