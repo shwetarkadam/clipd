@@ -87,6 +87,18 @@ impl ClipStore {
             [],
         )?;
 
+        // Image-clip columns (added in the image/OCR release). Each ALTER is a
+        // no-op error on a DB that already has the column, so ignore failures.
+        for col in [
+            "ALTER TABLE clips ADD COLUMN image_path TEXT",
+            "ALTER TABLE clips ADD COLUMN thumb_path TEXT",
+            "ALTER TABLE clips ADD COLUMN ocr_text TEXT",
+        ] {
+            if let Err(e) = self.conn.execute(col, []) {
+                log::debug!("image column migration (expected if present): {}", e);
+            }
+        }
+
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS clip_embeddings (
@@ -159,6 +171,29 @@ impl ClipStore {
         Ok(())
     }
 
+    /// The clip columns, in the canonical order expected by `row_to_clip`.
+    const CLIP_COLUMNS: &'static str = "id, content, content_type, content_hash, source_app, \
+         timestamp, preview, slot, image_path, thumb_path, ocr_text";
+
+    /// Map a row selected with `CLIP_COLUMNS` into a `ClipEntry`.
+    fn row_to_clip(row: &rusqlite::Row) -> SqlResult<ClipEntry> {
+        Ok(ClipEntry {
+            id: row.get(0)?,
+            content: row.get(1)?,
+            content_type: ContentType::from_str(&row.get::<_, String>(2)?),
+            content_hash: row.get(3)?,
+            source_app: row.get(4)?,
+            timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            preview: row.get(6)?,
+            slot: row.get(7)?,
+            image_path: row.get(8)?,
+            thumb_path: row.get(9)?,
+            ocr_text: row.get(10)?,
+        })
+    }
+
     /// Insert a new clip. Deduplicates by content hash (updates timestamp if duplicate).
     pub fn insert(&self, entry: &ClipEntry) -> SqlResult<i64> {
         // Check if same content already exists (dedup)
@@ -186,8 +221,8 @@ impl ClipStore {
         }
 
         self.conn.execute(
-            "INSERT INTO clips (content, content_type, content_hash, source_app, timestamp, preview, slot)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO clips (content, content_type, content_hash, source_app, timestamp, preview, slot, image_path, thumb_path, ocr_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 entry.content,
                 entry.content_type.as_str(),
@@ -196,6 +231,9 @@ impl ClipStore {
                 entry.timestamp.to_rfc3339(),
                 entry.preview,
                 entry.slot,
+                entry.image_path,
+                entry.thumb_path,
+                entry.ocr_text,
             ],
         )?;
 
@@ -204,25 +242,12 @@ impl ClipStore {
 
     /// Get recent clips, newest first.
     pub fn get_recent(&self, limit: usize) -> SqlResult<Vec<ClipEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, content, content_type, content_hash, source_app, timestamp, preview, slot
-             FROM clips ORDER BY timestamp DESC LIMIT ?1",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM clips ORDER BY timestamp DESC LIMIT ?1",
+            Self::CLIP_COLUMNS
+        ))?;
 
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok(ClipEntry {
-                id: row.get(0)?,
-                content: row.get(1)?,
-                content_type: ContentType::from_str(&row.get::<_, String>(2)?),
-                content_hash: row.get(3)?,
-                source_app: row.get(4)?,
-                timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now()),
-                preview: row.get(6)?,
-                slot: row.get(7)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![limit as i64], Self::row_to_clip)?;
 
         rows.collect()
     }
@@ -234,11 +259,15 @@ impl ClipStore {
         // If we have a text query, use FTS5
         if let Some(ref query) = filters.query {
             let fts_query = format!("\"{}\"", query.replace('"', "\"\""));
-            let mut sql = String::from(
-                "SELECT c.id, c.content, c.content_type, c.content_hash, c.source_app, c.timestamp, c.preview, c.slot
-                 FROM clips c
+            let mut sql = format!(
+                "SELECT {} FROM clips c
                  JOIN clips_fts f ON c.id = f.rowid
                  WHERE clips_fts MATCH ?1",
+                Self::CLIP_COLUMNS
+                    .split(", ")
+                    .map(|c| format!("c.{}", c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             let mut param_idx = 2;
             let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
@@ -267,28 +296,12 @@ impl ClipStore {
             let mut stmt = self.conn.prepare(&sql)?;
             let params_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params_vec.iter().map(|p| p.as_ref()).collect();
-            let rows = stmt.query_map(params_refs.as_slice(), |row| {
-                Ok(ClipEntry {
-                    id: row.get(0)?,
-                    content: row.get(1)?,
-                    content_type: ContentType::from_str(&row.get::<_, String>(2)?),
-                    content_hash: row.get(3)?,
-                    source_app: row.get(4)?,
-                    timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()),
-                    preview: row.get(6)?,
-                    slot: row.get(7)?,
-                })
-            })?;
+            let rows = stmt.query_map(params_refs.as_slice(), Self::row_to_clip)?;
 
             rows.collect()
         } else {
             // No text query — just filter
-            let mut sql = String::from(
-                "SELECT id, content, content_type, content_hash, source_app, timestamp, preview, slot
-                 FROM clips WHERE 1=1",
-            );
+            let mut sql = format!("SELECT {} FROM clips WHERE 1=1", Self::CLIP_COLUMNS);
             let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
             let mut param_idx = 1;
 
@@ -315,20 +328,7 @@ impl ClipStore {
             let mut stmt = self.conn.prepare(&sql)?;
             let params_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params_vec.iter().map(|p| p.as_ref()).collect();
-            let rows = stmt.query_map(params_refs.as_slice(), |row| {
-                Ok(ClipEntry {
-                    id: row.get(0)?,
-                    content: row.get(1)?,
-                    content_type: ContentType::from_str(&row.get::<_, String>(2)?),
-                    content_hash: row.get(3)?,
-                    source_app: row.get(4)?,
-                    timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()),
-                    preview: row.get(6)?,
-                    slot: row.get(7)?,
-                })
-            })?;
+            let rows = stmt.query_map(params_refs.as_slice(), Self::row_to_clip)?;
 
             rows.collect()
         }
@@ -337,28 +337,21 @@ impl ClipStore {
     /// Get a single clip by ID.
     pub fn get_by_id(&self, id: i64) -> SqlResult<ClipEntry> {
         self.conn.query_row(
-            "SELECT id, content, content_type, content_hash, source_app, timestamp, preview, slot
-             FROM clips WHERE id = ?1",
+            &format!("SELECT {} FROM clips WHERE id = ?1", Self::CLIP_COLUMNS),
             params![id],
-            |row| {
-                Ok(ClipEntry {
-                    id: row.get(0)?,
-                    content: row.get(1)?,
-                    content_type: ContentType::from_str(&row.get::<_, String>(2)?),
-                    content_hash: row.get(3)?,
-                    source_app: row.get(4)?,
-                    timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now()),
-                    preview: row.get(6)?,
-                    slot: row.get(7)?,
-                })
-            },
+            Self::row_to_clip,
         )
     }
 
     /// Delete a clip by ID.
     pub fn delete(&self, id: i64) -> SqlResult<bool> {
+        // Remove backing image files first (best-effort) if this is an image clip.
+        if let Ok(clip) = self.get_by_id(id) {
+            crate::images::delete_image_files(
+                clip.image_path.as_deref(),
+                clip.thumb_path.as_deref(),
+            );
+        }
         let count = self
             .conn
             .execute("DELETE FROM clips WHERE id = ?1", params![id])?;
@@ -793,6 +786,37 @@ mod tests {
         };
         let results = store.search(&filters).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_image_clip_roundtrip_and_ocr_search() {
+        let store = ClipStore::in_memory().unwrap();
+        let entry = ClipEntry::new_image(
+            "abc123".into(),
+            "/tmp/abc123.png".into(),
+            "/tmp/abc123_thumb.png".into(),
+            Some("Invoice total 4200".into()),
+            Some("Preview".into()),
+            800,
+            600,
+        );
+        let id = store.insert(&entry).unwrap();
+
+        let got = store.get_by_id(id).unwrap();
+        assert_eq!(got.content_type, ContentType::Image);
+        assert_eq!(got.image_path.as_deref(), Some("/tmp/abc123.png"));
+        assert_eq!(got.thumb_path.as_deref(), Some("/tmp/abc123_thumb.png"));
+        assert_eq!(got.ocr_text.as_deref(), Some("Invoice total 4200"));
+
+        // The OCR text is mirrored into content, so it's full-text searchable.
+        let filters = SearchFilters {
+            query: Some("Invoice".to_string()),
+            limit: 10,
+            ..Default::default()
+        };
+        let results = store.search(&filters).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id);
     }
 
     #[test]

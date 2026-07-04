@@ -9,6 +9,7 @@ pub enum ContentType {
     Code,
     Email,
     Path,
+    Image,
     Unknown,
 }
 
@@ -107,6 +108,7 @@ impl ContentType {
             ContentType::Code => "code",
             ContentType::Email => "email",
             ContentType::Path => "path",
+            ContentType::Image => "image",
             ContentType::Unknown => "unknown",
         }
     }
@@ -118,6 +120,7 @@ impl ContentType {
             "code" => ContentType::Code,
             "email" => ContentType::Email,
             "path" => ContentType::Path,
+            "image" => ContentType::Image,
             _ => ContentType::Unknown,
         }
     }
@@ -130,6 +133,7 @@ impl ContentType {
             ContentType::Code => "💻",
             ContentType::Email => "📧",
             ContentType::Path => "📁",
+            ContentType::Image => "🖼",
             ContentType::Unknown => "❓",
         }
     }
@@ -147,6 +151,16 @@ pub struct ClipEntry {
     pub preview: String,
     /// Slot this clip was saved to via multi-tap hotkey (None = auto-saved via OS copy).
     pub slot: Option<u8>,
+    /// For image clips: path to the full-resolution PNG on disk.
+    #[serde(default)]
+    pub image_path: Option<String>,
+    /// For image clips: path to the small thumbnail PNG (for list rendering).
+    #[serde(default)]
+    pub thumb_path: Option<String>,
+    /// For image clips: text recognized via on-device OCR (Apple Vision).
+    /// Mirrored into `content` so it's full-text searchable.
+    #[serde(default)]
+    pub ocr_text: Option<String>,
 }
 
 impl ClipEntry {
@@ -170,6 +184,48 @@ impl ClipEntry {
             timestamp: Utc::now(),
             preview,
             slot,
+            image_path: None,
+            thumb_path: None,
+            ocr_text: None,
+        }
+    }
+
+    /// Create an image clip. `content` mirrors the OCR text so images are
+    /// searchable by what they contain; `content_hash` is the image hash (used
+    /// for dedup); `preview` shows a glanceable label + any OCR snippet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_image(
+        content_hash: String,
+        image_path: String,
+        thumb_path: String,
+        ocr_text: Option<String>,
+        source_app: Option<String>,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let ocr_clean = ocr_text
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        let preview = match ocr_clean {
+            Some(text) => {
+                let snippet = Self::make_preview(text, 64);
+                format!("🖼 {}", snippet)
+            }
+            None => format!("🖼 Image · {}×{}", width, height),
+        };
+        ClipEntry {
+            id: 0,
+            content: ocr_clean.map(|s| s.to_string()).unwrap_or_default(),
+            content_type: ContentType::Image,
+            content_hash,
+            source_app,
+            timestamp: Utc::now(),
+            preview,
+            slot: None,
+            image_path: Some(image_path),
+            thumb_path: Some(thumb_path),
+            ocr_text: ocr_clean.map(|s| s.to_string()),
         }
     }
 

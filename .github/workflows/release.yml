@@ -45,6 +45,13 @@ jobs:
           cp -f clipd-hud ../target/release/clipd-hud
           chmod +x ../target/release/clipd-hud
 
+      - name: Build clipd-ocr (Swift — Apple Vision OCR)
+        run: |
+          cd clipd-ocr
+          swiftc -O -o clipd-ocr clipd-ocr.swift -framework Vision -framework AppKit
+          cp -f clipd-ocr ../target/release/clipd-ocr
+          chmod +x ../target/release/clipd-ocr
+
       # Import the self-signed "clipd-codesign" cert so every release shares one
       # stable identity. Without this, ad-hoc signing changes the signature hash
       # on each build and macOS silently drops Input Monitoring / Accessibility

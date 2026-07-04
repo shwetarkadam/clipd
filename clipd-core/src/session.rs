@@ -166,6 +166,9 @@ mod tests {
             timestamp: Utc::now() - Duration::minutes(mins_ago),
             preview: format!("clip {}", id),
             slot: None,
+            image_path: None,
+            thumb_path: None,
+            ocr_text: None,
         }
     }
 

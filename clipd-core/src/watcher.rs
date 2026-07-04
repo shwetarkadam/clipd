@@ -1,5 +1,7 @@
 use crate::models::ClipEntry;
-use crate::privacy::{detect_sensitive, is_excluded_app, load_privacy_config, looks_like_password};
+use crate::privacy::{
+    detect_sensitive, is_excluded_app, load_privacy_config, looks_like_password, PrivacyConfig,
+};
 use crate::slots::SlotManager;
 use sha2::{Digest, Sha256};
 use std::sync::mpsc;
@@ -10,6 +12,15 @@ use std::time::Duration;
 pub enum ClipEvent {
     /// New content detected on the clipboard.
     NewClip(ClipEntry),
+    /// A new image was copied. Carries raw RGBA8 pixels; the daemon persists it
+    /// to disk, runs OCR, and inserts the resulting clip. Kept separate from
+    /// NewClip so the (potentially large) pixel buffer only travels when needed.
+    NewImage {
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+        source_app: Option<String>,
+    },
     /// A password/secret was detected, so the daemon can offer to save it to a
     /// vault. Carries only the human label(s) — never the secret itself; it is
     /// re-read from the live clipboard at save time. `stored` is false for
@@ -43,6 +54,7 @@ impl ClipWatcher {
         slot_manager: Option<SlotManager>,
     ) {
         let mut last_hash = String::new();
+        let mut last_image_hash = String::new();
         let privacy_config = load_privacy_config();
 
         // Try to create the clipboard handle.
@@ -91,9 +103,19 @@ impl ClipWatcher {
                 continue;
             }
 
-            // Poll for text content
-            if let Ok(text) = clipboard.get_text() {
-                if !text.is_empty() {
+            // Poll for text content. When there's no text on the clipboard,
+            // fall through to image polling (a copied screenshot has no text).
+            let text = clipboard.get_text().ok().filter(|t| !t.is_empty());
+            if text.is_none() {
+                Self::poll_image(
+                    &mut clipboard,
+                    &mut last_image_hash,
+                    &privacy_config,
+                    &sender,
+                );
+            }
+            if let Some(text) = text {
+                {
                     let hash = Self::hash_content(&text);
 
                     if hash != last_hash {
@@ -174,6 +196,54 @@ impl ClipWatcher {
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+
+    fn hash_bytes(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Read an image off the clipboard and emit `NewImage` if it's new. Called
+    /// only when there's no text (a copied screenshot carries no text), so this
+    /// is cheap on the common text-copy path.
+    fn poll_image(
+        clipboard: &mut arboard::Clipboard,
+        last_image_hash: &mut String,
+        privacy_config: &PrivacyConfig,
+        sender: &mpsc::SyncSender<ClipEvent>,
+    ) {
+        let img = match clipboard.get_image() {
+            Ok(i) => i,
+            Err(_) => return, // no image on the clipboard
+        };
+        if img.width == 0 || img.height == 0 || img.bytes.is_empty() {
+            return;
+        }
+
+        let hash = Self::hash_bytes(&img.bytes);
+        if hash == *last_image_hash {
+            return; // same image still sitting on the clipboard
+        }
+        *last_image_hash = hash;
+
+        let source_app = Self::get_frontmost_app();
+        if privacy_config.enabled {
+            if let Some(app) = source_app.as_deref() {
+                if is_excluded_app(app, privacy_config) {
+                    log::info!("🔒 Image clip skipped (excluded app: {})", app);
+                    return;
+                }
+            }
+        }
+
+        log::debug!("New image clip: {}×{}", img.width, img.height);
+        let _ = sender.send(ClipEvent::NewImage {
+            width: img.width,
+            height: img.height,
+            rgba: img.bytes.into_owned(),
+            source_app,
+        });
     }
 
     /// Get the name of the frontmost application on macOS.

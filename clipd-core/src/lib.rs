@@ -1,5 +1,7 @@
+pub mod actions;
 pub mod collections;
 pub mod embedding;
+pub mod images;
 pub mod lock;
 pub mod models;
 pub mod paste_rules;
@@ -22,6 +24,10 @@ pub use embedding::{
     cosine_similarity as embedding_cosine, generate_embedding, generate_embeddings_batch,
     is_embedding_available, search_embeddings, Embedding, EmbeddingResult,
 };
+pub use actions::{
+    load_actions, run_action, save_actions, ActionOutput, ActionsConfig, CustomAction,
+};
+pub use images::{images_dir, load_rgba, save_rgba_image, SavedImage};
 pub use lock::{is_daemon_running, release_daemon_lock, try_acquire_daemon_lock};
 pub use models::{ClipEntry, ContentType, SearchFilters};
 pub use paste_rules::{
@@ -37,7 +43,10 @@ pub use session::{compute_sessions, Session, SessionConfig};
 pub use slots::{SlotManager, MAX_CLIP_SLOT};
 pub use snippets::Snippet;
 pub use store::ClipStore;
-pub use theme::{load_theme, save_theme, Rgb, Theme, ThemeColors};
+pub use theme::{
+    load_custom_colors, load_theme, save_custom_colors, save_theme, CustomColors, Rgb, Theme,
+    ThemeColors,
+};
 pub use transform::{
     all_transforms, apply_transform, load_last_active_app, load_paste_transform_settings,
     load_transform_config, paste_transforms, save_last_active_app, save_paste_transform_settings,

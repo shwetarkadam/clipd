@@ -70,7 +70,7 @@ impl Default for Theme {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 #[derive(Debug, Clone, Copy)]
@@ -94,23 +94,25 @@ pub struct ThemeColors {
     pub path: Rgb,
 }
 
+// Clean Raycast/Spotlight-style light theme: near-white surface, crisp
+// near-black text, hairline borders, subtle neutral selection.
 const LIGHT: ThemeColors = ThemeColors {
-    bg_base: Rgb(244, 246, 250),
-    bg_surface: Rgb(235, 238, 245),
-    bg_elevated: Rgb(255, 255, 255),
-    bg_selected: Rgb(220, 229, 245),
-    bg_hover: Rgb(229, 234, 243),
-    accent: Rgb(55, 113, 200),
-    accent2: Rgb(118, 87, 180),
-    text: Rgb(28, 34, 45),
-    subtext: Rgb(72, 82, 100),
-    overlay: Rgb(116, 126, 145),
-    green: Rgb(34, 139, 84),
-    border: Rgb(205, 212, 224),
-    code: Rgb(33, 130, 80),
-    url: Rgb(37, 128, 190),
-    email: Rgb(172, 112, 0),
-    path: Rgb(118, 87, 180),
+    bg_base: Rgb(250, 250, 252),
+    bg_surface: Rgb(255, 255, 255),
+    bg_elevated: Rgb(245, 246, 248),
+    bg_selected: Rgb(236, 237, 240),
+    bg_hover: Rgb(243, 244, 246),
+    accent: Rgb(10, 122, 255),
+    accent2: Rgb(120, 90, 190),
+    text: Rgb(26, 27, 30),
+    subtext: Rgb(98, 102, 112),
+    overlay: Rgb(150, 154, 163),
+    green: Rgb(30, 150, 90),
+    border: Rgb(228, 230, 235),
+    code: Rgb(28, 140, 85),
+    url: Rgb(18, 115, 205),
+    email: Rgb(168, 110, 0),
+    path: Rgb(120, 90, 190),
 };
 
 const CATPPUCCIN: ThemeColors = ThemeColors {
@@ -132,23 +134,25 @@ const CATPPUCCIN: ThemeColors = ThemeColors {
     path: Rgb(203, 166, 247),
 };
 
+// Authentic Sublime/Monokai palette: #272822 base, #F8F8F2 text, and the
+// signature green (#A6E22E) as the accent/highlight — never orange.
 const MONOKAI: ThemeColors = ThemeColors {
-    bg_base: Rgb(45, 42, 46),
-    bg_surface: Rgb(34, 32, 36),
-    bg_elevated: Rgb(62, 58, 65),
-    bg_selected: Rgb(82, 76, 88),
-    bg_hover: Rgb(68, 64, 72),
-    accent: Rgb(255, 216, 102),
-    accent2: Rgb(171, 157, 242),
-    text: Rgb(252, 252, 248),
-    subtext: Rgb(200, 196, 192),
-    overlay: Rgb(145, 140, 135),
-    green: Rgb(169, 220, 118),
-    border: Rgb(72, 68, 76),
-    code: Rgb(169, 220, 118),
-    url: Rgb(120, 220, 232),
-    email: Rgb(252, 152, 103),
-    path: Rgb(171, 157, 242),
+    bg_base: Rgb(39, 40, 34),
+    bg_surface: Rgb(30, 31, 26),
+    bg_elevated: Rgb(62, 61, 50),
+    bg_selected: Rgb(73, 72, 62),
+    bg_hover: Rgb(54, 55, 45),
+    accent: Rgb(166, 226, 46),
+    accent2: Rgb(174, 129, 255),
+    text: Rgb(248, 248, 242),
+    subtext: Rgb(190, 189, 175),
+    overlay: Rgb(117, 113, 94),
+    green: Rgb(166, 226, 46),
+    border: Rgb(73, 72, 62),
+    code: Rgb(166, 226, 46),
+    url: Rgb(102, 217, 239),
+    email: Rgb(230, 219, 116),
+    path: Rgb(174, 129, 255),
 };
 
 const DARK: ThemeColors = ThemeColors {
@@ -228,4 +232,136 @@ pub fn save_theme(theme: Theme) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(path, serde_json::to_string(&theme).unwrap_or_default());
+}
+
+// ---------------------------------------------------------------------------
+// Custom palette — user-defined colors that override the active theme.
+// The user picks colors "for his eyes" in Settings; when `enabled`, these are
+// layered on top of whatever base theme is selected.
+// ---------------------------------------------------------------------------
+
+/// User-defined color overrides. Kept small on purpose: an accent plus the two
+/// values that carry a palette (background + text). Surface/hover/selected are
+/// derived from the background so the whole UI stays coherent from one pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomColors {
+    pub enabled: bool,
+    pub accent: Rgb,
+    pub background: Rgb,
+    pub text: Rgb,
+}
+
+impl Default for CustomColors {
+    fn default() -> Self {
+        // Seed with the authentic Monokai palette so enabling or resetting
+        // custom colors does not turn the Monokai theme orange.
+        CustomColors {
+            enabled: false,
+            accent: Rgb(166, 226, 46),
+            background: Rgb(39, 40, 34),
+            text: Rgb(248, 248, 242),
+        }
+    }
+}
+
+impl CustomColors {
+    /// Overlay the custom palette onto a base set of theme colors.
+    pub fn apply_to(&self, c: &mut ThemeColors) {
+        if !self.enabled {
+            return;
+        }
+        c.accent = self.accent;
+        c.bg_base = self.background;
+        c.bg_surface = lighten(self.background, 0.05);
+        c.bg_elevated = lighten(self.background, 0.11);
+        c.bg_hover = lighten(self.background, 0.08);
+        c.bg_selected = mix(self.background, self.accent, 0.22);
+        c.text = self.text;
+        c.subtext = mix(self.text, self.background, 0.42);
+        c.border = lighten(self.background, 0.16);
+    }
+}
+
+fn lighten(Rgb(r, g, b): Rgb, f: f32) -> Rgb {
+    let f = f.clamp(0.0, 1.0);
+    let step = |v: u8| {
+        (v as f32 + (255.0 - v as f32) * f)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Rgb(step(r), step(g), step(b))
+}
+
+fn mix(Rgb(ar, ag, ab): Rgb, Rgb(br, bg, bb): Rgb, t: f32) -> Rgb {
+    let t = t.clamp(0.0, 1.0);
+    let m = |a: u8, b: u8| {
+        (a as f32 * (1.0 - t) + b as f32 * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Rgb(m(ar, br), m(ag, bg), m(ab, bb))
+}
+
+fn custom_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("clipd")
+        .join("custom_colors.json")
+}
+
+pub fn load_custom_colors() -> CustomColors {
+    std::fs::read_to_string(custom_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .map(migrate_legacy_custom_colors)
+        .unwrap_or_default()
+}
+
+fn migrate_legacy_custom_colors(colors: CustomColors) -> CustomColors {
+    let legacy_orange_seed = CustomColors {
+        enabled: true,
+        accent: Rgb(255, 160, 50),
+        background: Rgb(24, 26, 33),
+        text: Rgb(238, 241, 247),
+    };
+
+    if colors == legacy_orange_seed {
+        CustomColors::default()
+    } else {
+        colors
+    }
+}
+
+pub fn save_custom_colors(colors: &CustomColors) {
+    let path = custom_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serde_json::to_string(colors).unwrap_or_default());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monokai_uses_authentic_green_accent() {
+        let colors = Theme::Monokai.colors();
+        assert_eq!(colors.bg_base, Rgb(39, 40, 34));
+        assert_eq!(colors.text, Rgb(248, 248, 242));
+        assert_eq!(colors.accent, Rgb(166, 226, 46));
+    }
+
+    #[test]
+    fn legacy_orange_custom_seed_is_ignored() {
+        let migrated = migrate_legacy_custom_colors(CustomColors {
+            enabled: true,
+            accent: Rgb(255, 160, 50),
+            background: Rgb(24, 26, 33),
+            text: Rgb(238, 241, 247),
+        });
+
+        assert!(!migrated.enabled);
+        assert_eq!(migrated.accent, Rgb(166, 226, 46));
+    }
 }

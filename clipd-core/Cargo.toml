@@ -21,6 +21,8 @@ sha2 = { workspace = true }
 log = "0.4"
 base64 = { workspace = true }
 ureq = { workspace = true }
+# PNG encode/decode + thumbnailing for image clips (already in the tree via arboard).
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

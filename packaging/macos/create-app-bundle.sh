@@ -25,6 +25,16 @@ if [[ ! -f target/release/clipd-hud ]]; then
   echo "    (warning: no clipd-hud — install Xcode CLI tools; HUD will not work in this bundle)"
 fi
 
+echo "==> clipd-ocr (Swift — Apple Vision OCR for image clips)"
+if [[ ! -f target/release/clipd-ocr ]] && command -v swiftc &>/dev/null; then
+  (cd clipd-ocr && swiftc -O -o clipd-ocr clipd-ocr.swift -framework Vision -framework AppKit)
+  cp -f clipd-ocr/clipd-ocr target/release/clipd-ocr
+  chmod +x target/release/clipd-ocr
+fi
+if [[ ! -f target/release/clipd-ocr ]]; then
+  echo "    (warning: no clipd-ocr — image clips will be stored without searchable OCR text)"
+fi
+
 APP="target/release/Clipd.app"
 MACOS="$APP/Contents/MacOS"
 RES="$APP/Contents/Resources"
@@ -35,6 +45,10 @@ chmod +x "$MACOS/clipd" "$MACOS/clipd-gui" "$MACOS/clipd-ui"
 if [[ -f target/release/clipd-hud ]]; then
   cp -f target/release/clipd-hud "$MACOS/"
   chmod +x "$MACOS/clipd-hud"
+fi
+if [[ -f target/release/clipd-ocr ]]; then
+  cp -f target/release/clipd-ocr "$MACOS/"
+  chmod +x "$MACOS/clipd-ocr"
 fi
 
 # Sign helpers so macOS allows the daemon to spawn clipd-hud, and — critically —
@@ -55,7 +69,7 @@ else
   echo "==> codesign (identity: ${SIGN_ID} — TCC grants persist across updates)"
 fi
 if command -v codesign &>/dev/null; then
-  for bin in clipd clipd-gui clipd-ui clipd-hud; do
+  for bin in clipd clipd-gui clipd-ui clipd-hud clipd-ocr; do
     [[ -f "$MACOS/$bin" ]] || continue
     codesign --force --sign "$SIGN_ID" "$MACOS/$bin" 2>/dev/null || true
   done

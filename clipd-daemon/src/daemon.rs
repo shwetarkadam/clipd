@@ -2,9 +2,9 @@ use arboard::Clipboard;
 use clipd_core::{
     apply_transform, find_rules_for_app, generate_embedding, is_embedding_available,
     load_paste_rules, load_paste_transform_settings, load_transform_config, release_daemon_lock,
-    suggest_smart_transform, try_acquire_daemon_lock, ClipEntry, ClipEvent, ClipStore, ClipWatcher,
-    PasteRulesConfig, PasteTransformSettings, SlotManager, TransformConfig, TransformKind,
-    MAX_CLIP_SLOT,
+    save_rgba_image, suggest_smart_transform, try_acquire_daemon_lock, ClipEntry, ClipEvent,
+    ClipStore, ClipWatcher, PasteRulesConfig, PasteTransformSettings, SlotManager, TransformConfig,
+    TransformKind, MAX_CLIP_SLOT,
 };
 #[cfg(target_os = "macos")]
 use clipd_core::{available_targets, load_privacy_config, save_secret, OpenGuiHotkey, SecretEntry};
@@ -211,6 +211,55 @@ pub fn run_daemon_with_stop(
                         offer_vault_save(&kinds, stored);
                         #[cfg(not(target_os = "macos"))]
                         let _ = stored;
+                    }
+                    ClipEvent::NewImage {
+                        width,
+                        height,
+                        rgba,
+                        mut source_app,
+                    } => {
+                        // Images only persist when history is on (same gate as text).
+                        if !load_paste_transform_settings().remember_clipboard {
+                            continue;
+                        }
+                        #[cfg(target_os = "macos")]
+                        if source_app.is_none() {
+                            source_app = get_frontmost_app_name();
+                        }
+                        // 1. Write the PNG + thumbnail to disk.
+                        let saved = match save_rgba_image(width, height, &rgba) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log::error!("Failed to save image clip: {}", e);
+                                continue;
+                            }
+                        };
+                        // 2. On-device OCR (Apple Vision on macOS; no-op elsewhere).
+                        let ocr_text = run_ocr(&saved.full_path);
+                        // 3. Build + insert the clip (dedup by image hash).
+                        let entry = ClipEntry::new_image(
+                            saved.hash.clone(),
+                            saved.full_path.to_string_lossy().to_string(),
+                            saved.thumb_path.to_string_lossy().to_string(),
+                            ocr_text.clone(),
+                            source_app,
+                            saved.width,
+                            saved.height,
+                        );
+                        match store.insert(&entry) {
+                            Ok(id) => log::info!(
+                                "Saved image clip #{} ({}×{}){}",
+                                id,
+                                saved.width,
+                                saved.height,
+                                match &ocr_text {
+                                    Some(t) if !t.trim().is_empty() =>
+                                        format!(" · OCR {} chars", t.len()),
+                                    _ => String::new(),
+                                }
+                            ),
+                            Err(e) => log::error!("Failed to save image clip: {}", e),
+                        }
                     }
                 }
             }
@@ -2388,6 +2437,55 @@ fn find_hud_binary() -> std::path::PathBuf {
 
     // Fallback: search PATH
     std::path::PathBuf::from("clipd-hud")
+}
+
+/// Locate the `clipd-ocr` helper (Apple Vision OCR), next to the current exe.
+/// Mirrors `find_hud_binary`. Honors the `CLIPD_OCR_BIN` override.
+#[cfg(target_os = "macos")]
+fn find_ocr_binary() -> std::path::PathBuf {
+    if let Ok(from_env) = std::env::var("CLIPD_OCR_BIN") {
+        let p = std::path::PathBuf::from(from_env);
+        if p.is_file() {
+            return p;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join("clipd-ocr");
+            if cand.is_file() {
+                return cand;
+            }
+        }
+    }
+    std::path::PathBuf::from("clipd-ocr")
+}
+
+/// Run on-device OCR on an image file, returning recognized text if any.
+/// macOS invokes the bundled `clipd-ocr` (Apple Vision, on-device, no network).
+#[cfg(target_os = "macos")]
+fn run_ocr(image_path: &std::path::Path) -> Option<String> {
+    let bin = find_ocr_binary();
+    let output = std::process::Command::new(&bin)
+        .arg(image_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        log::debug!("clipd-ocr exited non-zero for {:?}", image_path);
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// OCR is macOS-only for now (Apple Vision). Other platforms store the image
+/// without recognized text.
+#[cfg(not(target_os = "macos"))]
+fn run_ocr(_image_path: &std::path::Path) -> Option<String> {
+    None
 }
 
 fn open_tui_search() {
