@@ -165,9 +165,39 @@ fn global_cursor_position() -> Option<egui::Pos2> {
     Some(egui::pos2(p.x as f32, p.y as f32))
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows: GetCursorPos returns *physical* pixels; callers on Windows must
+/// divide by the native scale factor before using it as egui points.
+#[cfg(target_os = "windows")]
+fn global_cursor_position() -> Option<egui::Pos2> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut p = POINT { x: 0, y: 0 };
+    // SAFETY: GetCursorPos only writes into the POINT we hand it.
+    if unsafe { GetCursorPos(&mut p) } != 0 {
+        Some(egui::pos2(p.x as f32, p.y as f32))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn global_cursor_position() -> Option<egui::Pos2> {
     None
+}
+
+/// Cursor position in egui points, correcting for the display scale factor on
+/// Windows (macOS already reports points).
+fn cursor_in_points(ctx: &egui::Context) -> Option<egui::Pos2> {
+    let p = global_cursor_position()?;
+    if cfg!(target_os = "windows") {
+        let scale = ctx
+            .input(|i| i.viewport().native_pixels_per_point)
+            .unwrap_or(1.0)
+            .max(0.5);
+        Some(egui::pos2(p.x / scale, p.y / scale))
+    } else {
+        Some(p)
+    }
 }
 
 /// Where to place the window so it feels like it popped up at the cursor:
@@ -350,9 +380,14 @@ fn main() -> eframe::Result {
         .with_resizable(true)
         .with_transparent(true);
     // Open where the user is working: palette appears at the mouse cursor.
-    if let Some(cursor) = global_cursor_position() {
-        let pos = window_pos_at_cursor(cursor, 520.0);
-        viewport = viewport.with_position([pos.x, pos.y]);
+    // macOS only at startup (CG reports points directly); on Windows the scale
+    // factor isn't known until the first frame, where the focus-gain handler
+    // repositions to the cursor anyway.
+    if cfg!(target_os = "macos") {
+        if let Some(cursor) = global_cursor_position() {
+            let pos = window_pos_at_cursor(cursor, 520.0);
+            viewport = viewport.with_position([pos.x, pos.y]);
+        }
     }
     let options = eframe::NativeOptions {
         viewport,
@@ -1171,7 +1206,7 @@ impl eframe::App for ClipdGui {
             // Summoned (Ctrl+G): jump to the mouse cursor — but only when the
             // cursor is outside the window, so clicking the window to focus it
             // never teleports it out from under the pointer.
-            if let Some(cursor) = global_cursor_position() {
+            if let Some(cursor) = cursor_in_points(ctx) {
                 let outside = ctx
                     .input(|i| i.viewport().outer_rect)
                     .map_or(true, |r| !r.contains(cursor));

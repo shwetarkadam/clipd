@@ -21,3 +21,9 @@ env_logger = "0.11"
 # Global mouse position, so the palette opens where the cursor is (Ctrl+G).
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

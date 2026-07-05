@@ -20,10 +20,17 @@ const MENU_ID_TUI_MODE: &str = "tui_mode";
 const MENU_ID_QUIT: &str = "quit";
 
 fn hud_tray_label(hud_on: bool) -> String {
-    if hud_on {
-        "HUD slot overlay: On — click to turn off".to_string()
+    // macOS shows the Swift HUD overlay; Windows shows overlay/toast
+    // notifications — same setting, platform-accurate name.
+    let what = if cfg!(target_os = "macos") {
+        "HUD slot overlay"
     } else {
-        "HUD slot overlay: Off — click to turn on".to_string()
+        "Slot notifications"
+    };
+    if hud_on {
+        format!("{}: On — click to turn off", what)
+    } else {
+        format!("{}: Off — click to turn on", what)
     }
 }
 
@@ -98,15 +105,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         item_hud.set_text(hud_tray_label(s.hud_enabled));
                         item_tui_mode.set_checked(load_tui_mode());
                     }
-                    TrayIconEvent::Click { button_state, .. }
-                        if matches!(
-                            button_state,
-                            MouseButtonState::Down | MouseButtonState::Up
-                        ) =>
+                    TrayIconEvent::Click {
+                        button,
+                        button_state,
+                        ..
+                    } if matches!(
+                        button_state,
+                        MouseButtonState::Down | MouseButtonState::Up
+                    ) =>
                     {
                         let s = load_paste_transform_settings();
                         item_hud.set_text(hud_tray_label(s.hud_enabled));
                         item_tui_mode.set_checked(load_tui_mode());
+                        // Windows convention: left-click the tray icon opens the
+                        // app; the menu stays on right-click. (On macOS the menu
+                        // opens on any click, so this never fires there.)
+                        #[cfg(target_os = "windows")]
+                        if button == tray_icon::MouseButton::Left
+                            && button_state == MouseButtonState::Up
+                        {
+                            open_gui_search();
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        let _ = button;
                     }
                     _ => {}
                 }
@@ -195,6 +216,30 @@ fn open_gui_search() {
         .spawn();
 }
 
+/// Windows: open the TUI search in a fresh console window.
+#[cfg(target_os = "windows")]
+fn open_search_in_terminal() {
+    let exe = resolve_clipd_exe();
+    let _ = Command::new("cmd")
+        .args(["/C", "start", "clipd search", &exe.to_string_lossy(), "search"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// Linux: best-effort default terminal.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn open_search_in_terminal() {
+    let exe = resolve_clipd_exe();
+    let _ = Command::new("x-terminal-emulator")
+        .arg("-e")
+        .arg(format!("{} search", exe.to_string_lossy()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+#[cfg(target_os = "macos")]
 fn open_search_in_terminal() {
     let exe = resolve_clipd_exe();
     let exe_str = exe.to_string_lossy().to_string();
@@ -299,10 +344,22 @@ fn start_daemon() -> DaemonHandle {
     DaemonHandle { stop, join }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn stop_existing_daemons() {
     let _ = Command::new("/usr/bin/pkill")
         .arg("-f")
         .arg("clipd daemon")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(target_os = "windows")]
+fn stop_existing_daemons() {
+    // Kill a stale external `clipd.exe daemon`. The CLI shares the image name
+    // but is short-lived, so force-killing by name is an acceptable sweep.
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", "clipd.exe"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -391,9 +448,17 @@ fn resolve_clipd_gui_exe() -> PathBuf {
 }
 
 fn daemon_log_path() -> PathBuf {
-    let logs_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Library/Logs");
+    let logs_dir = if cfg!(target_os = "macos") {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Library/Logs")
+    } else {
+        // Windows: %LOCALAPPDATA%\clipd\logs · Linux: ~/.local/share/clipd/logs
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("clipd")
+            .join("logs")
+    };
     let _ = std::fs::create_dir_all(&logs_dir);
     logs_dir.join("clipd-ui-daemon.log")
 }

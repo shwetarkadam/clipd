@@ -227,7 +227,14 @@ impl OpenGuiHotkey {
     pub fn label(&self) -> &'static str {
         match self {
             Self::CtrlG => "Ctrl+G",
-            Self::CmdShiftG => "Cmd+Shift+G",
+            // The Cmd key is Super/Win off macOS — label it what users see.
+            Self::CmdShiftG => {
+                if cfg!(target_os = "macos") {
+                    "Cmd+Shift+G"
+                } else {
+                    "Win+Shift+G"
+                }
+            }
             Self::CtrlShiftG => "Ctrl+Shift+G",
             Self::Disabled => "Disabled",
         }

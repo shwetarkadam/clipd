@@ -3,11 +3,11 @@ use clipd_core::{
     apply_transform, find_rules_for_app, generate_embedding, is_embedding_available,
     load_paste_rules, load_paste_transform_settings, load_transform_config, release_daemon_lock,
     save_rgba_image, suggest_smart_transform, try_acquire_daemon_lock, ClipEntry, ClipEvent,
-    ClipStore, ClipWatcher, PasteRulesConfig, PasteTransformSettings, SlotManager, TransformConfig,
-    TransformKind, MAX_CLIP_SLOT,
+    ClipStore, ClipWatcher, OpenGuiHotkey, PasteRulesConfig, PasteTransformSettings, SlotManager,
+    TransformConfig, TransformKind, MAX_CLIP_SLOT,
 };
 #[cfg(target_os = "macos")]
-use clipd_core::{available_targets, load_privacy_config, save_secret, OpenGuiHotkey, SecretEntry};
+use clipd_core::{available_targets, load_privacy_config, save_secret, SecretEntry};
 #[cfg(not(target_os = "macos"))]
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 #[cfg(not(target_os = "macos"))]
@@ -349,11 +349,29 @@ pub fn run_daemon_with_stop(
         } else {
             registered_hotkeys.push((tui_hk2, FinalAction::OpenTui));
         }
-        let gui_hk = HotKey::new(Some(Modifiers::CONTROL), Code::KeyG);
-        if let Err(e) = hotkey_manager.register(gui_hk) {
-            log::warn!("Failed to register Ctrl+G: {}", e);
+        // Open-GUI chord honors the same "Open clipd shortcut" setting as macOS.
+        // Note: registered at daemon startup — changing it in Settings takes
+        // effect after a daemon restart. Cmd maps to the Win/Super key here.
+        let gui_hotkey_setting = load_paste_transform_settings().open_gui_hotkey;
+        let gui_mods = match gui_hotkey_setting {
+            OpenGuiHotkey::CtrlG => Some(Modifiers::CONTROL),
+            OpenGuiHotkey::CmdShiftG => Some(Modifiers::SUPER | Modifiers::SHIFT),
+            OpenGuiHotkey::CtrlShiftG => Some(Modifiers::CONTROL | Modifiers::SHIFT),
+            OpenGuiHotkey::Disabled => None,
+        };
+        if let Some(mods) = gui_mods {
+            let gui_hk = HotKey::new(Some(mods), Code::KeyG);
+            if let Err(e) = hotkey_manager.register(gui_hk) {
+                log::warn!(
+                    "Failed to register {} (open GUI): {}",
+                    gui_hotkey_setting.label(),
+                    e
+                );
+            } else {
+                registered_hotkeys.push((gui_hk, FinalAction::OpenGui));
+            }
         } else {
-            registered_hotkeys.push((gui_hk, FinalAction::OpenGui));
+            log::info!("Open-GUI hotkey disabled in settings");
         }
 
         // Conflict-free slot picker (the "Clipd-owned palette" letter slots want):
@@ -1371,6 +1389,10 @@ fn notify_slot_pasted(slot: u8) {
 
 #[cfg(target_os = "windows")]
 fn notify_slot_action(action: &str, slot: u8) {
+    // Honor the tray "Slot notifications" toggle (same setting as macOS HUD).
+    if !load_paste_transform_settings().hud_enabled {
+        return;
+    }
     let label = if (31..=56).contains(&slot) {
         format!("slot {}", (b'A' + (slot - 31)) as char)
     } else {
