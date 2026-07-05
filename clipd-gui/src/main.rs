@@ -4,10 +4,10 @@ use clipd_core::{
     available_targets, compute_sessions, detect_sensitive, load_actions, load_custom_colors,
     load_paste_transform_settings, load_privacy_config, load_theme, load_transform_config,
     paste_transforms, run_action, save_actions, save_custom_colors, save_paste_transform_settings,
-    save_privacy_config, save_secret, save_theme, ActionOutput, ActionsConfig, ClipEntry, ClipStore,
-    ContentType, CustomAction, CustomColors, OpenGuiHotkey, PaletteTrigger, PasteTransformSettings,
-    PrivacyConfig, Rgb, SecretEntry, Session, SessionConfig, TfIdfIndex, Theme, TransformKind,
-    VaultTarget,
+    save_privacy_config, save_secret, save_theme, ActionOutput, ActionsConfig, ClipEntry,
+    ClipStore, ContentType, CustomAction, CustomColors, OpenGuiHotkey, PaletteTrigger,
+    PasteTransformSettings, PrivacyConfig, Rgb, SecretEntry, Session, SessionConfig, TfIdfIndex,
+    Theme, TransformKind, VaultTarget,
 };
 use eframe::egui::{self, Color32, FontId, Margin, RichText, Rounding, Stroke};
 use std::collections::HashSet;
@@ -22,7 +22,7 @@ const CARD_ROUND: f32 = 12.0;
 const CARD_PAD_X: f32 = 12.0;
 const CARD_PAD_Y: f32 = 8.0;
 /// Gap between rows in the list.
-const ROW_GAP: f32 = 3.0;
+const ROW_GAP: f32 = 6.0;
 /// Pill (tag) corner radius and padding.
 const PILL_ROUND: f32 = 6.0;
 const PILL_PAD_X: f32 = 7.0;
@@ -203,7 +203,10 @@ fn cursor_in_points(ctx: &egui::Context) -> Option<egui::Pos2> {
 /// Where to place the window so it feels like it popped up at the cursor:
 /// search bar centered under the pointer, just below it.
 fn window_pos_at_cursor(cursor: egui::Pos2, win_width: f32) -> egui::Pos2 {
-    egui::pos2((cursor.x - win_width * 0.5).max(8.0), (cursor.y - 24.0).max(8.0))
+    egui::pos2(
+        (cursor.x - win_width * 0.5).max(8.0),
+        (cursor.y - 24.0).max(8.0),
+    )
 }
 
 /// Tiny clipd logo mark: a clipboard outline with its clip tab, vector-drawn
@@ -236,7 +239,11 @@ fn draw_clipd_logo(painter: &egui::Painter, rect: egui::Rect, col: Color32) {
 fn load_thumb_texture(ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
     let (w, h, rgba) = clipd_core::load_rgba(std::path::Path::new(path)).ok()?;
     let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
-    Some(ctx.load_texture(format!("clipd_thumb_{path}"), img, egui::TextureOptions::LINEAR))
+    Some(ctx.load_texture(
+        format!("clipd_thumb_{path}"),
+        img,
+        egui::TextureOptions::LINEAR,
+    ))
 }
 
 fn tag_pill(ui: &mut egui::Ui, label: &str, col: Color32, c: &clipd_core::ThemeColors) {
@@ -317,7 +324,11 @@ fn row_star_button(
 }
 
 fn tab_chip(ui: &mut egui::Ui, label: &str, active: bool, c: &clipd_core::ThemeColors) -> bool {
-    let text_col = if active { rgb(c.accent) } else { rgb(c.subtext) };
+    let text_col = if active {
+        rgb(c.accent)
+    } else {
+        rgb(c.subtext)
+    };
     let response = ui.add(
         egui::Button::new(RichText::new(label).size(11.5).color(text_col))
             .fill(if active {
@@ -1101,18 +1112,15 @@ impl ClipdGui {
                 match action.output {
                     ActionOutput::Clipboard => {
                         self.set_clipboard(&out);
-                        self.action_status =
-                            Some((true, format!("{} → clipboard", action.name)));
+                        self.action_status = Some((true, format!("{} → clipboard", action.name)));
                     }
                     ActionOutput::NewClip => {
                         if !out.is_empty() {
-                            let entry =
-                                ClipEntry::new(out, Some("clipd action".into()), None);
+                            let entry = ClipEntry::new(out, Some("clipd action".into()), None);
                             let _ = self.store.insert(&entry);
                             self.refresh();
                         }
-                        self.action_status =
-                            Some((true, format!("{} → new clip", action.name)));
+                        self.action_status = Some((true, format!("{} → new clip", action.name)));
                     }
                     ActionOutput::None => {
                         self.action_status = Some((true, format!("{} ran", action.name)));
@@ -1271,120 +1279,6 @@ impl eframe::App for ClipdGui {
             self.cycle_theme(ctx);
         }
 
-        // ── Minimal command bar ──
-        egui::TopBottomPanel::top("top_bar")
-            .frame(
-                egui::Frame::none()
-                    .fill(rgba(c.bg_surface, 236))
-                    .rounding(egui::Rounding {
-                        nw: 18.0,
-                        ne: 18.0,
-                        sw: 0.0,
-                        se: 0.0,
-                    })
-                    .inner_margin(Margin {
-                        left: 12.0,
-                        right: 12.0,
-                        top: 9.0,
-                        bottom: 8.0,
-                    }),
-            )
-            .show(ctx, |ui| {
-                // The command bar doubles as the window drag handle (borderless window).
-                let bar_rect = ui.max_rect();
-                let drag = ui.interact(
-                    bar_rect,
-                    egui::Id::new("titlebar_drag"),
-                    egui::Sense::drag(),
-                );
-                if drag.drag_started() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-
-                    // No logo, no wordmark, no tabs — the search field IS the
-                    // header. Identity lives in the menu bar; Text is the
-                    // default view so it needs no chip.
-                    let nav_width = 88.0;
-                    let search_width = (ui.available_width() - nav_width).max(180.0);
-                    egui::Frame::none()
-                        .fill(rgb(c.bg_elevated))
-                        .rounding(Rounding::same(10.0))
-                        .inner_margin(Margin::symmetric(10.0, 6.0))
-                        .stroke(Stroke::new(0.6, rgb(c.border).gamma_multiply(0.75)))
-                        .show(ui, |ui| {
-                            ui.set_width(search_width);
-                            ui.horizontal(|ui| {
-                                draw_search_icon(ui, rgb(c.overlay));
-                                ui.add_space(6.0);
-                                let hint = match self.active_tab {
-                                    MainTab::Collections => "Search pins and collections...",
-                                    MainTab::Settings => "Search clips...",
-                                    MainTab::Text => "Search, or type 'from chrome'...",
-                                };
-                                let search = ui.add_sized(
-                                    [ui.available_width(), 18.0],
-                                    egui::TextEdit::singleline(&mut self.search_query)
-                                        .id(egui::Id::new("clip_search"))
-                                        .hint_text(hint)
-                                        .frame(false)
-                                        .font(egui::TextStyle::Body),
-                                );
-                                if self.focus_search {
-                                    search.request_focus();
-                                    self.focus_search = false;
-                                }
-                                if search.changed() {
-                                    self.apply_filter();
-                                }
-                                // Enter pastes the top match — the palette gesture.
-                                if search.lost_focus()
-                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                    && !self.filtered.is_empty()
-                                {
-                                    action = Action::Paste;
-                                }
-                            });
-                        });
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        let gear_col = if self.active_tab == MainTab::Settings {
-                            rgb(c.accent)
-                        } else {
-                            rgb(c.overlay)
-                        };
-                        let gear = ui.add(
-                            egui::Button::new(RichText::new("⚙").size(15.0).color(gear_col))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE)
-                                .min_size(egui::vec2(26.0, 30.0)),
-                        );
-                        if gear.clicked() {
-                            self.active_tab = if self.active_tab == MainTab::Settings {
-                                MainTab::Text
-                            } else {
-                                MainTab::Settings
-                            };
-                        }
-                        gear.on_hover_text("Settings");
-                        // One toggle chip: into pins/collections, click again
-                        // (or Esc) to come back. Text is the default — no chip.
-                        let pins_active = self.active_tab == MainTab::Collections;
-                        if tab_chip(ui, "Pins", pins_active, &c) {
-                            if pins_active {
-                                self.active_tab = MainTab::Text;
-                            } else {
-                                self.active_tab = MainTab::Collections;
-                                self.refresh_collections();
-                            }
-                        }
-                    });
-                });
-            });
-
         let preview_data = self.selected_clip().cloned();
         // Ensure the selected image clip's thumbnail is loaded so the preview
         // pane can show it (reuses the list's cache).
@@ -1471,11 +1365,17 @@ impl eframe::App for ClipdGui {
                 });
             });
 
-        // ── Center panel (same surface as header/footer = one seamless card) ──
+        // ── Center panel — search bar is a fixed header; clip list scrolls below ──
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
                     .fill(rgba(c.bg_surface, 236))
+                    .rounding(egui::Rounding {
+                        nw: 18.0,
+                        ne: 18.0,
+                        sw: 0.0,
+                        se: 0.0,
+                    })
                     .inner_margin(Margin::symmetric(
                         if self.active_tab == MainTab::Text {
                             14.0
@@ -1487,6 +1387,86 @@ impl eframe::App for ClipdGui {
             )
             .show(ctx, |ui| match self.active_tab {
                 MainTab::Text => {
+                    // Fixed search bar header
+                    ui.horizontal(|ui| {
+                        let controls_width = 96.0;
+                        let gap = 8.0;
+                        let search_width = (ui.available_width() - controls_width - gap).max(120.0);
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(search_width, 36.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                egui::Frame::none()
+                                    .fill(rgb(c.bg_elevated))
+                                    .rounding(Rounding::same(10.0))
+                                    .inner_margin(Margin::symmetric(10.0, 6.0))
+                                    .stroke(Stroke::new(0.6, rgb(c.border).gamma_multiply(0.75)))
+                                    .show(ui, |ui| {
+                                        ui.set_width((search_width - 22.0).max(80.0));
+                                        ui.horizontal(|ui| {
+                                            draw_search_icon(ui, rgb(c.overlay));
+                                            ui.add_space(6.0);
+                                            let hint = "Search, or type 'from chrome'...";
+                                            let search = ui.add_sized(
+                                                [ui.available_width(), 18.0],
+                                                egui::TextEdit::singleline(&mut self.search_query)
+                                                    .id(egui::Id::new("clip_search"))
+                                                    .hint_text(hint)
+                                                    .frame(false)
+                                                    .font(egui::TextStyle::Body),
+                                            );
+                                            if self.focus_search {
+                                                search.request_focus();
+                                                self.focus_search = false;
+                                            }
+                                            if search.changed() {
+                                                self.apply_filter();
+                                            }
+                                            if search.lost_focus()
+                                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                                && !self.filtered.is_empty()
+                                            {
+                                                action = Action::Paste;
+                                            }
+                                        });
+                                    });
+                            },
+                        );
+                        ui.add_space(gap);
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(controls_width, 36.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let gear_col = rgb(c.overlay);
+                                let gear = ui.add(
+                                    egui::Button::new(
+                                        RichText::new("⚙").size(15.0).color(gear_col),
+                                    )
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE)
+                                    .min_size(egui::vec2(26.0, 30.0)),
+                                );
+                                if gear.clicked() {
+                                    self.active_tab = MainTab::Settings;
+                                }
+                                gear.on_hover_text("Settings");
+                                let pins_active = self.active_tab == MainTab::Collections;
+                                if tab_chip(ui, "Pins", pins_active, &c) {
+                                    if pins_active {
+                                        self.active_tab = MainTab::Text;
+                                    } else {
+                                        self.active_tab = MainTab::Collections;
+                                        self.refresh_collections();
+                                    }
+                                }
+                            },
+                        );
+                    });
+
+                    // Scrollable clip list below
                     if self.filtered.is_empty() && self.matched_snippets.is_empty() {
                         self.render_empty_list(ui, &c);
                     } else {
@@ -1615,7 +1595,7 @@ impl ClipdGui {
     ) {
         // Header labels removed for a cleaner, search-first list (clip count
         // lives in the top bar; the click hint is in the footer).
-        ui.add_space(4.0);
+        ui.add_space(10.0);
 
         let visible_indices = self.filtered.clone();
         let snippets = self.matched_snippets.clone();
@@ -1737,6 +1717,9 @@ impl ClipdGui {
                         None
                     };
 
+                    // Gap between rows.
+                    ui.add_space(ROW_GAP);
+
                     // One clean line per clip: a small type dot, the content, and a
                     // muted time on the right. Pin only shows on the active row.
                     let frame_resp = egui::Frame::none()
@@ -1762,8 +1745,7 @@ impl ClipdGui {
                                         rgb(c.bg_elevated),
                                     );
                                     let size = tex.size_vec2();
-                                    let scale =
-                                        (tile.width() / size.x).min(tile.height() / size.y);
+                                    let scale = (tile.width() / size.x).min(tile.height() / size.y);
                                     let draw = egui::vec2(size.x * scale, size.y * scale);
                                     let img_rect =
                                         egui::Rect::from_center_size(tile.center(), draw);
@@ -1878,8 +1860,6 @@ impl ClipdGui {
                     if is_selected && self.scroll_to_selected {
                         resp.scroll_to_me(Some(egui::Align::Center));
                     }
-
-                    ui.add_space(ROW_GAP);
                 }
                 self.scroll_to_selected = false;
             });
@@ -4848,8 +4828,11 @@ fn render_preview(
     });
 
     // ── Custom actions: run a shell command/script on this clip ──
-    let enabled: Vec<(usize, &CustomAction)> =
-        actions.iter().enumerate().filter(|(_, a)| a.enabled).collect();
+    let enabled: Vec<(usize, &CustomAction)> = actions
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.enabled)
+        .collect();
     if !enabled.is_empty() {
         ui.add_space(8.0);
         ui.separator();
@@ -4877,11 +4860,11 @@ fn render_preview(
         });
         if let Some((ok, msg)) = &action_status {
             ui.add_space(4.0);
-            ui.label(
-                RichText::new(msg)
-                    .size(11.0)
-                    .color(if *ok { rgb(c.green) } else { rgb(c.accent2) }),
-            );
+            ui.label(RichText::new(msg).size(11.0).color(if *ok {
+                rgb(c.green)
+            } else {
+                rgb(c.accent2)
+            }));
         }
     }
 
@@ -4901,10 +4884,7 @@ fn render_preview(
                     let size = tex.size_vec2();
                     let scale = (avail / size.x).min(1.6);
                     let draw = egui::vec2(size.x * scale, size.y * scale);
-                    ui.add(
-                        egui::Image::new((tex.id(), draw))
-                            .rounding(Rounding::same(8.0)),
-                    );
+                    ui.add(egui::Image::new((tex.id(), draw)).rounding(Rounding::same(8.0)));
                 } else {
                     ui.label(
                         RichText::new("🖼 Image (preview unavailable)")

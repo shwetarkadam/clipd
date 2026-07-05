@@ -16,7 +16,7 @@ use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager,
 };
 #[cfg(target_os = "macos")]
-use rdev::{grab, Event, EventType, Key as RKey};
+use rdev::{grab, listen, Event, EventType, Key as RKey};
 #[cfg(target_os = "windows")]
 use rdev::{grab, Event, EventType, Key as RKey};
 #[cfg(target_os = "macos")]
@@ -437,9 +437,19 @@ pub fn run_daemon_with_stop(
         std::thread::Builder::new()
             .name("clipd-hotkey-listener".into())
             .spawn(move || {
+                let fallback_tx = hotkey_tx.clone();
+                let fallback_stop = stop_listener.clone();
                 if let Err(e) = start_macos_hotkey_listener(hotkey_tx, stop_listener) {
                     log::error!("Hotkey listener failed: {}", e);
-                    stop_on_hotkey_error.store(true, Ordering::Relaxed);
+                    log::warn!(
+                        "Falling back to passive open-GUI hotkey listener; slot copy/paste interception still needs macOS Accessibility/Input Monitoring."
+                    );
+                    if let Err(fallback_err) =
+                        start_macos_open_gui_fallback_listener(fallback_tx, fallback_stop)
+                    {
+                        log::error!("Open-GUI fallback listener failed: {}", fallback_err);
+                        stop_on_hotkey_error.store(true, Ordering::Relaxed);
+                    }
                 }
             })?;
 
@@ -1151,10 +1161,32 @@ fn restore_clipboard_to_slot(
 fn rkey_letter_index(key: RKey) -> Option<u8> {
     use RKey::*;
     Some(match key {
-        KeyA => 0, KeyB => 1, KeyC => 2, KeyD => 3, KeyE => 4, KeyF => 5, KeyG => 6,
-        KeyH => 7, KeyI => 8, KeyJ => 9, KeyK => 10, KeyL => 11, KeyM => 12, KeyN => 13,
-        KeyO => 14, KeyP => 15, KeyQ => 16, KeyR => 17, KeyS => 18, KeyT => 19, KeyU => 20,
-        KeyV => 21, KeyW => 22, KeyX => 23, KeyY => 24, KeyZ => 25,
+        KeyA => 0,
+        KeyB => 1,
+        KeyC => 2,
+        KeyD => 3,
+        KeyE => 4,
+        KeyF => 5,
+        KeyG => 6,
+        KeyH => 7,
+        KeyI => 8,
+        KeyJ => 9,
+        KeyK => 10,
+        KeyL => 11,
+        KeyM => 12,
+        KeyN => 13,
+        KeyO => 14,
+        KeyP => 15,
+        KeyQ => 16,
+        KeyR => 17,
+        KeyS => 18,
+        KeyT => 19,
+        KeyU => 20,
+        KeyV => 21,
+        KeyW => 22,
+        KeyX => 23,
+        KeyY => 24,
+        KeyZ => 25,
         _ => return None,
     })
 }
@@ -1220,7 +1252,8 @@ fn spawn_windows_grab(
                     }
                     Some(event)
                 }
-                EventType::KeyPress(RKey::ControlLeft) | EventType::KeyPress(RKey::ControlRight) => {
+                EventType::KeyPress(RKey::ControlLeft)
+                | EventType::KeyPress(RKey::ControlRight) => {
                     if let Ok(mut s) = state.lock() {
                         s.ctrl = true;
                     }
@@ -1255,7 +1288,9 @@ fn spawn_windows_grab(
                         }
                         s.c_last_press = Some(now);
                         s.c_taps = match s.c_last_tap {
-                            Some(p) if now.duration_since(p) < TAP_WINDOW => s.c_taps.saturating_add(1),
+                            Some(p) if now.duration_since(p) < TAP_WINDOW => {
+                                s.c_taps.saturating_add(1)
+                            }
                             _ => 1,
                         };
                         s.c_last_tap = Some(now);
@@ -1294,7 +1329,9 @@ fn spawn_windows_grab(
                         if s.ctrl && !s.alt && !s.meta {
                             let now = Instant::now();
                             s.v_taps = match s.v_last_tap {
-                                Some(p) if now.duration_since(p) < TAP_WINDOW => s.v_taps.saturating_add(1),
+                                Some(p) if now.duration_since(p) < TAP_WINDOW => {
+                                    s.v_taps.saturating_add(1)
+                                }
                                 _ => 1,
                             };
                             s.v_last_tap = Some(now);
@@ -2705,18 +2742,21 @@ fn notify(title: &str, body: &str) {
 }
 
 /// Bring an already-running clipd window to the front. Tries the names the
-/// eframe app may register under and never errors if none match (background
-/// daemon processes aren't in the System Events list, so this can't hit them).
+/// eframe app may register under, but only treats a process as the GUI when it
+/// owns at least one window. The menu-bar host can also be named "Clipd"; if we
+/// match that zero-window process, Ctrl+G appears to do nothing.
 /// Returns true if a window was focused.
 #[cfg(target_os = "macos")]
 fn focus_existing_gui() -> bool {
     let script = r#"tell application "System Events"
   repeat with n in {"clipd-gui", "Clipd", "clipd"}
     set matches to (every process whose name is (n as string))
-    if (count of matches) > 0 then
-      set frontmost of (item 1 of matches) to true
-      return "ok"
-    end if
+    repeat with p in matches
+      if (count of windows of p) > 0 then
+        set frontmost of p to true
+        return "ok"
+      end if
+    end repeat
   end repeat
 end tell
 return """#;
@@ -3525,6 +3565,73 @@ fn start_macos_hotkey_listener(
         Some(event)
     })
     .map_err(|e| format!("rdev grab error: {:?}", e))?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn start_macos_open_gui_fallback_listener(
+    tx: mpsc::Sender<HotkeyTick>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    struct State {
+        pressed_mods: HashSet<RKey>,
+        latch_ctrl_g: bool,
+        event_count: u64,
+    }
+
+    let mut state = State {
+        pressed_mods: HashSet::new(),
+        latch_ctrl_g: false,
+        event_count: 0,
+    };
+
+    listen(move |event: Event| {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        state.event_count += 1;
+        if state.event_count == 1 {
+            log::info!("🎹 rdev listen fallback: first event received");
+        }
+
+        match event.event_type {
+            EventType::KeyPress(key) => {
+                if is_modifier_key(key) {
+                    state.pressed_mods.insert(key);
+                    return;
+                }
+
+                if key == RKey::KeyG
+                    && (has_cmd(&state.pressed_mods) || has_ctrl(&state.pressed_mods))
+                    && !state.latch_ctrl_g
+                {
+                    let hk = load_paste_transform_settings().open_gui_hotkey;
+                    let matched = match hk {
+                        OpenGuiHotkey::CtrlG => is_ctrl_only(&state.pressed_mods),
+                        OpenGuiHotkey::CmdShiftG => is_cmd_shift(&state.pressed_mods),
+                        OpenGuiHotkey::CtrlShiftG => is_ctrl_shift(&state.pressed_mods),
+                        OpenGuiHotkey::Disabled => false,
+                    };
+                    if matched {
+                        state.latch_ctrl_g = true;
+                        log::info!("⌨️  {} → open GUI (fallback)", hk.label());
+                        let _ = tx.send(HotkeyTick::OpenGui);
+                    }
+                }
+            }
+            EventType::KeyRelease(key) => {
+                if is_modifier_key(key) {
+                    state.pressed_mods.remove(&key);
+                }
+                if key == RKey::KeyG {
+                    state.latch_ctrl_g = false;
+                }
+            }
+            _ => {}
+        }
+    })
+    .map_err(|e| format!("rdev listen error: {:?}", e))?;
     Ok(())
 }
 

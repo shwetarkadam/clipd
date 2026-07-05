@@ -1,10 +1,11 @@
 use crate::collections::{Collection, CollectionItem};
-use crate::snippets::Snippet;
 use crate::embedding::{embedding_from_bytes, embedding_to_bytes, Embedding};
 use crate::models::{ClipEntry, ClipStats, ContentType, SearchFilters};
+use crate::snippets::Snippet;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Result as SqlResult};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// SQLite-backed clipboard history store with FTS5 full-text search.
 pub struct ClipStore {
@@ -20,6 +21,7 @@ impl ClipStore {
         }
 
         let conn = Connection::open(db_path)?;
+        conn.busy_timeout(Duration::from_millis(150))?;
         let store = ClipStore {
             conn,
             db_path: db_path.to_path_buf(),
@@ -674,8 +676,10 @@ impl ClipStore {
 
     /// Delete a collection and its membership rows (clips themselves stay).
     pub fn delete_collection(&self, collection_id: i64) -> SqlResult<()> {
-        self.conn
-            .execute("DELETE FROM collections WHERE id = ?1", params![collection_id])?;
+        self.conn.execute(
+            "DELETE FROM collections WHERE id = ?1",
+            params![collection_id],
+        )?;
         Ok(())
     }
 
@@ -844,7 +848,9 @@ mod tests {
         let c1 = store.insert(&make_entry("prompt one")).unwrap();
         let c2 = store.insert(&make_entry("prompt two")).unwrap();
 
-        let coll = store.create_collection("Cursor prompts", Some("Cursor")).unwrap();
+        let coll = store
+            .create_collection("Cursor prompts", Some("Cursor"))
+            .unwrap();
         store.add_clip_to_collection(coll, c1).unwrap();
         store.add_clip_to_collection(coll, c2).unwrap();
         store.add_clip_to_collection(coll, c1).unwrap(); // dedup — no-op
@@ -859,7 +865,10 @@ mod tests {
 
         // Auto-route lookup by frontmost app (substring, case-insensitive).
         assert!(store.collection_for_app("Cursor").unwrap().is_some());
-        assert!(store.collection_for_app("com.todesktop.cursor").unwrap().is_some());
+        assert!(store
+            .collection_for_app("com.todesktop.cursor")
+            .unwrap()
+            .is_some());
         assert!(store.collection_for_app("Safari").unwrap().is_none());
 
         store.remove_collection_item(coll, c1).unwrap();

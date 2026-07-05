@@ -928,9 +928,10 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
 
     draw_search(f, app, chunks[0]);
 
+    // Single panel: 60% list, 40% preview
     let content = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(chunks[1]);
 
     draw_list(f, app, content[0]);
@@ -938,7 +939,7 @@ fn draw_ui(f: &mut Frame, app: &mut App) {
     draw_status(f, app, chunks[2]);
 
     match app.mode {
-        TuiMode::TransformPicker => draw_transform_picker(f, app),
+        TuiMode::TransformPicker => draw_transform_slideout(f, app),
         TuiMode::TransformInput => draw_transform_input(f, app),
         TuiMode::TransformResult => draw_transform_result(f, app),
         TuiMode::SessionView => draw_sessions(f, app),
@@ -1005,17 +1006,22 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
             let clip = &app.clips[idx];
             let icon = clip.content_type.icon();
             let time = relative_time(&clip.timestamp);
+            let source = clip.source_app.as_deref().unwrap_or("").chars().take(12).collect::<String>();
 
             let sensitive = !detect_sensitive(&clip.content, &app.privacy_config).is_empty();
-            let badge = if sensitive { "🔒" } else { "" };
 
+            // Fixed-width columns: slot(3) icon(2) preview(~) source(13) time(8)
+            let slot_w = 3;
+            let icon_w = 2;
+            let source_w = 13;
             let time_w = time.chars().count();
             let badge_w = if sensitive { 3 } else { 0 };
             let pick_w = if visible_idx < 9 { 4 } else { 2 };
-            let max_preview = inner_w.saturating_sub(time_w + badge_w + pick_w + 4);
+            let avail = inner_w.saturating_sub(slot_w + icon_w + source_w + time_w + badge_w + pick_w + 8);
+            let max_preview = avail;
             let preview = truncate(&clip.preview, max_preview);
             let preview_w = preview.chars().count();
-            let gap = inner_w.saturating_sub(preview_w + time_w + badge_w + pick_w + 2);
+            let gap = avail.saturating_sub(preview_w);
 
             let pick = if visible_idx < 9 {
                 Span::styled(
@@ -1023,21 +1029,38 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(color(c.accent)),
                 )
             } else {
-                Span::raw("  ")
+                Span::raw("   ")
+            };
+
+            let slot_badge = if let Some(slot) = clip.slot {
+                Span::styled(
+                    format!("[{}] ", slot),
+                    Style::default()
+                        .fg(color(c.bg_base))
+                        .bg(color(c.accent))
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("    ")
             };
 
             let mut spans = vec![
                 pick,
+                slot_badge,
                 Span::styled(format!("{} ", icon), Style::default()),
                 Span::styled(preview, Style::default().fg(color(c.text))),
             ];
             if sensitive {
                 spans.push(Span::styled(
-                    format!(" {}", badge),
+                    " 🔒",
                     Style::default().fg(Color::Yellow),
                 ));
             }
             spans.push(Span::raw(" ".repeat(gap)));
+            if !source.is_empty() {
+                spans.push(Span::styled(source, Style::default().fg(color(c.subtext))));
+                spans.push(Span::raw("  "));
+            }
             spans.push(Span::styled(time, Style::default().fg(color(c.accent))));
 
             ListItem::new(Line::from(spans))
@@ -1047,9 +1070,9 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
     let count = app.filtered.len();
     let total = app.clips.len();
     let title = if count == total {
-        format!(" 📋 Clips ({}) ", total)
+        format!(" Clips ({}) ", total)
     } else {
-        format!(" 📋 Clips ({}/{}) ", count, total)
+        format!(" Clips ({}/{}) ", count, total)
     };
 
     let list = List::new(items)
@@ -1077,11 +1100,10 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
     if let Some(ref clip) = app.selected_clip {
         let source = clip.source_app.as_deref().unwrap_or("unknown");
         let title = format!(
-            " {} {} | {} | id:{} ",
+            " {}  {}  ·  {} ",
             clip.content_type.icon(),
             clip.content_type.as_str(),
             source,
-            clip.id,
         );
 
         let content_color = match clip.content_type {
@@ -1092,7 +1114,25 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
             _ => color(c.text),
         };
 
-        let widget = Paragraph::new(clip.content.clone())
+        let sensitive = !detect_sensitive(&clip.content, &app.privacy_config).is_empty();
+        let sensitive_badge = if sensitive {
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled("🔒 sensitive", Style::default().fg(Color::Yellow)),
+            ])
+        } else {
+            Line::from("")
+        };
+
+        let header_line = Line::from(vec![
+            Span::styled(" ↩ Enter ", Style::default().fg(color(c.accent))),
+            Span::styled("copy", Style::default().fg(color(c.subtext))),
+            Span::raw("    "),
+            Span::styled(" T ", Style::default().fg(color(c.accent))),
+            Span::styled("transform", Style::default().fg(color(c.subtext))),
+        ]);
+
+        let widget = Paragraph::new(vec![sensitive_badge])
             .block(
                 Block::default()
                     .title(title)
@@ -1100,10 +1140,21 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(color(c.accent2))),
             )
-            .style(Style::default().fg(content_color))
-            .wrap(Wrap { trim: false });
+            .style(Style::default().fg(color(c.overlay)));
 
         f.render_widget(widget, area);
+
+        // Content below header
+        let content_area = Rect::new(area.x + 1, area.y + 2, area.width - 2, area.height.saturating_sub(3));
+        let content = Paragraph::new(clip.content.clone())
+            .style(Style::default().fg(content_color))
+            .wrap(Wrap { trim: false });
+        f.render_widget(content, content_area);
+
+        // Footer hint
+        let footer_y = area.y + area.height - 1;
+        let footer_area = Rect::new(area.x, footer_y, area.width, 1);
+        f.render_widget(Paragraph::new(header_line), footer_area);
     } else {
         let widget = Paragraph::new("  No clip selected")
             .block(
@@ -1131,46 +1182,28 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         Line::from(vec![
-            Span::styled(" j/k↑↓ ", Style::default().fg(accent)),
-            Span::styled("Nav", Style::default().fg(sub)),
-            Span::styled("  ", Style::default()),
-            Span::styled("1-9 ", Style::default().fg(accent)),
-            Span::styled("Copy row", Style::default().fg(sub)),
-            Span::styled("  ", Style::default()),
-            Span::styled("⏎ ", Style::default().fg(accent)),
+            Span::styled(" ⏎ ", Style::default().fg(accent)),
             Span::styled("Copy", Style::default().fg(sub)),
             Span::styled("  ", Style::default()),
-            Span::styled("Tab ", Style::default().fg(accent)),
-            Span::styled("Type filter", Style::default().fg(sub)),
-            Span::styled("  ", Style::default()),
-            Span::styled("S-Tab ", Style::default().fg(accent)),
-            Span::styled("App", Style::default().fg(sub)),
-            Span::styled("  ", Style::default()),
-            Span::styled("^A ", Style::default().fg(accent)),
-            Span::styled("All", Style::default().fg(sub)),
-            Span::styled("  ", Style::default()),
-            Span::styled("^T ", Style::default().fg(accent)),
-            Span::styled("Transform", Style::default().fg(sub)),
-            Span::styled("  ", Style::default()),
-            Span::styled("^G ", Style::default().fg(accent)),
-            Span::styled("Semantic", Style::default().fg(sub)),
-            Span::styled("  ", Style::default()),
-            Span::styled("^D ", Style::default().fg(accent)),
-            Span::styled("Del", Style::default().fg(sub)),
-            Span::styled("  ", Style::default()),
-            Span::styled("Esc ", Style::default().fg(accent)),
+            Span::styled(" Esc ", Style::default().fg(accent)),
             Span::styled("Quit", Style::default().fg(sub)),
+            Span::styled("  ", Style::default()),
+            Span::styled(" / ", Style::default().fg(accent)),
+            Span::styled("Focus search", Style::default().fg(sub)),
         ])
     };
 
     f.render_widget(Paragraph::new(line), area);
 }
 
-// ── Transform Overlays ──
+// ── Transform Slide-out Panel ──
 
-fn draw_transform_picker(f: &mut Frame, app: &App) {
-    let popup = centered_rect(55, 80, f.area());
-    f.render_widget(Clear, popup);
+fn draw_transform_slideout(f: &mut Frame, app: &App) {
+    // Render the panel on the right ~42% of the screen.
+    // The main list/preview on the left stays visible and navigable.
+    let panel_width = f.area().width * 42 / 100;
+    let panel_x = f.area().x + f.area().width - panel_width;
+    let panel_area = Rect::new(panel_x, f.area().y, panel_width, f.area().height);
 
     let c = app.theme.colors();
     let transforms = &app.transforms;
@@ -1224,12 +1257,12 @@ fn draw_transform_picker(f: &mut Frame, app: &App) {
     if let Some(ref err) = app.transform_error {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("  ⚠ {}", truncate(err, 50)),
+            format!("  ⚠ {}", truncate(err, (panel_width - 4) as usize)),
             Style::default().fg(Color::Red),
         )));
     }
 
-    let inner_height = popup.height.saturating_sub(4) as usize;
+    let inner_height = panel_area.height.saturating_sub(4) as usize;
     let scroll = if selected_line >= inner_height {
         (selected_line - inner_height + 3) as u16
     } else {
@@ -1239,7 +1272,7 @@ fn draw_transform_picker(f: &mut Frame, app: &App) {
     let widget = Paragraph::new(lines)
         .block(
             Block::default()
-                .title(" ✨ Transform ")
+                .title(" Transform ")
                 .title_bottom(Line::from(vec![
                     Span::styled(" ↑↓ ", Style::default().fg(color(c.accent))),
                     Span::styled("Navigate", Style::default().fg(color(c.subtext))),
@@ -1248,7 +1281,7 @@ fn draw_transform_picker(f: &mut Frame, app: &App) {
                     Span::styled("Apply", Style::default().fg(color(c.subtext))),
                     Span::styled("  ", Style::default()),
                     Span::styled("Esc ", Style::default().fg(color(c.accent))),
-                    Span::styled("Back ", Style::default().fg(color(c.subtext))),
+                    Span::styled("Close", Style::default().fg(color(c.subtext))),
                 ]))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -1257,7 +1290,7 @@ fn draw_transform_picker(f: &mut Frame, app: &App) {
         )
         .scroll((scroll, 0));
 
-    f.render_widget(widget, popup);
+    f.render_widget(widget, panel_area);
 }
 
 fn draw_transform_input(f: &mut Frame, app: &App) {

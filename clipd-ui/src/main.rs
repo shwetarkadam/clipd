@@ -109,11 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         button,
                         button_state,
                         ..
-                    } if matches!(
-                        button_state,
-                        MouseButtonState::Down | MouseButtonState::Up
-                    ) =>
-                    {
+                    } if matches!(button_state, MouseButtonState::Down | MouseButtonState::Up) => {
                         let s = load_paste_transform_settings();
                         item_hud.set_text(hud_tray_label(s.hud_enabled));
                         item_tui_mode.set_checked(load_tui_mode());
@@ -221,7 +217,13 @@ fn open_gui_search() {
 fn open_search_in_terminal() {
     let exe = resolve_clipd_exe();
     let _ = Command::new("cmd")
-        .args(["/C", "start", "clipd search", &exe.to_string_lossy(), "search"])
+        .args([
+            "/C",
+            "start",
+            "clipd search",
+            &exe.to_string_lossy(),
+            "search",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
@@ -308,11 +310,16 @@ struct DaemonHandle {
 }
 
 impl DaemonHandle {
-    /// Signal the daemon to wind down and wait for its worker thread to finish.
+    /// Signal the daemon to wind down. Join on a helper thread so the menu-bar
+    /// event loop never freezes if macOS's keyboard hook takes time to unwind.
     fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            let _ = std::thread::Builder::new()
+                .name("clipd-ui-daemon-stop".into())
+                .spawn(move || {
+                    let _ = join.join();
+                });
         }
     }
 }

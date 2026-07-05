@@ -21,10 +21,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Intel (macos-13) removed: GitHub retired those runners, so the job
+          # queued forever and blocked create-release (timeout-minutes only
+          # counts once a job *starts*). Intel support can return later via
+          # cross-compilation (x86_64-apple-darwin) on the arm64 runner.
           - runner: macos-14
             arch: arm64
-          - runner: macos-13
-            arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
