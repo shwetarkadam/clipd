@@ -203,6 +203,23 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+      - name: Build installer (Clipd-Setup.exe)
+        shell: pwsh
+        run: |
+          # NSIS (makensis) is preinstalled on windows-latest runners.
+          $Version = "${env:GITHUB_REF_NAME}".TrimStart("v")
+          foreach ($bin in @("clipd.exe", "clipd-ui.exe", "clipd-gui.exe", "clipd-mcp.exe", "clipd-overlay.exe", "clipd-picker.exe")) {
+            Copy-Item "target/release/$bin" packaging/windows/
+          }
+          makensis /DVERSION=$Version packaging/windows/clipd-installer.nsi
+          Copy-Item "packaging/windows/Clipd-Setup-$Version.exe" "target/release/Clipd-Setup-v$Version.exe"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipd-windows-installer
+          path: target/release/Clipd-Setup-*.exe
+
       - name: Package zip
         shell: pwsh
         run: |
@@ -243,4 +260,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/*.zip, artifacts/*.dmg, artifacts/*.deb
+          files: |
+            artifacts/*.zip
+            artifacts/*.dmg
+            artifacts/*.deb
+            artifacts/Clipd-Setup-*.exe

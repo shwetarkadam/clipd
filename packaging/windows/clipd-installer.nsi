@@ -71,6 +71,7 @@ Section "MainSection" SEC01
   File "clipd-gui.exe"
   File "clipd-mcp.exe"
   File "clipd-overlay.exe"
+  File "clipd-picker.exe"
 
   CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
   CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\clipd-ui.exe"
@@ -90,10 +91,8 @@ Section -Post
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "UninstallString" "$INSTDIR\uninstall.exe"
   WriteRegStr HKCU "${PRODUCT_UNINST_KEY}" "QuietUninstallString" "$INSTDIR\uninstall.exe /S"
 
-  ; Add to user PATH
-  EnVar::SetHKCU
-  EnVar::AddValue "Path" "$INSTDIR"
-  EnVar::UnSetHKCU
+  ; PATH is not modified here: the EnVar plugin isn't in stock NSIS (breaks CI
+  ; compile). CLI users can run install.ps1 or add %LOCALAPPDATA%\Clipd to PATH.
 
   ; Auto-start
   CreateShortCut "$SMSTARTUP\${PRODUCT_NAME}.lnk" "$INSTDIR\clipd-ui.exe"
@@ -105,6 +104,7 @@ Section Uninstall
   Delete "$INSTDIR\clipd-gui.exe"
   Delete "$INSTDIR\clipd-mcp.exe"
   Delete "$INSTDIR\clipd-overlay.exe"
+  Delete "$INSTDIR\clipd-picker.exe"
   Delete "$INSTDIR\uninstall.exe"
 
   RMDir "$INSTDIR"
@@ -115,8 +115,4 @@ Section Uninstall
   Delete "$SMSTARTUP\${PRODUCT_NAME}.lnk"
 
   DeleteRegKey HKCU "${PRODUCT_UNINST_KEY}"
-
-  EnVar::SetHKCU
-  EnVar::DeleteValue "Path" "$INSTDIR"
-  EnVar::UnSetHKCU
 SectionEnd
