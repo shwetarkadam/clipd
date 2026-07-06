@@ -2028,14 +2028,25 @@ fn simulate_copy() {
 fn simulate_paste() {
     if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
         #[cfg(target_os = "windows")]
-        release_windows_shortcut_modifiers(&mut enigo);
-        #[cfg(target_os = "windows")]
-        let v_key = Key::V;
+        {
+            release_windows_shortcut_modifiers(&mut enigo);
+            // Ctrl+V is registered as clipd's own global hotkey (tap counting),
+            // and RegisterHotKey swallows *injected* Ctrl+V too — a synthetic
+            // Ctrl+V loops back into clipd and never reaches the target app.
+            // Shift+Insert is Windows' second paste accelerator (Win32 edit
+            // controls, Office, browsers, terminals) and isn't registered by
+            // us, so it passes straight through.
+            let _ = enigo.key(Key::Shift, Direction::Press);
+            let _ = enigo.key(Key::Insert, Direction::Click);
+            let _ = enigo.key(Key::Shift, Direction::Release);
+        }
         #[cfg(not(target_os = "windows"))]
-        let v_key = Key::Unicode('v');
-        let _ = enigo.key(Key::Control, Direction::Press);
-        let _ = enigo.key(v_key, Direction::Click);
-        let _ = enigo.key(Key::Control, Direction::Release);
+        {
+            let v_key = Key::Unicode('v');
+            let _ = enigo.key(Key::Control, Direction::Press);
+            let _ = enigo.key(v_key, Direction::Click);
+            let _ = enigo.key(Key::Control, Direction::Release);
+        }
     }
 }
 
