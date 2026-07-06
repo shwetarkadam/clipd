@@ -19,8 +19,14 @@ rdev = { version = "0.5", features = ["unstable_grab"] }
 
 # Windows: rdev with grab — the hook only ever suppresses the single armed
 # letter (after Ctrl+C ×2 / Ctrl+V ×2); every other key passes straight through.
+# windows-sys: Win32 message pump — RegisterHotKey posts WM_HOTKEY to this
+# thread's queue, which global-hotkey only sees if we dispatch messages.
 [target.'cfg(target_os = "windows")'.dependencies]
 rdev = { version = "0.5", features = ["unstable_grab"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 notify-rust = "4"

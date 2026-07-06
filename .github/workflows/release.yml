@@ -206,12 +206,15 @@ jobs:
       - name: Build installer (Clipd-Setup.exe)
         shell: pwsh
         run: |
-          # NSIS (makensis) is preinstalled on windows-latest runners.
+          # makensis is NOT on PATH on windows-latest — install via chocolatey.
+          choco install nsis -y --no-progress
+          $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
           $Version = "${env:GITHUB_REF_NAME}".TrimStart("v")
           foreach ($bin in @("clipd.exe", "clipd-ui.exe", "clipd-gui.exe", "clipd-mcp.exe", "clipd-overlay.exe", "clipd-picker.exe")) {
             Copy-Item "target/release/$bin" packaging/windows/
           }
-          makensis /DVERSION=$Version packaging/windows/clipd-installer.nsi
+          & $makensis /DVERSION=$Version packaging/windows/clipd-installer.nsi
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           Copy-Item "packaging/windows/Clipd-Setup-$Version.exe" "target/release/Clipd-Setup-v$Version.exe"
 
       - name: Upload installer artifact

@@ -891,8 +891,20 @@ pub fn run_daemon_with_stop(
             ctrl_v_tap_state.clone(),
         );
         loop {
-            // Blocking recv — no CPU polling. Wake every 200ms to check stop flag.
-            let event = match receiver.recv_timeout(Duration::from_millis(200)) {
+            // Windows: RegisterHotKey delivers WM_HOTKEY to *this thread's*
+            // message queue (the manager was created here). global-hotkey only
+            // converts them to channel events when messages are dispatched —
+            // without this pump, no hotkey ever fires on Windows. Short recv
+            // timeout keeps pump latency low.
+            #[cfg(target_os = "windows")]
+            pump_win32_messages();
+            #[cfg(target_os = "windows")]
+            let recv_wait = Duration::from_millis(25);
+            #[cfg(not(target_os = "windows"))]
+            let recv_wait = Duration::from_millis(200);
+
+            // Blocking recv — no CPU polling. Wake periodically to check stop.
+            let event = match receiver.recv_timeout(recv_wait) {
                 Ok(e) => e,
                 Err(_) => {
                     // Timeout — check stop and loop
@@ -2453,6 +2465,25 @@ fn show_hud(text: &str) {
             e,
             hud_bin.display()
         ),
+    }
+}
+
+/// Dispatch pending Win32 messages on the current thread. Required for
+/// `global-hotkey`: its hidden window lives on the thread that created the
+/// manager, and WM_HOTKEY only reaches it through message dispatch.
+#[cfg(target_os = "windows")]
+fn pump_win32_messages() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+    // SAFETY: standard Win32 message pump; MSG is plain data written by
+    // PeekMessageW, and null HWND means "all windows on this thread".
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
 }
 
