@@ -14,3 +14,5 @@ clipd-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+# set_clipboard tool — lets an AI assistant put text on the user's clipboard.
+arboard = { workspace = true }

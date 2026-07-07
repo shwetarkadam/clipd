@@ -1,6 +1,7 @@
 use clipd_core::{
-    all_transforms, apply_transform, compute_sessions, load_transform_config, ClipStore,
-    SearchFilters, TfIdfIndex, TransformKind,
+    all_transforms, apply_transform, compute_sessions, embedding_cosine, generate_embedding,
+    is_embedding_available, load_transform_config, ClipEntry, ClipStore, SearchFilters,
+    SlotManager, TfIdfIndex, TransformKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,15 +63,77 @@ fn tool_definitions() -> Value {
         "tools": [
             {
                 "name": "search_clips",
-                "description": "Search clipboard history by text or meaning. Uses FTS5 full-text search with semantic fallback.",
+                "description": "Search clipboard history. 'hybrid' (default) merges exact full-text matches with semantic (by-meaning) matches; semantic uses stored embeddings when available, TF-IDF otherwise. Image clips match via their OCR text.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Search query text" },
                         "limit": { "type": "integer", "description": "Max results (default 20)", "default": 20 },
-                        "semantic": { "type": "boolean", "description": "Use semantic (TF-IDF) search instead of text match", "default": false }
+                        "mode": { "type": "string", "enum": ["hybrid", "keyword", "semantic"], "description": "Search mode (default hybrid)" }
                     },
                     "required": ["query"]
+                }
+            },
+            {
+                "name": "set_clipboard",
+                "description": "Put text on the user's clipboard so they can paste it anywhere. clipd's history records it automatically.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "The text to place on the clipboard" }
+                    },
+                    "required": ["content"]
+                }
+            },
+            {
+                "name": "add_clip",
+                "description": "Save text into clipd history WITHOUT touching the live clipboard (e.g. stash a result for later).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "Text to store" },
+                        "source": { "type": "string", "description": "Label for where this came from (default 'mcp')" }
+                    },
+                    "required": ["content"]
+                }
+            },
+            {
+                "name": "list_slots",
+                "description": "List clipd's multi-copy slots and their contents (slot 1 = latest copy; letter slots A-Z are 31-56).",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "list_snippets",
+                "description": "List saved snippets (reusable text recalled by trigger word).",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "save_snippet",
+                "description": "Create or update a snippet: reusable text the user recalls by typing its trigger in clipd's search.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "trigger": { "type": "string", "description": "Short trigger word (e.g. 'sig')" },
+                        "name": { "type": "string", "description": "Optional human-readable name" },
+                        "body": { "type": "string", "description": "The snippet text" }
+                    },
+                    "required": ["trigger", "body"]
+                }
+            },
+            {
+                "name": "list_collections",
+                "description": "List clip collections (named buckets, e.g. pinned clips).",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "get_collection",
+                "description": "Get the clips inside a collection by its name.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Collection name" }
+                    },
+                    "required": ["name"]
                 }
             },
             {
@@ -191,6 +254,13 @@ impl McpServer {
             "list_transforms" => self.tool_list_transforms(),
             "get_sessions" => self.tool_get_sessions(&arguments),
             "stats" => self.tool_stats(),
+            "set_clipboard" => self.tool_set_clipboard(&arguments),
+            "add_clip" => self.tool_add_clip(&arguments),
+            "list_slots" => self.tool_list_slots(),
+            "list_snippets" => self.tool_list_snippets(),
+            "save_snippet" => self.tool_save_snippet(&arguments),
+            "list_collections" => self.tool_list_collections(),
+            "get_collection" => self.tool_get_collection(&arguments),
             _ => Err(format!("Unknown tool: {}", tool_name)),
         };
 
@@ -275,34 +345,217 @@ impl McpServer {
             .get("limit")
             .and_then(|v| v.as_u64())
             .unwrap_or(20) as usize;
-        let semantic = args
-            .get("semantic")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // Back-compat: the old boolean `semantic: true` maps to mode=semantic.
+        let mode = args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or(if args.get("semantic").and_then(|v| v.as_bool()) == Some(true) {
+                "semantic"
+            } else {
+                "hybrid"
+            });
 
-        if semantic {
-            let all = self.store.get_recent(500).unwrap_or_default();
-            let docs: Vec<&str> = all.iter().map(|c| c.content.as_str()).collect();
-            let index = TfIdfIndex::build(&docs);
-            let results = index.search(query, limit);
-
-            let entries: Vec<Value> = results
-                .iter()
-                .filter_map(|r| all.get(r.clip_index))
-                .map(|c| clip_to_json(c))
-                .collect();
-
-            serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
-        } else {
+        let keyword_hits = |limit: usize| -> Vec<ClipEntry> {
             let filters = SearchFilters {
                 query: Some(query.to_string()),
                 limit,
                 ..Default::default()
             };
-            let clips = self.store.search(&filters).map_err(|e| e.to_string())?;
-            let entries: Vec<Value> = clips.iter().map(clip_to_json).collect();
-            serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+            self.store.search(&filters).unwrap_or_default()
+        };
+
+        let clips: Vec<ClipEntry> = match mode {
+            "keyword" => keyword_hits(limit),
+            "semantic" => self.semantic_hits(query, limit),
+            // Hybrid: exact matches first (they're precise), then by-meaning
+            // matches fill the remainder, deduped by id.
+            _ => {
+                let mut merged = keyword_hits(limit);
+                let mut seen: std::collections::HashSet<i64> =
+                    merged.iter().map(|c| c.id).collect();
+                for c in self.semantic_hits(query, limit) {
+                    if merged.len() >= limit {
+                        break;
+                    }
+                    if seen.insert(c.id) {
+                        merged.push(c);
+                    }
+                }
+                merged
+            }
+        };
+
+        let entries: Vec<Value> = clips.iter().map(clip_to_json).collect();
+        serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+    }
+
+    /// Semantic (by-meaning) matches over recent history. Prefers stored
+    /// vector embeddings (when an embedding API is configured and clips have
+    /// been embedded by the daemon); falls back to a local TF-IDF index, which
+    /// needs no API and runs fully offline.
+    fn semantic_hits(&self, query: &str, limit: usize) -> Vec<ClipEntry> {
+        let all = self.store.get_recent(500).unwrap_or_default();
+        if all.is_empty() {
+            return Vec::new();
         }
+
+        let config = load_transform_config();
+        if is_embedding_available(&config) {
+            let ids: Vec<i64> = all.iter().map(|c| c.id).collect();
+            if let Ok(embs) = self.store.get_embeddings_for_clip_ids(&ids) {
+                if !embs.is_empty() {
+                    if let Ok(q) = generate_embedding(query, &config) {
+                        let by_id: std::collections::HashMap<i64, &ClipEntry> =
+                            all.iter().map(|c| (c.id, c)).collect();
+                        let mut scored: Vec<(f32, &ClipEntry)> = embs
+                            .iter()
+                            .filter_map(|(id, e)| {
+                                Some((embedding_cosine(&q, e), *by_id.get(id)?))
+                            })
+                            .collect();
+                        scored.sort_by(|a, b| {
+                            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        return scored
+                            .into_iter()
+                            .take(limit)
+                            .map(|(_, c)| c.clone())
+                            .collect();
+                    }
+                }
+            }
+        }
+
+        let docs: Vec<&str> = all.iter().map(|c| c.content.as_str()).collect();
+        let index = TfIdfIndex::build(&docs);
+        index
+            .search(query, limit)
+            .iter()
+            .filter_map(|r| all.get(r.clip_index).cloned())
+            .collect()
+    }
+
+    // ── Write tools ──
+
+    fn tool_set_clipboard(&self, args: &Value) -> Result<String, String> {
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'content' parameter")?;
+        let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+        cb.set_text(content.to_string()).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "Copied {} characters to the clipboard — ready to paste.",
+            content.chars().count()
+        ))
+    }
+
+    fn tool_add_clip(&self, args: &Value) -> Result<String, String> {
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'content' parameter")?;
+        let source = args
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("mcp");
+        let entry = ClipEntry::new(content.to_string(), Some(source.to_string()), None);
+        let id = self.store.insert(&entry).map_err(|e| e.to_string())?;
+        Ok(format!("Saved to clipd history as clip #{}.", id))
+    }
+
+    fn tool_list_slots(&self) -> Result<String, String> {
+        let mgr = SlotManager::new();
+        let slots = mgr.list_slots()?;
+        let entries: Vec<Value> = slots
+            .iter()
+            .map(|(n, content)| {
+                let label = if (31..=56).contains(n) {
+                    format!("{}", (b'A' + (n - 31)) as char)
+                } else {
+                    n.to_string()
+                };
+                let preview: String = content.chars().take(120).collect();
+                serde_json::json!({ "slot": label, "preview": preview })
+            })
+            .collect();
+        serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+    }
+
+    fn tool_list_snippets(&self) -> Result<String, String> {
+        let snippets = self.store.list_snippets().map_err(|e| e.to_string())?;
+        let entries: Vec<Value> = snippets
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "trigger": s.trigger,
+                    "name": s.name,
+                    "body": s.body,
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+    }
+
+    fn tool_save_snippet(&self, args: &Value) -> Result<String, String> {
+        let trigger = args
+            .get("trigger")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'trigger' parameter")?;
+        let body = args
+            .get("body")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'body' parameter")?;
+        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        self.store
+            .upsert_snippet(trigger, name, body)
+            .map_err(|e| e.to_string())?;
+        Ok(format!(
+            "Snippet saved — typing '{}' in clipd's search recalls it.",
+            trigger
+        ))
+    }
+
+    fn tool_list_collections(&self) -> Result<String, String> {
+        let collections = self.store.list_collections().map_err(|e| e.to_string())?;
+        let entries: Vec<Value> = collections
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "items": c.item_count,
+                    "auto_route_app": c.source_app,
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
+    }
+
+    fn tool_get_collection(&self, args: &Value) -> Result<String, String> {
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'name' parameter")?;
+        let coll = self
+            .store
+            .get_collection_by_name(name)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("No collection named '{}'", name))?;
+        let items = self
+            .store
+            .collection_items(coll.id)
+            .map_err(|e| e.to_string())?;
+        let entries: Vec<Value> = items
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "clip_id": i.clip_id,
+                    "content": i.content,
+                    "added_at": i.added_at.to_rfc3339(),
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
     }
 
     fn tool_get_recent(&self, args: &Value) -> Result<String, String> {
@@ -400,14 +653,19 @@ impl McpServer {
 }
 
 fn clip_to_json(clip: &clipd_core::ClipEntry) -> Value {
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "id": clip.id,
         "content": clip.content,
         "content_type": clip.content_type.as_str(),
         "source_app": clip.source_app,
         "timestamp": clip.timestamp.to_rfc3339(),
         "preview": clip.preview,
-    })
+    });
+    // Image clips: content already carries the OCR text; expose the file too.
+    if let Some(path) = &clip.image_path {
+        v["image_path"] = Value::String(path.clone());
+    }
+    v
 }
 
 fn transform_name(t: &TransformKind) -> String {
@@ -514,6 +772,11 @@ fn main() {
             let err = err_response(request.id, -32600, "Invalid JSON-RPC version");
             let _ = writeln!(stdout, "{}", serde_json::to_string(&err).unwrap());
             let _ = stdout.flush();
+            continue;
+        }
+
+        // JSON-RPC notifications (no id) must not receive responses.
+        if request.id.is_none() && request.method.starts_with("notifications/") {
             continue;
         }
 

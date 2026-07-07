@@ -213,6 +213,42 @@ clipd/
 
 ---
 
+## AI assistants (MCP)
+
+clipd ships an MCP server (`clipd-mcp`) so AI assistants can search your
+clipboard history — including by meaning, and inside screenshots via OCR text —
+put results on your clipboard, and manage snippets. Everything runs locally
+against clipd's own database.
+
+**Claude Code:**
+
+```bash
+claude mcp add clipd -- /Applications/Clipd.app/Contents/MacOS/clipd-mcp
+```
+
+**Claude Desktop** (`claude_desktop_config.json`) / **Cursor** (`.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "clipd": { "command": "/Applications/Clipd.app/Contents/MacOS/clipd-mcp" }
+  }
+}
+```
+
+On Windows the binary is `%LOCALAPPDATA%\Clipd\clipd-mcp.exe`; on Linux, wherever
+you installed `clipd-mcp`.
+
+Tools: `search_clips` (hybrid keyword + semantic; embeddings when configured,
+local TF-IDF otherwise), `get_recent`, `get_clip`, `set_clipboard`, `add_clip`,
+`list_slots`, `list_snippets`, `save_snippet`, `list_collections`,
+`get_collection`, `transform`, `list_transforms`, `get_sessions`, `stats`.
+
+Try: "find that API key format I copied yesterday", "put the summary of my
+last 5 clips on my clipboard", "save my address as a snippet triggered by 'addr'".
+
+---
+
 ## Uninstall
 
 ```bash

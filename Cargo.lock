@@ -929,6 +929,7 @@ dependencies = [
 name = "clipd-mcp"
 version = "0.4.5"
 dependencies = [
+ "arboard",
  "chrono",
  "clipd-core",
  "serde",
