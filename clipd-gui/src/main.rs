@@ -1211,18 +1211,28 @@ impl eframe::App for ClipdGui {
             self.focus_search = true;
             self.search_query.clear();
             self.apply_filter();
-            // Summoned (Ctrl+G): jump to the mouse cursor — but only when the
-            // cursor is outside the window, so clicking the window to focus it
-            // never teleports it out from under the pointer.
-            if let Some(cursor) = cursor_in_points(ctx) {
-                let outside = ctx
-                    .input(|i| i.viewport().outer_rect)
-                    .map_or(true, |r| !r.contains(cursor));
-                if outside {
-                    let w = ctx.input(|i| i.screen_rect().width());
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                        window_pos_at_cursor(cursor, w),
-                    ));
+            // Summoned (Ctrl+G): jump to the mouse cursor — but NEVER while a
+            // mouse button is down (that's a click-to-focus: moving the window
+            // mid-click makes every button unclickable), and never when the
+            // cursor is already inside the window. On Windows we also require a
+            // known scale factor — without it the physical→points conversion is
+            // wrong on scaled displays and the containment check lies.
+            let pointer_down = ctx.input(|i| i.pointer.any_down());
+            let scale_known = !cfg!(target_os = "windows")
+                || ctx
+                    .input(|i| i.viewport().native_pixels_per_point)
+                    .is_some();
+            if !pointer_down && scale_known {
+                if let Some(cursor) = cursor_in_points(ctx) {
+                    let outside = ctx
+                        .input(|i| i.viewport().outer_rect)
+                        .map_or(true, |r| !r.contains(cursor));
+                    if outside {
+                        let w = ctx.input(|i| i.screen_rect().width());
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                            window_pos_at_cursor(cursor, w),
+                        ));
+                    }
                 }
             }
         }
@@ -1241,7 +1251,14 @@ impl eframe::App for ClipdGui {
         let mut should_cycle_theme = false;
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Escape) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                // Esc = back out one level: Pins/Settings → Clips; Clips → hide.
+                // Keyboard navigation must always work even if the mouse is
+                // misbehaving (borderless-window quirks on Windows).
+                if self.active_tab != MainTab::Text {
+                    self.active_tab = MainTab::Text;
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
             if i.key_pressed(egui::Key::ArrowDown) {
                 if self.selected + 1 < self.filtered.len() {
@@ -1385,99 +1402,36 @@ impl eframe::App for ClipdGui {
                         10.0,
                     )),
             )
-            .show(ctx, |ui| match self.active_tab {
-                MainTab::Text => {
-                    // Fixed search bar header
-                    ui.horizontal(|ui| {
-                        let controls_width = 96.0;
-                        let gap = 8.0;
-                        let search_width = (ui.available_width() - controls_width - gap).max(120.0);
-
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(search_width, 36.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                egui::Frame::none()
-                                    .fill(rgb(c.bg_elevated))
-                                    .rounding(Rounding::same(10.0))
-                                    .inner_margin(Margin::symmetric(10.0, 6.0))
-                                    .stroke(Stroke::new(0.6, rgb(c.border).gamma_multiply(0.75)))
-                                    .show(ui, |ui| {
-                                        ui.set_width((search_width - 22.0).max(80.0));
-                                        ui.horizontal(|ui| {
-                                            draw_search_icon(ui, rgb(c.overlay));
-                                            ui.add_space(6.0);
-                                            let hint = "Search, or type 'from chrome'...";
-                                            let search = ui.add_sized(
-                                                [ui.available_width(), 18.0],
-                                                egui::TextEdit::singleline(&mut self.search_query)
-                                                    .id(egui::Id::new("clip_search"))
-                                                    .hint_text(hint)
-                                                    .frame(false)
-                                                    .font(egui::TextStyle::Body),
-                                            );
-                                            if self.focus_search {
-                                                search.request_focus();
-                                                self.focus_search = false;
-                                            }
-                                            if search.changed() {
-                                                self.apply_filter();
-                                            }
-                                            if search.lost_focus()
-                                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                                && !self.filtered.is_empty()
-                                            {
-                                                action = Action::Paste;
-                                            }
-                                        });
-                                    });
-                            },
-                        );
-                        ui.add_space(gap);
-
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(controls_width, 36.0),
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                let gear_col = rgb(c.overlay);
-                                let gear = ui.add(
-                                    egui::Button::new(
-                                        RichText::new("⚙").size(15.0).color(gear_col),
-                                    )
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::NONE)
-                                    .min_size(egui::vec2(26.0, 30.0)),
-                                );
-                                if gear.clicked() {
-                                    self.active_tab = MainTab::Settings;
-                                }
-                                gear.on_hover_text("Settings");
-                                let pins_active = self.active_tab == MainTab::Collections;
-                                if tab_chip(ui, "Pins", pins_active, &c) {
-                                    if pins_active {
-                                        self.active_tab = MainTab::Text;
-                                    } else {
-                                        self.active_tab = MainTab::Collections;
-                                        self.refresh_collections();
-                                    }
-                                }
-                            },
-                        );
+            .show(ctx, |ui| {
+                // The header (search + Pins + gear) renders on EVERY tab —
+                // without it there is no way back from Pins/Settings.
+                // The panel has no horizontal margin off the Text tab, so pad
+                // the header itself there to keep it aligned.
+                let header_pad = if self.active_tab == MainTab::Text {
+                    0.0
+                } else {
+                    14.0
+                };
+                egui::Frame::none()
+                    .inner_margin(Margin::symmetric(header_pad, 0.0))
+                    .show(ui, |ui| {
+                        self.render_top_bar(ui, &mut action, &c);
                     });
 
-                    // Scrollable clip list below
-                    if self.filtered.is_empty() && self.matched_snippets.is_empty() {
-                        self.render_empty_list(ui, &c);
-                    } else {
-                        self.render_clip_list(ui, &mut action, &c);
+                match self.active_tab {
+                    MainTab::Text => {
+                        if self.filtered.is_empty() && self.matched_snippets.is_empty() {
+                            self.render_empty_list(ui, &c);
+                        } else {
+                            self.render_clip_list(ui, &mut action, &c);
+                        }
                     }
-                }
-                MainTab::Collections => {
-                    self.render_collections_panel(ui, &c);
-                }
-                MainTab::Settings => {
-                    self.render_settings_panel(ui, &c);
+                    MainTab::Collections => {
+                        self.render_collections_panel(ui, &c);
+                    }
+                    MainTab::Settings => {
+                        self.render_settings_panel(ui, &c);
+                    }
                 }
             });
 
@@ -2752,6 +2706,105 @@ impl ClipdGui {
             save_custom_colors(&self.custom_colors);
             apply_theme(ui.ctx(), self.theme);
         }
+    }
+
+    /// Search bar + Pins chip + Settings gear. Rendered on every tab so
+    /// navigation is always available (gear and Pins both toggle back).
+    fn render_top_bar(&mut self, ui: &mut egui::Ui, action: &mut Action, c: &clipd_core::ThemeColors) {
+        ui.horizontal(|ui| {
+            let controls_width = 96.0;
+            let gap = 8.0;
+            let search_width = (ui.available_width() - controls_width - gap).max(120.0);
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(search_width, 36.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    egui::Frame::none()
+                        .fill(rgb(c.bg_elevated))
+                        .rounding(Rounding::same(10.0))
+                        .inner_margin(Margin::symmetric(10.0, 6.0))
+                        .stroke(Stroke::new(0.6, rgb(c.border).gamma_multiply(0.75)))
+                        .show(ui, |ui| {
+                            ui.set_width((search_width - 22.0).max(80.0));
+                            ui.horizontal(|ui| {
+                                draw_search_icon(ui, rgb(c.overlay));
+                                ui.add_space(6.0);
+                                let hint = match self.active_tab {
+                                    MainTab::Collections => "Search pins and collections...",
+                                    MainTab::Settings => "Settings",
+                                    MainTab::Text => "Search, or type 'from chrome'...",
+                                };
+                                let search = ui.add_sized(
+                                    [ui.available_width(), 18.0],
+                                    egui::TextEdit::singleline(&mut self.search_query)
+                                        .id(egui::Id::new("clip_search"))
+                                        .hint_text(hint)
+                                        .frame(false)
+                                        .font(egui::TextStyle::Body),
+                                );
+                                if self.focus_search {
+                                    search.request_focus();
+                                    self.focus_search = false;
+                                }
+                                if search.changed() {
+                                    self.apply_filter();
+                                }
+                                // Enter pastes the top match — Text tab only.
+                                if self.active_tab == MainTab::Text
+                                    && search.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                    && !self.filtered.is_empty()
+                                {
+                                    *action = Action::Paste;
+                                }
+                            });
+                        });
+                },
+            );
+            ui.add_space(gap);
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(controls_width, 36.0),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let settings_active = self.active_tab == MainTab::Settings;
+                    let gear_col = if settings_active {
+                        rgb(c.accent)
+                    } else {
+                        rgb(c.overlay)
+                    };
+                    let gear = ui.add(
+                        egui::Button::new(RichText::new("⚙").size(15.0).color(gear_col))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE)
+                            .min_size(egui::vec2(26.0, 30.0)),
+                    );
+                    if gear.clicked() {
+                        self.active_tab = if settings_active {
+                            MainTab::Text
+                        } else {
+                            MainTab::Settings
+                        };
+                    }
+                    gear.on_hover_text(if settings_active {
+                        "Back to clips"
+                    } else {
+                        "Settings"
+                    });
+                    let pins_active = self.active_tab == MainTab::Collections;
+                    if tab_chip(ui, "Pins", pins_active, &c) {
+                        if pins_active {
+                            self.active_tab = MainTab::Text;
+                        } else {
+                            self.active_tab = MainTab::Collections;
+                            self.refresh_collections();
+                        }
+                    }
+                },
+            );
+        });
     }
 
     fn render_settings_panel(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
