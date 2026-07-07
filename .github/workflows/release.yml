@@ -103,10 +103,20 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           DMG_NAME="Clipd-macos-${{ matrix.arch }}-${VERSION}.dmg"
-          hdiutil create -volname "Clipd" \
-            -srcfolder "target/release/Clipd.app" \
-            -ov -format UDZO \
-            "target/release/${DMG_NAME}"
+          # hdiutil intermittently fails with "Resource busy" on GitHub runners
+          # (Spotlight/diskarbitrationd race) — retry a few times.
+          for attempt in 1 2 3 4 5; do
+            if hdiutil create -volname "Clipd" \
+              -srcfolder "target/release/Clipd.app" \
+              -ov -format UDZO \
+              "target/release/${DMG_NAME}"; then
+              exit 0
+            fi
+            echo "hdiutil attempt ${attempt} failed — retrying in 5s..."
+            sleep 5
+          done
+          echo "::error::hdiutil failed after 5 attempts"
+          exit 1
 
       - name: Upload zip artifact
         uses: actions/upload-artifact@v4
