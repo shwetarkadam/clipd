@@ -321,15 +321,10 @@ pub fn run_daemon_with_stop(
         // They collide with OS shortcuts, browser menus, AltGr keyboard layouts,
         // and app accelerators. Numeric slots use Ctrl+C/Ctrl+V multi-tap; A-Z
         // slots should be addressed through a Clipd-owned palette/prefix UI.
-        #[cfg(target_os = "windows")]
-        {
-            let ctrl_v_hk = HotKey::new(Some(Modifiers::CONTROL), Code::KeyV);
-            if let Err(e) = hotkey_manager.register(ctrl_v_hk) {
-                log::warn!("Failed to register Ctrl+V multi-slot paste: {}", e);
-            } else {
-                registered_hotkeys.push((ctrl_v_hk, FinalAction::CtrlVPasteTap));
-            }
-        }
+        // NOTE: plain Ctrl+V is deliberately NOT registered as a global hotkey.
+        // RegisterHotKey swallows the key system-wide — including the user's
+        // normal pastes — and breaks pasting whenever slot state is empty.
+        // Ctrl+V multi-tap lives in the passive grab hook instead.
 
         let smart_hk = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
         if let Err(e) = hotkey_manager.register(smart_hk) {
@@ -397,7 +392,7 @@ pub fn run_daemon_with_stop(
     println!("       Cmd+C × 3  → save to slot 3    Cmd+V × 3  → paste slot 3");
     println!();
     println!("     Option B — Ctrl tap:");
-    println!("       Ctrl+V × 1 → paste slot 1      Ctrl+C × 1 → save to slot 1");
+    println!("       Ctrl+V × 1 → normal paste      Ctrl+C × 1 → save to slot 1");
     println!("       Ctrl+V × 2 → paste slot 2      Ctrl+C × 2 → save to slot 2");
     println!();
     println!("     Multi-tap Cmd/Ctrl + C/V → slots 1..9 (after pause)");
@@ -871,25 +866,14 @@ pub fn run_daemon_with_stop(
         let paste_transform = load_paste_transform_settings();
         #[cfg(target_os = "windows")]
         let sequence_slot = Arc::new(Mutex::new(1u8));
-        #[cfg(target_os = "windows")]
-        let ctrl_v_tap_state = Arc::new(Mutex::new(WindowsTapState::default()));
         #[cfg(not(target_os = "windows"))]
         let mut sequence_slot: u8 = 1;
 
-        // Windows: a suppressing grab hook drives multi-tap copy (Ctrl+C ×N → slot
-        // N) and letter slots (Ctrl+C ×2 / Ctrl+V ×2, then a letter). It only ever
-        // suppresses the single armed letter — everything else passes through, so
-        // it can't disrupt typing. Numeric Ctrl+V paste stays on its existing
-        // path; a letter cancels the pending slot-N paste via the shared tap state.
+        // Windows: the grab hook owns ALL multi-tap copy/paste (Ctrl+C ×N,
+        // Ctrl+V ×N, letter slots). Tap 1 of Ctrl+V always passes through —
+        // normal paste is native and can never break.
         #[cfg(target_os = "windows")]
-        spawn_windows_grab(
-            slot_manager.clone(),
-            persist_tx.clone(),
-            suppress.clone(),
-            transform_config.clone(),
-            paste_transform.clone(),
-            ctrl_v_tap_state.clone(),
-        );
+        spawn_windows_grab(slot_manager.clone(), persist_tx.clone(), suppress.clone());
         loop {
             // Windows: RegisterHotKey delivers WM_HOTKEY to *this thread's*
             // message queue (the manager was created here). global-hotkey only
@@ -951,15 +935,6 @@ pub fn run_daemon_with_stop(
                             paste_transform.clone(),
                             sequence_slot.clone(),
                         ),
-                        (global_hotkey::HotKeyState::Pressed, FinalAction::CtrlVPasteTap) => {
-                            execute_windows_ctrl_v_tap(
-                                ctrl_v_tap_state.clone(),
-                                hotkey_slot_mgr.clone(),
-                                suppress.clone(),
-                                transform_config.clone(),
-                                paste_transform.clone(),
-                            );
-                        }
                         _ => {}
                     }
                 }
@@ -984,7 +959,6 @@ pub fn run_daemon_with_stop(
                             FinalAction::SmartPaste => {
                                 execute_smart_paste(&suppress, &transform_config, &paste_transform)
                             }
-                            FinalAction::CtrlVPasteTap => {}
                             FinalAction::SequencePaste => {
                                 execute_sequence_paste(
                                     &mut sequence_slot,
@@ -1039,7 +1013,6 @@ enum HotkeyTick {
 enum FinalAction {
     CopyToSlot(u8),
     PasteFromSlot(u8),
-    CtrlVPasteTap,
     OpenTui,
     OpenGui,
     OpenPicker,
@@ -1048,61 +1021,6 @@ enum FinalAction {
 }
 
 // ── Action executors ──
-
-#[cfg(target_os = "windows")]
-#[derive(Default)]
-struct WindowsTapState {
-    last_tap: Option<Instant>,
-    tap_count: u8,
-    generation: u64,
-}
-
-#[cfg(target_os = "windows")]
-fn execute_windows_ctrl_v_tap(
-    state: Arc<Mutex<WindowsTapState>>,
-    mgr: SlotManager,
-    suppress: Arc<AtomicBool>,
-    transform_cfg: TransformConfig,
-    paste_settings: PasteTransformSettings,
-) {
-    let now = Instant::now();
-    let generation = {
-        let Ok(mut s) = state.lock() else {
-            return;
-        };
-        s.tap_count = match s.last_tap {
-            Some(prev) if now.duration_since(prev) < TAP_WINDOW => s.tap_count.saturating_add(1),
-            _ => 1,
-        };
-        s.last_tap = Some(now);
-        s.generation = s.generation.wrapping_add(1);
-        log::info!("⌨️  Windows Ctrl+V tap #{}", s.tap_count);
-        s.generation
-    };
-
-    std::thread::spawn(move || {
-        std::thread::sleep(TAP_WINDOW + Duration::from_millis(80));
-        let slot = {
-            let Ok(mut s) = state.lock() else {
-                return;
-            };
-            if s.generation != generation {
-                return;
-            }
-            if s.last_tap.map_or(true, |prev| {
-                Instant::now().duration_since(prev) < TAP_WINDOW
-            }) {
-                return;
-            }
-            let slot = s.tap_count.clamp(1, 9);
-            s.tap_count = 0;
-            s.last_tap = None;
-            slot
-        };
-        log::info!("⌨️  Windows Ctrl+V final → slot {}", slot);
-        execute_direct_paste(slot, &mgr, &suppress, &transform_cfg, &paste_settings);
-    });
-}
 
 #[cfg(target_os = "windows")]
 fn execute_windows_deferred_action(
@@ -1139,10 +1057,7 @@ fn execute_windows_deferred_action(
                     );
                 }
             }
-            FinalAction::CtrlVPasteTap
-            | FinalAction::OpenTui
-            | FinalAction::OpenGui
-            | FinalAction::OpenPicker => {}
+            FinalAction::OpenTui | FinalAction::OpenGui | FinalAction::OpenPicker => {}
         }
     });
 }
@@ -1203,20 +1118,23 @@ fn rkey_letter_index(key: RKey) -> Option<u8> {
     })
 }
 
-/// Windows suppressing-grab keyboard handler. It passes EVERY key straight
-/// through except the single "armed" letter after `Ctrl+C x2` (-> copy to that
-/// letter slot) or `Ctrl+V x2` (-> paste that letter slot). Numeric `Ctrl+C xN`
-/// is saved here; numeric `Ctrl+V xN` stays on its own path, and a letter cancels
-/// the pending slot-N paste via the shared tap state -- so a double-tap never
-/// clashes with slot 2.
+/// Windows grab keyboard handler — owns ALL multi-tap copy/paste logic.
+///
+/// Design principles (learned the hard way):
+/// - Plain Ctrl+V is NEVER registered as a global hotkey: RegisterHotKey
+///   swallows every paste system-wide and breaks normal pasting whenever the
+///   slot machinery hiccups. Tap 1 always passes through natively.
+/// - Ctrl+V taps 2+ are suppressed; on commit we undo the single native paste
+///   and paste slot N (same design as macOS Cmd+V ×N).
+/// - Ctrl+C ×N passes through (the app performs the copy) and slot N is filled
+///   from the clipboard afterwards.
+/// - A letter within the grace after ×2 targets letter slots A–Z; it cancels
+///   the numeric commit via the generation counter, so ×2 never clashes.
 #[cfg(target_os = "windows")]
 fn spawn_windows_grab(
     slot_mgr: SlotManager,
     persist_tx: mpsc::SyncSender<ClipEvent>,
     suppress: Arc<AtomicBool>,
-    transform_cfg: TransformConfig,
-    paste_settings: PasteTransformSettings,
-    ctrl_v_tap_state: Arc<Mutex<WindowsTapState>>,
 ) {
     // Letter must arrive within the grace; paste grace is < the numeric-paste
     // commit (~430ms) so a letter reliably cancels slot N before it fires.
@@ -1234,7 +1152,9 @@ fn spawn_windows_grab(
             c_gen: u64,
             copy_letter_until: Option<Instant>,
             v_last_tap: Option<Instant>,
+            v_last_press: Option<Instant>,
             v_taps: u8,
+            v_gen: u64,
             paste_letter_until: Option<Instant>,
         }
         let state = Arc::new(Mutex::new(GrabState::default()));
@@ -1335,24 +1255,69 @@ fn spawn_windows_grab(
                     });
                     Some(event)
                 }
-                // Ctrl+V: pass through (numeric paste handled elsewhere); arm letter on x2.
+                // Ctrl+V: tap 1 passes straight through — the NATIVE paste
+                // happens instantly and normal pasting can never break. Taps
+                // 2+ are suppressed; when the window closes we undo the one
+                // native paste and paste slot N instead (the same
+                // undo-then-paste design as macOS Cmd+V ×N).
                 EventType::KeyPress(RKey::KeyV) => {
-                    if let Ok(mut s) = state.lock() {
-                        if s.ctrl && !s.alt && !s.meta {
-                            let now = Instant::now();
-                            s.v_taps = match s.v_last_tap {
-                                Some(p) if now.duration_since(p) < TAP_WINDOW => {
-                                    s.v_taps.saturating_add(1)
-                                }
-                                _ => 1,
-                            };
-                            s.v_last_tap = Some(now);
-                            if s.v_taps == 2 {
-                                s.paste_letter_until = Some(now + PASTE_LETTER_GRACE);
-                            }
+                    let now = Instant::now();
+                    let (taps, gen) = {
+                        let Ok(mut s) = state.lock() else {
+                            return Some(event);
+                        };
+                        if !s.ctrl || s.alt || s.meta {
+                            return Some(event);
                         }
+                        if s.v_last_press
+                            .map_or(false, |p| now.duration_since(p) < TAP_DEBOUNCE)
+                        {
+                            // Key auto-repeat while held: keep normal repeat
+                            // pasting on tap 1, swallow repeats mid-multi-tap.
+                            return if s.v_taps >= 2 { None } else { Some(event) };
+                        }
+                        s.v_last_press = Some(now);
+                        s.v_taps = match s.v_last_tap {
+                            Some(p) if now.duration_since(p) < TAP_WINDOW => {
+                                s.v_taps.saturating_add(1)
+                            }
+                            _ => 1,
+                        };
+                        s.v_last_tap = Some(now);
+                        s.v_gen = s.v_gen.wrapping_add(1);
+                        if s.v_taps == 2 {
+                            s.paste_letter_until = Some(now + PASTE_LETTER_GRACE);
+                        }
+                        (s.v_taps, s.v_gen)
+                    };
+                    if taps == 1 {
+                        return Some(event); // native paste — zero latency, zero risk
                     }
-                    Some(event)
+                    // taps >= 2: suppress this press and schedule the commit.
+                    let st = state.clone();
+                    let mgr = slot_mgr.clone();
+                    let supp = suppress.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(PASTE_LETTER_GRACE + Duration::from_millis(120));
+                        let slot = {
+                            let Ok(mut s) = st.lock() else {
+                                return;
+                            };
+                            if s.v_gen != gen {
+                                return; // another tap or a letter took over
+                            }
+                            let slot = s.v_taps.clamp(1, 9);
+                            s.v_taps = 0;
+                            s.v_last_tap = None;
+                            s.paste_letter_until = None;
+                            slot
+                        };
+                        // One native paste (tap 1) already landed — undo it,
+                        // then paste the requested slot.
+                        execute_undo_paste(slot, 1, &mgr, &supp);
+                        notify_slot_pasted(slot);
+                    });
+                    None
                 }
                 // A bare letter while armed -> letter copy/paste; SUPPRESS it.
                 EventType::KeyPress(key) => {
@@ -1377,6 +1342,9 @@ fn spawn_windows_grab(
                                 s.paste_letter_until = None;
                                 s.v_taps = 0;
                                 s.v_last_tap = None;
+                                // Cancel the pending numeric slot-2 commit —
+                                // this double-tap was the letter-paste prefix.
+                                s.v_gen = s.v_gen.wrapping_add(1);
                                 Some(false)
                             } else {
                                 None
@@ -1395,18 +1363,13 @@ fn spawn_windows_grab(
                             None
                         }
                         Some(false) => {
-                            if let Ok(mut cv) = ctrl_v_tap_state.lock() {
-                                cv.generation = cv.generation.wrapping_add(1);
-                                cv.tap_count = 0;
-                                cv.last_tap = None;
-                            }
                             let slot = 31 + idx;
                             let mgr = slot_mgr.clone();
                             let supp = suppress.clone();
-                            let tcfg = transform_cfg.clone();
-                            let pset = paste_settings.clone();
                             std::thread::spawn(move || {
-                                execute_direct_paste(slot, &mgr, &supp, &tcfg, &pset);
+                                // Tap 1 of the Ctrl+V ×2 prefix pasted natively
+                                // — undo it, then paste the letter slot.
+                                execute_undo_paste(slot, 1, &mgr, &supp);
                                 notify_slot_pasted(slot);
                             });
                             None
@@ -2030,15 +1993,13 @@ fn simulate_paste() {
         #[cfg(target_os = "windows")]
         {
             release_windows_shortcut_modifiers(&mut enigo);
-            // Ctrl+V is registered as clipd's own global hotkey (tap counting),
-            // and RegisterHotKey swallows *injected* Ctrl+V too — a synthetic
-            // Ctrl+V loops back into clipd and never reaches the target app.
-            // Shift+Insert is Windows' second paste accelerator (Win32 edit
-            // controls, Office, browsers, terminals) and isn't registered by
-            // us, so it passes straight through.
-            let _ = enigo.key(Key::Shift, Direction::Press);
-            let _ = enigo.key(Key::Insert, Direction::Click);
-            let _ = enigo.key(Key::Shift, Direction::Release);
+            // Safe to inject plain Ctrl+V: it is deliberately NOT registered
+            // as a global hotkey (tap counting lives in the grab hook, which
+            // passes our synthetic events through via the suppress flag), and
+            // Ctrl+V has the broadest app support of any paste gesture.
+            let _ = enigo.key(Key::Control, Direction::Press);
+            let _ = enigo.key(Key::V, Direction::Click);
+            let _ = enigo.key(Key::Control, Direction::Release);
         }
         #[cfg(not(target_os = "windows"))]
         {
