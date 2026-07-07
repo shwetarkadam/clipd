@@ -1118,6 +1118,25 @@ fn rkey_letter_index(key: RKey) -> Option<u8> {
     })
 }
 
+/// Live modifier state straight from the OS. Event-based tracking desyncs on
+/// Windows (LL hooks receive nothing while an elevated window is focused, so
+/// a Ctrl release can be missed and the state sticks) — GetAsyncKeyState is
+/// always truthful.
+#[cfg(target_os = "windows")]
+fn win_mods_now() -> (bool, bool, bool) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    const VK_CONTROL: i32 = 0x11;
+    const VK_MENU: i32 = 0x12; // Alt
+    const VK_LWIN: i32 = 0x5B;
+    const VK_RWIN: i32 = 0x5C;
+    let down = |vk: i32| unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 };
+    (
+        down(VK_CONTROL),
+        down(VK_MENU),
+        down(VK_LWIN) || down(VK_RWIN),
+    )
+}
+
 /// Windows grab keyboard handler — owns ALL multi-tap copy/paste logic.
 ///
 /// Design principles (learned the hard way):
@@ -1138,14 +1157,11 @@ fn spawn_windows_grab(
 ) {
     // Letter must arrive within the grace; paste grace is < the numeric-paste
     // commit (~430ms) so a letter reliably cancels slot N before it fires.
-    const COPY_LETTER_GRACE: Duration = Duration::from_millis(500);
-    const PASTE_LETTER_GRACE: Duration = Duration::from_millis(350);
+    const COPY_LETTER_GRACE: Duration = Duration::from_millis(650);
+    const PASTE_LETTER_GRACE: Duration = Duration::from_millis(450);
     std::thread::spawn(move || {
         #[derive(Default)]
         struct GrabState {
-            ctrl: bool,
-            alt: bool,
-            meta: bool,
             c_last_tap: Option<Instant>,
             c_last_press: Option<Instant>,
             c_taps: u8,
@@ -1165,54 +1181,17 @@ fn spawn_windows_grab(
                 return Some(event);
             }
             match event.event_type {
-                EventType::KeyRelease(RKey::ControlLeft)
-                | EventType::KeyRelease(RKey::ControlRight) => {
-                    if let Ok(mut s) = state.lock() {
-                        s.ctrl = false;
-                    }
-                    Some(event)
-                }
-                EventType::KeyRelease(RKey::Alt) | EventType::KeyRelease(RKey::AltGr) => {
-                    if let Ok(mut s) = state.lock() {
-                        s.alt = false;
-                    }
-                    Some(event)
-                }
-                EventType::KeyRelease(RKey::MetaLeft) | EventType::KeyRelease(RKey::MetaRight) => {
-                    if let Ok(mut s) = state.lock() {
-                        s.meta = false;
-                    }
-                    Some(event)
-                }
-                EventType::KeyPress(RKey::ControlLeft)
-                | EventType::KeyPress(RKey::ControlRight) => {
-                    if let Ok(mut s) = state.lock() {
-                        s.ctrl = true;
-                    }
-                    Some(event)
-                }
-                EventType::KeyPress(RKey::Alt) | EventType::KeyPress(RKey::AltGr) => {
-                    if let Ok(mut s) = state.lock() {
-                        s.alt = true;
-                    }
-                    Some(event)
-                }
-                EventType::KeyPress(RKey::MetaLeft) | EventType::KeyPress(RKey::MetaRight) => {
-                    if let Ok(mut s) = state.lock() {
-                        s.meta = true;
-                    }
-                    Some(event)
-                }
                 // Ctrl+C: numeric copy multi-tap (passes through); arm letter on x2.
                 EventType::KeyPress(RKey::KeyC) => {
+                    let (ctrl, alt, meta) = win_mods_now();
+                    if !ctrl || alt || meta {
+                        return Some(event);
+                    }
                     let now = Instant::now();
                     let gen = {
                         let Ok(mut s) = state.lock() else {
                             return Some(event);
                         };
-                        if !s.ctrl || s.alt || s.meta {
-                            return Some(event);
-                        }
                         if s.c_last_press
                             .map_or(false, |p| now.duration_since(p) < TAP_DEBOUNCE)
                         {
@@ -1261,14 +1240,15 @@ fn spawn_windows_grab(
                 // native paste and paste slot N instead (the same
                 // undo-then-paste design as macOS Cmd+V ×N).
                 EventType::KeyPress(RKey::KeyV) => {
+                    let (ctrl, alt, meta) = win_mods_now();
+                    if !ctrl || alt || meta {
+                        return Some(event);
+                    }
                     let now = Instant::now();
                     let (taps, gen) = {
                         let Ok(mut s) = state.lock() else {
                             return Some(event);
                         };
-                        if !s.ctrl || s.alt || s.meta {
-                            return Some(event);
-                        }
                         if s.v_last_press
                             .map_or(false, |p| now.duration_since(p) < TAP_DEBOUNCE)
                         {
@@ -1324,11 +1304,15 @@ fn spawn_windows_grab(
                     let Some(idx) = rkey_letter_index(key) else {
                         return Some(event);
                     };
+                    // Users naturally keep Ctrl held through the whole
+                    // gesture (Ctrl+C, C, E) — accept the letter with or
+                    // without Ctrl. Alt/Win combos stay untouched.
+                    let (_ctrl, alt, meta) = win_mods_now();
                     let action = {
                         let Ok(mut s) = state.lock() else {
                             return Some(event);
                         };
-                        if s.ctrl || s.alt || s.meta {
+                        if alt || meta {
                             None
                         } else {
                             let now = Instant::now();
