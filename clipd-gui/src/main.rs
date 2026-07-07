@@ -1260,6 +1260,15 @@ impl eframe::App for ClipdGui {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
+            // Cmd+, (Ctrl+, on Windows/Linux) — the standard "preferences"
+            // chord — toggles Settings, so the gear never needs the mouse.
+            if i.key_pressed(egui::Key::Comma) && i.modifiers.command {
+                self.active_tab = if self.active_tab == MainTab::Settings {
+                    MainTab::Text
+                } else {
+                    MainTab::Settings
+                };
+            }
             if i.key_pressed(egui::Key::ArrowDown) {
                 if self.selected + 1 < self.filtered.len() {
                     self.selected += 1;
@@ -1360,13 +1369,19 @@ impl eframe::App for ClipdGui {
                 // Hints on the left (Text tab only) + a watermark-subtle
                 // "clipd" wordmark on the right: identity without chrome.
                 ui.horizontal(|ui| {
-                    if self.active_tab == MainTab::Text {
-                        ui.label(
-                            RichText::new("enter  paste     space  preview")
-                                .size(10.0)
-                                .color(rgb(c.overlay).gamma_multiply(0.85)),
-                        );
-                    }
+                    // "cmd" is the Cmd key on macOS; egui maps the same
+                    // modifier to Ctrl on Windows/Linux, so label accordingly.
+                    let modk = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+                    let hints = if self.active_tab == MainTab::Text {
+                        format!("enter  paste     space  preview     {modk} ,  settings")
+                    } else {
+                        format!("esc  back to clips     {modk} ,  toggle settings")
+                    };
+                    ui.label(
+                        RichText::new(hints)
+                            .size(10.0)
+                            .color(rgb(c.overlay).gamma_multiply(0.85)),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new("clipd")
