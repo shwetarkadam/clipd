@@ -2205,6 +2205,11 @@ impl ClipdGui {
                         .selected_text(self.paste_settings.open_gui_hotkey.label())
                         .show_ui(ui, |ui| {
                             for hk in OpenGuiHotkey::ALL {
+                                // Alt+G is Windows-only (Option+G types © on
+                                // macOS) — hide it where it can't work.
+                                if hk == OpenGuiHotkey::AltG && !cfg!(target_os = "windows") {
+                                    continue;
+                                }
                                 ui.selectable_value(
                                     &mut self.paste_settings.open_gui_hotkey,
                                     hk,

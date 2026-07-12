@@ -350,6 +350,7 @@ pub fn run_daemon_with_stop(
         let gui_hotkey_setting = load_paste_transform_settings().open_gui_hotkey;
         let gui_mods = match gui_hotkey_setting {
             OpenGuiHotkey::CtrlG => Some(Modifiers::CONTROL),
+            OpenGuiHotkey::AltG => Some(Modifiers::ALT),
             OpenGuiHotkey::CmdShiftG => Some(Modifiers::SUPER | Modifiers::SHIFT),
             OpenGuiHotkey::CtrlShiftG => Some(Modifiers::CONTROL | Modifiers::SHIFT),
             OpenGuiHotkey::Disabled => None,
@@ -364,6 +365,15 @@ pub fn run_daemon_with_stop(
                 );
             } else {
                 registered_hotkeys.push((gui_hk, FinalAction::OpenGui));
+            }
+            // Windows: Alt+G always opens the GUI, even for users whose saved
+            // settings predate the AltG option (their config pins CtrlG).
+            #[cfg(target_os = "windows")]
+            if gui_hotkey_setting != OpenGuiHotkey::AltG {
+                let alt_g = HotKey::new(Some(Modifiers::ALT), Code::KeyG);
+                if hotkey_manager.register(alt_g).is_ok() {
+                    registered_hotkeys.push((alt_g, FinalAction::OpenGui));
+                }
             }
         } else {
             log::info!("Open-GUI hotkey disabled in settings");
@@ -3411,6 +3421,9 @@ fn start_macos_hotkey_listener(
                     let hk = load_paste_transform_settings().open_gui_hotkey;
                     let matched = match hk {
                         OpenGuiHotkey::CtrlG => is_ctrl_only(&s.pressed_mods),
+                        // Alt+G is a Windows-only binding (Option+G types © on
+                        // macOS keyboards) — treat as unbound here.
+                        OpenGuiHotkey::AltG => false,
                         OpenGuiHotkey::CmdShiftG => is_cmd_shift(&s.pressed_mods),
                         OpenGuiHotkey::CtrlShiftG => is_ctrl_shift(&s.pressed_mods),
                         OpenGuiHotkey::Disabled => false,
@@ -3604,6 +3617,8 @@ fn start_macos_open_gui_fallback_listener(
                     let hk = load_paste_transform_settings().open_gui_hotkey;
                     let matched = match hk {
                         OpenGuiHotkey::CtrlG => is_ctrl_only(&state.pressed_mods),
+                        // Alt+G is Windows-only — unbound on macOS.
+                        OpenGuiHotkey::AltG => false,
                         OpenGuiHotkey::CmdShiftG => is_cmd_shift(&state.pressed_mods),
                         OpenGuiHotkey::CtrlShiftG => is_ctrl_shift(&state.pressed_mods),
                         OpenGuiHotkey::Disabled => false,

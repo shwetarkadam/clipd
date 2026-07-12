@@ -212,6 +212,8 @@ impl PaletteTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpenGuiHotkey {
     CtrlG,
+    /// Windows-only: Alt+G avoids the Ctrl+G "find next" clash in browsers.
+    AltG,
     CmdShiftG,
     CtrlShiftG,
     Disabled,
@@ -219,7 +221,13 @@ pub enum OpenGuiHotkey {
 
 impl Default for OpenGuiHotkey {
     fn default() -> Self {
-        Self::CtrlG
+        // Windows defaults to Alt+G: Ctrl+G collides with "find next" in
+        // browsers/editors, and Alt+G is nearly always free.
+        if cfg!(target_os = "windows") {
+            Self::AltG
+        } else {
+            Self::CtrlG
+        }
     }
 }
 
@@ -227,6 +235,7 @@ impl OpenGuiHotkey {
     pub fn label(&self) -> &'static str {
         match self {
             Self::CtrlG => "Ctrl+G",
+            Self::AltG => "Alt+G",
             // The Cmd key is Super/Win off macOS — label it what users see.
             Self::CmdShiftG => {
                 if cfg!(target_os = "macos") {
@@ -240,8 +249,9 @@ impl OpenGuiHotkey {
         }
     }
 
-    pub const ALL: [OpenGuiHotkey; 4] = [
+    pub const ALL: [OpenGuiHotkey; 5] = [
         Self::CtrlG,
+        Self::AltG,
         Self::CmdShiftG,
         Self::CtrlShiftG,
         Self::Disabled,
