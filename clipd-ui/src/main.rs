@@ -370,6 +370,21 @@ fn stop_existing_daemons() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    // Also sweep stray clipd-ui.exe instances from earlier sessions (each
+    // hosts an in-process daemon → duplicate hooks and split slot state).
+    // Filter excludes ourselves.
+    let self_pid = std::process::id().to_string();
+    let _ = Command::new("taskkill")
+        .args([
+            "/F",
+            "/IM",
+            "clipd-ui.exe",
+            "/FI",
+            &format!("PID ne {}", self_pid),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 // ── Path resolution ──

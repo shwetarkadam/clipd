@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "blog",
+      "runtimeExecutable": "hugo",
+      "runtimeArgs": ["server", "-s", "/Users/shwetakadam/eng_projects/myblog", "-p", "1313"],
+      "port": 1313
+    }
+  ]
+}

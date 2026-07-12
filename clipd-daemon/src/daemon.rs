@@ -1229,8 +1229,11 @@ fn spawn_windows_grab(
                             s.copy_letter_until = None;
                             slot
                         };
+                        // execute_copy notifies on success via
+                        // save_text_to_slot — no unconditional toast here
+                        // (it used to claim "Saved" even when the clipboard
+                        // read failed).
                         execute_copy(slot, &mgr, &tx);
-                        notify_slot_saved(slot);
                     });
                     Some(event)
                 }
@@ -1342,7 +1345,6 @@ fn spawn_windows_grab(
                             let tx = persist_tx.clone();
                             std::thread::spawn(move || {
                                 execute_copy(slot, &mgr, &tx);
-                                notify_slot_saved(slot);
                             });
                             None
                         }
@@ -1452,7 +1454,13 @@ fn execute_copy(slot: u8, mgr: &SlotManager, persist_tx: &mpsc::SyncSender<ClipE
     if let Some(ref text) = text {
         save_text_to_slot(slot, text, mgr, persist_tx);
     } else {
-        log::info!("📋 Copy to slot {} skipped (clipboard empty)", slot);
+        // Loud on purpose: this is the "toast said copied but nothing saved"
+        // failure mode — surface the real clipboard error in the log.
+        log::warn!(
+            "📋 Copy to slot {} FAILED — clipboard unreadable/empty after retries: {:?}",
+            slot,
+            cb.get_text().err()
+        );
     }
 }
 
