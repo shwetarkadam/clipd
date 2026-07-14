@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use arboard::Clipboard;
 use chrono::{DateTime, Utc};
 use clipd_core::{
@@ -425,8 +427,8 @@ fn main() -> eframe::Result {
     result
 }
 
-/// Returns true if another clipd-gui process is already running. On macOS it
-/// also raises that instance's window to the front before returning.
+/// Returns true if another clipd-gui process is already running and raises its
+/// window on platforms where native focusing is available.
 #[cfg(target_os = "macos")]
 fn focus_existing_instance() -> bool {
     // At this point (before run_native) this process is not yet a UI app, so it
@@ -450,9 +452,36 @@ return """#;
         .unwrap_or(false)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn focus_existing_instance() -> bool {
+    focus_windows_gui_window()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn focus_existing_instance() -> bool {
     false
+}
+
+#[cfg(target_os = "windows")]
+fn focus_windows_gui_window() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+
+    let title: Vec<u16> = "clipd".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: title is a valid nul-terminated UTF-16 string. The returned HWND
+    // is only passed back to Win32 window-management functions.
+    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    if hwnd.is_null() {
+        return false;
+    }
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(hwnd);
+    }
+    true
 }
 
 /// Return focus to the app the user came from (recorded by the daemon when clipd
@@ -519,10 +548,20 @@ fn spawn_daemon_process() -> Option<std::process::Child> {
     let cli_bin = find_cli_binary()?;
 
     log::info!("Spawning daemon process: {} daemon", cli_bin.display());
-    std::process::Command::new(&cli_bin)
+    let mut command = std::process::Command::new(&cli_bin);
+    command
         .arg("daemon")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // clipd.exe is a console binary for CLI use. When the GUI needs to
+        // bootstrap its daemon, keep that console completely hidden.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
         .spawn()
         .map_err(|e| log::warn!("Failed to spawn daemon: {}", e))
         .ok()
@@ -784,7 +823,8 @@ impl ClipdGui {
     fn new(theme: Theme) -> Self {
         let db_path = ClipStore::default_path();
         let store = ClipStore::new(&db_path).expect("Failed to open clip database");
-        let clips = store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
+        let mut clips = store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
+        sync_active_slot_labels(&store, &mut clips);
         let count = clips.len();
         let session_config = SessionConfig::default();
         let sessions = compute_sessions(&clips, session_config.window_minutes);
@@ -912,6 +952,7 @@ impl ClipdGui {
 
     fn refresh(&mut self) {
         self.clips = self.store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
+        sync_active_slot_labels(&self.store, &mut self.clips);
         self.sessions = compute_sessions(&self.clips, self.session_config.window_minutes);
         self.cached_tfidf = None; // invalidate — will be rebuilt lazily on next search
         self.refresh_snippets();
@@ -4722,6 +4763,22 @@ impl ClipdGui {
                         );
                     });
             });
+    }
+}
+
+/// The history row's slot column is best-effort metadata and can lose a race
+/// with the clipboard watcher. The dedicated active-slot table is authoritative,
+/// so use it to keep the GUI's slot badges/filter in sync with what will paste.
+fn sync_active_slot_labels(store: &ClipStore, clips: &mut [ClipEntry]) {
+    let active_by_content: std::collections::HashMap<String, u8> = store
+        .list_active_slots()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(slot, _)| *slot > 0)
+        .map(|(slot, content)| (content, slot))
+        .collect();
+    for clip in clips {
+        clip.slot = active_by_content.get(&clip.content).copied();
     }
 }
 

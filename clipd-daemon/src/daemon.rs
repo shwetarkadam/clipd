@@ -83,7 +83,11 @@ pub fn run_daemon_with_stop(
     let db_path = ClipStore::default_path();
     println!("  📦 Database: {}", db_path.display());
     let _store = ClipStore::new(&db_path)?;
-    let slot_manager = SlotManager::new();
+    // Active slots are process-shared and survive restarts. This is especially
+    // important on Windows where tray/GUI upgrades can briefly overlap: the
+    // hook that observes paste must see the slot saved by the hook that saw copy.
+    let slot_manager = SlotManager::persistent(&db_path)
+        .map_err(|e| format!("Failed to open active-slot store: {e}"))?;
     let db_path_clone = db_path.clone();
 
     let stop_watcher = stop.clone();
@@ -424,7 +428,11 @@ pub fn run_daemon_with_stop(
     println!("       then just Cmd+C each item → stacks into slots 1..9");
     println!("       Cmd+Shift+V    → pick one to paste from the visual list");
     println!();
-    println!("     Ctrl+T → open TUI        Ctrl+G → open GUI");
+    if cfg!(target_os = "windows") {
+        println!("     Ctrl+T → open TUI        Alt+G → open GUI");
+    } else {
+        println!("     Ctrl+T → open TUI        Ctrl+G → open GUI");
+    }
     println!("     Ctrl+R → open search TUI");
     println!("     (action fires 0.35s after last tap)");
     println!();
@@ -1307,8 +1315,9 @@ fn spawn_windows_grab(
                         };
                         // One native paste (tap 1) already landed — undo it,
                         // then paste the requested slot.
-                        execute_undo_paste(slot, 1, &mgr, &supp);
-                        notify_slot_pasted(slot);
+                        if execute_undo_paste(slot, 1, &mgr, &supp) {
+                            notify_slot_pasted(slot);
+                        }
                     });
                     None
                 }
@@ -1365,8 +1374,9 @@ fn spawn_windows_grab(
                             std::thread::spawn(move || {
                                 // Tap 1 of the Ctrl+V ×2 prefix pasted natively
                                 // — undo it, then paste the letter slot.
-                                execute_undo_paste(slot, 1, &mgr, &supp);
-                                notify_slot_pasted(slot);
+                                if execute_undo_paste(slot, 1, &mgr, &supp) {
+                                    notify_slot_pasted(slot);
+                                }
                             });
                             None
                         }
@@ -1492,7 +1502,10 @@ fn save_text_to_slot(
     mgr: &SlotManager,
     persist_tx: &mpsc::SyncSender<ClipEvent>,
 ) {
-    mgr.copy_to_slot(slot, text).ok();
+    if let Err(e) = mgr.copy_to_slot(slot, text) {
+        log::warn!("📋 Save to slot {} FAILED: {}", slot, e);
+        return;
+    }
     log::info!("📋 Saved to slot {}: {}", slot, truncate(text, 40));
     #[cfg(target_os = "macos")]
     show_slot_content_notification("Copied", slot, text);
@@ -1511,13 +1524,13 @@ fn execute_undo_paste(
     native_paste_count: u8,
     mgr: &SlotManager,
     suppress: &Arc<AtomicBool>,
-) {
+) -> bool {
     if let Ok(Some(content)) = mgr.get_slot(slot) {
         let mut cb = match Clipboard::new() {
             Ok(c) => c,
             Err(e) => {
                 log::warn!("Paste from slot {} failed: {}", slot, e);
-                return;
+                return false;
             }
         };
 
@@ -1532,7 +1545,7 @@ fn execute_undo_paste(
         if let Err(e) = cb.set_text(&content) {
             suppress.store(false, Ordering::SeqCst);
             log::warn!("Paste from slot {} failed: {}", slot, e);
-            return;
+            return false;
         }
 
         std::thread::sleep(Duration::from_millis(50));
@@ -1562,8 +1575,10 @@ fn execute_undo_paste(
         }
 
         suppress.store(false, Ordering::SeqCst);
+        true
     } else {
         log::info!("📋 Slot {} is empty", slot);
+        false
     }
 }
 
@@ -2773,6 +2788,30 @@ return """#;
         .unwrap_or(false)
 }
 
+/// Bring the existing Windows palette to the foreground instead of launching
+/// another GUI process (and, before the GUI subsystem fix, another console).
+#[cfg(target_os = "windows")]
+fn focus_existing_gui() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+
+    let title: Vec<u16> = "clipd".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: title is a valid nul-terminated UTF-16 string and HWND is used
+    // only with Win32 window-management calls.
+    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    if hwnd.is_null() {
+        return false;
+    }
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(hwnd);
+    }
+    true
+}
+
 /// Launch the quick slot picker popup (next to the daemon binary), detached.
 #[cfg(target_os = "windows")]
 fn spawn_picker() {
@@ -2797,6 +2836,21 @@ fn spawn_picker() {
 }
 
 fn open_gui() {
+    // Coalesce duplicate hotkey delivery and impatient repeated presses while
+    // the first GUI process is still creating its window.
+    static LAST_OPEN: std::sync::OnceLock<std::sync::Mutex<Option<Instant>>> =
+        std::sync::OnceLock::new();
+    let gate = LAST_OPEN.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut last) = gate.lock() {
+        let now = Instant::now();
+        if last.map_or(false, |previous| {
+            now.duration_since(previous) < Duration::from_millis(900)
+        }) {
+            return;
+        }
+        *last = Some(now);
+    }
+
     log::info!("🖥️  Opening GUI...");
 
     // Remember which app the user was in (before clipd steals focus) so the GUI
@@ -2810,7 +2864,7 @@ fn open_gui() {
 
     // If the GUI is already running, bring its window to the front instead of
     // spawning a second instance.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     if focus_existing_gui() {
         return;
     }

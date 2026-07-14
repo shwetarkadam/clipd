@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -55,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let item_hud = MenuItem::with_id(MENU_ID_HUD, hud_tray_label(hud_on), true, None);
     let item_tui_mode = CheckMenuItem::with_id(
         MENU_ID_TUI_MODE,
-        "Developer mode (TUI)",
+        "Developer Terminal mode (optional)",
         true,
         load_tui_mode(),
         None,

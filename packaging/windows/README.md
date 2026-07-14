@@ -4,7 +4,12 @@ Clipd gives you clipboard history plus multiple independent clipboard slots.
 
 ## Start Clipd
 
-Double-click `clipd-gui.exe` for the normal app window. It starts the background daemon automatically.
+Launch **Clipd** from the Desktop or Start Menu. The GUI and tray start without
+opening a terminal window.
+
+The terminal/TUI is optional. Enable **Developer Terminal mode (optional)** from
+the tray menu or use the explicitly labeled Developer Terminal shortcut if you
+selected it during setup.
 
 For logs while testing hotkeys, run `ClipdDebug.bat`.
 
@@ -15,7 +20,7 @@ For logs while testing hotkeys, run `ClipdDebug.bat`.
 | Copy to numeric slot N | `Ctrl+C` xN |
 | Paste numeric slot N | `Ctrl+V` xN |
 | Smart paste | `Ctrl+Shift+V` |
-| Open Clipd window | `Ctrl+G` |
+| Open Clipd window | `Alt+G` |
 
 Direct alphabet-slot hotkeys are disabled on Windows because global `Win` / `Alt` / `Ctrl+Alt` letter chords collide with Windows, browsers, app shortcuts, and non-US keyboard layouts. Use the Clipd window/palette for letter aliases until the dedicated alphabet picker lands.
 

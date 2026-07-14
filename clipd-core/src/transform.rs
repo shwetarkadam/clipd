@@ -344,7 +344,7 @@ pub struct PasteTransformSettings {
     #[serde(default = "default_true_val")]
     pub warn_conflicting_shortcuts: bool,
 
-    /// Global hotkey that opens the clipd window (default Ctrl+G).
+    /// Global hotkey that opens the clipd window (Alt+G on Windows, Ctrl+G elsewhere).
     #[serde(default)]
     pub open_gui_hotkey: OpenGuiHotkey,
 

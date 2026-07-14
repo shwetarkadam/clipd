@@ -68,6 +68,15 @@ impl ClipStore {
             CREATE INDEX IF NOT EXISTS idx_clips_hash ON clips(content_hash);
             CREATE INDEX IF NOT EXISTS idx_clips_type ON clips(content_type);
             CREATE INDEX IF NOT EXISTS idx_clips_app ON clips(source_app);
+
+            -- Current multi-copy slots are separate from history: history may
+            -- be disabled or deduplicated, while a slot must remain pasteable
+            -- across helper processes and daemon restarts.
+            CREATE TABLE IF NOT EXISTS active_slots (
+                slot       INTEGER PRIMARY KEY,
+                content    TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             ",
         )?;
 
@@ -251,6 +260,15 @@ impl ClipStore {
 
         let rows = stmt.query_map(params![limit as i64], Self::row_to_clip)?;
 
+        rows.collect()
+    }
+
+    /// Current process-shared user slots, sorted by slot number.
+    pub fn list_active_slots(&self) -> SqlResult<Vec<(u8, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT slot, content FROM active_slots ORDER BY slot")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect()
     }
 

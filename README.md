@@ -132,7 +132,7 @@ The HUD shows the active slot bank while tapping, so you can stop when the targe
 | Shortcut | Action |
 |----------|--------|
 | `Ctrl+R` | Open search TUI |
-| `Ctrl+G` | Open GUI window |
+| `Ctrl+G` (macOS/Linux), `Alt+G` (Windows) | Open GUI window |
 | `Ctrl+Shift+V` | Smart paste (transform clipboard before pasting) |
 | `Cmd+Option+V` | Sequence paste (auto-increment through slots) |
 

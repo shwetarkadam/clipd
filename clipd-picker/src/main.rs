@@ -58,7 +58,9 @@ fn char_key(c: char) -> Option<Key> {
 }
 
 fn load_slots() -> Vec<Slot> {
-    let mgr = clipd_core::SlotManager::new();
+    let Ok(mgr) = clipd_core::SlotManager::persistent_default() else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     // Numeric slots 1–9, then letter slots A–Z (slots 31..=56).
     let entries = (1u8..=9)

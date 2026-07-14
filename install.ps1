@@ -72,10 +72,19 @@ try {
         exit 1
     }
 
+    # ── Stop an existing installation before upgrading ──
+    # This prevents an old tray/GUI/daemon from surviving the update while a
+    # second copy launches. Stop-Process itself does not open a terminal.
+    foreach ($ProcessName in @("clipd-ui", "clipd-gui", "clipd", "clipd-overlay", "clipd-picker")) {
+        Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Milliseconds 300
+
     # ── Install binaries ──
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 
-    foreach ($Bin in @("clipd.exe", "clipd-ui.exe", "clipd-gui.exe", "clipd-mcp.exe", "clipd-overlay.exe")) {
+    foreach ($Bin in @("clipd.exe", "clipd-ui.exe", "clipd-gui.exe", "clipd-mcp.exe", "clipd-overlay.exe", "clipd-picker.exe")) {
         $Src = Join-Path $SrcDir $Bin
         if (Test-Path $Src) {
             Copy-Item -Path $Src -Destination (Join-Path $InstallDir $Bin) -Force
@@ -107,19 +116,22 @@ try {
     $Shortcut.Description = "Clipd - Clipboard Manager (Tray)"
     $Shortcut.Save()
 
-    $GuiLnk = Join-Path $ClipdFolder "Clipd GUI.lnk"
-    $Shortcut = $WshShell.CreateShortcut($GuiLnk)
-    $Shortcut.TargetPath = Join-Path $InstallDir "clipd-gui.exe"
-    $Shortcut.WorkingDirectory = $InstallDir
-    $Shortcut.Description = "Clipd - GUI Search"
-    $Shortcut.Save()
-
-    $CLILnk = Join-Path $ClipdFolder "Clipd CLI.lnk"
-    $Shortcut = $WshShell.CreateShortcut($CLILnk)
-    $Shortcut.TargetPath = Join-Path $InstallDir "clipd.exe"
-    $Shortcut.WorkingDirectory = $InstallDir
-    $Shortcut.Description = "Clipd - Command Line"
-    $Shortcut.Save()
+    # Terminal/TUI is available, but explicitly opt-in and never launched by
+    # the installer or normal Clipd shortcut. Set CLIPD_TERMINAL_SHORTCUT=1
+    # before running this script if a Start Menu terminal shortcut is wanted.
+    Remove-Item (Join-Path $ClipdFolder "Clipd GUI.lnk") -Force -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $ClipdFolder "Clipd CLI.lnk") -Force -ErrorAction SilentlyContinue
+    $TerminalLnk = Join-Path $ClipdFolder "Clipd Developer Terminal (Optional).lnk"
+    if ($env:CLIPD_TERMINAL_SHORTCUT -eq "1") {
+        $Shortcut = $WshShell.CreateShortcut($TerminalLnk)
+        $Shortcut.TargetPath = $env:ComSpec
+        $Shortcut.Arguments = '/K ""{0}\clipd.exe" search"' -f $InstallDir
+        $Shortcut.WorkingDirectory = $InstallDir
+        $Shortcut.Description = "Optional Clipd developer terminal and TUI"
+        $Shortcut.Save()
+    } else {
+        Remove-Item $TerminalLnk -Force -ErrorAction SilentlyContinue
+    }
 
     Write-Ok "Created Start Menu shortcuts"
 
@@ -158,8 +170,8 @@ Write-Host ""
 Write-Ok "Done! Clipd $Version installed."
 Write-Host ""
 Write-Host "  Tray icon: check your system tray (bottom-right)"
-Write-Host "  CLI:       clipd list | clipd search | clipd slots"
-Write-Host "  GUI:       double-click the Desktop shortcut or Start Menu"
+Write-Host "  GUI:       opens by default; use the Desktop shortcut or Start Menu"
+Write-Host "  Terminal:  optional; run clipd search when you want the TUI"
 Write-Host ""
 Write-Host "  Uninstall:  Remove-Item -Recurse `"`$env:LOCALAPPDATA\Clipd`""
 Write-Host "             Then remove from PATH in System Settings > Environment Variables"

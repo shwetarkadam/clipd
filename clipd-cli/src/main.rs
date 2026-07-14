@@ -1,6 +1,6 @@
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
-use clipd_core::{ClipStore, ContentType, SearchFilters, MAX_CLIP_SLOT};
+use clipd_core::{ClipStore, ContentType, SearchFilters, SlotManager, MAX_CLIP_SLOT};
 
 #[derive(Parser)]
 #[command(
@@ -633,23 +633,33 @@ fn cmd_paste(slot: u8) {
         return;
     }
 
-    let store = open_store();
-    // slot 0 and slot 1 both mean "most recent"; slot N means Nth most recent.
-    let fetch = if slot <= 1 { 1 } else { slot as usize };
-    let clips = store.get_recent(fetch).unwrap_or_default();
-
-    if let Some(clip) = clips.last() {
-        print!("{}", clip.content);
-    } else {
-        eprintln!("❌ Slot {} is empty", slot);
+    match SlotManager::persistent_default().and_then(|slots| slots.get_slot(slot)) {
+        Ok(Some(content)) => print!("{}", content),
+        Ok(None) => eprintln!("❌ Slot {} is empty", slot),
+        Err(e) => eprintln!("❌ Failed to read slot {}: {}", slot, e),
     }
 }
 
 fn cmd_slots() {
     println!("  🎰 Slot contents:");
     println!("  {}", "─".repeat(50));
-    println!("  Slots are managed by the running daemon.");
-    println!("  Start the daemon with: clipd daemon");
+    match SlotManager::persistent_default().and_then(|slots| slots.list_slots()) {
+        Ok(slots) => {
+            for (slot, content) in slots.into_iter().filter(|(slot, _)| *slot > 0) {
+                let label = if (31..=56).contains(&slot) {
+                    ((b'A' + slot - 31) as char).to_string()
+                } else {
+                    slot.to_string()
+                };
+                println!(
+                    "  {:>2}  {}",
+                    label,
+                    truncate(&content.replace('\n', " "), 40)
+                );
+            }
+        }
+        Err(e) => eprintln!("❌ Failed to read slots: {}", e),
+    }
     println!();
     println!("  Hotkeys:");
     println!("    Cmd+C × N or Ctrl+C × N  → save to slot");
@@ -714,7 +724,10 @@ fn cmd_clear(slot: Option<u8>, all: bool, before: Option<String>) {
     let store = open_store();
 
     if let Some(s) = slot {
-        println!("  🗑️  Slot {} cleared (in-memory only — affects running daemon)", s);
+        match SlotManager::persistent_default().and_then(|slots| slots.clear_slot(s)) {
+            Ok(()) => println!("  🗑️  Slot {} cleared", s),
+            Err(e) => eprintln!("❌ Failed to clear slot {}: {}", s, e),
+        }
     } else if all {
         match store.clear_all() {
             Ok(count) => println!("  🗑️  Cleared {} clips from history", count),

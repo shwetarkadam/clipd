@@ -465,7 +465,7 @@ impl McpServer {
     }
 
     fn tool_list_slots(&self) -> Result<String, String> {
-        let mgr = SlotManager::new();
+        let mgr = SlotManager::persistent_default()?;
         let slots = mgr.list_slots()?;
         let entries: Vec<Value> = slots
             .iter()

@@ -29,40 +29,65 @@ RequestExecutionLevel user
 !define MUI_ABORTWARNING
 !define MUI_ICON "${NSISDIR}\Contrib\Graphics\Icons\modern-install.ico"
 !define MUI_UNICON "${NSISDIR}\Contrib\Graphics\Icons\modern-uninstall.ico"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\clipd-ui.exe"
+!define MUI_FINISHPAGE_RUN_TEXT "Launch Clipd (GUI)"
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
-!insertmacro MUI_PAGE_INSTFILES
-
 Page custom AutoStartPage AutoStartPageLeave
-
+!insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_WELCOME
 !insertmacro MUI_UNPAGE_INSTFILES
 
 !insertmacro MUI_LANGUAGE "English"
 
-Var AutoStart
+Var AutoStartCheckbox
+Var TerminalCheckbox
+Var AutoStartChoice
+Var TerminalChoice
+
+Function .onInit
+  ; GUI is the product default. Terminal/TUI access is an explicit opt-in.
+  StrCpy $AutoStartChoice ${BST_CHECKED}
+  StrCpy $TerminalChoice ${BST_UNCHECKED}
+FunctionEnd
 
 Function AutoStartPage
-  !insertmacro MUI_HEADER_TEXT "Auto-Start" "Launch Clipd automatically when you log in?"
+  !insertmacro MUI_HEADER_TEXT "Startup & optional tools" "Clipd opens as a GUI by default."
   nsDialogs::Create 1018
   Pop $0
   ${NSD_CreateCheckbox} 0 0 100% 12u "Start Clipd automatically on login"
-  Pop $AutoStart
-  ${NSD_SetState} $AutoStart ${BST_CHECKED}
+  Pop $AutoStartCheckbox
+  ${NSD_SetState} $AutoStartCheckbox $AutoStartChoice
+  ${NSD_CreateCheckbox} 0 24u 100% 12u "Add optional Developer Terminal / TUI shortcut"
+  Pop $TerminalCheckbox
+  ${NSD_SetState} $TerminalCheckbox $TerminalChoice
+  ${NSD_CreateLabel} 0 48u 100% 28u "The terminal is never opened automatically. You can enable Developer Terminal mode later from the Clipd tray menu."
+  Pop $0
   nsDialogs::Show
 FunctionEnd
 
 Function AutoStartPageLeave
-  ${NSD_GetState} $AutoStart $0
-  StrCmp $0 ${BST_CHECKED} 0 +3
-    CreateShortCut "$SMSTARTUP\${PRODUCT_NAME}.lnk" "$INSTDIR\clipd-ui.exe"
-  Goto +2
-    Delete "$SMSTARTUP\${PRODUCT_NAME}.lnk"
+  ${NSD_GetState} $AutoStartCheckbox $AutoStartChoice
+  ${NSD_GetState} $TerminalCheckbox $TerminalChoice
 FunctionEnd
 
 Section "MainSection" SEC01
+  ; Upgrades must not leave the old tray/GUI/daemon alive and then launch a
+  ; second copy. taskkill is run through nsExec, so no terminal is displayed.
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM clipd-ui.exe'
+  Pop $0
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM clipd-gui.exe'
+  Pop $0
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM clipd.exe'
+  Pop $0
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM clipd-overlay.exe'
+  Pop $0
+  nsExec::Exec '"$SYSDIR\taskkill.exe" /F /IM clipd-picker.exe'
+  Pop $0
+  Sleep 300
+
   SetOutPath "$INSTDIR"
   SetOverwrite on
 
@@ -75,8 +100,8 @@ Section "MainSection" SEC01
 
   CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
   CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\clipd-ui.exe"
-  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME} GUI.lnk" "$INSTDIR\clipd-gui.exe"
-  CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME} CLI.lnk" "$INSTDIR\clipd.exe"
+  Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME} GUI.lnk"
+  Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME} CLI.lnk"
   CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall ${PRODUCT_NAME}.lnk" "$INSTDIR\uninstall.exe"
 
   CreateShortCut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\clipd-ui.exe"
@@ -94,8 +119,21 @@ Section -Post
   ; PATH is not modified here: the EnVar plugin isn't in stock NSIS (breaks CI
   ; compile). CLI users can run install.ps1 or add %LOCALAPPDATA%\Clipd to PATH.
 
-  ; Auto-start
-  CreateShortCut "$SMSTARTUP\${PRODUCT_NAME}.lnk" "$INSTDIR\clipd-ui.exe"
+  ; Respect installer choices. GUI/tray is always the normal launch path;
+  ; terminal mode is present only when the user explicitly asks for it.
+  StrCmp $AutoStartChoice ${BST_CHECKED} 0 NoAutoStart
+    CreateShortCut "$SMSTARTUP\${PRODUCT_NAME}.lnk" "$INSTDIR\clipd-ui.exe"
+    Goto AutoStartDone
+  NoAutoStart:
+    Delete "$SMSTARTUP\${PRODUCT_NAME}.lnk"
+  AutoStartDone:
+
+  StrCmp $TerminalChoice ${BST_CHECKED} 0 NoTerminalShortcut
+    CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME} Developer Terminal (Optional).lnk" "$SYSDIR\cmd.exe" '/K ""$INSTDIR\clipd.exe" search"' "$INSTDIR\clipd.exe" 0
+    Goto TerminalShortcutDone
+  NoTerminalShortcut:
+    Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME} Developer Terminal (Optional).lnk"
+  TerminalShortcutDone:
 SectionEnd
 
 Section Uninstall
