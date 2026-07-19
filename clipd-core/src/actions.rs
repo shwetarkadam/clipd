@@ -63,6 +63,11 @@ pub struct CustomAction {
     pub output: ActionOutput,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// When non-empty, this action runs AUTOMATICALLY whenever a newly
+    /// captured clip contains this text (case-insensitive). Clipboard-output
+    /// actions never auto-run (self-trigger loop risk).
+    #[serde(default)]
+    pub auto_pattern: String,
 }
 
 impl CustomAction {
@@ -72,6 +77,7 @@ impl CustomAction {
             command: command.into(),
             output,
             enabled: true,
+            auto_pattern: String::new(),
         }
     }
 }

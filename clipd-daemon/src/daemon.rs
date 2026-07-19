@@ -189,6 +189,7 @@ pub fn run_daemon_with_stop(
                                     entry.content_type.as_str(),
                                     truncate(&entry.preview, 60)
                                 );
+                                run_auto_actions(&entry);
                                 if embed_available {
                                     match generate_embedding(&content_for_embed, &embed_config) {
                                         Ok(emb) => {
@@ -2454,6 +2455,62 @@ fn show_hud(text: &str) {
             e,
             hud_bin.display()
         ),
+    }
+}
+
+/// CopyQ-style automation: any enabled Custom Action with a non-empty
+/// `auto_pattern` runs automatically when a newly captured clip contains that
+/// text (case-insensitive). Loop-proofing: clips produced by actions are
+/// tagged source "action:<name>" and never re-trigger, and Clipboard-output
+/// actions are skipped (writing the clipboard from a clipboard event would
+/// self-trigger).
+fn run_auto_actions(entry: &clipd_core::ClipEntry) {
+    if entry.content.is_empty() {
+        return;
+    }
+    if entry
+        .source_app
+        .as_deref()
+        .map_or(false, |sa| sa.starts_with("action:"))
+    {
+        return;
+    }
+    let cfg = clipd_core::load_actions();
+    let content_lower = entry.content.to_lowercase();
+    for action in cfg.actions {
+        if !action.enabled || action.auto_pattern.trim().is_empty() {
+            continue;
+        }
+        if !content_lower.contains(&action.auto_pattern.trim().to_lowercase()) {
+            continue;
+        }
+        if action.output == clipd_core::ActionOutput::Clipboard {
+            log::warn!(
+                "Auto-action '{}' skipped: clipboard-output actions cannot auto-run",
+                action.name
+            );
+            continue;
+        }
+        let content = entry.content.clone();
+        std::thread::spawn(move || {
+            log::info!("⚙️  Auto-action '{}' triggered", action.name);
+            match clipd_core::run_action(&action.command, &content, Duration::from_secs(15)) {
+                Ok(out) => {
+                    if action.output == clipd_core::ActionOutput::NewClip && !out.trim().is_empty()
+                    {
+                        if let Ok(store) = ClipStore::new(&ClipStore::default_path()) {
+                            let result = ClipEntry::new(
+                                out.trim_end_matches('\n').to_string(),
+                                Some(format!("action:{}", action.name)),
+                                None,
+                            );
+                            let _ = store.insert(&result);
+                        }
+                    }
+                }
+                Err(e) => log::warn!("Auto-action '{}' failed: {}", action.name, e),
+            }
+        });
     }
 }
 

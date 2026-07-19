@@ -121,7 +121,7 @@ impl ClipWatcher {
                     if hash != last_hash {
                         last_hash = hash;
 
-                        let source_app = Self::get_frontmost_app();
+                        let (source_app, source_title) = Self::get_frontmost_context();
 
                         // Copies made from a password manager are already vaulted
                         // — drop silently, nothing to offer.
@@ -163,7 +163,8 @@ impl ClipWatcher {
                         // Look up which slot this content is in (if any).
                         let slot = slot_manager.as_ref().and_then(|mgr| mgr.find_slot(&text));
 
-                        let entry = ClipEntry::new(text, source_app, slot);
+                        let mut entry = ClipEntry::new(text, source_app, slot);
+                        entry.source_title = source_title;
                         log::debug!(
                             "New clip: {} [{}] slot={:?} {}",
                             entry.content_type.icon(),
@@ -246,32 +247,90 @@ impl ClipWatcher {
         });
     }
 
-    /// Get the name of the frontmost application on macOS.
-    /// Returns None on other platforms or on error.
+    /// Frontmost application name + window title (provenance) at copy time.
+    /// macOS: one osascript call (accessibility permission the daemon already
+    /// holds). Windows: Win32 foreground-window APIs. Title is best-effort.
     #[cfg(target_os = "macos")]
-    fn get_frontmost_app() -> Option<String> {
+    fn get_frontmost_context() -> (Option<String>, Option<String>) {
         use std::process::Command;
-        let output = Command::new("osascript")
-            .arg("-e")
-            .arg("tell application \"System Events\" to get name of first application process whose frontmost is true")
-            .output()
-            .ok()?;
+        let script = r#"tell application "System Events"
+  set p to first application process whose frontmost is true
+  set appName to name of p
+  set winTitle to ""
+  try
+    set winTitle to name of front window of p
+  end try
+end tell
+appName & linefeed & winTitle"#;
+        let output = match Command::new("osascript").arg("-e").arg(script).output() {
+            Ok(o) if o.status.success() => o,
+            _ => return (None, None),
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut lines = text.lines();
+        let app = lines
+            .next()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let title = lines
+            .next()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        (app, title)
+    }
 
-        if output.status.success() {
-            let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if name.is_empty() {
-                None
-            } else {
-                Some(name)
+    #[cfg(target_os = "windows")]
+    fn get_frontmost_context() -> (Option<String>, Option<String>) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+        };
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_null() {
+                return (None, None);
             }
-        } else {
-            None
+            // Window title.
+            let mut buf = [0u16; 512];
+            let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            let title = if n > 0 {
+                Some(String::from_utf16_lossy(&buf[..n as usize]))
+            } else {
+                None
+            };
+            // Owning process → executable stem as the app name.
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            let mut app = None;
+            if pid != 0 {
+                let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if !handle.is_null() {
+                    let mut path_buf = [0u16; 1024];
+                    let mut len = path_buf.len() as u32;
+                    if QueryFullProcessImageNameW(handle, 0, path_buf.as_mut_ptr(), &mut len) != 0 {
+                        let full = String::from_utf16_lossy(&path_buf[..len as usize]);
+                        app = std::path::Path::new(&full)
+                            .file_stem()
+                            .map(|st| st.to_string_lossy().to_string());
+                    }
+                    CloseHandle(handle);
+                }
+            }
+            (app, title)
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    fn get_frontmost_context() -> (Option<String>, Option<String>) {
+        (None, None)
+    }
+
+    /// App name only — used by the image path and privacy exclusion checks.
     fn get_frontmost_app() -> Option<String> {
-        None
+        Self::get_frontmost_context().0
     }
 }
 

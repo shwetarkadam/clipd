@@ -163,6 +163,7 @@ mod tests {
             content_type: crate::models::ContentType::Text,
             content_hash: format!("hash{}", id),
             source_app: Some(app.into()),
+            source_title: None,
             timestamp: Utc::now() - Duration::minutes(mins_ago),
             preview: format!("clip {}", id),
             slot: None,

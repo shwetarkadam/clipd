@@ -104,6 +104,7 @@ impl ClipStore {
             "ALTER TABLE clips ADD COLUMN image_path TEXT",
             "ALTER TABLE clips ADD COLUMN thumb_path TEXT",
             "ALTER TABLE clips ADD COLUMN ocr_text TEXT",
+            "ALTER TABLE clips ADD COLUMN source_title TEXT",
         ] {
             if let Err(e) = self.conn.execute(col, []) {
                 log::debug!("image column migration (expected if present): {}", e);
@@ -184,7 +185,7 @@ impl ClipStore {
 
     /// The clip columns, in the canonical order expected by `row_to_clip`.
     const CLIP_COLUMNS: &'static str = "id, content, content_type, content_hash, source_app, \
-         timestamp, preview, slot, image_path, thumb_path, ocr_text";
+         timestamp, preview, slot, image_path, thumb_path, ocr_text, source_title";
 
     /// Map a row selected with `CLIP_COLUMNS` into a `ClipEntry`.
     fn row_to_clip(row: &rusqlite::Row) -> SqlResult<ClipEntry> {
@@ -202,6 +203,7 @@ impl ClipStore {
             image_path: row.get(8)?,
             thumb_path: row.get(9)?,
             ocr_text: row.get(10)?,
+            source_title: row.get(11)?,
         })
     }
 
@@ -232,8 +234,8 @@ impl ClipStore {
         }
 
         self.conn.execute(
-            "INSERT INTO clips (content, content_type, content_hash, source_app, timestamp, preview, slot, image_path, thumb_path, ocr_text)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO clips (content, content_type, content_hash, source_app, timestamp, preview, slot, image_path, thumb_path, ocr_text, source_title)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 entry.content,
                 entry.content_type.as_str(),
@@ -245,6 +247,7 @@ impl ClipStore {
                 entry.image_path,
                 entry.thumb_path,
                 entry.ocr_text,
+                entry.source_title,
             ],
         )?;
 

@@ -69,7 +69,9 @@ fn tool_definitions() -> Value {
                     "properties": {
                         "query": { "type": "string", "description": "Search query text" },
                         "limit": { "type": "integer", "description": "Max results (default 20)", "default": 20 },
-                        "mode": { "type": "string", "enum": ["hybrid", "keyword", "semantic"], "description": "Search mode (default hybrid)" }
+                        "mode": { "type": "string", "enum": ["hybrid", "keyword", "semantic"], "description": "Search mode (default hybrid)" },
+                        "app": { "type": "string", "description": "Provenance filter: only clips copied from apps/window titles containing this text (e.g. 'datagrip', 'chrome')" },
+                        "since_hours": { "type": "number", "description": "Only clips copied within the last N hours (e.g. 24 for 'yesterday-ish')" }
                     },
                     "required": ["query"]
                 }
@@ -385,6 +387,35 @@ impl McpServer {
             }
         };
 
+        // Provenance filters: app/window-title substring + recency window —
+        // together these answer "the SQL I copied from DataGrip yesterday".
+        let app_filter = args
+            .get("app")
+            .and_then(|v| v.as_str())
+            .map(|a| a.to_lowercase())
+            .filter(|a| !a.is_empty());
+        let since = args
+            .get("since_hours")
+            .and_then(|v| v.as_f64())
+            .map(|h| chrono::Utc::now() - chrono::Duration::seconds((h * 3600.0) as i64));
+        let clips: Vec<ClipEntry> = clips
+            .into_iter()
+            .filter(|c| {
+                app_filter.as_deref().map_or(true, |a| {
+                    c.source_app
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(a)
+                        || c.source_title
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(a)
+                }) && since.map_or(true, |t| c.timestamp >= t)
+            })
+            .collect();
+
         let entries: Vec<Value> = clips.iter().map(clip_to_json).collect();
         serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
     }
@@ -658,6 +689,7 @@ fn clip_to_json(clip: &clipd_core::ClipEntry) -> Value {
         "content": clip.content,
         "content_type": clip.content_type.as_str(),
         "source_app": clip.source_app,
+        "source_title": clip.source_title,
         "timestamp": clip.timestamp.to_rfc3339(),
         "preview": clip.preview,
     });

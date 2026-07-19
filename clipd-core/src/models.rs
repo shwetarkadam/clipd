@@ -147,6 +147,10 @@ pub struct ClipEntry {
     pub content_type: ContentType,
     pub content_hash: String,
     pub source_app: Option<String>,
+    /// Provenance: the frontmost window's title at copy time (e.g. the browser
+    /// tab or document name). Powers "find the SQL I copied from DataGrip".
+    #[serde(default)]
+    pub source_title: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub preview: String,
     /// Slot this clip was saved to via multi-tap hotkey (None = auto-saved via OS copy).
@@ -181,6 +185,7 @@ impl ClipEntry {
             content_type,
             content_hash,
             source_app,
+            source_title: None,
             timestamp: Utc::now(),
             preview,
             slot,
@@ -220,6 +225,7 @@ impl ClipEntry {
             content_type: ContentType::Image,
             content_hash,
             source_app,
+            source_title: None,
             timestamp: Utc::now(),
             preview,
             slot: None,
