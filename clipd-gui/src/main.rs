@@ -860,7 +860,7 @@ fn resolved_theme(ctx: &egui::Context, theme: Theme) -> Theme {
 fn apply_theme(ctx: &egui::Context, theme: Theme) {
     ctx.set_theme(match theme {
         Theme::System => egui::ThemePreference::System,
-        Theme::Light => egui::ThemePreference::Light,
+        t if t.is_light() => egui::ThemePreference::Light,
         _ => egui::ThemePreference::Dark,
     });
 
