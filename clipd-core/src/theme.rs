@@ -13,13 +13,17 @@ pub enum Theme {
     /// Warm vintage-paper light theme (parchment, ink, terracotta) —
     /// modeled on shwetakadam.com.
     Paper,
+    /// The same paper palette at night: espresso grounds, cream ink,
+    /// terracotta lifted for dark-background contrast.
+    PaperDark,
 }
 
 impl Theme {
-    pub const ALL: [Theme; 8] = [
+    pub const ALL: [Theme; 9] = [
         Theme::System,
         Theme::Light,
         Theme::Paper,
+        Theme::PaperDark,
         Theme::Dark,
         Theme::Catppuccin,
         Theme::Monokai,
@@ -37,6 +41,7 @@ impl Theme {
             Theme::Nord => "Nord",
             Theme::Dracula => "Dracula",
             Theme::Paper => "Paper",
+            Theme::PaperDark => "Paper Dark",
         }
     }
 
@@ -49,7 +54,8 @@ impl Theme {
             Theme::Monokai => Theme::Nord,
             Theme::Nord => Theme::Dracula,
             Theme::Dracula => Theme::Paper,
-            Theme::Paper => Theme::System,
+            Theme::Paper => Theme::PaperDark,
+            Theme::PaperDark => Theme::System,
         }
     }
 
@@ -63,6 +69,7 @@ impl Theme {
             Theme::Nord => NORD,
             Theme::Dracula => DRACULA,
             Theme::Paper => PAPER,
+            Theme::PaperDark => PAPER_DARK,
         }
     }
 
@@ -238,6 +245,27 @@ const PAPER: ThemeColors = ThemeColors {
     url: Rgb(58, 100, 140),
     email: Rgb(154, 110, 26),
     path: Rgb(122, 78, 110),
+};
+
+// Paper at night: the same warm story inverted — espresso-brown grounds,
+// cream ink, the terracotta accent lifted a step for contrast on dark.
+const PAPER_DARK: ThemeColors = ThemeColors {
+    bg_base: Rgb(42, 35, 27),
+    bg_surface: Rgb(34, 28, 21),
+    bg_elevated: Rgb(58, 49, 40),
+    bg_selected: Rgb(72, 60, 47),
+    bg_hover: Rgb(63, 53, 42),
+    accent: Rgb(214, 96, 52),
+    accent2: Rgb(201, 163, 95),
+    text: Rgb(240, 232, 216),
+    subtext: Rgb(198, 186, 165),
+    overlay: Rgb(152, 139, 119),
+    green: Rgb(150, 178, 118),
+    border: Rgb(76, 65, 51),
+    code: Rgb(164, 184, 116),
+    url: Rgb(130, 176, 210),
+    email: Rgb(216, 178, 108),
+    path: Rgb(192, 150, 184),
 };
 
 fn pref_path() -> PathBuf {
