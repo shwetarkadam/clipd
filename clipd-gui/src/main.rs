@@ -2157,9 +2157,16 @@ impl ClipdGui {
                     // Double-click a row = inspect it: open the preview pane
                     // attached to the palette (Esc or Space collapses it).
                     if resp.double_clicked() && !star_clicked {
+                        let was_selected = self.selected == display_idx;
                         self.selected = display_idx;
                         let ctx = ui.ctx().clone();
-                        self.set_preview_open(&ctx, true);
+                        // Toggle: double-click the same row again to close the
+                        // preview; a different row switches the preview to it.
+                        if self.show_preview && was_selected {
+                            self.set_preview_open(&ctx, false);
+                        } else {
+                            self.set_preview_open(&ctx, true);
+                        }
                     }
                     if is_selected && self.scroll_to_selected {
                         resp.scroll_to_me(Some(egui::Align::Center));
