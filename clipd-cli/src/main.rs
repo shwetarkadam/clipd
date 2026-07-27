@@ -1,6 +1,9 @@
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
-use clipd_core::{ClipStore, ContentType, SearchFilters, SlotManager, MAX_CLIP_SLOT};
+use clipd_core::{
+    AskConfig, AskFilters, AskThread, ClipStore, ContentType, SearchFilters, SlotManager,
+    MAX_CLIP_SLOT,
+};
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +58,40 @@ enum Commands {
         /// Maximum results
         #[arg(short = 'n', long, default_value = "50")]
         limit: usize,
+    },
+
+    /// Ask a question about your clipboard history (grounded, with citations)
+    Ask {
+        /// The question, e.g. "what was that stripe webhook payload?"
+        question: Vec<String>,
+
+        /// Continue the most recent conversation instead of starting fresh
+        #[arg(short, long)]
+        continue_thread: bool,
+
+        /// Only consider clips from this app
+        #[arg(short, long)]
+        app: Option<String>,
+
+        /// Only consider clips from the last: 1h, 6h, 1d, 7d, 30d
+        #[arg(short, long)]
+        last: Option<String>,
+
+        /// How many clips to put in front of the model
+        #[arg(short = 'k', long, default_value = "8")]
+        top_k: usize,
+
+        /// Emit JSON (answer, sources, confidence) instead of prose
+        #[arg(long)]
+        json: bool,
+
+        /// Retrieve and rank only — never call the API, even if a key is set
+        #[arg(long)]
+        no_ai: bool,
+
+        /// List saved ask conversations and exit
+        #[arg(long)]
+        threads: bool,
     },
 
     /// Output a slot's content to stdout (for piping)
@@ -229,6 +266,28 @@ fn main() {
             } else {
                 cmd_search(query, app, content_type, last, limit);
             }
+        }
+
+        Some(Commands::Ask {
+            question,
+            continue_thread,
+            app,
+            last,
+            top_k,
+            json,
+            no_ai,
+            threads,
+        }) => {
+            cmd_ask(
+                question.join(" "),
+                continue_thread,
+                app,
+                last,
+                top_k,
+                json,
+                no_ai,
+                threads,
+            );
         }
 
         Some(Commands::Paste { slot }) => {
@@ -720,6 +779,137 @@ fn cmd_stats() {
     println!("  {}", "─".repeat(40));
 }
 
+// ── Ask ──
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_ask(
+    question: String,
+    continue_thread: bool,
+    app: Option<String>,
+    last: Option<String>,
+    top_k: usize,
+    json: bool,
+    no_ai: bool,
+    threads: bool,
+) {
+    let store = open_store();
+
+    if threads {
+        list_ask_threads(&store);
+        return;
+    }
+
+    if question.trim().is_empty() {
+        eprintln!("  Usage: clipd ask \"what was that postgres connection string?\"");
+        eprintln!("         clipd ask --continue-thread \"and the one before it?\"");
+        eprintln!("         clipd ask --threads    List saved conversations");
+        std::process::exit(2);
+    }
+
+    let filters = AskFilters {
+        source_app: app,
+        since: last.and_then(|l| parse_duration(&l).map(|d| Utc::now() - d)),
+    };
+    let cfg = AskConfig {
+        top_k: top_k.clamp(1, 40),
+        ..Default::default()
+    };
+
+    // --no-ai forces the local path by handing `ask` an empty key, so the two
+    // modes go through exactly one code path rather than diverging here.
+    let api = if no_ai {
+        clipd_core::TransformConfig {
+            api_key: None,
+            ..clipd_core::load_transform_config()
+        }
+    } else {
+        clipd_core::load_transform_config()
+    };
+
+    let mut thread = if continue_thread {
+        AskThread::resume_latest(&store)
+    } else {
+        AskThread::new()
+    };
+
+    if continue_thread && !thread.turns.is_empty() && !json {
+        println!(
+            "  ↩︎  Continuing conversation ({} previous turn{})",
+            thread.turns.len(),
+            if thread.turns.len() == 1 { "" } else { "s" }
+        );
+        println!();
+    }
+
+    let answer = match clipd_core::ask(&store, &question, &thread, &filters, &cfg, &api) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("❌ {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        println!("{}", ask_json(&answer));
+    } else {
+        println!("{}", answer.render());
+    }
+
+    // Retrieval-only runs produce no answer worth replaying to a model, so
+    // they don't open or extend a thread.
+    if !answer.retrieval_only {
+        thread.record(&store, &answer);
+    }
+}
+
+fn list_ask_threads(store: &ClipStore) {
+    match store.list_ask_threads(20) {
+        Ok(threads) if threads.is_empty() => {
+            println!("  No saved conversations yet. Start one with `clipd ask \"...\"`.");
+        }
+        Ok(threads) => {
+            println!("  💬 Ask conversations\n");
+            for (id, title, updated, turns) in threads {
+                println!(
+                    "  #{:<4} {:<48} {} turn{}, {}",
+                    id,
+                    title,
+                    turns,
+                    if turns == 1 { "" } else { "s" },
+                    format_relative_time(&updated)
+                );
+            }
+            println!("\n  Resume the most recent: clipd ask --continue-thread \"...\"");
+        }
+        Err(e) => eprintln!("❌ Failed to list conversations: {}", e),
+    }
+}
+
+fn ask_json(answer: &clipd_core::AskAnswer) -> String {
+    let value = serde_json::json!({
+        "question": answer.question,
+        "answer": answer.answer,
+        "confidence": answer.confidence.label(),
+        "retrieval_only": answer.retrieval_only,
+        "withheld_count": answer.withheld_count,
+        "invalid_citations": answer.invalid_citations,
+        "estimated_prompt_tokens": answer.estimated_prompt_tokens,
+        "usage": answer.usage,
+        "sources": answer.sources,
+        "retrieved": answer.retrieved.iter().map(|r| serde_json::json!({
+            "clip_id": r.clip.id,
+            "preview": r.clip.preview,
+            "source_app": r.clip.source_app,
+            "timestamp": r.clip.timestamp,
+            "fused_score": r.fused_score,
+            "matched_by": r.matched_by(),
+            "retriever_count": r.retriever_count(),
+            "withheld": r.withheld,
+        })).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
+}
+
 fn cmd_clear(slot: Option<u8>, all: bool, before: Option<String>) {
     let store = open_store();
 
@@ -732,6 +922,13 @@ fn cmd_clear(slot: Option<u8>, all: bool, before: Option<String>) {
         match store.clear_all() {
             Ok(count) => println!("  🗑️  Cleared {} clips from history", count),
             Err(e) => eprintln!("❌ Failed to clear: {}", e),
+        }
+        // Questions and answers quote the clips they were about, so wiping
+        // history without wiping conversations would leave copies behind.
+        match store.clear_ask_threads() {
+            Ok(n) if n > 0 => println!("  🗑️  Cleared {} ask conversation(s)", n),
+            Ok(_) => {}
+            Err(e) => eprintln!("❌ Failed to clear ask conversations: {}", e),
         }
     } else if let Some(before_str) = before {
         if let Some(dur) = parse_duration(&before_str) {

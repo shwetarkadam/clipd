@@ -1,7 +1,8 @@
+use chrono::{Duration, Utc};
 use clipd_core::{
     all_transforms, apply_transform, compute_sessions, embedding_cosine, generate_embedding,
-    is_embedding_available, load_transform_config, ClipEntry, ClipStore, SearchFilters,
-    SlotManager, TfIdfIndex, TransformKind,
+    is_embedding_available, load_transform_config, AskConfig, AskFilters, AskThread, ClipEntry,
+    ClipStore, SearchFilters, SlotManager, TfIdfIndex, TransformConfig, TransformKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -190,6 +191,28 @@ fn tool_definitions() -> Value {
                 "name": "stats",
                 "description": "Get clipboard store statistics.",
                 "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "ask",
+                "description": "Ask a natural-language question about the user's clipboard history. \
+                                Runs hybrid retrieval (full-text + TF-IDF + embeddings) fused by \
+                                reciprocal rank, then answers ONLY from the retrieved clips, citing \
+                                each one as [#id]. Prefer this over search_clips when the user asks \
+                                a question ('what was the postgres URL I copied?') rather than for \
+                                a keyword. Clips containing detected secrets are withheld. When no \
+                                API key is configured this returns the ranked clips without a \
+                                written answer.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "question": { "type": "string", "description": "The natural-language question" },
+                        "app": { "type": "string", "description": "Only consider clips copied from this app" },
+                        "since_hours": { "type": "integer", "description": "Only consider clips from the last N hours" },
+                        "top_k": { "type": "integer", "description": "How many clips to ground the answer in (default 8)", "default": 8 },
+                        "retrieval_only": { "type": "boolean", "description": "Skip generation; return the ranked clips only", "default": false }
+                    },
+                    "required": ["question"]
+                }
             }
         ]
     })
@@ -263,6 +286,7 @@ impl McpServer {
             "save_snippet" => self.tool_save_snippet(&arguments),
             "list_collections" => self.tool_list_collections(),
             "get_collection" => self.tool_get_collection(&arguments),
+            "ask" => self.tool_ask(&arguments),
             _ => Err(format!("Unknown tool: {}", tool_name)),
         };
 
@@ -679,6 +703,86 @@ impl McpServer {
             "top_apps": stats.top_apps,
             "type_counts": stats.type_counts,
         });
+        serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
+    }
+
+    /// Grounded Q&A over history. Returns the answer alongside the evidence so
+    /// the calling model can check the citations rather than trust them.
+    fn tool_ask(&self, args: &Value) -> Result<String, String> {
+        let question = args
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if question.is_empty() {
+            return Err("`question` is required".into());
+        }
+
+        let filters = AskFilters {
+            source_app: args
+                .get("app")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            since: args
+                .get("since_hours")
+                .and_then(|v| v.as_i64())
+                .map(|h| Utc::now() - Duration::hours(h)),
+        };
+
+        let cfg = AskConfig {
+            top_k: args
+                .get("top_k")
+                .and_then(|v| v.as_u64())
+                .map(|k| (k as usize).clamp(1, 40))
+                .unwrap_or(8),
+            ..Default::default()
+        };
+
+        // `retrieval_only` is honoured by blanking the key, so both paths run
+        // through the same engine rather than a parallel implementation.
+        let api = if args
+            .get("retrieval_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            TransformConfig {
+                api_key: None,
+                ..load_transform_config()
+            }
+        } else {
+            load_transform_config()
+        };
+
+        // MCP calls are stateless — each tool call is its own conversation.
+        let thread = AskThread::new();
+        let answer = clipd_core::ask(&self.store, question, &thread, &filters, &cfg, &api)?;
+
+        let result = serde_json::json!({
+            "question": answer.question,
+            "answer": answer.answer,
+            "confidence": answer.confidence.label(),
+            "retrieval_only": answer.retrieval_only,
+            "withheld_count": answer.withheld_count,
+            "invalid_citations": answer.invalid_citations,
+            "sources": answer.sources.iter().map(|s| serde_json::json!({
+                "clip_id": s.clip_id,
+                "preview": s.preview,
+                "source_app": s.source_app,
+                "timestamp": s.timestamp.to_rfc3339(),
+                "matched_by": s.matched_by,
+            })).collect::<Vec<_>>(),
+            "retrieved": answer.retrieved.iter().map(|r| serde_json::json!({
+                "clip_id": r.clip.id,
+                "preview": r.clip.preview,
+                "source_app": r.clip.source_app,
+                "timestamp": r.clip.timestamp.to_rfc3339(),
+                "fused_score": r.fused_score,
+                "matched_by": r.matched_by(),
+                "retriever_count": r.retriever_count(),
+                "withheld": r.withheld,
+            })).collect::<Vec<_>>(),
+        });
+
         serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
     }
 }

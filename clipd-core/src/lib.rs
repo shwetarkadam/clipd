@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod ask;
 pub mod collections;
 pub mod embedding;
 pub mod images;
@@ -17,6 +18,10 @@ pub mod transform;
 pub mod vault;
 pub mod watcher;
 
+pub use ask::{
+    ask, estimate_tokens, has_api_key, retrieve, AskAnswer, AskConfig, AskFilters, AskSource,
+    AskThread, AskTurn, Confidence, RetrievedClip, Retriever,
+};
 pub use collections::{
     make_template, refine_prompt, summarize_collection, Collection, CollectionItem,
 };
@@ -25,7 +30,7 @@ pub use embedding::{
     is_embedding_available, search_embeddings, Embedding, EmbeddingResult,
 };
 pub use actions::{
-    load_actions, run_action, save_actions, ActionOutput, ActionsConfig, CustomAction,
+    ask_action, load_actions, run_action, save_actions, ActionOutput, ActionsConfig, CustomAction,
 };
 pub use images::{images_dir, load_rgba, save_rgba_image, SavedImage};
 pub use lock::{is_daemon_running, release_daemon_lock, try_acquire_daemon_lock};

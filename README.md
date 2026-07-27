@@ -161,7 +161,75 @@ Click the clipd icon in the menu bar for quick access:
 - **Native macOS UI** — quick visual access to your slots and settings
 - **HUD overlay** — floating display shows which slot you're targeting as you tap
 - **Smart paste** — transform clipboard content before pasting (trim, format JSON, fix grammar, etc.)
+- **Ask your clipboard** — natural-language recall, grounded in clips you really copied
 - **Lightweight daemon** — runs quietly in the background, zero config
+
+---
+
+## Ask Your Clipboard
+
+Stop remembering slot numbers. Ask for what you copied.
+
+```bash
+clipd ask "what was that postgres connection string?"
+```
+
+Type `?` at the start of the search bar in the GUI to do the same thing there —
+the answer appears in the preview pane, and every `[#id]` citation is a button
+that jumps to the clip it came from.
+
+**How it finds things.** Three retrievers run in parallel and their *rankings*
+are combined with weighted Reciprocal Rank Fusion — not their scores, which sit
+on incomparable scales:
+
+| Retriever | Good at | Local? |
+|-----------|---------|--------|
+| SQLite FTS5 | exact tokens, error strings, identifiers | yes |
+| TF-IDF cosine | paraphrase, "the database thing" | yes |
+| Embeddings | true synonymy | needs an API key |
+
+A clip that two retrievers found independently outranks one that a single
+retriever loved. That agreement is also what drives the confidence rating.
+
+**How it stays honest.**
+
+- The model is shown numbered clips and told to answer *only* from them.
+- Every `[#id]` it emits is checked against the clips actually sent. Fabricated
+  ids are stripped, not rendered — you never see a hallucination dressed as a
+  source.
+- Clips matching the secret detectors (API keys, private keys, passwords) are
+  withheld from the request entirely. The answer tells you how many.
+- Confidence is reported: `high` = cited clips multiple retrievers agreed on,
+  `medium` = cited a single retriever's hit, `low` = cited nothing checkable,
+  `none` = found nothing.
+
+**No API key? It still works.** Retrieval is entirely local, so `clipd ask`
+falls back to showing you the ranked clips with no synthesis and no network
+call. To get written answers, set `api_key` in `transform.json` — on macOS
+that's `~/Library/Application Support/clipd/transform.json`, on Linux
+`~/.local/share/clipd/transform.json`. Any OpenAI-compatible endpoint works,
+including Ollama and LM Studio:
+
+```json
+{
+  "api_key": "sk-...",
+  "api_url": "https://api.openai.com/v1/chat/completions",
+  "model": "gpt-4o-mini"
+}
+```
+
+```bash
+clipd ask "which staging URL did I use"        # ask
+clipd ask -c "and the one before that?"        # follow up in the same thread
+clipd ask --threads                            # list saved conversations
+clipd ask --no-ai "docker"                     # local ranking only, never calls out
+clipd ask --json "..."                         # answer + sources + confidence as JSON
+clipd ask --app DataGrip --last 7d "..."       # narrow before retrieving
+```
+
+Conversations live in memory for the session and are written through to SQLite,
+so `--continue-thread` still resolves after a restart. `clipd clear --all`
+wipes them along with your history.
 
 ---
 
@@ -175,6 +243,7 @@ clipd daemon       # Start daemon only (headless)
 clipd list         # Show recent clips
 clipd search       # Interactive search (TUI)
 clipd search <q>   # Text search
+clipd ask "<q>"    # Ask a question about your history (grounded, cited)
 clipd paste <slot> # Output slot to stdout
 clipd slots        # Show slot contents
 clipd stats        # Usage statistics
@@ -219,6 +288,11 @@ clipd ships an MCP server (`clipd-mcp`) so AI assistants can search your
 clipboard history — including by meaning, and inside screenshots via OCR text —
 put results on your clipboard, and manage snippets. Everything runs locally
 against clipd's own database.
+
+The `ask` tool exposes the same grounded Q&A as `clipd ask`, returning the
+answer *and* the evidence (`sources`, `confidence`, `matched_by`) so the
+calling assistant can verify citations rather than trust them. Inside Claude
+Code, `/ask <question>` routes through it.
 
 **Claude Code:**
 

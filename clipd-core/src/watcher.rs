@@ -29,6 +29,18 @@ pub enum ClipEvent {
     SensitiveClip { kinds: String, stored: bool },
 }
 
+/// True when the frontmost app is one of clipd's own windows, so the watcher
+/// can ignore its own UI (search text, re-copied clips).
+fn is_own_ui(app: Option<&str>) -> bool {
+    let Some(app) = app else { return false };
+    let a = app.to_lowercase();
+    a == "clipd"
+        || a == "clipd-gui"
+        || a == "clipd-ui"
+        || a.starts_with("clipd-")
+        || a == "clipd.app"
+}
+
 /// Watches the OS clipboard for changes by polling.
 pub struct ClipWatcher {
     poll_interval: Duration,
@@ -122,6 +134,17 @@ impl ClipWatcher {
                         last_hash = hash;
 
                         let (source_app, source_title) = Self::get_frontmost_context();
+
+                        // Never record clipd's own UI as a clip. Text copied
+                        // while clipd is frontmost is either a clip being
+                        // re-used (already in history) or the search box's own
+                        // contents — the latter polluted history with query
+                        // strings that then out-ranked real clips when asking.
+                        if is_own_ui(source_app.as_deref()) {
+                            log::debug!("Skipping clip copied from clipd itself");
+                            std::thread::sleep(self.poll_interval);
+                            continue;
+                        }
 
                         // Copies made from a password manager are already vaulted
                         // — drop silently, nothing to offer.

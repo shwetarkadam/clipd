@@ -1,3 +1,4 @@
+use crate::ask::AskTurn;
 use crate::collections::{Collection, CollectionItem};
 use crate::embedding::{embedding_from_bytes, embedding_to_bytes, Embedding};
 use crate::models::{ClipEntry, ClipStats, ContentType, SearchFilters};
@@ -150,6 +151,36 @@ impl ClipStore {
             ",
         )?;
 
+        // Ask threads: conversation state for `clipd ask`. Turns live in
+        // memory for the life of a session and are written through here, so a
+        // follow-up still resolves after a restart. `cited_ids` is a JSON
+        // array of clip ids rather than a join table — it is display metadata
+        // that must survive the cited clip being deleted, not a live FK.
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS ask_threads (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                title      TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ask_turns (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id INTEGER NOT NULL REFERENCES ask_threads(id) ON DELETE CASCADE,
+                question  TEXT NOT NULL,
+                answer    TEXT NOT NULL,
+                cited_ids TEXT NOT NULL DEFAULT '[]',
+                asked_at  TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ask_turns_thread
+                ON ask_turns(thread_id, id);
+            CREATE INDEX IF NOT EXISTS idx_ask_threads_updated
+                ON ask_threads(updated_at DESC);
+            ",
+        )?;
+
         // Create FTS5 virtual table for full-text search
         self.conn.execute_batch(
             "
@@ -220,13 +251,21 @@ impl ClipStore {
             .ok();
 
         if let Some(existing_id) = existing {
-            // Update timestamp to move it to the top
+            // Bump the timestamp so reuse floats to the top, but NEVER
+            // overwrite provenance that is already recorded: re-copying a clip
+            // (often from clipd's own window) would otherwise rewrite "where
+            // this came from" to clipd itself, destroying the original source.
+            // First capture wins — that is what provenance means.
             self.conn.execute(
-                "UPDATE clips SET timestamp = ?1, source_app = ?2, slot = ?3 WHERE id = ?4",
+                "UPDATE clips SET timestamp = ?1, slot = ?2,
+                     source_app = COALESCE(source_app, ?3),
+                     source_title = COALESCE(source_title, ?4)
+                 WHERE id = ?5",
                 params![
                     entry.timestamp.to_rfc3339(),
-                    entry.source_app,
                     entry.slot,
+                    entry.source_app,
+                    entry.source_title,
                     existing_id
                 ],
             )?;
@@ -763,6 +802,114 @@ impl ClipStore {
             .execute("DELETE FROM snippets WHERE trigger = ?1", params![trigger])?;
         Ok(n > 0)
     }
+
+    // ── Ask threads ──
+
+    /// Start a new ask conversation. Returns its id.
+    pub fn create_ask_thread(&self, title: &str) -> SqlResult<i64> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO ask_threads (title, created_at, updated_at) VALUES (?1, ?2, ?2)",
+            params![title, now],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Append one question/answer exchange, bumping the thread's recency so
+    /// `latest_ask_thread` picks it up.
+    pub fn append_ask_turn(&self, thread_id: i64, turn: &AskTurn) -> SqlResult<()> {
+        let cited = serde_json::to_string(&turn.cited_ids).unwrap_or_else(|_| "[]".into());
+        self.conn.execute(
+            "INSERT INTO ask_turns (thread_id, question, answer, cited_ids, asked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                thread_id,
+                turn.question,
+                turn.answer,
+                cited,
+                turn.asked_at.to_rfc3339()
+            ],
+        )?;
+        self.conn.execute(
+            "UPDATE ask_threads SET updated_at = ?2 WHERE id = ?1",
+            params![thread_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Every turn in a thread, oldest first (the order the model expects).
+    pub fn ask_thread_turns(&self, thread_id: i64) -> SqlResult<Vec<AskTurn>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT question, answer, cited_ids, asked_at
+             FROM ask_turns WHERE thread_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |row| {
+            let cited_json: String = row.get(2)?;
+            Ok(AskTurn {
+                question: row.get(0)?,
+                answer: row.get(1)?,
+                cited_ids: serde_json::from_str(&cited_json).unwrap_or_default(),
+                asked_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(3)?)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Most recently used thread, for `clipd ask --continue`.
+    pub fn latest_ask_thread(&self) -> SqlResult<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM ask_threads ORDER BY updated_at DESC LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        Ok(match rows.next()? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
+    }
+
+    /// Threads newest first, as `(id, title, updated_at, turn_count)`.
+    pub fn list_ask_threads(&self, limit: usize) -> SqlResult<Vec<(i64, String, DateTime<Utc>, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id, t.title, t.updated_at, COUNT(u.id)
+             FROM ask_threads t LEFT JOIN ask_turns u ON u.thread_id = t.id
+             GROUP BY t.id ORDER BY t.updated_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                row.get::<_, i64>(3)? as usize,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Delete a thread and its turns.
+    pub fn delete_ask_thread(&self, thread_id: i64) -> SqlResult<()> {
+        // Older DBs were created before `PRAGMA foreign_keys` was worth
+        // relying on, so delete children explicitly rather than trusting the
+        // CASCADE to fire.
+        self.conn.execute(
+            "DELETE FROM ask_turns WHERE thread_id = ?1",
+            params![thread_id],
+        )?;
+        self.conn
+            .execute("DELETE FROM ask_threads WHERE id = ?1", params![thread_id])?;
+        Ok(())
+    }
+
+    /// Delete every ask thread. Questions are as sensitive as clips, so
+    /// `clipd clear --all` wipes these too.
+    pub fn clear_ask_threads(&self) -> SqlResult<usize> {
+        self.conn.execute("DELETE FROM ask_turns", [])?;
+        let n = self.conn.execute("DELETE FROM ask_threads", [])?;
+        Ok(n)
+    }
 }
 
 #[cfg(test)]
@@ -772,6 +919,88 @@ mod tests {
 
     fn make_entry(content: &str) -> ClipEntry {
         ClipEntry::new(content.to_string(), Some("test_app".to_string()), None)
+    }
+
+    fn make_turn(q: &str, a: &str, cited: Vec<i64>) -> AskTurn {
+        AskTurn {
+            question: q.to_string(),
+            answer: a.to_string(),
+            cited_ids: cited,
+            asked_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_ask_thread_roundtrip_preserves_order_and_citations() {
+        let store = ClipStore::in_memory().unwrap();
+        let id = store.create_ask_thread("stripe webhook").unwrap();
+
+        store
+            .append_ask_turn(id, &make_turn("first?", "a1", vec![7, 9]))
+            .unwrap();
+        store
+            .append_ask_turn(id, &make_turn("second?", "a2", vec![]))
+            .unwrap();
+
+        let turns = store.ask_thread_turns(id).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].question, "first?", "oldest turn must come first");
+        assert_eq!(turns[0].cited_ids, vec![7, 9]);
+        assert!(turns[1].cited_ids.is_empty());
+    }
+
+    #[test]
+    fn test_latest_ask_thread_follows_most_recent_activity() {
+        let store = ClipStore::in_memory().unwrap();
+        let first = store.create_ask_thread("older").unwrap();
+        let second = store.create_ask_thread("newer").unwrap();
+
+        // Appending to the older thread makes it the one --continue resumes.
+        store
+            .append_ask_turn(first, &make_turn("q", "a", vec![]))
+            .unwrap();
+
+        assert_eq!(store.latest_ask_thread().unwrap(), Some(first));
+        assert_ne!(store.latest_ask_thread().unwrap(), Some(second));
+    }
+
+    #[test]
+    fn test_delete_ask_thread_removes_its_turns() {
+        let store = ClipStore::in_memory().unwrap();
+        let id = store.create_ask_thread("scratch").unwrap();
+        store
+            .append_ask_turn(id, &make_turn("q", "a", vec![1]))
+            .unwrap();
+
+        store.delete_ask_thread(id).unwrap();
+
+        assert!(store.ask_thread_turns(id).unwrap().is_empty());
+        assert_eq!(store.latest_ask_thread().unwrap(), None);
+    }
+
+    #[test]
+    fn test_list_ask_threads_reports_turn_counts() {
+        let store = ClipStore::in_memory().unwrap();
+        let id = store.create_ask_thread("counted").unwrap();
+        store
+            .append_ask_turn(id, &make_turn("q1", "a1", vec![]))
+            .unwrap();
+        store
+            .append_ask_turn(id, &make_turn("q2", "a2", vec![]))
+            .unwrap();
+
+        let threads = store.list_ask_threads(10).unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].1, "counted");
+        assert_eq!(threads[0].3, 2);
+    }
+
+    #[test]
+    fn test_empty_thread_is_listed_with_zero_turns() {
+        let store = ClipStore::in_memory().unwrap();
+        store.create_ask_thread("no turns yet").unwrap();
+        let threads = store.list_ask_threads(10).unwrap();
+        assert_eq!(threads[0].3, 0);
     }
 
     #[test]

@@ -113,8 +113,28 @@ pub fn load_actions() -> ActionsConfig {
                 "wc -w | tr -d ' '",
                 ActionOutput::Clipboard,
             ),
+            // Treats the clip itself as the question: copy "where did I put
+            // the staging URL", run this, and the answer lands in history.
+            // NewClip rather than Clipboard so answering never overwrites what
+            // the user has staged to paste.
+            CustomAction::new(
+                "Ask clipd about this",
+                "clipd ask \"$(cat)\"",
+                ActionOutput::NewClip,
+            ),
         ],
     }
+}
+
+/// The seed action that routes a clip through `clipd ask`. Exposed so the GUI
+/// can offer it to users whose `actions.json` predates the ask feature —
+/// `load_actions` only seeds on first run.
+pub fn ask_action() -> CustomAction {
+    CustomAction::new(
+        "Ask clipd about this",
+        "clipd ask \"$(cat)\"",
+        ActionOutput::NewClip,
+    )
 }
 
 pub fn save_actions(cfg: &ActionsConfig) {
