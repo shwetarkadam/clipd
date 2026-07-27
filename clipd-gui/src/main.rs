@@ -6,10 +6,10 @@ use clipd_core::{
     available_targets, compute_sessions, detect_sensitive, load_actions, load_custom_colors,
     load_paste_transform_settings, load_privacy_config, load_theme, load_transform_config,
     paste_transforms, run_action, save_actions, save_custom_colors, save_paste_transform_settings,
-    save_privacy_config, save_secret, save_theme, ActionOutput, ActionsConfig, ClipEntry,
-    ClipStore, ContentType, CustomAction, CustomColors, OpenGuiHotkey, PaletteTrigger,
-    PasteTransformSettings, PrivacyConfig, Rgb, SecretEntry, Session, SessionConfig, TfIdfIndex,
-    Theme, TransformKind, VaultTarget,
+    save_privacy_config, save_secret, save_theme, ActionOutput, ActionsConfig, AskAnswer,
+    AskConfig, AskFilters, AskThread, ClipEntry, ClipStore, ContentType, CustomAction,
+    CustomColors, OpenGuiHotkey, PaletteTrigger, PasteTransformSettings, PrivacyConfig, Rgb,
+    SecretEntry, Session, SessionConfig, TfIdfIndex, Theme, TransformKind, VaultTarget,
 };
 use eframe::egui::{self, Color32, FontId, Margin, RichText, Rounding, Stroke};
 use std::collections::HashSet;
@@ -524,6 +524,10 @@ enum Action {
     ToggleStar(i64),
     /// Run custom action at this index on the selected clip.
     RunAction(usize),
+    /// Send the `?`-prefixed search bar contents to the ask engine.
+    Ask,
+    /// Select the clip behind a clicked `[#id]` citation.
+    JumpToClip(i64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -990,6 +994,59 @@ struct ClipdGui {
     new_collection_name: String,
     new_collection_app: String,
     ai_result: Option<String>,
+
+    /// Ask mode — engaged by a leading `?` in the search bar.
+    ask: AskState,
+}
+
+/// State for `?`-prefixed questions. The request runs on a worker thread and
+/// reports back through `rx`; egui is immediate-mode, so a blocking HTTP call
+/// on the UI thread would freeze the window for the whole round trip.
+#[derive(Default)]
+struct AskState {
+    /// The question that produced `answer`, or is currently in flight.
+    question: String,
+    running: bool,
+    rx: Option<std::sync::mpsc::Receiver<Result<AskAnswer, String>>>,
+    answer: Option<AskAnswer>,
+    error: Option<String>,
+    /// Conversation so far. Follow-ups replay it; it is also written to SQLite.
+    thread: AskThread,
+}
+
+impl AskState {
+    /// Clear the answer but keep the conversation — used when the query
+    /// changes so a stale answer never sits under a new question.
+    fn clear_answer(&mut self) {
+        self.answer = None;
+        self.error = None;
+    }
+
+    /// Drop everything, including conversation history.
+    fn reset(&mut self) {
+        self.clear_answer();
+        self.question.clear();
+        self.thread = AskThread::new();
+    }
+}
+
+/// The question in the search bar, if it is one. `?` alone is not a question.
+/// Extract the question from the search box. Two spellings count as asking:
+/// a leading `?` (the documented gesture) and a natural trailing `?` on a
+/// multi-word query ("how do I install clipd?") — people type questions the
+/// second way instinctively, and treating that as a search made Enter fall
+/// through to paste-and-hide, which looked like a crash.
+fn ask_query(search: &str) -> Option<&str> {
+    let t = search.trim();
+    if let Some(rest) = t.strip_prefix('?') {
+        let rest = rest.trim();
+        return (!rest.is_empty()).then_some(rest);
+    }
+    if t.ends_with('?') && t.split_whitespace().count() >= 2 {
+        let rest = t.trim_end_matches('?').trim_end();
+        return (!rest.is_empty()).then_some(rest);
+    }
+    None
 }
 
 impl ClipdGui {
@@ -1053,6 +1110,7 @@ impl ClipdGui {
             new_collection_name: String::new(),
             new_collection_app: String::new(),
             ai_result: None,
+            ask: AskState::default(),
         };
         app.refresh_collections();
         app.refresh_starred();
@@ -1126,12 +1184,30 @@ impl ClipdGui {
     }
 
     fn refresh(&mut self) {
+        // Resolve the selection to a clip id *before* `clips` is replaced —
+        // afterwards `filtered` holds indices into a vector that no longer
+        // exists, and reading through them can be out of bounds.
+        let selected_id = self
+            .filtered
+            .get(self.selected)
+            .and_then(|&i| self.clips.get(i))
+            .map(|c| c.id);
+
         self.clips = self.store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
         sync_active_slot_labels(&self.store, &mut self.clips);
         self.sessions = compute_sessions(&self.clips, self.session_config.window_minutes);
         self.cached_tfidf = None; // invalidate — will be rebuilt lazily on next search
         self.refresh_snippets();
         self.apply_filter();
+
+        // Ask mode keeps its own list (the retrieved clips), which apply_filter
+        // deliberately leaves alone — so re-derive those indices here against
+        // the clips we just reloaded, holding the user's place.
+        if let Some(answer) = self.ask.answer.take() {
+            self.show_retrieved(&answer, selected_id);
+            self.ask.answer = Some(answer);
+        }
+
         self.last_refresh = Instant::now();
     }
 
@@ -1139,7 +1215,137 @@ impl ClipdGui {
         self.snippets = self.store.list_snippets().unwrap_or_default();
     }
 
+    /// Whether the search bar currently holds a question.
+    fn in_ask_mode(&self) -> bool {
+        self.search_query.trim().starts_with('?') || ask_query(&self.search_query).is_some()
+    }
+
+    /// Fire the question on a worker thread. The worker opens its own store
+    /// handle — SQLite is happy with concurrent readers, and `ClipStore` is
+    /// not shareable across threads.
+    fn start_ask(&mut self, ctx: &egui::Context) {
+        let Some(question) = ask_query(&self.search_query) else {
+            return;
+        };
+        if self.ask.running {
+            return;
+        }
+
+        let question = question.to_string();
+        let worker_question = question.clone();
+        let thread = self.ask.thread.clone();
+        let filters = AskFilters::default();
+        let cfg = AskConfig::default();
+        let api = load_transform_config();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            let result = match ClipStore::new(&ClipStore::default_path()) {
+                Ok(store) => {
+                    clipd_core::ask(&store, &worker_question, &thread, &filters, &cfg, &api)
+                }
+                Err(e) => Err(format!("Could not open the clip database: {}", e)),
+            };
+            // If the window closed mid-flight the receiver is gone; that's a
+            // normal shutdown, not an error worth surfacing.
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+
+        self.ask.question = question;
+        self.ask.running = true;
+        self.ask.clear_answer();
+        self.ask.rx = Some(rx);
+    }
+
+    /// Collect a finished ask, if one landed since the last frame.
+    fn poll_ask(&mut self) {
+        let Some(rx) = &self.ask.rx else { return };
+        let received = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.ask.running = false;
+                self.ask.rx = None;
+                self.ask.error = Some("The ask worker stopped unexpectedly.".into());
+                return;
+            }
+        };
+
+        self.ask.running = false;
+        self.ask.rx = None;
+
+        match received {
+            Ok(answer) => {
+                // Show the evidence: the list narrows to exactly the clips the
+                // answer was allowed to draw on, so citations and rows agree.
+                self.show_retrieved(&answer, None);
+                if !answer.retrieval_only {
+                    self.ask.thread.record(&self.store, &answer);
+                }
+                self.ask.answer = Some(answer);
+            }
+            Err(e) => self.ask.error = Some(e),
+        }
+    }
+
+    /// Narrow the visible list to the retrieved clips, ranked order preserved.
+    /// `keep_selected` holds the user's place across a background refresh;
+    /// `None` means this is a fresh answer, so jump to the top hit.
+    fn show_retrieved(&mut self, answer: &AskAnswer, keep_selected: Option<i64>) {
+        let ranked: Vec<usize> = answer
+            .retrieved
+            .iter()
+            .filter_map(|r| self.clips.iter().position(|c| c.id == r.clip.id))
+            .collect();
+
+        if ranked.is_empty() {
+            return;
+        }
+        self.filtered = ranked;
+
+        match keep_selected.and_then(|id| {
+            self.filtered
+                .iter()
+                .position(|&i| self.clips[i].id == id)
+        }) {
+            // Held our place — don't yank the scroll position out from under
+            // someone who is reading.
+            Some(pos) => self.selected = pos,
+            None => {
+                self.selected = 0;
+                self.scroll_to_selected = true;
+            }
+        }
+    }
+
+    /// Jump the list selection to a cited clip. Returns false when the clip is
+    /// no longer in the loaded window (history is capped at MAX_LOADED_CLIPS).
+    fn jump_to_clip(&mut self, clip_id: i64) -> bool {
+        let Some(idx) = self.clips.iter().position(|c| c.id == clip_id) else {
+            return false;
+        };
+        if !self.filtered.contains(&idx) {
+            self.filtered.push(idx);
+        }
+        if let Some(pos) = self.filtered.iter().position(|&i| i == idx) {
+            self.selected = pos;
+            self.scroll_to_selected = true;
+        }
+        true
+    }
+
     fn apply_filter(&mut self) {
+        // In ask mode the query is a sentence, not a filter — running it
+        // through the substring matcher would empty the list on every
+        // keystroke. The list is repopulated with the retrieved clips once an
+        // answer lands; until then it keeps showing recent history. Note this
+        // must not clear the answer: refresh() calls apply_filter on a timer.
+        if self.in_ask_mode() {
+            return;
+        }
+
         // ── Slot filter: only show clips saved to a slot ──
         let mut base_indices: Vec<usize> = if self.show_active_slots_only {
             self.clips
@@ -1461,6 +1667,12 @@ impl eframe::App for ClipdGui {
         }
         ctx.request_repaint_after(Duration::from_secs(3));
 
+        self.poll_ask();
+        if self.ask.running {
+            // Keep the spinner moving and pick the answer up promptly.
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+
         // When the window is summoned (gains focus), drop the cursor into search
         // with a clean query — so the palette is "type to recall" every time.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
@@ -1561,7 +1773,12 @@ impl eframe::App for ClipdGui {
                 self.scroll_to_selected = true;
             }
             if i.key_pressed(egui::Key::Enter) && !search_has_focus {
-                action = Action::Paste;
+                // Never paste-and-hide out of a question — re-ask instead.
+                action = if self.in_ask_mode() {
+                    Action::Ask
+                } else {
+                    Action::Paste
+                };
             }
             // Space toggles the on-demand preview pane (single column stays clean by default).
             if i.key_pressed(egui::Key::Space) && !search_has_focus {
@@ -1616,6 +1833,13 @@ impl eframe::App for ClipdGui {
         if esc_back {
             if self.active_tab != MainTab::Text {
                 self.active_tab = MainTab::Text;
+            } else if self.in_ask_mode() {
+                // Leaving ask mode ends the conversation — a later `?` starts
+                // fresh rather than silently inheriting old turns as context.
+                self.search_query.clear();
+                self.ask.reset();
+                self.apply_filter();
+                self.set_preview_open(ctx, false);
             } else if self.show_preview {
                 self.set_preview_open(ctx, false);
             } else {
@@ -1689,6 +1913,11 @@ impl eframe::App for ClipdGui {
                 });
             });
 
+        // Ask mode always needs the inspector — that's where the answer goes.
+        if self.active_tab == MainTab::Text && self.in_ask_mode() && !self.show_preview {
+            self.set_preview_open(ctx, true);
+        }
+
         // ── Right inspector: on-demand preview (Text tab, toggled with Space) ──
         if self.active_tab == MainTab::Text && self.show_preview {
             egui::SidePanel::right("clip_inspector")
@@ -1706,7 +1935,9 @@ impl eframe::App for ClipdGui {
                         }),
                 )
                 .show(ctx, |ui| {
-                    if let Some(clip) = &preview_data {
+                    if self.in_ask_mode() {
+                        render_ask_panel(ui, &self.ask, &mut action, &c);
+                    } else if let Some(clip) = &preview_data {
                         let is_starred = self.starred_clip_ids.contains(&clip.id);
                         render_preview(
                             ui,
@@ -1804,6 +2035,22 @@ impl eframe::App for ClipdGui {
             }
             Action::RunAction(idx) => {
                 self.run_custom_action(idx);
+                ctx.request_repaint();
+            }
+            Action::Ask => {
+                self.start_ask(ctx);
+                // Enter moved focus out of the field; put it back so a
+                // follow-up can be typed straight away.
+                self.focus_search = true;
+                ctx.request_repaint();
+            }
+            Action::JumpToClip(clip_id) => {
+                if !self.jump_to_clip(clip_id) {
+                    self.ask.error = Some(format!(
+                        "Clip #{} is no longer in the loaded history window.",
+                        clip_id
+                    ));
+                }
                 ctx.request_repaint();
             }
             Action::None => {}
@@ -3104,7 +3351,12 @@ impl ClipdGui {
                                 let hint = match self.active_tab {
                                     MainTab::Collections => "Search pins and collections...",
                                     MainTab::Settings => "Settings",
-                                    MainTab::Text => "Search, or type 'from chrome'...",
+                                    MainTab::Text if self.in_ask_mode() => {
+                                        "Ask about your clips, then press Enter"
+                                    }
+                                    MainTab::Text => {
+                                        "Search, 'from chrome', or ? to ask..."
+                                    }
                                 };
                                 let search = ui.add_sized(
                                     [ui.available_width(), 18.0],
@@ -3119,15 +3371,24 @@ impl ClipdGui {
                                     self.focus_search = false;
                                 }
                                 if search.changed() {
+                                    // Editing the question invalidates the
+                                    // answer sitting under it.
+                                    if self.in_ask_mode() {
+                                        self.ask.clear_answer();
+                                    }
                                     self.apply_filter();
                                 }
-                                // Enter pastes the top match — Text tab only.
+                                // Enter asks in ask mode, pastes otherwise —
+                                // Text tab only.
                                 if self.active_tab == MainTab::Text
                                     && search.lost_focus()
                                     && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                    && !self.filtered.is_empty()
                                 {
-                                    *action = Action::Paste;
+                                    if self.in_ask_mode() {
+                                        *action = Action::Ask;
+                                    } else if !self.filtered.is_empty() {
+                                        *action = Action::Paste;
+                                    }
                                 }
                             });
                         });
@@ -5526,6 +5787,385 @@ fn render_preview(
     });
 }
 
+// ── Ask panel ──
+
+/// One piece of an answer: prose, or a citation that resolves to a real clip.
+enum AnswerPart<'a> {
+    Text(&'a str),
+    Citation(i64),
+}
+
+/// Split an answer on `[#id]` so citations can be rendered as buttons rather
+/// than as literal text. Ids are already validated by the core engine, so
+/// anything still in `[#…]` form here is known to point at a real clip.
+fn split_citations(answer: &str) -> Vec<AnswerPart<'_>> {
+    let mut parts = Vec::new();
+    let mut rest = answer;
+
+    while let Some(start) = rest.find("[#") {
+        let after = &rest[start + 2..];
+        let digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+
+        if digits.is_empty() || !after[digits.len()..].starts_with(']') {
+            // Not a citation after all — keep scanning past this bracket.
+            let (head, tail) = rest.split_at(start + 2);
+            parts.push(AnswerPart::Text(head));
+            rest = tail;
+            continue;
+        }
+
+        if start > 0 {
+            parts.push(AnswerPart::Text(&rest[..start]));
+        }
+        if let Ok(id) = digits.parse::<i64>() {
+            parts.push(AnswerPart::Citation(id));
+        }
+        rest = &rest[start + 2 + digits.len() + 1..];
+    }
+
+    if !rest.is_empty() {
+        parts.push(AnswerPart::Text(rest));
+    }
+    parts
+}
+
+fn confidence_color(conf: clipd_core::Confidence, c: &clipd_core::ThemeColors) -> Color32 {
+    match conf {
+        clipd_core::Confidence::High => rgb(c.accent),
+        clipd_core::Confidence::Medium => rgb(c.text),
+        clipd_core::Confidence::Low | clipd_core::Confidence::None => rgb(c.subtext),
+    }
+}
+
+fn render_ask_panel(
+    ui: &mut egui::Ui,
+    ask: &AskState,
+    action: &mut Action,
+    c: &clipd_core::ThemeColors,
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("ASK")
+                .size(10.5)
+                .strong()
+                .color(rgb(c.accent)),
+        );
+        if !ask.thread.turns.is_empty() {
+            ui.label(
+                RichText::new(format!("· {} turns", ask.thread.turns.len()))
+                    .size(10.5)
+                    .color(rgb(c.subtext)),
+            );
+        }
+    });
+    ui.add_space(8.0);
+
+    if ask.running {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Searching your clips…")
+                    .size(12.5)
+                    .color(rgb(c.subtext)),
+            );
+        });
+        return;
+    }
+
+    if let Some(err) = &ask.error {
+        egui::Frame::none()
+            .fill(rgb(c.bg_elevated))
+            .rounding(Rounding::same(CARD_ROUND))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(err).size(12.0).color(rgb(c.text)));
+            });
+        return;
+    }
+
+    let Some(answer) = &ask.answer else {
+        ui.add_space(60.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new("Ask about anything you've copied")
+                    .size(13.0)
+                    .color(rgb(c.subtext)),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("? what was that postgres URL")
+                    .size(11.5)
+                    .italics()
+                    .color(rgb(c.overlay)),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Enter to ask · Esc to leave ask mode")
+                    .size(11.0)
+                    .color(rgb(c.overlay)),
+            );
+        });
+        return;
+    };
+
+    egui::ScrollArea::vertical()
+        .id_salt("ask_scroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(&answer.question)
+                    .size(12.0)
+                    .italics()
+                    .color(rgb(c.subtext)),
+            );
+            ui.add_space(10.0);
+
+            if answer.retrieval_only {
+                egui::Frame::none()
+                    .fill(rgb(c.bg_elevated))
+                    .rounding(Rounding::same(CARD_ROUND))
+                    .inner_margin(Margin::symmetric(12.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new(
+                                "No API key set — these are the clips clipd found, ranked. \
+                                 Nothing left your machine.",
+                            )
+                            .size(11.5)
+                            .color(rgb(c.subtext)),
+                        );
+                    });
+                ui.add_space(10.0);
+            } else {
+                // Prose with inline, clickable citations.
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    for part in split_citations(&answer.answer) {
+                        match part {
+                            AnswerPart::Text(text) => {
+                                ui.label(
+                                    RichText::new(text).size(13.0).color(rgb(c.text)),
+                                );
+                            }
+                            AnswerPart::Citation(id) => {
+                                let chip = ui.add(
+                                    egui::Button::new(
+                                        RichText::new(format!("#{}", id))
+                                            .size(11.0)
+                                            .color(rgb(c.accent)),
+                                    )
+                                    .fill(rgb(c.bg_elevated))
+                                    .rounding(Rounding::same(PILL_ROUND))
+                                    .stroke(Stroke::new(
+                                        0.7,
+                                        rgb(c.accent).gamma_multiply(0.5),
+                                    )),
+                                );
+                                if chip.clicked() {
+                                    *action = Action::JumpToClip(id);
+                                }
+                                chip.on_hover_text("Show this clip");
+                            }
+                        }
+                    }
+                });
+                ui.add_space(14.0);
+            }
+
+            // ── Sources ──
+            let heading = if answer.retrieval_only {
+                "RETRIEVED"
+            } else {
+                "SOURCES"
+            };
+            ui.label(
+                RichText::new(heading)
+                    .size(10.0)
+                    .strong()
+                    .color(rgb(c.subtext)),
+            );
+            ui.add_space(6.0);
+
+            if answer.retrieval_only {
+                for r in &answer.retrieved {
+                    render_source_row(
+                        ui,
+                        r.clip.id,
+                        &r.clip.preview,
+                        r.clip.source_app.as_deref(),
+                        &r.matched_by(),
+                        r.withheld.as_deref(),
+                        action,
+                        c,
+                    );
+                }
+            } else if answer.sources.is_empty() {
+                ui.label(
+                    RichText::new("Nothing cited — treat this answer with suspicion.")
+                        .size(11.5)
+                        .color(rgb(c.subtext)),
+                );
+            } else {
+                for s in &answer.sources {
+                    render_source_row(
+                        ui,
+                        s.clip_id,
+                        &s.preview,
+                        s.source_app.as_deref(),
+                        &s.matched_by,
+                        None,
+                        action,
+                        c,
+                    );
+                }
+            }
+
+            // ── Footer: confidence and what was held back ──
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            if !answer.retrieval_only {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Confidence")
+                            .size(10.5)
+                            .color(rgb(c.subtext)),
+                    );
+                    ui.label(
+                        RichText::new(answer.confidence.label())
+                            .size(11.0)
+                            .strong()
+                            .color(confidence_color(answer.confidence, c)),
+                    );
+                })
+                .response
+                .on_hover_text(
+                    "high = cited clips that more than one retriever found independently",
+                );
+            }
+
+            ui.label(
+                RichText::new(format!(
+                    "{} clips retrieved · {} cited",
+                    answer.retrieved.len(),
+                    answer.sources.len()
+                ))
+                .size(10.5)
+                .color(rgb(c.subtext)),
+            );
+
+            if answer.withheld_count > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "🔒 {} clip(s) held back — they contain secrets",
+                        answer.withheld_count
+                    ))
+                    .size(10.5)
+                    .color(rgb(c.subtext)),
+                )
+                .on_hover_text("Clips matching the secret detectors are never sent to the API");
+            }
+
+            if !answer.invalid_citations.is_empty() {
+                ui.label(
+                    RichText::new(format!(
+                        "⚠ {} fabricated citation(s) removed",
+                        answer.invalid_citations.len()
+                    ))
+                    .size(10.5)
+                    .color(rgb(c.subtext)),
+                )
+                .on_hover_text("The model cited clip ids that were never in its context");
+            }
+
+            ui.add_space(10.0);
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_source_row(
+    ui: &mut egui::Ui,
+    clip_id: i64,
+    preview: &str,
+    source_app: Option<&str>,
+    matched_by: &str,
+    withheld: Option<&str>,
+    action: &mut Action,
+    c: &clipd_core::ThemeColors,
+) {
+    let row = egui::Frame::none()
+        .fill(rgb(c.bg_elevated))
+        .rounding(Rounding::same(PILL_ROUND))
+        .inner_margin(Margin::symmetric(10.0, 7.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("#{}", clip_id))
+                        .size(10.5)
+                        .strong()
+                        .color(rgb(c.accent)),
+                );
+                ui.label(
+                    RichText::new(one_line_preview(preview, 40))
+                        .size(11.5)
+                        .color(rgb(c.text)),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(source_app.unwrap_or("unknown app"))
+                        .size(10.0)
+                        .color(rgb(c.subtext)),
+                );
+                ui.label(RichText::new("·").size(10.0).color(rgb(c.overlay)));
+                ui.label(RichText::new(matched_by).size(10.0).color(rgb(c.subtext)));
+                if let Some(kind) = withheld {
+                    ui.label(
+                        RichText::new(format!("· 🔒 {}", kind))
+                            .size(10.0)
+                            .color(rgb(c.subtext)),
+                    );
+                }
+            });
+        });
+
+    let hit = ui.interact(
+        row.response.rect,
+        egui::Id::new(("ask_source", clip_id)),
+        egui::Sense::click(),
+    );
+    if hit.clicked() {
+        *action = Action::JumpToClip(clip_id);
+    }
+    if hit.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.add_space(5.0);
+}
+
+/// Flatten a preview to a single line, ellipsised. Clip previews can carry
+/// newlines and control characters straight from the source app.
+fn one_line_preview(s: &str, max: usize) -> String {
+    let flat = s
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        format!(
+            "{}…",
+            flat.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
+    }
+}
+
 fn render_empty_preview(ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
     ui.label(
         RichText::new("PREVIEW")
@@ -5575,4 +6215,86 @@ fn relative_time(dt: &DateTime<Utc>) -> String {
         return format!("{}w ago", days / 7);
     }
     dt.format("%b %d").to_string()
+}
+
+// ── Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Flatten parsed parts back to a debuggable shape.
+    fn parts(answer: &str) -> Vec<String> {
+        split_citations(answer)
+            .into_iter()
+            .map(|p| match p {
+                AnswerPart::Text(t) => format!("T:{}", t),
+                AnswerPart::Citation(id) => format!("C:{}", id),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ask_query_requires_content_after_the_marker() {
+        assert_eq!(ask_query("?what did I copy"), Some("what did I copy"));
+        assert_eq!(ask_query("?   spaced  "), Some("spaced"));
+        assert_eq!(ask_query("?"), None, "bare ? is not yet a question");
+        assert_eq!(ask_query("?   "), None);
+        assert_eq!(ask_query("stripe"), None, "plain search is not ask mode");
+    }
+
+    #[test]
+    fn citations_become_their_own_parts() {
+        assert_eq!(
+            parts("You copied it from [#42] earlier."),
+            vec!["T:You copied it from ", "C:42", "T: earlier."]
+        );
+    }
+
+    #[test]
+    fn adjacent_citations_both_parse() {
+        assert_eq!(parts("[#1][#2]"), vec!["C:1", "C:2"]);
+    }
+
+    #[test]
+    fn a_citation_at_the_very_end_is_not_dropped() {
+        assert_eq!(parts("see [#7]"), vec!["T:see ", "C:7"]);
+    }
+
+    #[test]
+    fn plain_prose_is_a_single_part() {
+        assert_eq!(parts("no citations here"), vec!["T:no citations here"]);
+    }
+
+    #[test]
+    fn malformed_brackets_do_not_swallow_the_rest_of_the_answer() {
+        // `[#` with no digits must not eat the trailing real citation — the
+        // scanner has to advance past it rather than give up.
+        assert_eq!(
+            parts("array[#] then [#5]"),
+            vec!["T:array[#", "T:] then ", "C:5"]
+        );
+    }
+
+    #[test]
+    fn unterminated_citation_stays_as_text() {
+        assert_eq!(parts("[#12 no close"), vec!["T:[#", "T:12 no close"]);
+    }
+
+    #[test]
+    fn empty_answer_yields_no_parts() {
+        assert!(split_citations("").is_empty());
+    }
+
+    #[test]
+    fn previews_are_flattened_to_one_line() {
+        assert_eq!(one_line_preview("a\nb\tc", 40), "a b c");
+    }
+
+    #[test]
+    fn long_previews_are_ellipsised() {
+        let out = one_line_preview(&"x".repeat(100), 10);
+        assert_eq!(out.chars().count(), 10);
+        assert!(out.ends_with('…'));
+    }
 }
