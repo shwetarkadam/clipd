@@ -86,7 +86,40 @@ jobs:
         run: bash packaging/macos/create-app-bundle.sh
 
       - name: Code sign Clipd.app
-        run: codesign --force --deep --sign "${CLIPD_SIGN_ID:--}" target/release/Clipd.app
+        # Hardened runtime + timestamp are prerequisites for notarization;
+        # without them notarytool rejects the submission.
+        run: |
+          codesign --force --deep --options runtime --timestamp \
+            --sign "${CLIPD_SIGN_ID:--}" target/release/Clipd.app
+
+      - name: Notarize and staple
+        # Signing alone is not enough. An un-notarized download is refused by
+        # Gatekeeper — "cannot be opened because Apple cannot check it for
+        # malicious software" — and the user has to right-click → Open or strip
+        # the quarantine flag by hand. That is the single biggest install
+        # friction on macOS, and it happens before the app has run once.
+        #
+        # Skipped with a warning when the credentials are absent, so a build
+        # without them still produces artifacts rather than failing.
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_ID" ] || [ -z "$APPLE_TEAM_ID" ] || [ -z "$APPLE_APP_PASSWORD" ]; then
+            echo "::warning::Apple notarization secrets not set — the download will be quarantined and users must right-click → Open."
+            exit 0
+          fi
+          ditto -c -k --keepParent target/release/Clipd.app /tmp/clipd-notarize.zip
+          xcrun notarytool submit /tmp/clipd-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+          # Staple so the ticket travels with the app and Gatekeeper is happy
+          # even on a machine that is offline.
+          xcrun stapler staple target/release/Clipd.app
+          xcrun stapler validate target/release/Clipd.app
 
       - name: Package zip (with .app + CLI)
         run: |

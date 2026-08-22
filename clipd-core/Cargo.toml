@@ -22,14 +22,31 @@ log = "0.4"
 base64 = { workspace = true }
 ureq = { workspace = true }
 # PNG encode/decode + thumbnailing for image clips (already in the tree via arboard).
-image = { version = "0.25", default-features = false, features = ["png"] }
+# PNG for clip thumbnails; JPEG so the island's file shelf can preview the
+# photos people actually drag onto it.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+mdns-sd = "0.11"
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # Native macOS Keychain access (no `security` CLI, no terminal prompt, no argv).
+# The -sys/core-foundation crates are needed to attach attributes the safe
+# wrapper doesn't expose (label, comment, accessibility) and to enumerate items.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "2"
+security-framework-sys = "2"
+core-foundation = "0.9"
+core-foundation-sys = "0.8"
+# Direct NSPasteboard access, for the concealed-copy flavour that arboard
+# doesn't expose. Same versions arboard already pulls in.
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSURL"] }
 
 # Daemon-lock liveness check (OpenProcess) — the lock must know whether the
 # PID in the lock file is still running.
@@ -42,3 +59,4 @@ windows-sys = { version = "0.59", features = [
 
 [dev-dependencies]
 tempfile = "3"
+x25519-dalek = "2"

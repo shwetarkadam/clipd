@@ -170,6 +170,7 @@ mod tests {
             image_path: None,
             thumb_path: None,
             ocr_text: None,
+            files: Vec::new(),
         }
     }
 

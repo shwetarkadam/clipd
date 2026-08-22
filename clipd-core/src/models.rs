@@ -1,3 +1,4 @@
+use crate::files::{format_size, hash_file_set, FileRef};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -8,8 +9,12 @@ pub enum ContentType {
     Url,
     Code,
     Email,
+    /// A *path-shaped string* — text that looks like a path. Distinct from
+    /// [`ContentType::File`], which is an actual file copied from Finder.
     Path,
     Image,
+    /// One or more real files copied from Finder, backed by [`FileRef`]s.
+    File,
     Unknown,
 }
 
@@ -109,6 +114,7 @@ impl ContentType {
             ContentType::Email => "email",
             ContentType::Path => "path",
             ContentType::Image => "image",
+            ContentType::File => "file",
             ContentType::Unknown => "unknown",
         }
     }
@@ -121,6 +127,7 @@ impl ContentType {
             "email" => ContentType::Email,
             "path" => ContentType::Path,
             "image" => ContentType::Image,
+            "file" => ContentType::File,
             _ => ContentType::Unknown,
         }
     }
@@ -134,6 +141,7 @@ impl ContentType {
             ContentType::Email => "📧",
             ContentType::Path => "📁",
             ContentType::Image => "🖼",
+            ContentType::File => "📎",
             ContentType::Unknown => "❓",
         }
     }
@@ -165,6 +173,9 @@ pub struct ClipEntry {
     /// Mirrored into `content` so it's full-text searchable.
     #[serde(default)]
     pub ocr_text: Option<String>,
+    /// For file clips: the files this clip carries. Empty for every other type.
+    #[serde(default)]
+    pub files: Vec<FileRef>,
 }
 
 impl ClipEntry {
@@ -192,6 +203,7 @@ impl ClipEntry {
             image_path: None,
             thumb_path: None,
             ocr_text: None,
+            files: Vec::new(),
         }
     }
 
@@ -232,6 +244,42 @@ impl ClipEntry {
             image_path: Some(image_path),
             thumb_path: Some(thumb_path),
             ocr_text: ocr_clean.map(|s| s.to_string()),
+            files: Vec::new(),
+        }
+    }
+
+    /// Create a file clip from files copied in Finder.
+    ///
+    /// `content` is the newline-joined original paths, which is what makes a
+    /// file clip findable by the same full-text search as everything else —
+    /// "that PDF from Downloads" works without a special code path.
+    pub fn new_files(files: Vec<FileRef>, source_app: Option<String>) -> Self {
+        let content = files
+            .iter()
+            .map(|f| f.original_path.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let total: u64 = files.iter().map(|f| f.size).sum();
+        let preview = match files.len() {
+            0 => "📎 No files".to_string(),
+            1 => format!("📎 {} · {}", files[0].name, format_size(total)),
+            n => format!("📎 {n} files · {}", format_size(total)),
+        };
+
+        ClipEntry {
+            id: 0,
+            content,
+            content_type: ContentType::File,
+            content_hash: hash_file_set(&files),
+            source_app,
+            source_title: None,
+            timestamp: Utc::now(),
+            preview,
+            slot: None,
+            image_path: None,
+            thumb_path: None,
+            ocr_text: None,
+            files,
         }
     }
 

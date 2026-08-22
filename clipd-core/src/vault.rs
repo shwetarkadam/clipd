@@ -9,6 +9,12 @@
 //! Each backend shells out to the vendor's own CLI (`op`, `bw`, `security`), so
 //! clipd never implements its own cryptography. Where the CLI allows it, the
 //! secret is passed via stdin rather than argv to avoid leaking through `ps`.
+//!
+//! The system store (macOS Keychain) additionally supports **reading back**:
+//! [`list_secrets`] enumerates what clipd has saved and [`reveal_secret`]
+//! fetches one plaintext on demand. Listing never touches plaintext, so the
+//! vault browser can be rendered without unlocking anything; `reveal_secret` is
+//! the single choke point where a password leaves the Keychain.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -106,6 +112,106 @@ pub fn save_secret(target: VaultTarget, entry: &SecretEntry) -> Result<String, S
         VaultTarget::OnePassword => save_1password(entry),
         VaultTarget::Bitwarden => save_bitwarden(entry),
         VaultTarget::Keychain => save_keychain(entry),
+    }
+}
+
+// ── Reading back what clipd saved ──────────────────────────────────────────
+
+/// A secret clipd has stored in the system store, as returned by
+/// [`list_secrets`].
+///
+/// Deliberately carries no plaintext: a list of these can be held in UI state,
+/// logged, or rendered without ever decrypting anything. [`reveal_secret`] is
+/// the only way to get the password itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretRef {
+    /// Keychain service attribute; with `account` this is the item's primary key.
+    pub service: String,
+    /// Keychain account attribute — a unique, sortable id for clipd-written items.
+    pub account: String,
+    /// Human-readable name, shown both in clipd and in Keychain Access.
+    pub title: String,
+    /// Provenance note: where and when the password was captured.
+    pub note: String,
+    /// Unix seconds the item was created, when the store reports it.
+    pub saved_at: Option<i64>,
+}
+
+impl SecretRef {
+    /// Stable identity for UI selection and dedup.
+    pub fn key(&self) -> String {
+        format!("{}\u{0}{}", self.service, self.account)
+    }
+}
+
+/// Every secret clipd has written to the system store, newest first.
+///
+/// Includes items written by older clipd versions under the previous naming
+/// scheme so nothing already saved becomes unreachable.
+pub fn list_secrets() -> Result<Vec<SecretRef>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        keychain::list()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(format!(
+            "Browsing saved secrets isn't supported for the {} yet — open it directly to view them.",
+            system_store_label()
+        ))
+    }
+}
+
+/// Fetch one secret's plaintext. This is the only call that decrypts.
+pub fn reveal_secret(secret: &SecretRef) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        keychain::reveal(secret)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = secret;
+        Err(format!(
+            "Reading secrets back isn't supported for the {} yet.",
+            system_store_label()
+        ))
+    }
+}
+
+/// Permanently remove a secret from the system store.
+pub fn forget_secret(secret: &SecretRef) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        keychain::forget(secret)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = secret;
+        Err(format!(
+            "Deleting secrets isn't supported for the {} yet.",
+            system_store_label()
+        ))
+    }
+}
+
+/// Give a saved secret a meaningful name. Renaming rewrites the label only —
+/// the password is never read or re-written.
+pub fn rename_secret(secret: &SecretRef, new_title: &str) -> Result<(), String> {
+    let new_title = new_title.trim();
+    if new_title.is_empty() {
+        return Err("A name can't be empty.".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        keychain::rename(secret, new_title)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = secret;
+        Err(format!(
+            "Renaming secrets isn't supported for the {} yet.",
+            system_store_label()
+        ))
     }
 }
 
@@ -274,30 +380,415 @@ fn save_keychain(entry: &SecretEntry) -> Result<String, String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn save_keychain_macos(entry: &SecretEntry) -> Result<String, String> {
+    let saved = keychain::save(entry)?;
+    Ok(format!("Saved “{}” to the macOS Keychain.", saved.title))
+}
+
 // Uses the Security framework directly — no `security` CLI, so there is no
 // terminal prompt and the password never touches argv or a tty. Works whether
 // clipd was launched from Finder, a tray, or a terminal.
+//
+// Schema: every clipd secret is a generic password under the constant service
+// `clipd-vault`, keyed by a unique, sortable `account` id. The display name
+// lives in `kSecAttrLabel` — that is the column Keychain Access actually shows,
+// so items stay findable outside clipd. Using one fixed service (rather than
+// baking the title into it, as older builds did) means listing is a single
+// exact-match query and renaming doesn't have to move the item.
 #[cfg(target_os = "macos")]
-fn save_keychain_macos(entry: &SecretEntry) -> Result<String, String> {
-    use security_framework::passwords::{
-        delete_generic_password, set_generic_password,
+pub mod keychain {
+    use super::{SecretEntry, SecretRef};
+    use core_foundation::array::CFArray;
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::data::CFData;
+    use core_foundation::date::CFDate;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::CFString;
+    use core_foundation_sys::array::CFArrayRef;
+    use core_foundation_sys::base::CFTypeRef;
+    use core_foundation_sys::string::CFStringRef;
+    use security_framework_sys::item::{
+        kSecAttrAccount, kSecAttrComment, kSecAttrDescription, kSecAttrLabel, kSecAttrService,
+        kSecAttrSynchronizable, kSecClass, kSecClassGenericPassword, kSecMatchLimit,
+        kSecMatchLimitAll, kSecReturnAttributes, kSecReturnData, kSecValueData,
+    };
+    use security_framework_sys::keychain_item::{
+        SecItemAdd, SecItemCopyMatching, SecItemDelete, SecItemUpdate,
     };
 
-    let title = entry.effective_title();
-    let account = if entry.username.trim().is_empty() {
-        "clipd"
-    } else {
-        entry.username.trim()
-    };
-    // The (service, account) pair is the item key; scope service per title so
-    // distinct saves don't overwrite each other.
-    let service = format!("clipd: {title}");
+    /// The service every clipd secret is filed under.
+    pub const SERVICE: &str = "clipd-vault";
+    /// Services used by clipd builds that predate the vault browser. Items
+    /// written back then must stay listable, or upgrading would strand them.
+    const LEGACY_PREFIX: &str = "clipd: ";
+    /// Shown in the "Kind" column of Keychain Access.
+    const KIND: &str = "clipd saved password";
 
-    // Replace any existing item so a re-save updates rather than errors.
-    let _ = delete_generic_password(&service, account);
-    set_generic_password(&service, account, entry.password.as_bytes())
-        .map(|_| format!("Saved “{title}” to the macOS Keychain (account: {account})."))
-        .map_err(|e| format!("Keychain rejected the item: {e}"))
+    // Attributes the Security framework exports but `security-framework-sys`
+    // does not re-export. Declared here against the same framework binary.
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        static kSecAttrAccessible: CFStringRef;
+        static kSecAttrAccessibleWhenUnlockedThisDeviceOnly: CFStringRef;
+        static kSecAttrCreationDate: CFStringRef;
+    }
+
+    const ERR_SUCCESS: i32 = 0;
+    const ERR_ITEM_NOT_FOUND: i32 = -25300;
+    const ERR_DUPLICATE_ITEM: i32 = -25299;
+    /// CFAbsoluteTime epoch (2001-01-01) expressed in Unix seconds.
+    const CF_EPOCH_OFFSET: f64 = 978_307_200.0;
+
+    fn cfkey(k: CFStringRef) -> CFString {
+        unsafe { CFString::wrap_under_get_rule(k) }
+    }
+
+    fn describe(status: i32, context: &str) -> String {
+        let detail = security_framework::base::Error::from_code(status).to_string();
+        format!("{context} (Keychain error {status}: {detail})")
+    }
+
+    /// Base query identifying a single generic-password item.
+    /// Store a password under a custom service/account (for clipd's own keys).
+    /// Unlike `save`, this is a simple upsert — no provenance or title tracking.
+    pub fn store(service: &str, account: &str, password: &str, label: &str) -> Result<(), String> {
+        // Delete existing entry first (upsert).
+        let _ = delete_by_service_account(service, account);
+        let query = item_query(service, account);
+        add_item_with_label(&query, password.as_bytes(), label)
+    }
+
+    /// Load a password by service/account. Returns None if not found.
+    pub fn load(service: &str, account: &str) -> Result<Option<String>, String> {
+        let mut pairs = item_query(service, account);
+        pairs.push((cfkey(unsafe { kSecReturnData }), CFBoolean::true_value().into_CFType()));
+        let query = CFDictionary::from_CFType_pairs(&pairs);
+        let mut out: CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut out) };
+        if status == ERR_ITEM_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != ERR_SUCCESS {
+            return Err(describe(status, "Couldn't read keychain item"));
+        }
+        if out.is_null() {
+            return Ok(None);
+        }
+        let data = unsafe { CFData::wrap_under_create_rule(out as _) };
+        String::from_utf8(data.bytes().to_vec())
+            .map(Some)
+            .map_err(|_| "Keychain item isn't valid UTF-8.".to_string())
+    }
+
+    /// Delete a keychain item by service/account.
+    pub fn delete_by_service_account(service: &str, account: &str) -> Result<(), String> {
+        let query = CFDictionary::from_CFType_pairs(&item_query(service, account));
+        let status = unsafe { SecItemDelete(query.as_concrete_TypeRef()) };
+        match status {
+            ERR_SUCCESS | ERR_ITEM_NOT_FOUND => Ok(()),
+            other => Err(describe(other, "Couldn't delete keychain item")),
+        }
+    }
+
+    fn add_item_with_label(
+        query: &[(CFString, CFType)],
+        password: &[u8],
+        label: &str,
+    ) -> Result<(), String> {
+        let mut pairs = query.to_vec();
+        pairs.push((cfkey(unsafe { kSecAttrLabel }), CFString::from(label).into_CFType()));
+        // Reuse add_item which handles duplicate → update.
+        match add_item(&pairs, password) {
+            Ok(()) => Ok(()),
+            Err(code) => Err(describe(code, "Couldn't store keychain item")),
+        }
+    }
+
+    fn item_query(service: &str, account: &str) -> Vec<(CFString, CFType)> {
+        vec![
+            (cfkey(unsafe { kSecClass }), unsafe {
+                CFString::wrap_under_get_rule(kSecClassGenericPassword)
+            }
+            .into_CFType()),
+            (
+                cfkey(unsafe { kSecAttrService }),
+                CFString::from(service).into_CFType(),
+            ),
+            (
+                cfkey(unsafe { kSecAttrAccount }),
+                CFString::from(account).into_CFType(),
+            ),
+        ]
+    }
+
+    /// A unique, sortable, human-legible item id (`20260730T153302-0007`).
+    ///
+    /// The counter disambiguates saves that land in the same second, which the
+    /// timestamp alone cannot; without it a rapid second save would overwrite
+    /// the first.
+    fn new_account_id() -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed) % 10_000;
+        format!(
+            "{}-{:04}",
+            chrono::Local::now().format("%Y%m%dT%H%M%S"),
+            n
+        )
+    }
+
+    pub fn save(entry: &SecretEntry) -> Result<SecretRef, String> {
+        let title = entry.effective_title();
+        let account = new_account_id();
+        let note = build_note(entry);
+
+        let mut query = item_query(SERVICE, &account);
+        query.push((
+            cfkey(unsafe { kSecAttrLabel }),
+            CFString::from(title.as_str()).into_CFType(),
+        ));
+        query.push((
+            cfkey(unsafe { kSecAttrDescription }),
+            CFString::from(KIND).into_CFType(),
+        ));
+        query.push((
+            cfkey(unsafe { kSecAttrComment }),
+            CFString::from(note.as_str()).into_CFType(),
+        ));
+        // Never let a clipd-captured password ride iCloud Keychain to other
+        // devices. Non-synchronizable is already the default; state it anyway so
+        // the intent survives future edits.
+        query.push((
+            cfkey(unsafe { kSecAttrSynchronizable }),
+            CFBoolean::false_value().into_CFType(),
+        ));
+
+        // Everything above is accepted by both keychain implementations. The
+        // accessibility class is only honoured by the data-protection keychain,
+        // and the legacy file-based keychain rejects the whole add when it sees
+        // it — so it goes on a separate attempt we can fall back from.
+        let mut hardened = query.clone();
+        hardened.push((
+            cfkey(unsafe { kSecAttrAccessible }),
+            unsafe { CFString::wrap_under_get_rule(kSecAttrAccessibleWhenUnlockedThisDeviceOnly) }
+                .into_CFType(),
+        ));
+
+        match add_item(&hardened, entry.password.as_bytes()) {
+            Ok(()) => {}
+            Err(status) => {
+                log::debug!(
+                    "Keychain rejected device-only accessibility ({status}); \
+                     retrying without it"
+                );
+                add_item(&query, entry.password.as_bytes())
+                    .map_err(|s| describe(s, "Keychain refused to store the password"))?;
+            }
+        }
+
+        Ok(SecretRef {
+            service: SERVICE.to_string(),
+            account,
+            title,
+            note,
+            saved_at: Some(chrono::Local::now().timestamp()),
+        })
+    }
+
+    fn add_item(query: &[(CFString, CFType)], password: &[u8]) -> Result<(), i32> {
+        let mut pairs = query.to_vec();
+        pairs.push((
+            cfkey(unsafe { kSecValueData }),
+            CFData::from_buffer(password).into_CFType(),
+        ));
+        let params = CFDictionary::from_CFType_pairs(&pairs);
+        let mut out: CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemAdd(params.as_concrete_TypeRef(), &mut out) };
+        match status {
+            ERR_SUCCESS => Ok(()),
+            // Account ids are unique per save, so this only happens if the same
+            // id is reused after a process restart within the same second.
+            ERR_DUPLICATE_ITEM => {
+                let find = CFDictionary::from_CFType_pairs(query);
+                let update = CFDictionary::from_CFType_pairs(&[(
+                    cfkey(unsafe { kSecValueData }),
+                    CFData::from_buffer(password).into_CFType(),
+                )]);
+                let status = unsafe {
+                    SecItemUpdate(find.as_concrete_TypeRef(), update.as_concrete_TypeRef())
+                };
+                if status == ERR_SUCCESS {
+                    Ok(())
+                } else {
+                    Err(status)
+                }
+            }
+            other => Err(other),
+        }
+    }
+
+    /// Provenance line stored alongside the item, so a password found months
+    /// later in Keychain Access still explains where it came from.
+    fn build_note(entry: &SecretEntry) -> String {
+        let mut note = entry.notes.trim().to_string();
+        if !entry.username.trim().is_empty() {
+            let user = format!("Username: {}", entry.username.trim());
+            note = if note.is_empty() {
+                user
+            } else {
+                format!("{user}\n{note}")
+            };
+        }
+        if !entry.url.trim().is_empty() {
+            note = format!("{note}\n{}", entry.url.trim());
+        }
+        note.trim().to_string()
+    }
+
+    pub fn list() -> Result<Vec<SecretRef>, String> {
+        // Attributes only — no kSecReturnData — so this never decrypts and
+        // never triggers a per-item access prompt.
+        let query = CFDictionary::from_CFType_pairs(&[
+            (cfkey(unsafe { kSecClass }), unsafe {
+                CFString::wrap_under_get_rule(kSecClassGenericPassword)
+            }
+            .into_CFType()),
+            (cfkey(unsafe { kSecMatchLimit }), unsafe {
+                CFString::wrap_under_get_rule(kSecMatchLimitAll)
+            }
+            .into_CFType()),
+            (
+                cfkey(unsafe { kSecReturnAttributes }),
+                CFBoolean::true_value().into_CFType(),
+            ),
+        ]);
+
+        let mut out: CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut out) };
+        if status == ERR_ITEM_NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        if status != ERR_SUCCESS {
+            return Err(describe(status, "Couldn't read the Keychain"));
+        }
+        if out.is_null() {
+            return Ok(Vec::new());
+        }
+
+        let items: CFArray<CFDictionary<CFString, CFType>> =
+            unsafe { CFArray::wrap_under_create_rule(out as CFArrayRef) };
+
+        let mut secrets: Vec<SecretRef> = Vec::new();
+        for item in items.iter() {
+            let service = attr_string(&item, unsafe { kSecAttrService }).unwrap_or_default();
+            if !is_clipd_item(&service) {
+                continue;
+            }
+            let account = attr_string(&item, unsafe { kSecAttrAccount }).unwrap_or_default();
+            let label = attr_string(&item, unsafe { kSecAttrLabel });
+            secrets.push(SecretRef {
+                title: display_title(label, &service, &account),
+                note: attr_string(&item, unsafe { kSecAttrComment }).unwrap_or_default(),
+                saved_at: attr_unix_time(&item, unsafe { kSecAttrCreationDate }),
+                service,
+                account,
+            });
+        }
+
+        // Newest first; undated legacy items sort to the bottom but stay stable.
+        secrets.sort_by(|a, b| {
+            b.saved_at
+                .cmp(&a.saved_at)
+                .then_with(|| b.account.cmp(&a.account))
+        });
+        Ok(secrets)
+    }
+
+    fn is_clipd_item(service: &str) -> bool {
+        service == SERVICE || service.starts_with(LEGACY_PREFIX)
+    }
+
+    /// Legacy items had no useful label — their name was baked into the service
+    /// as `clipd: <title>`. Recover it so old saves don't list as blank rows.
+    fn display_title(label: Option<String>, service: &str, account: &str) -> String {
+        if let Some(label) = label {
+            let label = label.trim();
+            if !label.is_empty() && label != service {
+                return label.to_string();
+            }
+        }
+        if let Some(rest) = service.strip_prefix(LEGACY_PREFIX) {
+            if !rest.trim().is_empty() {
+                return rest.trim().to_string();
+            }
+        }
+        if account.is_empty() {
+            "Untitled password".to_string()
+        } else {
+            account.to_string()
+        }
+    }
+
+    fn attr_string(item: &CFDictionary<CFString, CFType>, key: CFStringRef) -> Option<String> {
+        let value = item.find(cfkey(key))?;
+        value.downcast::<CFString>().map(|s| s.to_string())
+    }
+
+    fn attr_unix_time(item: &CFDictionary<CFString, CFType>, key: CFStringRef) -> Option<i64> {
+        let value = item.find(cfkey(key))?;
+        let date = value.downcast::<CFDate>()?;
+        Some((date.abs_time() + CF_EPOCH_OFFSET) as i64)
+    }
+
+    pub fn reveal(secret: &SecretRef) -> Result<String, String> {
+        let mut pairs = item_query(&secret.service, &secret.account);
+        pairs.push((
+            cfkey(unsafe { kSecReturnData }),
+            CFBoolean::true_value().into_CFType(),
+        ));
+        let query = CFDictionary::from_CFType_pairs(&pairs);
+
+        let mut out: CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut out) };
+        if status == ERR_ITEM_NOT_FOUND {
+            return Err("That password is no longer in the Keychain.".into());
+        }
+        if status != ERR_SUCCESS {
+            return Err(describe(status, "Couldn't read that password"));
+        }
+        if out.is_null() {
+            return Err("The Keychain returned an empty result.".into());
+        }
+        let data = unsafe { CFData::wrap_under_create_rule(out as _) };
+        String::from_utf8(data.bytes().to_vec())
+            .map_err(|_| "That Keychain item isn't valid UTF-8 text.".to_string())
+    }
+
+    pub fn forget(secret: &SecretRef) -> Result<(), String> {
+        let query = CFDictionary::from_CFType_pairs(&item_query(&secret.service, &secret.account));
+        let status = unsafe { SecItemDelete(query.as_concrete_TypeRef()) };
+        match status {
+            ERR_SUCCESS | ERR_ITEM_NOT_FOUND => Ok(()),
+            other => Err(describe(other, "Couldn't delete that password")),
+        }
+    }
+
+    pub fn rename(secret: &SecretRef, new_title: &str) -> Result<(), String> {
+        let query = CFDictionary::from_CFType_pairs(&item_query(&secret.service, &secret.account));
+        let update = CFDictionary::from_CFType_pairs(&[(
+            cfkey(unsafe { kSecAttrLabel }),
+            CFString::from(new_title).into_CFType(),
+        )]);
+        let status =
+            unsafe { SecItemUpdate(query.as_concrete_TypeRef(), update.as_concrete_TypeRef()) };
+        match status {
+            ERR_SUCCESS => Ok(()),
+            ERR_ITEM_NOT_FOUND => Err("That password is no longer in the Keychain.".into()),
+            other => Err(describe(other, "Couldn't rename that password")),
+        }
+    }
 }
 
 // Linux Secret Service via `secret-tool` (libsecret). The password is read from
@@ -481,6 +972,67 @@ mod tests {
         assert_eq!(json_str("a\"b"), "\"a\\\"b\"");
         assert_eq!(json_str("a\\b"), "\"a\\\\b\"");
         assert_eq!(json_str("a\nb"), "\"a\\nb\"");
+    }
+
+    // Exercises the real login Keychain, so it is opt-in: run with
+    // `CLIPD_KEYCHAIN_TESTS=1 cargo test -p clipd-core`. Cleans up after itself
+    // even when an assertion fails, so a bad run can't litter the Keychain.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_save_list_reveal_rename_forget() {
+        if std::env::var("CLIPD_KEYCHAIN_TESTS").is_err() {
+            return;
+        }
+        let marker = format!("clipd selftest {}", std::process::id());
+        let mut entry = SecretEntry::new("correct horse battery staple");
+        entry.title = marker.clone();
+        entry.notes = "written by clipd's test suite".into();
+
+        let saved = keychain::save(&entry).expect("save");
+        let cleanup = saved.clone();
+        let result = std::panic::catch_unwind(|| {
+            let listed = list_secrets().expect("list");
+            let found = listed
+                .iter()
+                .find(|s| s.account == cleanup.account)
+                .expect("saved item appears in the listing");
+            assert_eq!(found.title, cleanup.title);
+            assert_eq!(found.service, keychain::SERVICE);
+            assert!(found.saved_at.is_some(), "creation date should be reported");
+            // The listing must never carry plaintext.
+            assert!(!found.note.contains("correct horse"));
+
+            assert_eq!(
+                reveal_secret(found).expect("reveal"),
+                "correct horse battery staple"
+            );
+
+            let renamed_to = format!("{} renamed", cleanup.title);
+            rename_secret(found, &renamed_to).expect("rename");
+            let after = list_secrets().expect("list after rename");
+            let found = after
+                .iter()
+                .find(|s| s.account == cleanup.account)
+                .expect("still present after rename");
+            assert_eq!(found.title, renamed_to);
+            // Renaming must not disturb the stored password.
+            assert_eq!(
+                reveal_secret(found).expect("reveal after rename"),
+                "correct horse battery staple"
+            );
+        });
+
+        forget_secret(&saved).expect("forget");
+        assert!(
+            list_secrets()
+                .expect("list after delete")
+                .iter()
+                .all(|s| s.account != saved.account),
+            "deleted item should be gone"
+        );
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     #[test]

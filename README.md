@@ -205,8 +205,12 @@ retriever loved. That agreement is also what drives the confidence rating.
 
 **No API key? It still works.** Retrieval is entirely local, so `clipd ask`
 falls back to showing you the ranked clips with no synthesis and no network
-call. To get written answers, set `api_key` in `transform.json` — on macOS
-that's `~/Library/Application Support/clipd/transform.json`, on Linux
+call.
+
+To get written answers, add a key under **Settings ▸ Ask AI** in the search
+window, which has a "Test connection" button that tells you whether the key and
+endpoint actually work. It writes `transform.json` for you — on macOS
+`~/Library/Application Support/clipd/transform.json`, on Linux
 `~/.local/share/clipd/transform.json`. Any OpenAI-compatible endpoint works,
 including Ollama and LM Studio:
 

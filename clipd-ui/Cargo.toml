@@ -14,6 +14,21 @@ clipd-core = { workspace = true }
 clipd-daemon = { workspace = true }
 tao = "0.30"
 tray-icon = "0.19"
+arboard = { workspace = true }
+chrono = { workspace = true }
 dirs = "5"
 log = "0.4"
 env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+global-hotkey = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSWorkspace",
+    "NSRunningApplication",
+    # Reading the notch, so the status item can be pushed clear of it.
+    "NSScreen",
+] }
+objc2-foundation = { version = "0.3", features = ["NSString"] }

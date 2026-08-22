@@ -1,6 +1,7 @@
 use crate::ask::AskTurn;
 use crate::collections::{Collection, CollectionItem};
 use crate::embedding::{embedding_from_bytes, embedding_to_bytes, Embedding};
+use crate::files::FileRef;
 use crate::models::{ClipEntry, ClipStats, ContentType, SearchFilters};
 use crate::snippets::Snippet;
 use chrono::{DateTime, Utc};
@@ -31,8 +32,7 @@ impl ClipStore {
         Ok(store)
     }
 
-    /// Open an in-memory store (for tests).
-    #[cfg(test)]
+    /// Open an in-memory store (tests and offline eval harness).
     pub fn in_memory() -> SqlResult<Self> {
         let conn = Connection::open_in_memory()?;
         let store = ClipStore {
@@ -106,6 +106,10 @@ impl ClipStore {
             "ALTER TABLE clips ADD COLUMN thumb_path TEXT",
             "ALTER TABLE clips ADD COLUMN ocr_text TEXT",
             "ALTER TABLE clips ADD COLUMN source_title TEXT",
+            // File clips: a JSON array of FileRef. A column rather than a side
+            // table because it is always read with the clip and never queried
+            // on its own.
+            "ALTER TABLE clips ADD COLUMN files_json TEXT",
         ] {
             if let Err(e) = self.conn.execute(col, []) {
                 log::debug!("image column migration (expected if present): {}", e);
@@ -216,10 +220,24 @@ impl ClipStore {
 
     /// The clip columns, in the canonical order expected by `row_to_clip`.
     const CLIP_COLUMNS: &'static str = "id, content, content_type, content_hash, source_app, \
-         timestamp, preview, slot, image_path, thumb_path, ocr_text, source_title";
+         timestamp, preview, slot, image_path, thumb_path, ocr_text, source_title, files_json";
 
     /// Map a row selected with `CLIP_COLUMNS` into a `ClipEntry`.
     fn row_to_clip(row: &rusqlite::Row) -> SqlResult<ClipEntry> {
+        // A clip with unreadable file JSON is still a usable clip — its text
+        // and provenance are intact — so a parse failure degrades to "no
+        // files" rather than failing the whole query.
+        let files = row
+            .get::<_, Option<String>>(12)?
+            .and_then(|json| match serde_json::from_str(&json) {
+                Ok(files) => Some(files),
+                Err(e) => {
+                    log::warn!("ignoring malformed files_json on a clip: {e}");
+                    None
+                }
+            })
+            .unwrap_or_default();
+
         Ok(ClipEntry {
             id: row.get(0)?,
             content: row.get(1)?,
@@ -235,6 +253,7 @@ impl ClipStore {
             thumb_path: row.get(9)?,
             ocr_text: row.get(10)?,
             source_title: row.get(11)?,
+            files,
         })
     }
 
@@ -272,9 +291,19 @@ impl ClipStore {
             return Ok(existing_id);
         }
 
+        // Only file clips carry a JSON payload; everything else stores NULL so
+        // the column costs nothing on the overwhelmingly common text row.
+        let files_json = if entry.files.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&entry.files).map_err(|e| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+            })?)
+        };
+
         self.conn.execute(
-            "INSERT INTO clips (content, content_type, content_hash, source_app, timestamp, preview, slot, image_path, thumb_path, ocr_text, source_title)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO clips (content, content_type, content_hash, source_app, timestamp, preview, slot, image_path, thumb_path, ocr_text, source_title, files_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 entry.content,
                 entry.content_type.as_str(),
@@ -287,6 +316,7 @@ impl ClipStore {
                 entry.thumb_path,
                 entry.ocr_text,
                 entry.source_title,
+                files_json,
             ],
         )?;
 
@@ -312,6 +342,23 @@ impl ClipStore {
             .prepare("SELECT slot, content FROM active_slots ORDER BY slot")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect()
+    }
+
+    /// Most recent history row whose content exactly matches `content`.
+    ///
+    /// Used to keep active multi-slots visible in the GUI even when they fall
+    /// outside the recent-N window the palette normally loads.
+    pub fn find_by_content(&self, content: &str) -> SqlResult<Option<ClipEntry>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {} FROM clips WHERE content = ?1 ORDER BY timestamp DESC LIMIT 1",
+            Self::CLIP_COLUMNS
+        ))?;
+        let mut rows = stmt.query_map(params![content], Self::row_to_clip)?;
+        match rows.next() {
+            Some(Ok(clip)) => Ok(Some(clip)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
     }
 
     /// Full-text search with optional filters.
@@ -413,11 +460,37 @@ impl ClipStore {
                 clip.image_path.as_deref(),
                 clip.thumb_path.as_deref(),
             );
+            let orphans = self.unshared_blobs(id, &clip.files)?;
+            crate::files::delete_file_blobs(&orphans);
         }
         let count = self
             .conn
             .execute("DELETE FROM clips WHERE id = ?1", params![id])?;
         Ok(count > 0)
+    }
+
+    /// Of `files`, those whose blobs no clip other than `clip_id` references.
+    ///
+    /// Blobs are content-addressed, so copying the same file twice produces two
+    /// clips pointing at one file on disk. Deleting either clip must not pull
+    /// the blob out from under the other.
+    fn unshared_blobs(&self, clip_id: i64, files: &[FileRef]) -> SqlResult<Vec<FileRef>> {
+        let mut orphans = Vec::new();
+        for f in files {
+            let Some(blob) = &f.blob_path else { continue };
+            // files_json is a JSON array of objects; the blob path appears in it
+            // verbatim, so a substring match is enough to find co-owners.
+            let shared: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM clips
+                 WHERE id != ?1 AND files_json IS NOT NULL AND instr(files_json, ?2) > 0",
+                params![clip_id, blob],
+                |row| row.get(0),
+            )?;
+            if shared == 0 {
+                orphans.push(f.clone());
+            }
+        }
+        Ok(orphans)
     }
 
     /// Delete clips older than the given date.
@@ -919,6 +992,111 @@ mod tests {
 
     fn make_entry(content: &str) -> ClipEntry {
         ClipEntry::new(content.to_string(), Some("test_app".to_string()), None)
+    }
+
+    fn make_file_ref(name: &str, blob: Option<&str>) -> FileRef {
+        FileRef {
+            name: name.to_string(),
+            original_path: format!("/Users/test/Downloads/{name}"),
+            blob_path: blob.map(|b| b.to_string()),
+            size: 1234,
+        }
+    }
+
+    #[test]
+    fn file_clips_roundtrip_through_the_database() {
+        let store = ClipStore::in_memory().unwrap();
+        let files = vec![
+            make_file_ref("report.pdf", Some("/blobs/aaa.pdf")),
+            make_file_ref("huge.iso", None),
+        ];
+        let entry = ClipEntry::new_files(files.clone(), Some("Finder".into()));
+        let id = store.insert(&entry).unwrap();
+
+        let back = store.get_by_id(id).unwrap();
+        assert_eq!(back.content_type, ContentType::File);
+        assert_eq!(back.files, files);
+        // The original paths are the searchable body of a file clip.
+        assert!(back.content.contains("report.pdf"));
+        assert!(back.preview.contains("2 files"));
+    }
+
+    #[test]
+    fn non_file_clips_leave_the_files_column_null() {
+        let store = ClipStore::in_memory().unwrap();
+        let id = store.insert(&make_entry("just some text")).unwrap();
+        let json: Option<String> = store
+            .conn
+            .query_row("SELECT files_json FROM clips WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(json.is_none(), "text clips should not carry a JSON payload");
+        assert!(store.get_by_id(id).unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn file_clips_are_searchable_by_filename() {
+        let store = ClipStore::in_memory().unwrap();
+        store
+            .insert(&ClipEntry::new_files(
+                vec![make_file_ref("quarterly-report.pdf", Some("/blobs/q.pdf"))],
+                Some("Finder".into()),
+            ))
+            .unwrap();
+
+        let hits = store
+            .search(&SearchFilters {
+                query: Some("quarterly".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1, "a file clip must be findable by its name");
+        assert_eq!(hits[0].files.len(), 1);
+    }
+
+    #[test]
+    fn a_blob_shared_by_two_clips_survives_deleting_one() {
+        let store = ClipStore::in_memory().unwrap();
+        let shared = make_file_ref("shared.pdf", Some("/blobs/shared.pdf"));
+        let only_in_pair = make_file_ref("other.pdf", Some("/blobs/other.pdf"));
+
+        // Copying {shared, other} and later just {shared} makes two clips that
+        // both point at the shared blob on disk.
+        let pair = store
+            .insert(&ClipEntry::new_files(
+                vec![shared.clone(), only_in_pair.clone()],
+                None,
+            ))
+            .unwrap();
+        let single = store
+            .insert(&ClipEntry::new_files(vec![shared.clone()], None))
+            .unwrap();
+        assert_ne!(pair, single, "different file sets are different clips");
+
+        // Deleting the pair may collect `other`, but never the shared blob.
+        let orphans = store
+            .unshared_blobs(pair, &store.get_by_id(pair).unwrap().files)
+            .unwrap();
+        assert_eq!(orphans, vec![only_in_pair], "only the unshared blob");
+
+        store.delete(pair).unwrap();
+
+        // With the pair gone, the last reference to `shared` is collectable.
+        let orphans = store.unshared_blobs(single, &[shared.clone()]).unwrap();
+        assert_eq!(orphans, vec![shared], "last reference gone");
+    }
+
+    #[test]
+    fn copying_the_same_file_twice_is_one_clip() {
+        let store = ClipStore::in_memory().unwrap();
+        let f = make_file_ref("doc.pdf", Some("/blobs/doc.pdf"));
+        let a = store
+            .insert(&ClipEntry::new_files(vec![f.clone()], None))
+            .unwrap();
+        let b = store.insert(&ClipEntry::new_files(vec![f], None)).unwrap();
+        assert_eq!(a, b, "identical file sets dedup like identical text does");
     }
 
     fn make_turn(q: &str, a: &str, cited: Vec<i64>) -> AskTurn {

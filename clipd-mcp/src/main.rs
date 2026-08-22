@@ -770,6 +770,7 @@ impl McpServer {
                 "source_app": s.source_app,
                 "timestamp": s.timestamp.to_rfc3339(),
                 "matched_by": s.matched_by,
+                "grounding_score": s.grounding_score,
             })).collect::<Vec<_>>(),
             "retrieved": answer.retrieved.iter().map(|r| serde_json::json!({
                 "clip_id": r.clip.id,
