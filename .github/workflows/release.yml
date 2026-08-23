@@ -305,11 +305,86 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
-          # One download per platform — keep the release page unambiguous.
-          # (zips remain available as workflow artifacts for anyone who wants
-          # portable binaries, but they don't clutter the release.)
+          # Off deliberately. The generated changelog quotes PR and commit
+          # titles verbatim, and one of ours said "notarized macOS build" — a
+          # claim the build cannot make while the Apple secrets are unset and
+          # the notarize step skips. A release page that overstates its own
+          # signing status is worse than one with no changelog.
+          generate_release_notes: false
+          # Lead with the install script, because it is the only macOS path
+          # that does not hit Gatekeeper.
+          #
+          # A .dmg downloaded in a browser is quarantined, and an app that is
+          # signed but not notarized is then refused outright: "Apple could not
+          # verify Clipd.app is free of malware". On macOS 15 that dialog has a
+          # single Done button — the old right-click → Open escape hatch is
+          # gone — so the user has to go digging in System Settings. The script
+          # fetches the same build and clears the quarantine flag, so it just
+          # opens. Anyone who scrolls to the files below should know what they
+          # are choosing.
+          body: |
+            ## Install
+
+            **macOS and Linux** — one line:
+
+            ```
+            curl -fsSL https://raw.githubusercontent.com/shwetarkadam/clipd/main/install.sh | bash
+            ```
+
+            Downloads the build below, puts **Clipd.app** in `/Applications`
+            and the `clipd` CLI in `/usr/local/bin`, and clears the download's
+            quarantine flag so macOS opens it without a security prompt.
+
+            **Windows** — download `Clipd-Setup-*.exe`. SmartScreen warns on
+            first run: *More info → Run anyway*. clipd is open source and
+            unsigned.
+
+            After installing, macOS asks for **Accessibility** and **Input
+            Monitoring** — multi-slot copy reads the keyboard, so it cannot
+            work without them.
+
+            <details>
+            <summary>If you download the .zip by hand instead</summary>
+
+            macOS will refuse to open the app: *"Apple could not verify
+            Clipd.app is free of malware that may harm your Mac."*
+
+            Nothing is wrong with the build. clipd is code-signed, but Apple
+            only stops showing that warning for apps that have been
+            **notarized**, which requires a paid Apple Developer account. This
+            project is open source and earns nothing, so it is not notarized.
+
+            Open it anyway: **System Settings → Privacy & Security**, scroll to
+            Security, click **Open Anyway**. On macOS 15 the warning dialog
+            itself has only a *Done* button — the old right-click → Open
+            shortcut no longer works.
+
+            Or clear the flag yourself:
+
+            ```
+            xattr -dr com.apple.quarantine /Applications/Clipd.app
+            ```
+
+            The install command does this for you, which is why it is the
+            recommended path.
+            </details>
+
+            ---
+
+            **Changes:** see the
+            [full changelog](https://github.com/shwetarkadam/clipd/commits/main).
+
+          # The zips are not optional extras — install.sh downloads them by
+          # name. Leaving them off made the one-line install, the path the
+          # README recommends and the only one that avoids Gatekeeper, return a
+          # 404 for every user. They fell back to the .dmg and hit the malware
+          # warning, which is what made clipd look broken on first contact.
+          #
+          # One artifact per platform beyond that: the Windows installer, which
+          # has no script path. The .dmg and .deb are gone — a second macOS
+          # download that behaves worse than the first is not a choice worth
+          # offering.
           files: |
-            artifacts/*.dmg
+            artifacts/Clipd-macos-*.zip
+            artifacts/Clipd-linux-*.zip
             artifacts/Clipd-Setup-*.exe
-            artifacts/*.deb
