@@ -1,19 +1,23 @@
 //! Ask — grounded question answering over clipboard history (RAG).
 //!
-//! Three retrievers already exist in this crate and each is good at something
-//! different: FTS5 (`ClipStore::search`) nails exact tokens and rare strings,
-//! TF-IDF (`semantic::TfIdfIndex`) survives paraphrase, and cloud embeddings
+//! **Hybrid retrieval.** Three retrievers, each good at something different:
+//! FTS5 (`ClipStore::search`) nails exact tokens and rare strings, TF-IDF
+//! (`semantic::TfIdfIndex`) survives paraphrase, and cloud embeddings
 //! (`embedding::search_embeddings`) catch true synonymy. `retrieve` runs all
-//! three and fuses their *rankings* — not their scores, which are on wildly
-//! different scales — with weighted Reciprocal Rank Fusion.
+//! three (honouring the same app/time filters) and fuses their *rankings* —
+//! not their scores, which are on wildly different scales — with weighted
+//! Reciprocal Rank Fusion. Offline quality is measured by
+//! [`crate::ask_eval::run_retrieval_eval`].
 //!
-//! The generation half is deliberately paranoid. Clips are the user's real
-//! keystrokes, so before anything leaves the machine every candidate goes
-//! through `privacy::detect_sensitive` and secrets are dropped. The model is
-//! told to answer only from the numbered clips it is shown and to cite
-//! `[#id]`; on the way back every citation is checked against the context that
-//! was actually sent, and ids the model invented are stripped rather than
-//! rendered. Grounding you can't verify isn't grounding.
+//! **Citation grounding.** The generation half is deliberately paranoid.
+//! Clips are the user's real keystrokes, so before anything leaves the machine
+//! every candidate goes through `privacy::detect_sensitive` and secrets are
+//! dropped. The model is told to answer only from the numbered clips it is
+//! shown and to cite `[#id]` with a short quote. On the way back:
+//! 1. ids the model invented are rewritten to `[unverified]`;
+//! 2. each surviving cite is scored for lexical overlap between the citing
+//!    sentence and the clip body (`AskSource::grounding_score`) — catching
+//!    "right id, wrong fact" hallucinations that bare ID allowlisting misses.
 //!
 //! With no API key configured the whole generation step is skipped and the
 //! fused ranking is returned as-is (`AskAnswer::retrieval_only`). Recall still
@@ -174,6 +178,11 @@ pub struct AskSource {
     pub timestamp: DateTime<Utc>,
     pub matched_by: String,
     pub fused_score: f64,
+    /// Lexical overlap between the citing sentence and the clip body (0–1).
+    /// Low scores mean the model cited a real id but the claim isn't supported
+    /// by that clip's text — the common "right source, wrong fact" hallucination.
+    #[serde(default)]
+    pub grounding_score: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -210,10 +219,12 @@ impl AskAnswer {
         let mut out = String::new();
 
         if self.retrieval_only {
-            out.push_str(
-                "No API key configured — showing what clipd found, without a written answer.\n\
-                 (Set api_key in transform.json to get synthesized answers.)\n\n",
-            );
+            out.push_str(&format!(
+                "No model configured — showing what clipd found, without a written answer.\n\
+                 (Settings ▸ Ask AI: add an API key, or point it at a local model \
+                 that needs none. Config: {})\n\n",
+                crate::transform::transform_config_path().display()
+            ));
             if self.retrieved.is_empty() {
                 out.push_str("No matching clips.\n");
                 return out;
@@ -273,6 +284,17 @@ impl AskAnswer {
                 "Warning: the model cited {} clip id(s) that were not in its context; \
                  those citations were dropped.\n",
                 self.invalid_citations.len()
+            ));
+        }
+        let weak: Vec<_> = self
+            .sources
+            .iter()
+            .filter(|s| s.grounding_score < GROUNDING_WEAK)
+            .collect();
+        if !weak.is_empty() {
+            out.push_str(&format!(
+                "Warning: {} citation(s) look poorly grounded (claim doesn't overlap the clip text).\n",
+                weak.len()
             ));
         }
         out
@@ -354,10 +376,19 @@ fn title_from(question: &str) -> String {
 
 // ── Entry point ──
 
+/// Whether a key has been configured.
+pub fn has_api_key(api: &TransformConfig) -> bool {
+    api.api_key.as_deref().is_some_and(|k| !k.is_empty())
+}
+
 /// Whether synthesis is possible at all. When false, `ask` returns the fused
 /// ranking and nothing leaves the machine.
-pub fn has_api_key(api: &TransformConfig) -> bool {
-    api.api_key.as_deref().map_or(false, |k| !k.is_empty())
+///
+/// A key is not the only way in: local model servers (Ollama, LM Studio) take
+/// requests with no credentials, so pointing `api_url` at loopback is enough.
+/// Gating on the key alone used to make a perfectly good local model unusable.
+pub fn can_synthesize(api: &TransformConfig) -> bool {
+    has_api_key(api) || crate::transform::is_local_endpoint(&api.api_url)
 }
 
 /// Retrieve, then (when a key is configured) answer.
@@ -385,7 +416,7 @@ pub fn ask(
     }
     let withheld_count = retrieved.iter().filter(|r| r.withheld.is_some()).count();
 
-    if !has_api_key(api) {
+    if !can_synthesize(api) {
         return Ok(AskAnswer {
             question: question.to_string(),
             answer: String::new(),
@@ -425,16 +456,27 @@ pub fn ask(
     let allowed: Vec<i64> = usable.iter().map(|r| r.clip.id).collect();
     let (answer, cited, invalid_citations) = resolve_citations(&raw, &allowed);
 
+    // Claim-level grounding: a valid [#id] is necessary but not sufficient —
+    // the citing sentence must also overlap the clip body.
+    let bodies: HashMap<i64, String> = usable
+        .iter()
+        .map(|r| (r.clip.id, clip_body(&r.clip)))
+        .collect();
+    let grounding = ground_citations(&answer, &cited, &bodies);
+
     let sources: Vec<AskSource> = cited
         .iter()
-        .filter_map(|id| retrieved.iter().find(|r| r.clip.id == *id))
-        .map(|r| AskSource {
-            clip_id: r.clip.id,
-            preview: r.clip.preview.clone(),
-            source_app: r.clip.source_app.clone(),
-            timestamp: r.clip.timestamp,
-            matched_by: r.matched_by(),
-            fused_score: r.fused_score,
+        .filter_map(|id| {
+            let r = retrieved.iter().find(|r| r.clip.id == *id)?;
+            Some(AskSource {
+                clip_id: r.clip.id,
+                preview: r.clip.preview.clone(),
+                source_app: r.clip.source_app.clone(),
+                timestamp: r.clip.timestamp,
+                matched_by: r.matched_by(),
+                fused_score: r.fused_score,
+                grounding_score: grounding.get(id).copied().unwrap_or(0.0),
+            })
         })
         .collect();
 
@@ -506,7 +548,9 @@ pub fn retrieve(
     }
 
     // 3. Embeddings — optional, and only over clips already embedded.
-    if let Some(emb_ids) = embedding_candidates(store, query, cfg, api, &mut pool) {
+    // Honours the same app/time filters as FTS and TF-IDF so hybrid fusion
+    // never reintroduces clips the user explicitly scoped out.
+    if let Some(emb_ids) = embedding_candidates(store, query, filters, cfg, api, &mut pool) {
         if !emb_ids.is_empty() {
             ranked.push((Retriever::Embedding, emb_ids));
         }
@@ -613,6 +657,7 @@ fn fulltext_candidates(
 fn embedding_candidates(
     store: &ClipStore,
     query: &str,
+    filters: &AskFilters,
     cfg: &AskConfig,
     api: &TransformConfig,
     pool: &mut HashMap<i64, ClipEntry>,
@@ -638,22 +683,42 @@ fn embedding_candidates(
     };
 
     let stored = store.get_all_embeddings().ok()?;
-    let ids: Vec<i64> = search_embeddings(&query_vec, &stored, cfg.candidates_per_retriever, 0.15)
+    // Fetch more than top_k so app/time filtering still leaves enough.
+    let fetch_n = cfg.candidates_per_retriever.saturating_mul(3).max(cfg.candidates_per_retriever);
+    let ids: Vec<i64> = search_embeddings(&query_vec, &stored, fetch_n, 0.15)
         .into_iter()
         .filter_map(|r| {
-            if pool.contains_key(&r.clip_id) {
-                Some(r.clip_id)
+            let clip = if let Some(existing) = pool.get(&r.clip_id) {
+                existing.clone()
             } else {
-                store.get_by_id(r.clip_id).ok().map(|clip| {
-                    let id = clip.id;
-                    pool.insert(id, clip);
-                    id
-                })
+                store.get_by_id(r.clip_id).ok()?
+            };
+            if !clip_matches_filters(&clip, filters) {
+                return None;
             }
+            let id = clip.id;
+            pool.entry(id).or_insert(clip);
+            Some(id)
         })
+        .take(cfg.candidates_per_retriever)
         .collect();
 
     Some(ids)
+}
+
+fn clip_matches_filters(clip: &ClipEntry, filters: &AskFilters) -> bool {
+    if let Some(ref app) = filters.source_app {
+        match clip.source_app.as_deref() {
+            Some(a) if a.to_lowercase().contains(&app.to_lowercase()) => {}
+            _ => return false,
+        }
+    }
+    if let Some(since) = filters.since {
+        if clip.timestamp < since {
+            return false;
+        }
+    }
+    true
 }
 
 // ── Context assembly ──
@@ -740,12 +805,15 @@ Rules, in order of importance:
 user, their files, or their history.
 2. Cite the id of every clip you use, inline, in the form [#42]. An answer with \
 no citation is only acceptable when you found nothing.
-3. If the clips do not contain the answer, say so plainly and name the closest \
+3. Ground every claim: when you cite [#42], the sentence must contain a short \
+exact quote or distinctive token from that clip. Do not attach a citation to \
+facts the clip does not support.
+4. If the clips do not contain the answer, say so plainly and name the closest \
 thing you did find. Never guess, never fill gaps from general knowledge, and \
 never invent a clip id.
-4. When the user asks for something they copied, reproduce it exactly — same \
+5. When the user asks for something they copied, reproduce it exactly — same \
 characters, same formatting. Do not clean it up, summarize it, or correct it.
-5. Be brief. Answer the question, cite, stop.";
+6. Be brief. Answer the question, cite, stop.";
 
 fn generate(
     question: &str,
@@ -754,11 +822,10 @@ fn generate(
     cfg: &AskConfig,
     api: &TransformConfig,
 ) -> Result<(String, Option<Usage>), String> {
-    let api_key = api
-        .api_key
-        .as_deref()
-        .filter(|k| !k.is_empty())
-        .ok_or("Ask requires an API key — set it in transform.json")?;
+    let api_key = api.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty());
+    if api_key.is_none() && !crate::transform::is_local_endpoint(&api.api_url) {
+        return Err("Ask needs an API key, or a local model endpoint — see Settings ▸ Ask AI.".into());
+    }
 
     let mut messages: Vec<serde_json::Value> = vec![serde_json::json!({
         "role": "system",
@@ -786,11 +853,15 @@ fn generate(
         "temperature": cfg.temperature,
     });
 
-    let response = ureq::post(&api.api_url)
-        .set("Content-Type", "application/json")
-        .set("Authorization", &format!("Bearer {}", api_key))
+    let mut request = ureq::post(&api.api_url).set("Content-Type", "application/json");
+    // Local servers reject nothing, but sending `Bearer ` with an empty key
+    // makes some of them 401 rather than ignore it.
+    if let Some(key) = api_key {
+        request = request.set("Authorization", &format!("Bearer {key}"));
+    }
+    let response = request
         .send_json(body)
-        .map_err(|e| format!("Ask API request failed: {}", e))?;
+        .map_err(|e| crate::transform::explain_api_error(e, api))?;
 
     let resp: serde_json::Value = response
         .into_json()
@@ -816,6 +887,13 @@ fn generate(
 }
 
 // ── Grounding enforcement ──
+
+/// Minimum average grounding score for High confidence. Below this, even
+/// multi-retriever agreement only earns Medium — the cite may be real but the
+/// claim isn't supported by the clip text.
+const GROUNDING_HIGH_FLOOR: f64 = 0.25;
+/// Below this, a source is treated as poorly grounded and caps confidence.
+const GROUNDING_WEAK: f64 = 0.12;
 
 /// Pull `[#id]` citations out of the answer and split them into ids that were
 /// really in the context and ids the model made up. Fabricated citations are
@@ -861,6 +939,124 @@ fn resolve_citations(answer: &str, allowed: &[i64]) -> (String, Vec<i64>, Vec<i6
     (out, cited, invalid)
 }
 
+/// Per-citation lexical grounding: does the sentence that cites `[#id]`
+/// actually overlap the clip body?
+///
+/// This catches the common failure mode where the model cites a real clip id
+/// but invents facts that clip doesn't contain. Pure ID allowlisting can't
+/// see that; token overlap can.
+fn ground_citations(
+    answer: &str,
+    cited: &[i64],
+    bodies: &HashMap<i64, String>,
+) -> HashMap<i64, f64> {
+    let mut scores = HashMap::new();
+    for &id in cited {
+        let Some(body) = bodies.get(&id) else {
+            scores.insert(id, 0.0);
+            continue;
+        };
+        let sentence = citing_sentence(answer, id).unwrap_or(answer);
+        scores.insert(id, lexical_grounding(sentence, body));
+    }
+    scores
+}
+
+/// Sentence (or line) containing `[#id]`. Falls back to the whole answer.
+fn citing_sentence(answer: &str, id: i64) -> Option<&str> {
+    let marker = format!("[#{id}]");
+    let pos = answer.find(&marker)?;
+    // Expand to the nearest sentence/line boundaries around the citation.
+    let before = &answer[..pos];
+    let after = &answer[pos + marker.len()..];
+    let start = before
+        .rfind(['.', '!', '?', '\n'])
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let end_rel = after
+        .find(['.', '!', '?', '\n'])
+        .map(|i| pos + marker.len() + i + 1)
+        .unwrap_or(answer.len());
+    Some(answer[start..end_rel].trim())
+}
+
+/// Coverage of content tokens in `claim` by `evidence`, with a boost when a
+/// distinctive exact substring from the claim appears in the evidence.
+fn lexical_grounding(claim: &str, evidence: &str) -> f64 {
+    let claim_tokens = content_tokens(claim);
+    if claim_tokens.is_empty() {
+        // Cite-only sentence ("see [#3]") — ID validity already checked.
+        return 0.5;
+    }
+    let evidence_tokens: std::collections::HashSet<String> =
+        content_tokens(evidence).into_iter().collect();
+    let overlap = claim_tokens
+        .iter()
+        .filter(|t| evidence_tokens.contains(*t))
+        .count();
+    let mut score = overlap as f64 / claim_tokens.len() as f64;
+
+    if has_distinctive_quote(claim, evidence) {
+        score = score.max(0.85);
+    }
+    score
+}
+
+fn content_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.')
+        .filter(|w| w.len() >= 3)
+        .map(|w| w.to_lowercase())
+        // Strip citation markers' numeric residue and question fluff.
+        .filter(|w| !QUESTION_WORDS.contains(&w.as_str()))
+        .filter(|w| !w.chars().all(|c| c.is_ascii_digit()))
+        .collect()
+}
+
+/// True when a meaningful chunk of the claim appears verbatim in the evidence
+/// — the strongest grounding signal. Covers multi-word phrases and long
+/// single tokens (URLs, connection strings, IDs) that never form a 2-gram.
+fn has_distinctive_quote(claim: &str, evidence: &str) -> bool {
+    let claim_flat: String = claim
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let evidence_l = evidence.to_lowercase();
+
+    // Long single tokens (URLs, DSNs, API keys) are distinctive on their own.
+    for word in claim_flat.split_whitespace() {
+        let w = word.trim_matches(|c: char| matches!(c, '[' | ']' | '#' | '.' | ',' | ';' | ':'));
+        if w.len() >= 12 && evidence_l.contains(&w.to_lowercase()) {
+            return true;
+        }
+    }
+
+    // Walk windows of 2–6 tokens looking for an exact phrase hit.
+    let words: Vec<&str> = claim_flat.split_whitespace().collect();
+    for window in (2..=6).rev() {
+        if words.len() < window {
+            continue;
+        }
+        for i in 0..=words.len() - window {
+            let phrase = words[i..i + window].join(" ").to_lowercase();
+            // Skip windows that are only question fluff / citation residue.
+            let meaningful = phrase
+                .split_whitespace()
+                .filter(|w| w.len() >= 3 && !QUESTION_WORDS.contains(w))
+                .count();
+            if meaningful < 2 {
+                continue;
+            }
+            if evidence_l.contains(&phrase) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn score_confidence(
     answer: &str,
     sources: &[AskSource],
@@ -881,6 +1077,16 @@ fn score_confidence(
         return Confidence::Low;
     }
 
+    let avg_grounding =
+        sources.iter().map(|s| s.grounding_score).sum::<f64>() / sources.len() as f64;
+    let any_weak = sources.iter().any(|s| s.grounding_score < GROUNDING_WEAK);
+
+    // A cite whose sentence doesn't overlap the clip at all is a soft
+    // hallucination — keep the source (the id was real) but never call it High.
+    if any_weak && avg_grounding < GROUNDING_HIGH_FLOOR {
+        return Confidence::Low;
+    }
+
     let multi_retriever = sources.iter().any(|s| {
         retrieved
             .iter()
@@ -889,8 +1095,10 @@ fn score_confidence(
             .unwrap_or(false)
     });
 
-    if multi_retriever {
+    if multi_retriever && avg_grounding >= GROUNDING_HIGH_FLOOR {
         Confidence::High
+    } else if multi_retriever || avg_grounding >= GROUNDING_HIGH_FLOOR {
+        Confidence::Medium
     } else {
         Confidence::Medium
     }
@@ -972,6 +1180,7 @@ mod tests {
             image_path: None,
             thumb_path: None,
             ocr_text: None,
+            files: Vec::new(),
         }
     }
 
@@ -1074,6 +1283,7 @@ mod tests {
             timestamp: Utc::now(),
             matched_by: "full-text + tf-idf".into(),
             fused_score: 0.5,
+            grounding_score: 0.8,
         }];
         assert_eq!(score_confidence("see [#1]", &src, &[r.clone()]), Confidence::High);
 
@@ -1081,6 +1291,50 @@ mod tests {
         assert_eq!(
             score_confidence("see [#1]", &src, &[r]),
             Confidence::Medium
+        );
+    }
+
+    #[test]
+    fn weak_grounding_caps_confidence_even_with_agreement() {
+        let r = RetrievedClip {
+            clip: clip(1, "postgres://db.internal/prod"),
+            fused_score: 0.5,
+            hits: vec![(Retriever::FullText, 1), (Retriever::TfIdf, 2)],
+            withheld: None,
+        };
+        let src = vec![AskSource {
+            clip_id: 1,
+            preview: "postgres://…".into(),
+            source_app: None,
+            timestamp: Utc::now(),
+            matched_by: "full-text + tf-idf".into(),
+            fused_score: 0.5,
+            // Model cited the right id but invented an unrelated claim.
+            grounding_score: 0.05,
+        }];
+        assert_eq!(
+            score_confidence("The API key is sk-abc [#1].", &src, &[r]),
+            Confidence::Low
+        );
+    }
+
+    #[test]
+    fn lexical_grounding_rewards_exact_quotes() {
+        let body = "postgres://admin:hunter2@db.internal:5432/production";
+        let claim = "The connection string is postgres://admin:hunter2@db.internal:5432/production [#1].";
+        assert!(
+            lexical_grounding(claim, body) >= 0.85,
+            "exact quote from the clip should ground strongly"
+        );
+    }
+
+    #[test]
+    fn lexical_grounding_penalizes_unsupported_claims() {
+        let body = "brew install --cask docker";
+        let claim = "Your AWS access key is AKIA1234567890 [#1].";
+        assert!(
+            lexical_grounding(claim, body) < GROUNDING_WEAK,
+            "unrelated claim against a real cite must score weak"
         );
     }
 
@@ -1526,11 +1780,12 @@ mod tests {
     #[test]
     fn a_blank_key_skips_the_network_entirely() {
         let store = seeded_store();
-        // Port 1 is not listening; if generation were attempted this errors
-        // instead of returning a clean retrieval-only answer.
+        // A remote host with no key must never be contacted — if a request were
+        // attempted this would fail rather than return a retrieval-only answer.
+        // (Deliberately not loopback: a keyless local endpoint is legitimate.)
         let api = TransformConfig {
             api_key: None,
-            api_url: "http://127.0.0.1:1/v1/chat/completions".into(),
+            api_url: "https://api.invalid/v1/chat/completions".into(),
             model: "unused".into(),
         };
 
@@ -1547,6 +1802,39 @@ mod tests {
         assert!(answer.retrieval_only);
         assert!(answer.answer.is_empty());
         assert_eq!(answer.confidence, Confidence::None);
+    }
+
+    /// A local model server needs no credentials, so a keyless loopback config
+    /// must actually be used rather than silently downgraded to retrieval-only.
+    #[test]
+    fn a_keyless_local_endpoint_is_used_for_synthesis() {
+        let api = TransformConfig {
+            api_key: None,
+            api_url: "http://localhost:11434/v1/chat/completions".into(),
+            model: "llama3.2".into(),
+        };
+        assert!(can_synthesize(&api));
+        assert!(!has_api_key(&api));
+
+        // Nothing is listening on port 1, so this proves a request was attempted
+        // instead of falling back to a retrieval-only answer.
+        let store = seeded_store();
+        let dead_local = TransformConfig {
+            api_url: "http://127.0.0.1:1/v1/chat/completions".into(),
+            ..api
+        };
+        let result = ask(
+            &store,
+            "docker",
+            &AskThread::new(),
+            &AskFilters::default(),
+            &AskConfig::default(),
+            &dead_local,
+        );
+        assert!(
+            result.is_err(),
+            "a keyless local endpoint should be contacted, not skipped"
+        );
     }
 
     #[test]

@@ -103,6 +103,18 @@ pub fn load_rgba(path: &Path) -> io::Result<(u32, u32, Vec<u8>)> {
     Ok((w, h, img.into_raw()))
 }
 
+/// Decode PNG bytes already in memory — for images compiled into the binary.
+///
+/// `load_rgba` reads from disk, which an embedded asset has no path for. A
+/// brand mark must not depend on a file being installed next to the binary.
+pub fn decode_rgba(bytes: &[u8]) -> io::Result<(u32, u32, Vec<u8>)> {
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    Ok((w, h, img.into_raw()))
+}
+
 /// Remove the files backing an image clip (best-effort; ignores missing files).
 pub fn delete_image_files(image_path: Option<&str>, thumb_path: Option<&str>) {
     for p in [image_path, thumb_path].into_iter().flatten() {

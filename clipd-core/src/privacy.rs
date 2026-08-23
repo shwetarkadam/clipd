@@ -54,6 +54,12 @@ pub struct PrivacyConfig {
     /// offer to save it into a vault (1Password / Bitwarden / Keychain).
     #[serde(default = "default_true")]
     pub offer_vault_on_secret: bool,
+    /// Save detected passwords without asking. Off by default: silently filing
+    /// every high-entropy string into the Keychain fills it with junk from
+    /// false positives, and a password landing in permanent storage is not
+    /// something clipd should decide on the user's behalf.
+    #[serde(default)]
+    pub vault_auto_save: bool,
 }
 
 fn default_true() -> bool {
@@ -80,6 +86,7 @@ impl Default for PrivacyConfig {
             detect_ssn: true,
             custom_skip_patterns: Vec::new(),
             offer_vault_on_secret: true,
+            vault_auto_save: false,
         }
     }
 }
@@ -166,6 +173,23 @@ fn is_uuid(s: &str) -> bool {
             c.is_ascii_hexdigit()
         }
     })
+}
+
+/// What a list should show in place of a secret's raw text.
+///
+/// Detection already builds the right string — `sk-proj-********…`, keeping
+/// the prefix so you can tell which key it is — but nothing was displaying it,
+/// so every list rendered the key in full and the row tooltip printed the
+/// whole thing. Storing it in the Keychain does not help there: the value is
+/// still on screen, and asking the user to move it by hand means it is exposed
+/// until they remember to.
+///
+/// The clip's `content` is untouched — pasting has to give back the real key.
+/// This is only what gets drawn.
+pub fn redacted_display(content: &str, config: &PrivacyConfig) -> Option<String> {
+    detect_sensitive(content, config)
+        .first()
+        .map(|m| m.redacted_preview.clone())
 }
 
 pub fn detect_sensitive(content: &str, config: &PrivacyConfig) -> Vec<SensitiveMatch> {
@@ -440,6 +464,31 @@ mod tests {
         assert!(!looks_like_password("550e8400-e29b-41d4-a716-446655440000"));
         // Too long (likely a token/blob, caught by prefix detectors if a key)
         assert!(!looks_like_password(&"Aa1!".repeat(20)));
+    }
+
+    #[test]
+    fn a_copied_api_key_is_never_drawn_in_full() {
+        // Storing the key in the Keychain does not protect what is already on
+        // screen, and it is a step the user has to remember to take. A clip
+        // that holds a key shows its prefix and nothing else, without anyone
+        // asking — the prefix is what tells you *which* key it is.
+        let key = "sk-proj-_ltF9pCj7mkEAYF6hfqo1z1jAbdbmvaiX3HOC9GO42";
+        let shown = redacted_display(key, &cfg()).expect("a key must be redacted");
+        assert!(shown.starts_with("sk-"), "the prefix is the useful part");
+        assert!(
+            !shown.contains("ltF9pCj7mk"),
+            "the secret itself must not survive into the preview: {shown}"
+        );
+        assert!(shown.len() < key.len());
+
+        // Ordinary text is left alone — masking everything would make the
+        // list useless.
+        assert!(redacted_display("just some notes", &cfg()).is_none());
+
+        // Turning detection off turns masking off with it.
+        let mut off = cfg();
+        off.enabled = false;
+        assert!(redacted_display(key, &off).is_none());
     }
 
     #[test]

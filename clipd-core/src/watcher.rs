@@ -21,12 +21,28 @@ pub enum ClipEvent {
         rgba: Vec<u8>,
         source_app: Option<String>,
     },
+    /// Files were copied in Finder. Carries only the paths — the daemon does
+    /// the copying into the blob store, which can be slow for a large
+    /// selection and must not stall the polling loop.
+    NewFiles {
+        paths: Vec<std::path::PathBuf>,
+        source_app: Option<String>,
+        source_title: Option<String>,
+    },
     /// A password/secret was detected, so the daemon can offer to save it to a
-    /// vault. Carries only the human label(s) — never the secret itself; it is
-    /// re-read from the live clipboard at save time. `stored` is false for
-    /// confidently-detected secrets (dropped from history) and true for fuzzy
-    /// heuristic matches (kept in history, just offered).
-    SensitiveClip { kinds: String, stored: bool },
+    /// vault.
+    ///
+    /// The secret travels with the event. Earlier versions sent only the label
+    /// and re-read the clipboard when the user accepted, which meant a copy
+    /// made in the intervening moment got vaulted instead of the password the
+    /// prompt was about. `stored` is false for confidently-detected secrets
+    /// (dropped from history) and true for fuzzy heuristic matches (kept in
+    /// history, just offered).
+    SensitiveClip {
+        kinds: String,
+        secret: String,
+        stored: bool,
+    },
 }
 
 /// True when the frontmost app is one of clipd's own windows, so the watcher
@@ -67,6 +83,7 @@ impl ClipWatcher {
     ) {
         let mut last_hash = String::new();
         let mut last_image_hash = String::new();
+        let mut last_files_hash = String::new();
         let privacy_config = load_privacy_config();
 
         // Try to create the clipboard handle.
@@ -106,7 +123,7 @@ impl ClipWatcher {
             // The daemon mutated the clipboard (e.g. restored slot 1 after multi-tap copy).
             // Re-sync last_hash so we don't emit a duplicate NewClip.
             if refresh_hash.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                if let Ok(text) = clipboard.get_text() {
+                if let Some(text) = crate::pasteboard::read_text() {
                     if !text.is_empty() {
                         last_hash = Self::hash_content(&text);
                     }
@@ -115,9 +132,18 @@ impl ClipWatcher {
                 continue;
             }
 
+            // Files before text. A Finder copy puts a *text* representation on
+            // the pasteboard alongside the file URLs, so polling text first
+            // would file "report.pdf" away as a string and lose the file that
+            // copy was actually about.
+            if Self::poll_files(&mut last_files_hash, &privacy_config, &sender) {
+                std::thread::sleep(self.poll_interval);
+                continue;
+            }
+
             // Poll for text content. When there's no text on the clipboard,
             // fall through to image polling (a copied screenshot has no text).
-            let text = clipboard.get_text().ok().filter(|t| !t.is_empty());
+            let text = crate::pasteboard::read_text().filter(|t| !t.is_empty());
             if text.is_none() {
                 Self::poll_image(
                     &mut clipboard,
@@ -132,6 +158,17 @@ impl ClipWatcher {
 
                     if hash != last_hash {
                         last_hash = hash;
+
+                        // The copier explicitly marked this as a secret. That is
+                        // a far stronger signal than any text heuristic, and it
+                        // covers password managers whose process name isn't in
+                        // the exclusion list — plus clipd's own vault copy-backs.
+                        if privacy_config.enabled && crate::secret_clipboard::clipboard_is_concealed()
+                        {
+                            log::info!("🔒 Clip skipped (marked concealed by the source app)");
+                            std::thread::sleep(self.poll_interval);
+                            continue;
+                        }
 
                         let (source_app, source_title) = Self::get_frontmost_context();
 
@@ -170,6 +207,7 @@ impl ClipWatcher {
                             log::info!("🔒 Sensitive clip not stored ({})", kinds);
                             let _ = sender.send(ClipEvent::SensitiveClip {
                                 kinds,
+                                secret: text.clone(),
                                 stored: false,
                             });
                             std::thread::sleep(self.poll_interval);
@@ -182,6 +220,13 @@ impl ClipWatcher {
                         let heuristic_password = privacy_config.enabled
                             && privacy_config.offer_vault_on_secret
                             && looks_like_password(&text);
+                        // Taken before `text` is moved into the entry below, so
+                        // the vault offer can carry the exact secret it is about.
+                        let secret_for_vault = if heuristic_password {
+                            Some(text.clone())
+                        } else {
+                            None
+                        };
 
                         // Look up which slot this content is in (if any).
                         let slot = slot_manager.as_ref().and_then(|mgr| mgr.find_slot(&text));
@@ -201,10 +246,11 @@ impl ClipWatcher {
                             break;
                         }
 
-                        if heuristic_password {
+                        if let Some(secret) = secret_for_vault {
                             log::info!("🔐 Clip looks like a password — offering to vault it");
                             let _ = sender.send(ClipEvent::SensitiveClip {
                                 kinds: "possible password".to_string(),
+                                secret,
                                 stored: true,
                             });
                         }
@@ -226,6 +272,62 @@ impl ClipWatcher {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         format!("{:x}", hasher.finalize())
+    }
+
+    /// Read copied files off the clipboard and emit `NewFiles` if they're new.
+    ///
+    /// Returns whether the clipboard is holding files at all — the caller uses
+    /// that to skip the text and image paths, which would otherwise record the
+    /// filename Finder helpfully leaves alongside the URLs.
+    fn poll_files(
+        last_files_hash: &mut String,
+        privacy_config: &PrivacyConfig,
+        sender: &mpsc::SyncSender<ClipEvent>,
+    ) -> bool {
+        let paths = crate::pasteboard::read_file_urls();
+        if paths.is_empty() {
+            // Forget the last selection so re-copying those same files after
+            // copying something else registers as a new clip.
+            last_files_hash.clear();
+            return false;
+        }
+
+        let joined = paths
+            .iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hash = Self::hash_content(&joined);
+        if hash == *last_files_hash {
+            return true; // same selection still sitting on the clipboard
+        }
+        *last_files_hash = hash;
+
+        let (source_app, source_title) = Self::get_frontmost_context();
+
+        // Pasting a file clip puts those files back on the clipboard; without
+        // this, clipd would re-file its own paste as a fresh copy.
+        if is_own_ui(source_app.as_deref()) {
+            log::debug!("Skipping file clip copied from clipd itself");
+            return true;
+        }
+
+        if privacy_config.enabled {
+            if let Some(app) = source_app.as_deref() {
+                if is_excluded_app(app, privacy_config) {
+                    log::info!("🔒 File clip skipped (excluded app: {})", app);
+                    return true;
+                }
+            }
+        }
+
+        log::debug!("New file clip: {} file(s)", paths.len());
+        let _ = sender.send(ClipEvent::NewFiles {
+            paths,
+            source_app,
+            source_title,
+        });
+        true
     }
 
     /// Read an image off the clipboard and emit `NewImage` if it's new. Called

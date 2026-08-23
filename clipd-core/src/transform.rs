@@ -179,6 +179,49 @@ impl Default for SlotInputMode {
     }
 }
 
+/// GUI layout mode: palette window or Dynamic Notch Island.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GuiLayout {
+    /// Traditional floating palette window (default).
+    Palette,
+    /// Dynamic Notch Island — sits at the MacBook notch, expands on hover,
+    /// can show clipboard + extensible widgets.
+    Notch,
+}
+
+impl Default for GuiLayout {
+    fn default() -> Self {
+        Self::Palette
+    }
+}
+
+impl GuiLayout {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Palette => "Palette",
+            Self::Notch => "Notch Island",
+        }
+    }
+
+    /// One line of explanation, for the settings cards.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Palette => {
+                "The floating card you summon with the hotkey, plus the menu-bar HUD."
+            }
+            Self::Notch => {
+                "A slab at the top of the display that hugs the notch and holds modules."
+            }
+        }
+    }
+
+    pub const ALL: [GuiLayout; 2] = [Self::Palette, Self::Notch];
+}
+
+fn default_gui_layout() -> GuiLayout {
+    GuiLayout::Palette
+}
+
 /// Global shortcut that opens the memory palette. A small preset list for now
 /// (a free-form custom binding can come later).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +232,13 @@ pub enum PaletteTrigger {
     CtrlOptSpace,
     /// Option+Space — two keys, but normally inserts a non-breaking space.
     OptSpace,
+    /// Not bound — the palette has no shortcut and the keys stay yours.
+    ///
+    /// This lives in the trigger list rather than behind its own toggle. A
+    /// separate "Enable memory palette" switch sat directly under this dropdown
+    /// carrying the identical description, and one control that both picks a
+    /// chord and includes "none" says the same thing without the duplication.
+    Off,
 }
 
 impl Default for PaletteTrigger {
@@ -203,12 +253,16 @@ impl PaletteTrigger {
             Self::CmdShiftV => "Cmd+Shift+V",
             Self::CtrlOptSpace => "Ctrl+Option+Space",
             Self::OptSpace => "Option+Space",
+            Self::Off => "Off",
         }
     }
 }
 
-/// Global hotkey that opens the clipd window. All options use the `G` key with
-/// different modifiers so they never collide with the letter-slot chords.
+/// Global hotkey that opens the clipd window.
+///
+/// The `G` options never collide with the letter-slot chords, which all use
+/// letters. `CtrlSpace` is the one non-letter binding — Space is not a slot key,
+/// so it is equally safe from clipd's side, though the OS may claim it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpenGuiHotkey {
     CtrlG,
@@ -216,6 +270,13 @@ pub enum OpenGuiHotkey {
     AltG,
     CmdShiftG,
     CtrlShiftG,
+    /// Spotlight-style summon. Note macOS ships Ctrl+Space as "select the
+    /// previous input source", which wins unless that shortcut is freed.
+    CtrlSpace,
+    /// Option+Space — two keys, the same shape as the memory palette's own
+    /// default. Note it normally inserts a non-breaking space, and that only
+    /// one of these two features can hold it at a time.
+    OptSpace,
     Disabled,
 }
 
@@ -245,16 +306,86 @@ impl OpenGuiHotkey {
                 }
             }
             Self::CtrlShiftG => "Ctrl+Shift+G",
+            Self::CtrlSpace => "Ctrl+Space",
+            Self::OptSpace => "Option+Space",
             Self::Disabled => "Disabled",
         }
     }
 
-    pub const ALL: [OpenGuiHotkey; 5] = [
+    /// Whether the chord's non-modifier key is Space rather than `G`.
+    ///
+    /// Lets the hotkey listeners pick the right key without matching on every
+    /// variant, and without clipd-core depending on a keyboard crate.
+    pub fn uses_space_key(&self) -> bool {
+        matches!(self, Self::CtrlSpace | Self::OptSpace)
+    }
+
+    /// A caveat to show next to this choice, when there is one.
+    pub fn warning(&self) -> Option<&'static str> {
+        match self {
+            Self::OptSpace => Some(
+                "Also the memory palette's default — set that to Off, or they compete for the same keys.",
+            ),
+            Self::CtrlSpace if cfg!(target_os = "macos") => Some(
+                "macOS uses Ctrl+Space to switch input sources. If clipd doesn't open, \
+                 clear it under System Settings ▸ Keyboard ▸ Keyboard Shortcuts ▸ Input Sources.",
+            ),
+            _ => None,
+        }
+    }
+
+    pub const ALL: [OpenGuiHotkey; 7] = [
         Self::CtrlG,
         Self::AltG,
         Self::CmdShiftG,
         Self::CtrlShiftG,
+        Self::CtrlSpace,
+        Self::OptSpace,
         Self::Disabled,
+    ];
+}
+
+/// What clipd does when the user presses Ctrl+Space.
+///
+/// Three non-clashing options are offered so the user can tune their workflow
+/// without creating conflicts with each other or macOS defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CtrlSpaceAction {
+    /// Open the clipd GUI — the main searchable clipboard history window.
+    OpenGui,
+    /// Show the slot-memory HUD — a compact panel listing recent slots.
+    SlotMemory,
+    /// Show the command palette — pick a custom action to run on the current clipboard.
+    CommandPalette,
+}
+
+impl Default for CtrlSpaceAction {
+    fn default() -> Self {
+        Self::OpenGui
+    }
+}
+
+impl CtrlSpaceAction {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OpenGui => "Open clipd GUI",
+            Self::SlotMemory => "Slot Memory",
+            Self::CommandPalette => "Command Palette",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::OpenGui => "Open the main searchable clipboard window",
+            Self::SlotMemory => "Show recent slots — quick access to copied items",
+            Self::CommandPalette => "Run a custom shell command on the clipboard",
+        }
+    }
+
+    pub const ALL: [CtrlSpaceAction; 3] = [
+        Self::OpenGui,
+        Self::SlotMemory,
+        Self::CommandPalette,
     ];
 }
 
@@ -277,6 +408,22 @@ pub struct PasteTransformSettings {
 
     #[serde(default = "default_true_val")]
     pub hud_enabled: bool,
+
+    /// Open the clipboard popover when the pointer merely rests on the tray
+    /// icon. Fast when you want it, intrusive when you were reaching for the
+    /// menu — hence a switch rather than a fixed behaviour.
+    #[serde(default = "default_true_val")]
+    pub hover_opens_hud: bool,
+
+    /// Show the running clip count in the popover. Some people read it as
+    /// useful state, others as noise on a panel meant to be glanced at.
+    #[serde(default = "default_true_val")]
+    pub show_clip_count: bool,
+
+    /// GUI layout mode: "palette" (default window) or "notch" (Dynamic Notch
+    /// Island at the MacBook notch, like iPhone Dynamic Island).
+    #[serde(default = "default_gui_layout")]
+    pub gui_layout: GuiLayout,
 
     /// After multi-tap copy (Cmd+C × N), restore clipboard to slot 1's content.
     /// When false, the clipboard keeps the original copied content after multi-tap.
@@ -348,6 +495,10 @@ pub struct PasteTransformSettings {
     #[serde(default)]
     pub open_gui_hotkey: OpenGuiHotkey,
 
+    /// What Ctrl+Space does: open GUI, slot memory, or command palette.
+    #[serde(default)]
+    pub ctrl_space_action: CtrlSpaceAction,
+
     /// After copying a clip from the GUI, return focus to the app you were in
     /// (the one focused when you summoned clipd), so you can paste right away.
     #[serde(default = "default_true_val")]
@@ -370,6 +521,9 @@ impl Default for PasteTransformSettings {
             default_ai_prompt: String::new(),
             onboarding_seen: false,
             hud_enabled: true,
+            hover_opens_hud: true,
+            show_clip_count: true,
+            gui_layout: GuiLayout::Palette,
             copy_multi_tap_restore: true,
             letter_slots_enabled: true,
             slot_input_mode: SlotInputMode::default(),
@@ -385,6 +539,7 @@ impl Default for PasteTransformSettings {
             copy_on_select: true,
             warn_conflicting_shortcuts: true,
             open_gui_hotkey: OpenGuiHotkey::default(),
+            ctrl_space_action: CtrlSpaceAction::default(),
             return_focus_after_copy: true,
         }
     }
@@ -475,21 +630,215 @@ fn config_path() -> PathBuf {
         .join("transform.json")
 }
 
+/// Check that an API key and endpoint actually work, returning the model name
+/// the server reports back.
+///
+/// Exists so the UI can tell "no key configured" apart from "key is wrong" or
+/// "endpoint unreachable" — three failures that otherwise look identical to a
+/// user, since Ask degrades to retrieval-only in every case.
+pub fn probe_api(config: &TransformConfig) -> Result<String, String> {
+    let api_key = config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+    if api_key.is_none() && !is_local_endpoint(&config.api_url) {
+        return Err("No API key set.".into());
+    }
+
+    let mut request = ureq::post(&config.api_url).set("Content-Type", "application/json");
+    if let Some(key) = api_key {
+        request = request.set("Authorization", &format!("Bearer {key}"));
+    }
+    let response = request.send_json(serde_json::json!({
+        "model": config.model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+    }));
+
+    match response {
+        Ok(resp) => {
+            let body: serde_json::Value = resp
+                .into_json()
+                .map_err(|e| format!("The endpoint replied with something unreadable: {e}"))?;
+            if let Some(err) = body["error"]["message"].as_str() {
+                return Err(format!("The provider rejected it: {err}"));
+            }
+            Ok(body["model"].as_str().unwrap_or(&config.model).to_string())
+        }
+        Err(e) => Err(explain_api_error(e, config)),
+    }
+}
+
+/// Turn a `ureq` failure into something a user can act on.
+///
+/// The raw error is plumbing — `status code 401` doesn't tell anyone that their
+/// key is wrong, and a bare connection error doesn't hint that a local LLM
+/// server isn't running. Both Ask and the settings connection test route through
+/// here so the same failure reads the same way everywhere.
+pub(crate) fn explain_api_error(err: ureq::Error, config: &TransformConfig) -> String {
+    match err {
+        // A 4xx/5xx body usually carries the provider's own explanation, which
+        // beats the status code alone (bad key vs unknown model vs no quota).
+        ureq::Error::Status(code, resp) => {
+            let detail = resp
+                .into_json::<serde_json::Value>()
+                .ok()
+                .and_then(|b| b["error"]["message"].as_str().map(str::to_string));
+            match (code, detail) {
+                (_, Some(msg)) => format!("The provider rejected this ({code}): {msg}"),
+                (401 | 403, None) => format!(
+                    "The API key was refused ({code}). Check it is correct and still active."
+                ),
+                (404, None) => format!(
+                    "Not found (404) — check the endpoint URL and that the model “{}” exists.",
+                    config.model
+                ),
+                (429, None) => {
+                    "Rate limited or out of quota (429). Check your provider's billing.".into()
+                }
+                (500..=599, None) => {
+                    format!("The provider is having trouble (HTTP {code}). Try again shortly.")
+                }
+                _ => format!("The provider returned HTTP {code}."),
+            }
+        }
+        ureq::Error::Transport(t) => format!(
+            "Couldn't reach {} — {}. If this is a local model, check the server is running.",
+            config.api_url, t
+        ),
+    }
+}
+
+/// The host part of a URL, with scheme, userinfo, port, and path removed.
+///
+/// Hand-rolled rather than pulling in a URL parser, so it is deliberately strict
+/// about the two ways a hostile URL can look local when it isn't:
+/// `http://localhost@example.com/` (userinfo) and `http://example.com/?localhost`
+/// (query string).
+fn url_host(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    // Authority ends at the first '/', '?' or '#'.
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|a| !a.is_empty())?;
+    // Anything before the last '@' is credentials, not the host.
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        // Bracketed IPv6 literal, e.g. [::1]:11434.
+        rest.split_once(']').map(|(h, _)| h)?
+    } else {
+        host_port.split(':').next()?
+    };
+
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Whether this endpoint lives on the machine clipd is running on.
+///
+/// Local model servers (Ollama, LM Studio, llama.cpp) accept requests with no
+/// credentials, so a keyless config is legitimate for them — but only for them.
+/// Treating a remote host as keyless would mean silently sending clipboard
+/// contents off the machine unauthenticated, so this errs towards `false`.
+pub fn is_local_endpoint(url: &str) -> bool {
+    let Some(host) = url_host(url) else {
+        return false;
+    };
+    if host == "localhost" || host.ends_with(".localhost") || host == "::1" {
+        return true;
+    }
+    // Any 127.0.0.0/8 address, and the unspecified addresses.
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_unspecified(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback() || v6.is_unspecified(),
+        Err(_) => false,
+    }
+}
+
+/// Where the AI config actually lives on this machine.
+///
+/// Exposed so the UI can show the real path instead of a hardcoded guess — the
+/// location differs per platform (`~/Library/Application Support` on macOS,
+/// `~/.local/share` on Linux, `%LOCALAPPDATA%` on Windows), and naming the wrong
+/// one sends users to edit a file clipd will never read.
+pub fn transform_config_path() -> PathBuf {
+    config_path()
+}
+
 pub fn load_transform_config() -> TransformConfig {
-    std::fs::read_to_string(config_path())
+    let mut config: TransformConfig = std::fs::read_to_string(config_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    // If the key is in the legacy plaintext field, migrate it to the Keychain
+    // and clear the file copy. Future loads read from the Keychain only.
+    if let Some(key) = config.api_key.take() {
+        let trimmed = key.trim().to_string();
+        if !trimmed.is_empty() {
+            let _ = save_ai_key_to_keychain(&trimmed);
+            // Overwrite the file without the key.
+            config.api_key = None;
+            save_transform_config(&config);
+        }
+    }
+
+    // Load the key from the Keychain.
+    config.api_key = load_ai_key_from_keychain();
+    config
 }
 
 pub fn save_transform_config(config: &TransformConfig) {
+    // The API key is stored in the Keychain, not in the file.
+    // Save the key to the Keychain, then write the rest to disk without it.
+    if let Some(key) = &config.api_key {
+        let trimmed = key.trim().to_string();
+        if !trimmed.is_empty() {
+            let _ = save_ai_key_to_keychain(&trimmed);
+        }
+    }
+    let file_config = TransformConfig {
+        api_key: None,
+        api_url: config.api_url.clone(),
+        model: config.model.clone(),
+    };
     let path = config_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(json) = serde_json::to_string_pretty(config) {
+    if let Ok(json) = serde_json::to_string_pretty(&file_config) {
         let _ = std::fs::write(path, json);
     }
+}
+
+/// Keychain service name for clipd's own AI API key.
+const AI_KEY_SERVICE: &str = "clipd-ai-key";
+const AI_KEY_ACCOUNT: &str = "default";
+
+#[cfg(target_os = "macos")]
+fn save_ai_key_to_keychain(key: &str) -> Result<(), String> {
+    use crate::vault::keychain::{delete_by_service_account, store};
+    // Delete any existing entry first (upsert).
+    let _ = delete_by_service_account(AI_KEY_SERVICE, AI_KEY_ACCOUNT);
+    store(AI_KEY_SERVICE, AI_KEY_ACCOUNT, key, "clipd AI API key")
+}
+
+#[cfg(target_os = "macos")]
+fn load_ai_key_from_keychain() -> Option<String> {
+    use crate::vault::keychain::load;
+    load(AI_KEY_SERVICE, AI_KEY_ACCOUNT).ok().flatten()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn save_ai_key_to_keychain(_key: &str) -> Result<(), String> {
+    Ok(()) // No keychain on this platform; key stays in config file.
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_ai_key_from_keychain() -> Option<String> {
+    None
 }
 
 // ── Apply Transform ──
@@ -1045,7 +1394,57 @@ fn ai_transform(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_palette_trigger_carries_its_own_off_switch() {
+        // There used to be an "Enable memory palette" toggle sitting directly
+        // under this dropdown with the identical description, so the same
+        // decision was expressed twice. One control that picks a chord *or*
+        // none says it once.
+        assert_eq!(PaletteTrigger::Off.label(), "Off");
+        // The default still binds something — the palette works without anyone
+        // visiting settings.
+        assert_ne!(PaletteTrigger::default(), PaletteTrigger::Off);
+        assert!(PasteTransformSettings::default().palette_enabled);
+    }
+
     use super::*;
+
+    #[test]
+    fn loopback_endpoints_count_as_local() {
+        for url in [
+            "http://localhost:11434/v1/chat/completions",
+            "http://127.0.0.1:1234/v1/chat/completions",
+            "http://127.7.7.7:8080/v1",
+            "https://LOCALHOST:8080/v1",
+            "http://[::1]:11434/v1/chat/completions",
+            "http://0.0.0.0:8080/v1",
+            "http://ollama.localhost/v1",
+        ] {
+            assert!(is_local_endpoint(url), "should be local: {url}");
+        }
+    }
+
+    #[test]
+    fn remote_endpoints_are_never_treated_as_local() {
+        for url in [
+            "https://api.openai.com/v1/chat/completions",
+            "https://api.anthropic.com/v1/messages",
+            // Userinfo that merely looks like loopback.
+            "http://localhost@example.com/v1",
+            "http://127.0.0.1@evil.example/v1",
+            // Loopback only in the path or query.
+            "https://example.com/localhost/v1",
+            "https://example.com/v1?host=127.0.0.1",
+            "https://example.com/v1#localhost",
+            // Hostnames that merely start or end with a local-looking label.
+            "https://localhost.example.com/v1",
+            "https://notlocalhost/v1",
+            "https://127.0.0.1.example.com/v1",
+            "",
+        ] {
+            assert!(!is_local_endpoint(url), "should NOT be local: {url}");
+        }
+    }
 
     #[test]
     fn test_pretty_json() {

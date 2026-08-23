@@ -51,38 +51,8 @@ if [[ -f target/release/clipd-ocr ]]; then
   chmod +x "$MACOS/clipd-ocr"
 fi
 
-# Sign helpers so macOS allows the daemon to spawn clipd-hud, and — critically —
-# so the Input Monitoring / Accessibility grants persist across updates.
-#
-# Set CLIPD_SIGN_ID to a stable code-signing identity (e.g. a self-signed
-# "clipd-codesign" cert created in Keychain Access, or a Developer ID) so the
-# app keeps the SAME code signature across rebuilds. macOS keys TCC grants to
-# that identity, so users grant Input Monitoring once and it sticks.
-#
-# Without it we fall back to ad-hoc ("-"), whose signature hash changes every
-# build — that makes macOS treat each build as a new app and silently drops the
-# previously-granted Input Monitoring permission (multi-slot copy / HUD break).
-SIGN_ID="${CLIPD_SIGN_ID:--}"
-if [[ "$SIGN_ID" == "-" ]]; then
-  echo "==> codesign (ad-hoc — grants will NOT persist across updates; set CLIPD_SIGN_ID to fix)"
-else
-  echo "==> codesign (identity: ${SIGN_ID} — TCC grants persist across updates)"
-fi
-if command -v codesign &>/dev/null; then
-  for bin in clipd clipd-gui clipd-ui clipd-hud clipd-ocr; do
-    [[ -f "$MACOS/$bin" ]] || continue
-    codesign --force --sign "$SIGN_ID" "$MACOS/$bin" 2>/dev/null || true
-  done
-  codesign --force --deep --sign "$SIGN_ID" "$APP" 2>/dev/null || true
-else
-  echo "    (skip: codesign not found)"
-fi
-
-# Strip quarantine so Finder-launched copies do not block helper binaries (clipd-hud) as harshly.
-if command -v xattr &>/dev/null; then
-  xattr -cr "$APP" 2>/dev/null || true
-fi
-
+# Info.plist MUST be written before codesign — writing it after invalidates
+# the sealed signature and launchd fails with POSIX 163.
 # Menu bar + daemon + main window: clipd-ui is the entry (spawns daemon, opens clipd-gui).
 # Dock / Finder use CFBundleExecutable; must match filename in MacOS/
 EXEC_NAME="clipd-ui"
@@ -118,14 +88,101 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <!-- AppleScript — used to open TUI in Terminal / Warp when Developer mode is on -->
   <key>NSAppleEventsUsageDescription</key>
   <string>Clipd uses AppleScript to open a terminal window for the developer TUI mode.</string>
-  <!-- Run as a regular app (not just menu bar agent) so macOS prompts for permissions -->
+  <!-- Local Network — required on macOS 15+ to find your other machines over
+       Bonjour and send clips straight to them. Without NSBonjourServices the
+       browse returns nothing at all, silently: no error, no peers, ever. Every
+       service type clipd browses for MUST be listed below or it is invisible. -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Clipd finds your other computers on this network so you can send clips, links and files straight to them. Nothing leaves your local network.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <!-- Everyday discovery: which of your machines are on this network. -->
+    <string>_clipd._tcp</string>
+    <!-- Only advertised while `clipd pair` is running. -->
+    <string>_clipd-pair._tcp</string>
+  </array>
+  <!-- Menu-bar agent: no Dock icon. Status item stays owned by clipd-ui when
+       other apps (e.g. Sublime) become frontmost. TCC prompts still work. -->
   <key>LSUIElement</key>
-  <false/>
+  <true/>
   <key>LSBackgroundOnly</key>
   <false/>
 </dict>
 </plist>
 PLIST
+
+
+# Sign helpers so macOS allows the daemon to spawn clipd-hud, and — critically —
+# so the Input Monitoring / Accessibility grants persist across updates.
+#
+# Set CLIPD_SIGN_ID to a stable code-signing identity (e.g. a self-signed
+# "clipd-codesign" cert created in Keychain Access, or a Developer ID) so the
+# app keeps the SAME code signature across rebuilds. macOS keys TCC grants to
+# that identity, so users grant Input Monitoring once and it sticks.
+#
+# Without it we fall back to ad-hoc ("-"), whose signature hash changes every
+# build — that makes macOS treat each build as a new app and silently drops the
+# previously-granted Input Monitoring permission (multi-slot copy / HUD break).
+#
+# Since that failure is silent and costs an afternoon to diagnose, an identity in
+# the login keychain is used automatically. Set CLIPD_SIGN_ID="-" to force ad-hoc.
+pick_signing_identity() {
+  local list
+  list="$(security find-identity -v -p codesigning 2>/dev/null)" || return 0
+  local preference
+  # Developer ID first (also valid for distribution), then a dev cert, then any.
+  for preference in 'Developer ID Application' 'Apple Development' ''; do
+    local found
+    found="$(printf '%s\n' "$list" \
+      | grep -F "\"${preference}" \
+      | head -1 \
+      | sed -E 's/^[^"]*"(.*)".*$/\1/')"
+    if [[ -n "$found" ]]; then
+      printf '%s' "$found"
+      return 0
+    fi
+  done
+}
+
+if [[ -n "${CLIPD_SIGN_ID+isset}" ]]; then
+  SIGN_ID="$CLIPD_SIGN_ID"          # explicit wins, including "-" for ad-hoc
+else
+  SIGN_ID="$(pick_signing_identity)"
+  SIGN_ID="${SIGN_ID:--}"
+fi
+
+if [[ "$SIGN_ID" == "-" ]]; then
+  echo "==> codesign (ad-hoc — TCC grants will NOT persist across rebuilds:"
+  echo "    macOS will silently drop Input Monitoring on the next build.)"
+  if [[ -z "${CLIPD_SIGN_ID+isset}" ]]; then
+    echo "    No signing identity found. Create a self-signed cert in Keychain"
+    echo "    Access named clipd-codesign, or set CLIPD_SIGN_ID."
+  fi
+else
+  echo "==> codesign (identity: ${SIGN_ID} — TCC grants persist across rebuilds)"
+fi
+if command -v codesign &>/dev/null; then
+  for bin in clipd clipd-gui clipd-ui clipd-hud clipd-ocr; do
+    [[ -f "$MACOS/$bin" ]] || continue
+    if ! codesign --force --sign "$SIGN_ID" "$MACOS/$bin"; then
+      echo "ERROR: codesign failed for $MACOS/$bin using '$SIGN_ID'" >&2
+      echo "       The app was not packaged because a changing ad-hoc signature" >&2
+      echo "       would silently break Input Monitoring and slot HUD feedback." >&2
+      exit 1
+    fi
+  done
+  if ! codesign --force --deep --sign "$SIGN_ID" "$APP"; then
+    echo "ERROR: codesign failed for $APP using '$SIGN_ID'" >&2
+    exit 1
+  fi
+else
+  echo "    (skip: codesign not found)"
+fi
+
+# Strip quarantine so Finder-launched copies do not block helper binaries (clipd-hud) as harshly.
+if command -v xattr &>/dev/null; then
+  xattr -cr "$APP" 2>/dev/null || true
+fi
 
 echo ""
 echo "Built: $APP"

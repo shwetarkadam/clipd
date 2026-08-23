@@ -1,13 +1,16 @@
 use arboard::Clipboard;
 use clipd_core::{
-    apply_transform, find_rules_for_app, generate_embedding, is_embedding_available,
+    apply_transform, find_rules_for_app, generate_embedding, is_embedding_available, load_actions,
     load_paste_rules, load_paste_transform_settings, load_transform_config, release_daemon_lock,
-    save_rgba_image, suggest_smart_transform, try_acquire_daemon_lock, ClipEntry, ClipEvent,
-    ClipStore, ClipWatcher, OpenGuiHotkey, PasteRulesConfig, PasteTransformSettings, SlotManager,
-    TransformConfig, TransformKind, MAX_CLIP_SLOT,
+    run_action, save_files, save_hotkey_status, save_rgba_image, suggest_smart_transform,
+    try_acquire_daemon_lock, ActionOutput, ClipEntry, ClipEvent, ClipStore, ClipWatcher,
+    CtrlSpaceAction, CustomAction, HotkeyStatus, OpenGuiHotkey, PaletteTrigger, PasteRulesConfig,
+    PasteTransformSettings, SlotManager, TransformConfig, TransformKind, MAX_CLIP_SLOT,
 };
 #[cfg(target_os = "macos")]
-use clipd_core::{available_targets, load_privacy_config, save_secret, SecretEntry};
+use clipd_core::{
+    available_targets, load_privacy_config, save_secret, SecretEntry, VaultTarget,
+};
 #[cfg(not(target_os = "macos"))]
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 #[cfg(not(target_os = "macos"))]
@@ -23,21 +26,81 @@ use rdev::{grab, Event, EventType, Key as RKey};
 use std::collections::HashSet;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "windows")]
 use std::sync::Mutex;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+/// In-process hosts (clipd-ui) can fire Settings shortcuts without the
+/// CGEventTap — Carbon `RegisterEventHotKey` is enough for discrete chords.
+static EXTERNAL_TICK_TX: Mutex<Option<mpsc::Sender<HotkeyTick>>> = Mutex::new(None);
+
+/// Shortcut requests from the tray host's Carbon hotkey registrations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutRequest {
+    OpenGui,
+    SlotMemory,
+    CommandPalette,
+    SlotPicker,
+    /// Send the clipboard to the other Mac — the menu-bar and GUI entry point
+    /// to the same action Ctrl+Shift+S triggers.
+    Send,
+}
+
+/// Ask the running in-process daemon to perform a Settings shortcut action.
+pub fn request_shortcut(req: ShortcutRequest) -> bool {
+    let tick = match req {
+        ShortcutRequest::OpenGui => HotkeyTick::OpenGui,
+        ShortcutRequest::SlotMemory => HotkeyTick::SlotMemoryHud,
+        ShortcutRequest::CommandPalette => HotkeyTick::CommandPalette,
+        ShortcutRequest::SlotPicker => HotkeyTick::SlotPicker,
+        ShortcutRequest::Send => HotkeyTick::SendToDevice,
+    };
+    EXTERNAL_TICK_TX
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().cloned())
+        .is_some_and(|tx| tx.send(tick).is_ok())
+}
+
+fn install_external_tick_tx(tx: mpsc::Sender<HotkeyTick>) {
+    if let Ok(mut guard) = EXTERNAL_TICK_TX.lock() {
+        *guard = Some(tx);
+    }
+}
+
+fn clear_external_tick_tx() {
+    if let Ok(mut guard) = EXTERNAL_TICK_TX.lock() {
+        *guard = None;
+    }
+}
+
 /// How long to wait after the last tap before deciding the final slot.
-const TAP_WINDOW: Duration = Duration::from_millis(350);
+///
+/// This is the gap allowed *between* taps, not just the trailing wait — the
+/// count commits and resets the moment it lapses. At 350ms, reaching slot 15
+/// meant landing five taps in a drum roll; anyone counting deliberately got
+/// five separate commits, all to slot 11. The higher banks are the ones people
+/// count into, and counting is not something to be hurried.
+///
+/// The cost is that the slot commits this long after your last tap, which is a
+/// background save nobody is waiting on.
+const TAP_WINDOW: Duration = Duration::from_millis(650);
 /// How long Option+C / Option+V waits for a following A-Z letter slot.
 const LETTER_PREFIX_WINDOW: Duration = Duration::from_millis(900);
 /// Max gap between two Cmd+C presses to count as a double-tap (quick letter save).
 const QUICK_DOUBLE_WINDOW: Duration = Duration::from_millis(400);
-/// After a double Cmd+C, how long the numeric slot commit waits for a letter
-/// (which cancels it) before saving to the numeric slot. Keeps the letter and
-/// numeric paths from clashing.
-const QUICK_LETTER_GRACE: Duration = Duration::from_millis(500);
+/// How long after a double Cmd+C a letter still means "and put it in that slot
+/// too".
+///
+/// This used to be half a second, and it was half a second because the numeric
+/// commit was *held* for exactly that long so a following letter could cancel
+/// it. That made it a race: press the letter in time and you got slot A, miss
+/// and you got slot 2, and you had to know the rule to understand which.
+///
+/// The letter no longer cancels anything — the content lands in the numeric
+/// slot immediately and in the letter slot as well. Nothing is waiting on you,
+/// so the window can be long enough that nobody has to hurry.
+const QUICK_LETTER_GRACE: Duration = Duration::from_millis(2000);
 /// Ignore duplicate key events faster than this (macOS key-repeat / missing KeyRelease on C/V).
 const TAP_DEBOUNCE: Duration = Duration::from_millis(65);
 
@@ -125,6 +188,26 @@ pub fn run_daemon_with_stop(
             );
         })?;
 
+    // ── Sync Inbox Thread ──
+    // Announce this Mac in the shared iCloud folder and collect anything other
+    // Macs have sent it. Polling rather than FSEvents: iCloud materialises
+    // downloaded files in ways that do not always produce a filesystem event,
+    // and a stat of one small directory every few seconds costs nothing.
+    let inbox_db_path = db_path.clone();
+    let inbox_stop = stop.clone();
+    let _inbox_handle = std::thread::Builder::new()
+        .name("clipd-sync-inbox".into())
+        .spawn(move || run_sync_inbox(&inbox_db_path, inbox_stop))?;
+
+    // ── LAN Transport ──
+    // Direct machine-to-machine sending. Independent of the folder transport
+    // above: either can be unavailable without disabling the other.
+    let lan_db_path = db_path.clone();
+    let lan_stop = stop.clone();
+    let _lan_handle = std::thread::Builder::new()
+        .name("clipd-lan".into())
+        .spawn(move || run_lan_transport(&lan_db_path, lan_stop))?;
+
     // ── Store Writer Thread ──
     let slot_writer = slot_manager.clone();
     let store_handle = std::thread::Builder::new()
@@ -190,6 +273,12 @@ pub fn run_daemon_with_stop(
                                     truncate(&entry.preview, 60)
                                 );
                                 run_auto_actions(&entry);
+                                // Spawn enrichment (link preview, translation, tagging).
+                                clipd_core::spawn_enrichment(
+                                    id,
+                                    entry.content.clone(),
+                                    entry.content_type,
+                                );
                                 if embed_available {
                                     match generate_embedding(&content_for_embed, &embed_config) {
                                         Ok(emb) => {
@@ -210,12 +299,16 @@ pub fn run_daemon_with_stop(
                             Err(e) => log::error!("Failed to save clip: {}", e),
                         }
                     }
-                    ClipEvent::SensitiveClip { kinds, stored } => {
+                    ClipEvent::SensitiveClip {
+                        kinds,
+                        secret,
+                        stored,
+                    } => {
                         log::info!("🔐 Password detected ({}) — offering vault save", kinds);
                         #[cfg(target_os = "macos")]
-                        offer_vault_save(&kinds, stored);
+                        offer_vault_save(&kinds, secret, stored);
                         #[cfg(not(target_os = "macos"))]
-                        let _ = stored;
+                        let _ = (secret, stored);
                     }
                     ClipEvent::NewImage {
                         width,
@@ -252,18 +345,58 @@ pub fn run_daemon_with_stop(
                             saved.height,
                         );
                         match store.insert(&entry) {
-                            Ok(id) => log::info!(
-                                "Saved image clip #{} ({}×{}){}",
-                                id,
-                                saved.width,
-                                saved.height,
-                                match &ocr_text {
-                                    Some(t) if !t.trim().is_empty() =>
-                                        format!(" · OCR {} chars", t.len()),
-                                    _ => String::new(),
-                                }
-                            ),
+                            Ok(id) => {
+                                log::info!(
+                                    "Saved image clip #{} ({}×{}){}",
+                                    id,
+                                    saved.width,
+                                    saved.height,
+                                    match &ocr_text {
+                                        Some(t) if !t.trim().is_empty() =>
+                                            format!(" · OCR {} chars", t.len()),
+                                        _ => String::new(),
+                                    }
+                                );
+                                // Spawn enrichment for image (tagging, etc.).
+                                clipd_core::spawn_enrichment(
+                                    id,
+                                    ocr_text.clone().unwrap_or_default(),
+                                    clipd_core::ContentType::Image,
+                                );
+                            }
                             Err(e) => log::error!("Failed to save image clip: {}", e),
+                        }
+                    }
+                    ClipEvent::NewFiles {
+                        paths,
+                        mut source_app,
+                        source_title,
+                    } => {
+                        // Files persist under the same gate as text and images.
+                        if !load_paste_transform_settings().remember_clipboard {
+                            continue;
+                        }
+                        #[cfg(target_os = "macos")]
+                        if source_app.is_none() {
+                            source_app = get_frontmost_app_name();
+                        }
+                        // Copy the bytes into the blob store. Done here rather
+                        // than in the watcher so a large selection cannot stall
+                        // clipboard polling.
+                        let files = save_files(&paths);
+                        if files.is_empty() {
+                            log::warn!("File clip skipped — none of the files could be read");
+                            continue;
+                        }
+                        let mut entry = ClipEntry::new_files(files, source_app);
+                        entry.source_title = source_title;
+                        match store.insert(&entry) {
+                            Ok(id) => log::info!(
+                                "Saved file clip #{}: {}",
+                                id,
+                                truncate(&entry.preview, 60)
+                            ),
+                            Err(e) => log::error!("Failed to save file clip: {}", e),
                         }
                     }
                 }
@@ -358,10 +491,17 @@ pub fn run_daemon_with_stop(
             OpenGuiHotkey::AltG => Some(Modifiers::ALT),
             OpenGuiHotkey::CmdShiftG => Some(Modifiers::SUPER | Modifiers::SHIFT),
             OpenGuiHotkey::CtrlShiftG => Some(Modifiers::CONTROL | Modifiers::SHIFT),
+            OpenGuiHotkey::CtrlSpace => Some(Modifiers::CONTROL),
+            OpenGuiHotkey::OptSpace => Some(Modifiers::ALT),
             OpenGuiHotkey::Disabled => None,
         };
+        let gui_code = if gui_hotkey_setting.uses_space_key() {
+            Code::Space
+        } else {
+            Code::KeyG
+        };
         if let Some(mods) = gui_mods {
-            let gui_hk = HotKey::new(Some(mods), Code::KeyG);
+            let gui_hk = HotKey::new(Some(mods), gui_code);
             if let Err(e) = hotkey_manager.register(gui_hk) {
                 log::warn!(
                     "Failed to register {} (open GUI): {}",
@@ -413,15 +553,18 @@ pub fn run_daemon_with_stop(
     println!("     Multi-tap Cmd/Ctrl + C/V → slots 1..9 (after pause)");
     println!();
     println!("     Ctrl+Shift+V  → smart paste (transform clipboard + paste)");
-    println!("     Cmd+Option+V  → sequence paste (auto-increment through slots)");
+    println!("     Cmd+Option+Shift+V → sequence paste (auto-increment through slots)");
     println!("     Ctrl+Option+1..9 → paste slot directly");
     println!("     Ctrl+Shift+Option+1..9 → save clipboard to slot directly");
     println!(
         "     Excel/developer mode: Cmd+C/V taps → slots 1..9, Option+C/V taps → slots 11..30"
     );
-    println!("     Letter slots: Ctrl+Option+C then A..Z → copy slots 31..56");
-    println!("                   Ctrl+Option+V then A..Z → paste slots 31..56");
-    println!("                   Ctrl+Shift+Option+A..Z also copies directly");
+    println!("     Letter slots A..Z (31..56):");
+    println!("       Cmd+Option+C then a letter → copy to that letter slot");
+    println!("       Cmd+Option+V then a letter → paste that letter slot");
+    println!("       Ctrl+Option+A..Z          → paste, one chord");
+    println!("       Ctrl+Shift+Option+A..Z    → copy, one chord");
+    println!("       Ctrl+Option+C / V then a letter → the leader forms");
     println!("     Ctrl+Option+Space → show recent slot memory");
     println!();
     println!("     Collect mode (grab a batch, no slot picking):");
@@ -429,11 +572,10 @@ pub fn run_daemon_with_stop(
     println!("       then just Cmd+C each item → stacks into slots 1..9");
     println!("       Cmd+Shift+V    → pick one to paste from the visual list");
     println!();
-    if cfg!(target_os = "windows") {
-        println!("     Ctrl+T → open TUI        Alt+G → open GUI");
-    } else {
-        println!("     Ctrl+T → open TUI        Ctrl+G → open GUI");
-    }
+    println!(
+        "     Ctrl+T → open TUI        {} → open GUI",
+        load_paste_transform_settings().open_gui_hotkey.label()
+    );
     println!("     Ctrl+R → open search TUI");
     println!("     (action fires 0.35s after last tap)");
     println!();
@@ -445,26 +587,22 @@ pub fn run_daemon_with_stop(
     {
         println!("  🪄 Starting rdev hotkey listener...");
         let (hotkey_tx, hotkey_rx) = mpsc::channel::<HotkeyTick>();
+        // Tray host (clipd-ui) registers Carbon hotkeys for Settings chords and
+        // posts through this channel — works even while the CGEventTap retries.
+        install_external_tick_tx(hotkey_tx.clone());
         let stop_listener = stop.clone();
-        let stop_on_hotkey_error = stop.clone();
 
         std::thread::Builder::new()
             .name("clipd-hotkey-listener".into())
             .spawn(move || {
                 let fallback_tx = hotkey_tx.clone();
                 let fallback_stop = stop_listener.clone();
-                if let Err(e) = start_macos_hotkey_listener(hotkey_tx, stop_listener) {
-                    log::error!("Hotkey listener failed: {}", e);
-                    log::warn!(
-                        "Falling back to passive open-GUI hotkey listener; slot copy/paste interception still needs macOS Accessibility/Input Monitoring."
-                    );
-                    if let Err(fallback_err) =
-                        start_macos_open_gui_fallback_listener(fallback_tx, fallback_stop)
-                    {
-                        log::error!("Open-GUI fallback listener failed: {}", fallback_err);
-                        stop_on_hotkey_error.store(true, Ordering::Relaxed);
-                    }
-                }
+                run_macos_hotkey_listener_with_retry(
+                    hotkey_tx,
+                    stop_listener,
+                    fallback_tx,
+                    fallback_stop,
+                );
             })?;
 
         let hotkey_slot_mgr = slot_manager.clone();
@@ -521,17 +659,11 @@ pub fn run_daemon_with_stop(
                         }
                         last_cmd_c = now;
                         cmd_c_taps = (cmd_c_taps + 1).min(primary_tap_slot_limit(&paste_transform));
-                        // When quick letter save is on, a 2nd+ tap could be a
-                        // letter save — hold the numeric commit slightly longer
-                        // so a following letter can cancel it (no slot-2 clash).
-                        let quick_letters = paste_transform.letter_slots_enabled
-                            && paste_transform.quick_letter_slots_enabled;
-                        let window = if cmd_c_taps >= 2 && quick_letters {
-                            QUICK_LETTER_GRACE
-                        } else {
-                            TAP_WINDOW
-                        };
-                        cmd_c_deadline = Some(now + window);
+                        // The numeric slot commits on its own schedule now. It
+                        // used to stall for the letter window so a letter could
+                        // cancel it, which is what turned a convenience into
+                        // something you could get wrong.
+                        cmd_c_deadline = Some(now + TAP_WINDOW);
                         if cmd_c_taps >= 1 {
                             let slot = primary_slot_for_taps(cmd_c_taps, &paste_transform);
                             log::info!("⌨️  Cmd+C tap #{} → slot {}", cmd_c_taps, slot);
@@ -653,13 +785,11 @@ pub fn run_daemon_with_stop(
                     }
                     HotkeyTick::CopySelectionToSlot(slot) => {
                         if paste_transform.letter_slots_enabled {
-                            // A letter followed a double Cmd+C → cancel the pending
-                            // numeric slot commit so the content lands ONLY in the
-                            // letter slot, not also in slot 2.
-                            cmd_c_taps = 0;
-                            cmd_c_deadline = None;
-                            upper_c_taps = 0;
-                            upper_c_deadline = None;
+                            // Additive, not exclusive. The content is already on
+                            // its way to the numeric slot; this puts it in the
+                            // letter slot as well rather than racing to take it
+                            // back. Same content in two places is harmless — and
+                            // it means there is no deadline to miss.
                             simulate_copy();
                             execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
                         }
@@ -682,6 +812,13 @@ pub fn run_daemon_with_stop(
                     HotkeyTick::SlotMemoryHud => {
                         #[cfg(target_os = "macos")]
                         show_slot_memory_hud(&hotkey_slot_mgr);
+                    }
+                    HotkeyTick::CommandPalette => {
+                        #[cfg(target_os = "macos")]
+                        show_command_palette_hud();
+                    }
+                    HotkeyTick::SendToDevice => {
+                        send_clipboard_to_other_mac();
                     }
                     HotkeyTick::ToggleCollect => {
                         collecting = !collecting;
@@ -996,6 +1133,7 @@ pub fn run_daemon_with_stop(
 
     println!("\n  🛑 Shutting down clipd daemon...");
     stop.store(true, Ordering::Relaxed);
+    clear_external_tick_tx();
     watcher_handle.join().ok();
     store_handle.join().ok();
     // Release so an in-process host (clipd-ui) can cleanly restart the daemon.
@@ -1025,6 +1163,8 @@ enum HotkeyTick {
     PasteFromSlot(u8),       // Ctrl+Option+1..9 — paste slot
     SlotMemoryHud,           // Ctrl+Option+Space — show recent slot memory
     ToggleCollect,           // Ctrl+Option+` — toggle Collect mode on/off
+    CommandPalette,          // Ctrl+Space → command palette
+    SendToDevice,            // Ctrl+Shift+S — send the clipboard to the other Mac
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1450,18 +1590,15 @@ fn spawn_overlay(msg: &str) -> bool {
 }
 
 fn execute_copy(slot: u8, mgr: &SlotManager, persist_tx: &mpsc::SyncSender<ClipEvent>) {
-    let mut cb = match Clipboard::new() {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("Copy to slot {} failed: {}", slot, e);
-            return;
-        }
-    };
-    // After multi-tap Cmd+C the OS can lag slightly before text is readable.
+    // Reads go through the serialized helper: the watcher thread polls the
+    // same NSPasteboard continuously, and concurrent access corrupts AppKit's
+    // type cache (SIGSEGV inside objc_msgSend). Note the sleep between
+    // attempts is deliberately *outside* the lock, so a retry loop here never
+    // stalls the watcher for a quarter of a second.
     let mut text: Option<String> = None;
     for attempt in 0..6 {
-        match cb.get_text() {
-            Ok(t) if !t.is_empty() => {
+        match clipd_core::pasteboard::read_text() {
+            Some(t) if !t.is_empty() => {
                 text = Some(t);
                 break;
             }
@@ -1476,11 +1613,10 @@ fn execute_copy(slot: u8, mgr: &SlotManager, persist_tx: &mpsc::SyncSender<ClipE
         save_text_to_slot(slot, text, mgr, persist_tx);
     } else {
         // Loud on purpose: this is the "toast said copied but nothing saved"
-        // failure mode — surface the real clipboard error in the log.
+        // failure mode.
         log::warn!(
-            "📋 Copy to slot {} FAILED — clipboard unreadable/empty after retries: {:?}",
-            slot,
-            cb.get_text().err()
+            "📋 Copy to slot {} FAILED — clipboard unreadable or empty after retries",
+            slot
         );
     }
 }
@@ -1590,44 +1726,21 @@ fn execute_direct_paste(
     slot: u8,
     mgr: &SlotManager,
     suppress: &Arc<AtomicBool>,
-    transform_cfg: &TransformConfig,
-    paste_settings: &PasteTransformSettings,
+    // Kept in the signature: this used to run the transform chain, and the
+    // next person to reach for it should see why it no longer does.
+    _transform_cfg: &TransformConfig,
+    _paste_settings: &PasteTransformSettings,
 ) {
-    if let Ok(Some(mut content)) = mgr.get_slot(slot) {
-        // Apply "Transform on Paste" if enabled
-        if paste_settings.enabled {
-            #[cfg(target_os = "macos")]
-            let dest_app = get_frontmost_app_name();
-            #[cfg(not(target_os = "macos"))]
-            let dest_app: Option<String> = None;
-
-            if paste_settings.smart_mode {
-                let ct = clipd_core::ContentType::detect(&content);
-                let suggestions = suggest_smart_transform(&content, &ct, dest_app.as_deref());
-                for t in &suggestions {
-                    if let Ok(transformed) = apply_transform(t, &content, transform_cfg) {
-                        log::info!("🧠 Smart transform (Ctrl+V slot {}): {}", slot, t.label());
-                        content = transformed;
-                        break;
-                    }
-                }
-            }
-
-            for t in &paste_settings.active_transforms {
-                if let Ok(transformed) = apply_transform(t, &content, transform_cfg) {
-                    log::info!("✨ Paste transform (Ctrl+V slot {}): {}", slot, t.label());
-                    content = transformed;
-                }
-            }
-
-            if !paste_settings.default_ai_prompt.is_empty() {
-                let kind = TransformKind::CustomPrompt(paste_settings.default_ai_prompt.clone());
-                if let Ok(transformed) = apply_transform(&kind, &content, transform_cfg) {
-                    log::info!("✨ AI prompt transform (Ctrl+V slot {})", slot);
-                    content = transformed;
-                }
-            }
-        }
+    if let Ok(Some(content)) = mgr.get_slot(slot) {
+        // A slot paste is verbatim — the transform chain is deliberately not
+        // run here.
+        //
+        // Transforms belong to the explicit smart-paste gesture, and the
+        // settings page says so in as many words: "Applied with ⌘⇧V — normal
+        // Cmd+V is unchanged". Running them on a slot paste meant asking for
+        // slot R and getting your text lowercased and line-numbered, because
+        // `AddLineNumbers` and `Lowercase` happened to be in the active list.
+        // Someone reaching for a specific slot wants what they put in it.
 
         let mut cb = match Clipboard::new() {
             Ok(c) => c,
@@ -2406,6 +2519,97 @@ fn show_collect_done_hud() {
     show_hud("STYLE\ttoast\nBADGE\t✓\nTITLE\tCollect mode off\nHINT\t⌘⇧V to pick");
 }
 
+/// Show the command palette — a prompt HUD listing all enabled custom actions,
+/// then run the chosen one on the current clipboard.
+#[cfg(target_os = "macos")]
+fn show_command_palette_hud() {
+    let cfg = load_actions();
+    let actions: Vec<&CustomAction> = cfg.actions.iter().filter(|a| a.enabled).collect();
+
+    if actions.is_empty() {
+        show_hud(
+            "STYLE\ttoast\nBADGE\t⚠️\nTITLE\tNo actions configured\nHINT\tAdd custom actions in clipd settings",
+        );
+        return;
+    }
+
+    // Build button lines: BTN\tid\tlabel\tprimary(0/1)
+    let mut btn_lines = String::new();
+    for (i, action) in actions.iter().enumerate() {
+        let primary = if i == 0 { "1" } else { "0" };
+        btn_lines.push_str(&format!("BTN\t{}\t{}\t{}\n", i, action.name, primary));
+    }
+
+    let payload = format!(
+        "STYLE\tprompt\nBADGE\t⚡\nTITLE\tCommand Palette\n\
+         HINT\tRun a custom action on the clipboard\n\
+         {btn_lines}\
+         TIMEOUT\t30"
+    );
+
+    let choice = run_hud_prompt(&payload);
+
+    let Some(choice) = choice else {
+        return;
+    };
+
+    let idx = match choice.parse::<usize>() {
+        Ok(i) if i < actions.len() => i,
+        _ => return,
+    };
+    let action = actions[idx];
+
+    // Read current clipboard
+    let content = match Clipboard::new() {
+        Ok(mut cb) => cb.get_text().unwrap_or_default(),
+        Err(e) => {
+            log::warn!("Command palette: clipboard access failed: {}", e);
+            return;
+        }
+    };
+
+    if content.is_empty() {
+        show_hud("STYLE\ttoast\nBADGE\t⚠️\nTITLE\tClipboard is empty\nHINT\tCopy something first");
+        return;
+    }
+
+    log::info!(
+        "⚙️  Command palette: running '{}' on clipboard",
+        action.name
+    );
+    match run_action(&action.command, &content, Duration::from_secs(30)) {
+        Ok(out) => {
+            if action.output == ActionOutput::Clipboard && !out.trim().is_empty() {
+                if let Ok(mut cb) = Clipboard::new() {
+                    let _ = cb.set_text(&out);
+                }
+                show_hud(&format!(
+                    "STYLE\ttoast\nBADGE\t✓\nTITLE\t{}\nHINT\tResult on clipboard",
+                    action.name
+                ));
+            } else if action.output == ActionOutput::NewClip && !out.trim().is_empty() {
+                show_hud(&format!(
+                    "STYLE\ttoast\nBADGE\t✓\nTITLE\t{}\nHINT\tResult saved to history",
+                    action.name
+                ));
+            } else {
+                show_hud(&format!(
+                    "STYLE\ttoast\nBADGE\t✓\nTITLE\t{}\nHINT\tDone",
+                    action.name
+                ));
+            }
+        }
+        Err(e) => {
+            log::warn!("Command palette: action '{}' failed: {}", action.name, e);
+            show_hud(&format!(
+                "STYLE\ttoast\nBADGE\t✗\nTITLE\t{}\nHINT\t{}",
+                action.name,
+                e.chars().take(60).collect::<String>()
+            ));
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn slot_label(slot: u8) -> String {
     if (31..=56).contains(&slot) {
@@ -2414,6 +2618,30 @@ fn slot_label(slot: u8) -> String {
     } else {
         format!("Slot {}", slot)
     }
+}
+
+/// How much of the top of the screen the island can occupy when open.
+///
+/// Shared with the GUI, which uses the same band to keep a palette opened at
+/// the cursor from landing under the island. Not macOS-only: the clearance
+/// arithmetic below is platform-independent, and gating it here left it
+/// undefined for the code that uses it on Windows and Linux.
+const ISLAND_RESERVED_TOP: u32 = clipd_core::ISLAND_RESERVED_TOP as u32;
+
+/// The payload, plus the room the island needs if it is the active layout.
+///
+/// Both surfaces used to open at the top centre and land on top of each
+/// other. The island is the one that belongs there — it *is* the top of the
+/// screen — so the HUD is the one that moves.
+fn hud_payload_with_clearance(text: &str) -> String {
+    add_hud_clearance(text, clipd_core::island_layout_active())
+}
+
+fn add_hud_clearance(text: &str, island_active: bool) -> String {
+    if !island_active {
+        return text.to_string();
+    }
+    format!("{text}\nAVOIDTOP\t{ISLAND_RESERVED_TOP}")
 }
 
 /// Show a brief HUD overlay with arbitrary text.
@@ -2425,6 +2653,7 @@ fn show_hud(text: &str) {
         log::info!("HUD suppressed (hud_enabled=false)");
         return;
     }
+    let text = &hud_payload_with_clearance(text);
 
     use std::sync::Mutex;
     use std::sync::OnceLock;
@@ -2742,12 +2971,15 @@ fn resolve_clipd_cli_exe() -> std::path::PathBuf {
     std::path::PathBuf::from(suffix)
 }
 
-/// A password was just copied and dropped from history. Offer to file it into a
-/// vault. Runs the modal off the persist thread so clip persistence isn't blocked.
+/// A password was just copied. Offer to file it into a vault.
+///
+/// The secret arrives with the event rather than being re-read from the
+/// clipboard, so what gets saved is exactly what the prompt is about even if
+/// the user copies something else while deciding.
 #[cfg(target_os = "macos")]
-fn offer_vault_save(kinds: &str, stored: bool) {
+fn offer_vault_save(kinds: &str, secret: String, stored: bool) {
     let config = load_privacy_config();
-    if !config.offer_vault_on_secret {
+    if !config.offer_vault_on_secret || secret.trim().is_empty() {
         return;
     }
     let targets = available_targets();
@@ -2757,43 +2989,51 @@ fn offer_vault_save(kinds: &str, stored: bool) {
         );
         return;
     }
-    let _ = stored;
     // Prefer the native system store (Keychain on macOS) — instant, no prompt,
-    // no terminal. No centered modal: we save automatically and confirm with a
-    // passive top-right notification banner.
+    // no terminal.
     let target = targets
         .iter()
         .copied()
         .find(|t| t.id() == "keychain")
         .unwrap_or(targets[0]);
+
     let kinds = kinds.to_string();
+    let auto = config.vault_auto_save;
+    // Off the persist thread: the prompt blocks for as long as the user takes,
+    // and clip persistence must not wait on it.
     std::thread::spawn(move || {
-        // Re-read the secret from the live clipboard at save time — it was never
-        // carried through the event channel.
-        let password = match Clipboard::new().and_then(|mut c| c.get_text()) {
-            Ok(p) if !p.trim().is_empty() => p,
-            _ => return,
-        };
-        // A unique, readable title per save so distinct passwords become
-        // distinct Keychain entries instead of overwriting one another.
-        let stamp = chrono::Local::now().format("%b %d %H:%M:%S");
+        if !auto && !confirm_vault_save(&secret, &kinds, target, stored) {
+            log::info!("🔐 User declined to vault the detected password");
+            return;
+        }
+
         let entry = SecretEntry {
-            title: format!("clipd password — {}", stamp),
+            title: vault_entry_title(&kinds),
             username: String::new(),
-            password,
+            password: secret,
             url: String::new(),
-            notes: format!("Saved from clipd ({})", kinds),
+            notes: format!("Captured by clipd ({kinds})."),
         };
         match save_secret(target, &entry) {
             Ok(_) => {
-                log::info!("🔐 Auto-saved detected password to {}", target.label());
+                log::info!("🔐 Saved detected password to {}", target.label());
                 // clipd's own corner HUD — reliable from the daemon, unlike
-                // osascript notifications. Also fire a system banner as a backup.
+                // osascript notifications.
                 show_hud(&format!(
                     "STYLE\ttoast\nBADGE\t🔐\nTITLE\tPassword saved\nHINT\t{}",
                     target.label()
                 ));
-                notify("clipd", &format!("🔐 Password saved to {}", target.label()));
+                // The banner is passive by necessity: an `osascript`
+                // notification belongs to a process that has already exited, so
+                // macOS has nothing to deliver a click to. Say where the
+                // password went instead of implying the banner is actionable.
+                notify(
+                    "clipd",
+                    &format!(
+                        "🔐 Saved to {} — find it in clipd ▸ Saved passwords",
+                        target.label()
+                    ),
+                );
             }
             Err(e) => {
                 log::warn!("🔐 Vault save failed: {}", e);
@@ -2806,7 +3046,99 @@ fn offer_vault_save(kinds: &str, stored: bool) {
     });
 }
 
+/// Name a new vault entry after where it came from, so it is recognisable in
+/// clipd's vault list and in Keychain Access months later. Older builds used a
+/// bare timestamp, which made every entry look identical.
+#[cfg(target_os = "macos")]
+fn vault_entry_title(kinds: &str) -> String {
+    let stamp = chrono::Local::now().format("%b %-d, %-I:%M %p");
+    match frontmost_app_name() {
+        Some(app) => format!("{app} — {kinds} ({stamp})"),
+        None => format!("clipd — {kinds} ({stamp})"),
+    }
+}
+
+/// Ask before writing a password to permanent storage. Returns true to save.
+///
+/// Blocks on the HUD subprocess, which prints the chosen button id. Anything
+/// other than an explicit "save" — timeout, dismissal, or a HUD that failed to
+/// launch — means don't save.
+#[cfg(target_os = "macos")]
+fn confirm_vault_save(secret: &str, kinds: &str, target: VaultTarget, stored: bool) -> bool {
+    let source = frontmost_app_name();
+    let hint = match (&source, stored) {
+        (Some(app), true) => format!("Copied from {app} · kept in history"),
+        (Some(app), false) => format!("Copied from {app} · not saved to history"),
+        (None, true) => "Kept in history".to_string(),
+        (None, false) => "Not saved to history".to_string(),
+    };
+    // Never render the secret itself — the prompt may sit on screen in view of
+    // whoever is around. Length alone is enough to identify it.
+    let preview = format!("{} · {} characters", kinds, secret.chars().count());
+
+    let payload = format!(
+        "STYLE\tprompt\nBADGE\t🔐\nTITLE\tSave this password?\nHINT\t{hint}\n\
+         PREVIEW\ttext\t{preview}\nBTN\tskip\tNot now\t0\nBTN\tsave\tSave to {}\t1\nTIMEOUT\t15",
+        target.label()
+    );
+
+    match run_hud_prompt(&payload) {
+        Some(choice) => choice == "save",
+        None => {
+            // Without a working prompt we cannot get consent, and silently
+            // saving is exactly the behaviour this replaced.
+            log::warn!("🔐 Couldn't show the vault prompt — not saving the password");
+            false
+        }
+    }
+}
+
+/// Run the HUD in interactive mode and wait for the user's choice.
+///
+/// Deliberately does not go through [`show_hud`]: that kills any previous HUD
+/// and returns immediately, whereas a prompt has to outlive passing toasts and
+/// be waited on.
+#[cfg(target_os = "macos")]
+fn run_hud_prompt(payload: &str) -> Option<String> {
+    let payload = &hud_payload_with_clearance(payload);
+    let hud_bin = find_hud_binary();
+    let out = std::process::Command::new(&hud_bin)
+        .arg(payload)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| log::warn!("HUD prompt failed to launch ({}): {e}", hud_bin.display()))
+        .ok()?;
+    let choice = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if choice.is_empty() {
+        None
+    } else {
+        Some(choice)
+    }
+}
+
+/// Name of the frontmost app, for labelling where a password came from.
+#[cfg(target_os = "macos")]
+fn frontmost_app_name() -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to get name of first process whose frontmost is true")
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() || name.to_lowercase().starts_with("clipd") {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// Non-modal macOS notification banner.
+///
+/// These are informational only. `osascript` exits as soon as the banner is
+/// posted, so macOS has no live process to route a click to — anything the user
+/// should be able to act on has to be a HUD prompt, the menu bar, or the vault
+/// window instead.
 #[cfg(target_os = "macos")]
 fn notify(title: &str, body: &str) {
     let body = body.replace('"', "'");
@@ -2816,6 +3148,245 @@ fn notify(title: &str, body: &str) {
         .arg("-e")
         .arg(&script)
         .output();
+}
+
+/// Send whatever is on the clipboard right now to the other Mac.
+///
+/// Deliberately has no picker and no confirmation. With one other Mac there is
+/// nothing to choose, and a dialog on every send would cost more than the
+/// occasional mistake — feedback is a notification after the fact, not a
+/// question before it. Failures are notifications too: this runs from a hotkey
+/// with no window in front, so a silent failure would be indistinguishable
+/// from the feature not existing.
+fn send_clipboard_to_other_mac() {
+    let clip = match clipboard_as_clip() {
+        Ok(c) => c,
+        Err(e) => {
+            log::info!("Send skipped: {e}");
+            #[cfg(target_os = "macos")]
+            notify("Nothing to send", &e);
+            return;
+        }
+    };
+
+    match clipd_core::sync::send_clip(&clip, None) {
+        Ok(device) => {
+            log::info!("📤 Sent to {}: {}", device.name, truncate(&clip.preview, 60));
+            #[cfg(target_os = "macos")]
+            notify(
+                &format!("Sent to {}", device.name),
+                &truncate(&clip.preview, 80),
+            );
+        }
+        Err(e) => {
+            log::warn!("Send failed: {e}");
+            #[cfg(target_os = "macos")]
+            notify("Couldn't send", &e);
+        }
+    }
+}
+
+/// Build a clip from the current clipboard, files first.
+///
+/// Same ordering as the watcher, and for the same reason: a Finder copy also
+/// puts text on the pasteboard, so checking text first would send the filename
+/// as a string instead of the file.
+fn clipboard_as_clip() -> Result<ClipEntry, String> {
+    let files = clipd_core::clipboard_read_file_urls();
+    if !files.is_empty() {
+        let refs = clipd_core::save_files(&files);
+        if refs.is_empty() {
+            return Err("The copied files couldn't be read.".into());
+        }
+        return Ok(ClipEntry::new_files(refs, None));
+    }
+
+    match clipd_core::clipboard_read_text() {
+        Some(text) if !text.trim().is_empty() => Ok(ClipEntry::new(text, None, None)),
+        _ => Err("Copy something first, then press Ctrl+Shift+S.".into()),
+    }
+}
+
+/// Listen for clips sent directly over the local network, and keep this
+/// machine discoverable.
+///
+/// Binds port 0 so the OS picks a free port — a fixed port would collide with
+/// anything else and would tell the network what this machine runs. mDNS
+/// carries the real port, so nothing has to guess.
+fn run_lan_transport(db_path: &std::path::Path, stop: Arc<AtomicBool>) {
+    let identity = match clipd_core::lan_identity::Identity::load_or_create() {
+        Ok(i) => i,
+        Err(e) => {
+            log::warn!("LAN sending is off — couldn't load this machine's key: {e}");
+            return;
+        }
+    };
+
+    let listener = match std::net::TcpListener::bind("0.0.0.0:0") {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!("LAN sending is off — couldn't open a port: {e}");
+            return;
+        }
+    };
+    let port = match listener.local_addr() {
+        Ok(a) => a.port(),
+        Err(e) => {
+            log::warn!("LAN sending is off — couldn't read the port: {e}");
+            return;
+        }
+    };
+
+    // Announce + browse on their own thread; the accept loop owns this one.
+    let discovery_stop = stop.clone();
+    let _ = std::thread::Builder::new()
+        .name("clipd-lan-mdns".into())
+        .spawn(move || {
+            if let Err(e) = clipd_core::lan_discovery::run(port, discovery_stop) {
+                log::warn!("Network discovery stopped: {e}");
+            }
+        });
+
+    let store = match ClipStore::new(db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("LAN transport couldn't open the store: {e}");
+            return;
+        }
+    };
+
+    // Unblock accept() periodically so a quit is not stuck waiting for a
+    // connection that never comes.
+    let _ = listener.set_nonblocking(true);
+    log::info!("🔌 Listening for clips on the local network (port {port})");
+
+    while !stop.load(Ordering::Relaxed) {
+        let (mut stream, from) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
+            Err(e) => {
+                log::debug!("LAN accept failed: {e}");
+                continue;
+            }
+        };
+        // The socket itself must block, even though the listener does not.
+        let _ = stream.set_nonblocking(false);
+
+        let trusted = |device_id: &str, key: &x25519_dalek::PublicKey| {
+            clipd_core::lan_identity::is_trusted(device_id, key)
+        };
+
+        let mut accept = |envelope: clipd_core::Envelope, from_name: &str| -> Result<i64, String> {
+            let clip = clipd_core::clip_from_envelope(&envelope, &clipd_core::files_dir())?;
+            let summary = envelope.summary();
+            let id = store
+                .insert(&clip)
+                .map_err(|e| format!("Couldn't save that clip: {e}"))?;
+            log::info!("📥 Received clip #{id} over the network: {summary}");
+            #[cfg(target_os = "macos")]
+            notify(&summary, &truncate(&clip.preview, 80));
+            let _ = from_name;
+            Ok(id)
+        };
+
+        if let Err(e) =
+            clipd_core::lan::serve_connection(&mut stream, &identity, &trusted, &mut accept)
+        {
+            // Refusals are normal and worth seeing, but they are not errors in
+            // the daemon — an unpaired machine trying its luck is the system
+            // working.
+            log::info!("Refused or failed a connection from {from}: {e}");
+        }
+    }
+}
+
+/// How often the inbox is checked for clips sent from another Mac. Fast enough
+/// that a link feels like it arrives on its own, slow enough to be invisible.
+const INBOX_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Announce this Mac, then collect envelopes other Macs drop into its inbox.
+///
+/// Received clips land in history and are **not** put on the live clipboard.
+/// Silently replacing what someone has copied on the machine they are sitting
+/// at is a good way to destroy their work; the notification is the handle for
+/// promoting it deliberately.
+fn run_sync_inbox(db_path: &std::path::Path, stop: Arc<AtomicBool>) {
+    let Some(root) = clipd_core::sync_root() else {
+        log::info!("📡 Sending between Macs is off (iCloud Drive isn't enabled)");
+        return;
+    };
+
+    let me = match clipd_core::register_device(&root) {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("Couldn't announce this Mac for sync: {e}");
+            return;
+        }
+    };
+    log::info!("📡 Sync ready — this Mac is \"{}\"", me.name);
+
+    let store = match ClipStore::new(db_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Sync inbox couldn't open the store: {e}");
+            return;
+        }
+    };
+
+    while !stop.load(Ordering::Relaxed) {
+        clipd_core::sync::request_downloads(&root, &me.id);
+
+        for (path, parsed) in clipd_core::pending(&root, &me.id) {
+            let envelope = match parsed {
+                Ok(e) => e,
+                Err(e) => {
+                    // A file we cannot parse will never become parseable.
+                    // Leaving it would mean retrying it every 3 seconds forever.
+                    log::warn!("Discarding an unreadable envelope: {e}");
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+            };
+
+            let clip = match clipd_core::clip_from_envelope(&envelope, &clipd_core::files_dir()) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("Couldn't unpack a clip from {}: {e}", envelope.from_name);
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+            };
+
+            let summary = envelope.summary();
+            match store.insert(&clip) {
+                Ok(id) => {
+                    log::info!("📥 Received clip #{id}: {summary}");
+                    // Only remove the envelope once it is safely in the store,
+                    // so a crash mid-ingest replays rather than loses the clip.
+                    let _ = std::fs::remove_file(&path);
+                    #[cfg(target_os = "macos")]
+                    notify(&summary, &truncate(&clip.preview, 80));
+                }
+                Err(e) => {
+                    // Keep the envelope and try again on the next pass.
+                    log::error!("Couldn't save a received clip (will retry): {e}");
+                }
+            }
+        }
+
+        // Refresh our heartbeat so the other Mac keeps offering this one as a
+        // target, then sleep in slices so a quit is not held up by a full tick.
+        let _ = clipd_core::register_device(&root);
+        for _ in 0..INBOX_POLL.as_secs() {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
 }
 
 /// Bring an already-running clipd window to the front. Tries the names the
@@ -2919,10 +3490,15 @@ fn open_gui() {
         }
     }
 
-    // If the GUI is already running, bring its window to the front instead of
-    // spawning a second instance.
+    // Only front an existing *palette*. The island and the tray popover are
+    // also `clipd-gui` processes and they are always alive — the popover is
+    // kept resident so hovering the tray icon does not pay for a process
+    // launch. `focus_existing_gui` asks System Events for any clipd-gui with a
+    // window, so once those two existed it always said yes, and this returned
+    // early every time: the shortcut fronted the parked popover instead of
+    // opening the palette, which looks exactly like the shortcut being dead.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if focus_existing_gui() {
+    if clipd_core::surface_is_running("gui-main") && focus_existing_gui() {
         return;
     }
 
@@ -3232,6 +3808,98 @@ fn setup_ctrlc(stop: Arc<AtomicBool>) {
 
 // ── macOS rdev listener ──
 
+/// Keep trying to install the event tap while permission changes settle.
+///
+/// macOS often needs the user to flip Accessibility / Input Monitoring in
+/// System Settings after the first failed tap. Without a retry loop, multi-slot
+/// copy stays dead until a full Clipd restart — even after the toggles are on.
+/// Keep the passive retry alive for the lifetime of the tray host. The
+/// open-GUI-only listener runs alongside it so Ctrl+Space still works while
+/// macOS is waiting for either privacy toggle.
+#[cfg(target_os = "macos")]
+fn run_macos_hotkey_listener_with_retry(
+    hotkey_tx: mpsc::Sender<HotkeyTick>,
+    stop_listener: Arc<AtomicBool>,
+    fallback_tx: mpsc::Sender<HotkeyTick>,
+    fallback_stop: Arc<AtomicBool>,
+) {
+    const FAST_RETRY_PAUSE: Duration = Duration::from_secs(2);
+    const SETTLED_RETRY_PAUSE: Duration = Duration::from_secs(10);
+    const FAST_ATTEMPTS: u64 = 45;
+
+    // Start the listen-only fallback immediately so Settings shortcuts
+    // (Ctrl+Space / palette) work while the modifying tap is retrying.
+    {
+        let tx = fallback_tx.clone();
+        let stop = fallback_stop.clone();
+        let _ = std::thread::Builder::new()
+            .name("clipd-hotkey-fallback".into())
+            .spawn(move || {
+                log::info!(
+                    "🎹 Starting listen-only fallback for Settings shortcuts \
+                     (open-GUI / palette) while multi-slot tap retries"
+                );
+                if let Err(fallback_err) = start_macos_open_gui_fallback_listener(tx, stop) {
+                    log::error!("Settings-shortcut fallback listener failed: {}", fallback_err);
+                }
+            });
+    }
+
+    let mut attempt = 0_u64;
+    loop {
+        if stop_listener.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Status check only on this background thread. The actual TCC *prompt*
+        // is issued on clipd-ui's main thread at launch — macOS ignores
+        // AXIsProcessTrustedWithOptions / CGRequestListenEventAccess from here.
+        let granted = clipd_core::keyboard_permissions_granted();
+        if !granted {
+            save_hotkey_status(HotkeyStatus::NeedsAccessibility);
+        }
+
+        // On success this blocks forever inside CFRunLoopRun.
+        match start_macos_hotkey_listener(hotkey_tx.clone(), stop_listener.clone()) {
+            Ok(()) => {
+                // Runloop exited (stop/shutdown). Status was set on first event.
+                log::info!("🎹 Hotkey listener stopped");
+                return;
+            }
+            Err(e) => {
+                attempt = attempt.saturating_add(1);
+                // Be loud during startup, then reduce an expected missing-TCC
+                // state to one useful line per minute instead of flooding the
+                // log forever while still retrying forever.
+                if attempt <= 3 || attempt % 6 == 0 {
+                    log::error!(
+                        "Hotkey listener unavailable (attempt {}): {} (Accessibility={} InputMonitoring={})",
+                        attempt,
+                        e,
+                        clipd_core::accessibility_granted(),
+                        clipd_core::input_monitoring_granted(),
+                    );
+                }
+                save_hotkey_status(HotkeyStatus::NeedsAccessibility);
+
+                // Wait for the user to flip the toggles, then try again.
+                let retry_pause = if attempt < FAST_ATTEMPTS {
+                    FAST_RETRY_PAUSE
+                } else {
+                    SETTLED_RETRY_PAUSE
+                };
+                let deadline = Instant::now() + retry_pause;
+                while Instant::now() < deadline {
+                    if stop_listener.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn start_macos_hotkey_listener(
     tx: mpsc::Sender<HotkeyTick>,
@@ -3243,9 +3911,11 @@ fn start_macos_hotkey_listener(
         // macOS key-repeat sends many KeyPress events while V/C is held. Count one tap per
         // physical press→release, not per repeat tick (otherwise tap #16 → wrong slot / empty).
         latch_ctrl_shift_v: bool,
+        latch_ctrl_shift_s: bool,
         latch_cmd_shift_v: bool,
         latch_ctrl_shift_opt_c: bool,
         latch_cmd_opt_v: bool,
+        latch_cmd_opt_c: bool,
         latch_shift_opt_c: bool,
         latch_shift_opt_v: bool,
         latch_ctrl_opt_slot: [bool; 10],
@@ -3267,15 +3937,23 @@ fn start_macos_hotkey_listener(
         latch_ctrl_v: bool,
         /// Time of the last plain Cmd+C press — for double-tap quick letter save.
         cmd_c_last_press: Option<Instant>,
+        /// Last bare Option tap, for the double-tap letter gesture.
+        opt_last_tap: Option<Instant>,
+        /// A letter copy or paste waiting for the chord's modifiers to be
+        /// released. Both inject a keystroke, and both need a clean keyboard.
+        pending_letter_paste: Option<u8>,
+        pending_letter_copy: Option<u8>,
     }
 
     let state = std::cell::RefCell::new(State {
         pressed_mods: HashSet::new(),
         event_count: 0,
         latch_ctrl_shift_v: false,
+        latch_ctrl_shift_s: false,
         latch_cmd_shift_v: false,
         latch_ctrl_shift_opt_c: false,
         latch_cmd_opt_v: false,
+        latch_cmd_opt_c: false,
         latch_shift_opt_c: false,
         latch_shift_opt_v: false,
         latch_ctrl_opt_slot: [false; 10],
@@ -3296,6 +3974,9 @@ fn start_macos_hotkey_listener(
         latch_ctrl_c: false,
         latch_ctrl_v: false,
         cmd_c_last_press: None,
+        opt_last_tap: None,
+        pending_letter_paste: None,
+        pending_letter_copy: None,
     });
 
     grab(move |event: Event| {
@@ -3306,17 +3987,69 @@ fn start_macos_hotkey_listener(
         let mut s = state.borrow_mut();
         s.event_count += 1;
         if s.event_count == 1 {
-            log::info!("🎹 rdev: first event received — Input Monitoring permissions OK");
+            save_hotkey_status(HotkeyStatus::Ok);
+            log::info!(
+                "🎹 Hotkey listener up — multi-slot copy/paste active \
+                 (first event received; Input Monitoring OK)"
+            );
         }
 
         match event.event_type.clone() {
             EventType::KeyPress(key) => {
                 if is_modifier_key(key) {
+                    // Two taps of Option, nothing else in between, arm a letter
+                    // slot save.
+                    //
+                    // Option *alone* types nothing, which is the whole point.
+                    // Option+C and Option+V looked like a tidy mirrored pair
+                    // but they emit ç and √ — so every time clipd failed to
+                    // swallow one, the character landed in the document. A
+                    // modifier on its own cannot do that.
+                    if matches!(key, RKey::Alt | RKey::AltGr)
+                        && letter_capture_active()
+                        && s.pressed_mods.is_empty()
+                    {
+                        let now = Instant::now();
+                        let is_second = s
+                            .opt_last_tap
+                            .is_some_and(|p| now.duration_since(p) < QUICK_DOUBLE_WINDOW);
+                        if is_second {
+                            s.letter_copy_prefix_until = Some(now + QUICK_LETTER_GRACE);
+                            s.letter_paste_prefix_until = None;
+                            s.opt_last_tap = None;
+                            log::info!("⌨️  Option ×2 → letter slot copy armed");
+                        } else {
+                            s.opt_last_tap = Some(now);
+                        }
+                    }
                     s.pressed_mods.insert(key);
                     return Some(event);
                 }
 
-                if letter_capture_active() && is_bare_letter(&s.pressed_mods) {
+                // Any other key ends a half-finished double-tap, so Option used
+                // as an ordinary modifier never drifts into arming the gesture.
+                s.opt_last_tap = None;
+
+
+                // A letter counts whether or not the leader's modifiers are
+                // still down.
+                //
+                // Requiring a *bare* letter meant you had to fully release
+                // ⌘⌥ (or ⌃⌥) before pressing it — nobody does that mid-chord,
+                // so the leader forms looked broken to anyone who held the
+                // modifiers the way a chord invites you to. Windows already
+                // accepted the letter either way; macOS did not.
+                //
+                // Only while a prefix is actually armed, and that window is
+                // under a second, so no ordinary chord gets caught by it.
+                let prefix_armed = {
+                    let now = Instant::now();
+                    s.letter_copy_prefix_until.is_some_and(|u| now <= u)
+                        || s.letter_paste_prefix_until.is_some_and(|u| now <= u)
+                };
+                if letter_capture_active()
+                    && (is_bare_letter(&s.pressed_mods) || prefix_armed)
+                {
                     let now = Instant::now();
                     if let Some(until) = s.letter_copy_prefix_until {
                         if now <= until {
@@ -3328,7 +4061,21 @@ fn start_macos_hotkey_listener(
                                     letter,
                                     slot
                                 );
-                                let _ = tx.send(HotkeyTick::CopySelectionToSlot(slot));
+                                // Wait for the chord to be let go, exactly as
+                                // the paste side does.
+                                //
+                                // The copy is grabbed by injecting ⌘C, and
+                                // macOS adds that to whatever is physically
+                                // held — so firing under ⌘⌥ sends ⌘⌥C, the
+                                // selection never reaches the clipboard, and
+                                // the slot quietly stores whatever was on it
+                                // before. The HUD still says "copied", which is
+                                // what makes this one hard to spot.
+                                if s.pressed_mods.is_empty() {
+                                    let _ = tx.send(HotkeyTick::CopySelectionToSlot(slot));
+                                } else {
+                                    s.pending_letter_copy = Some(slot);
+                                }
                                 return None;
                             }
                         } else {
@@ -3341,17 +4088,43 @@ fn start_macos_hotkey_listener(
                                 s.letter_copy_prefix_until = None;
                                 s.letter_paste_prefix_until = None;
                                 log::info!(
-                                    "⌨️  Ctrl+Option+V then {} → paste slot {}",
+                                    "⌨️  Option+V leader then {} → paste slot {}",
                                     letter,
                                     slot
                                 );
-                                let _ = tx.send(HotkeyTick::PasteFromSlot(slot));
+                                // Wait for the chord to be let go before
+                                // pasting.
+                                //
+                                // The paste is injected as ⌘V, and macOS adds
+                                // it to whatever is *physically* held — so
+                                // firing while ⌘⌥ is still down delivers ⌘⌥V,
+                                // which is not a paste. Copy survives this;
+                                // paste does not. Windows already releases the
+                                // modifiers before injecting; this is the
+                                // macOS equivalent.
+                                if s.pressed_mods.is_empty() {
+                                    let _ = tx.send(HotkeyTick::PasteFromSlot(slot));
+                                } else {
+                                    s.pending_letter_paste = Some(slot);
+                                }
                                 return None;
                             }
                         } else {
                             s.letter_paste_prefix_until = None;
                         }
                     }
+                }
+
+                // Ctrl+Shift+S → send the clipboard to the other Mac.
+                // Returns the event: this chord has no system meaning, and
+                // swallowing it would break any app that binds it itself.
+                if is_ctrl_shift(&s.pressed_mods) && key == RKey::KeyS {
+                    if !s.latch_ctrl_shift_s {
+                        s.latch_ctrl_shift_s = true;
+                        log::info!("⌨️  Ctrl+Shift+S → send to other Mac");
+                        let _ = tx.send(HotkeyTick::SendToDevice);
+                    }
+                    return Some(event);
                 }
 
                 // Ctrl+Shift+V → smart paste (transform clipboard + paste)
@@ -3364,14 +4137,22 @@ fn start_macos_hotkey_listener(
                     return Some(event);
                 }
 
-                // Cmd+Shift+V → slot picker HUD
-                if is_cmd_shift(&s.pressed_mods) && key == RKey::KeyV {
+                // Memory palette — chord comes from Settings → Palette shortcut.
+                if matches_palette_trigger(key, &s.pressed_mods) {
                     if !s.latch_cmd_shift_v {
                         s.latch_cmd_shift_v = true;
-                        log::info!("⌨️  Cmd+Shift+V → slot picker");
+                        log::info!(
+                            "⌨️  {} → memory palette",
+                            load_paste_transform_settings().palette_trigger.label()
+                        );
                         let _ = tx.send(HotkeyTick::SlotPicker);
                     }
-                    return Some(event);
+                    // Swallow Space variants so they don't type into the focused app.
+                    return if key == RKey::Space {
+                        None
+                    } else {
+                        Some(event)
+                    };
                 }
 
                 // Ctrl+Shift+Option+A..Z → copy selected text to letter slots 31..56.
@@ -3444,11 +4225,21 @@ fn start_macos_hotkey_listener(
 
                 // Ctrl+Option+1..9 → paste from slot directly
                 if is_ctrl_opt(&s.pressed_mods) {
+                    // Ctrl+Option+Space is the memory-palette chord when chosen in
+                    // Settings; otherwise keep the legacy slot-memory HUD binding.
                     if key == RKey::Space {
                         if !s.latch_ctrl_opt_space {
                             s.latch_ctrl_opt_space = true;
-                            log::info!("⌨️  Ctrl+Option+Space → slot memory HUD");
-                            let _ = tx.send(HotkeyTick::SlotMemoryHud);
+                            let settings = load_paste_transform_settings();
+                            if settings.palette_enabled
+                                && settings.palette_trigger == PaletteTrigger::CtrlOptSpace
+                            {
+                                log::info!("⌨️  Ctrl+Option+Space → memory palette");
+                                let _ = tx.send(HotkeyTick::SlotPicker);
+                            } else {
+                                log::info!("⌨️  Ctrl+Option+Space → slot memory HUD");
+                                let _ = tx.send(HotkeyTick::SlotMemoryHud);
+                            }
                         }
                         return None;
                     }
@@ -3494,10 +4285,43 @@ fn start_macos_hotkey_listener(
                 }
 
                 // Cmd+Option+V → sequence paste
-                if batch_drain_enabled() && is_cmd_opt(&s.pressed_mods) && key == RKey::KeyV {
+                // Cmd+Option+C / Cmd+Option+V then a letter → letter slots.
+                //
+                // Cmd suppresses Option's character composition, so unlike
+                // Option+C these emit nothing if a swallow is ever missed —
+                // which is what ruled that pair out. Checked before batch-drain
+                // so the letter leader owns Cmd+Option+V; batch-drain moved to
+                // Cmd+Option+Shift+V rather than being quietly overridden.
+                if letter_capture_active()
+                    && is_cmd_opt(&s.pressed_mods)
+                    && matches!(key, RKey::KeyC | RKey::KeyV)
+                {
+                    let now = Instant::now();
+                    if key == RKey::KeyC {
+                        if !s.latch_cmd_opt_c {
+                            s.latch_cmd_opt_c = true;
+                            s.letter_copy_prefix_until = Some(now + LETTER_PREFIX_WINDOW);
+                            s.letter_paste_prefix_until = None;
+                            log::info!("⌨️  Cmd+Option+C → letter slot copy armed");
+                        }
+                    } else if !s.latch_cmd_opt_v {
+                        s.latch_cmd_opt_v = true;
+                        s.letter_paste_prefix_until = Some(now + LETTER_PREFIX_WINDOW);
+                        s.letter_copy_prefix_until = None;
+                        log::info!("⌨️  Cmd+Option+V → letter slot paste armed");
+                    }
+                    return None;
+                }
+
+                // Batch-drain moved off Cmd+Option+V to make room for the
+                // letter leader above.
+                if batch_drain_enabled()
+                    && is_cmd_opt_shift(&s.pressed_mods)
+                    && key == RKey::KeyV
+                {
                     if !s.latch_cmd_opt_v {
                         s.latch_cmd_opt_v = true;
-                        log::info!("⌨️  Cmd+Option+V → sequence paste (batch-drain)");
+                        log::info!("⌨️  Cmd+Option+Shift+V → sequence paste (batch-drain)");
                         let _ = tx.send(HotkeyTick::SequencePaste);
                     }
                     return Some(event);
@@ -3523,27 +4347,51 @@ fn start_macos_hotkey_listener(
                     return Some(event);
                 }
 
-                // Open GUI — configurable chord, all on the G key. Only read the
-                // setting when G is pressed with a modifier (never on bare typing).
-                if key == RKey::KeyG
-                    && (has_cmd(&s.pressed_mods) || has_ctrl(&s.pressed_mods))
+                // Open GUI — configurable chord on either G or Space. Only read
+                // the setting when one of those is pressed with a modifier, so
+                // bare typing never touches the config file.
+                // Ctrl+Option+Space (slot HUD) is handled above and returns
+                // early; `is_ctrl_only` keeps Ctrl+Space distinct from it.
+                if matches!(key, RKey::KeyG | RKey::Space)
+                    && (has_cmd(&s.pressed_mods)
+                        || has_ctrl(&s.pressed_mods)
+                        // Option+Space is a valid open-clipd binding now, and
+                        // this guard would have discarded it before the match
+                        // below ever ran.
+                        || has_opt(&s.pressed_mods))
                     && !s.latch_ctrl_g
                 {
                     let hk = load_paste_transform_settings().open_gui_hotkey;
-                    let matched = match hk {
-                        OpenGuiHotkey::CtrlG => is_ctrl_only(&s.pressed_mods),
-                        // Alt+G is a Windows-only binding (Option+G types © on
-                        // macOS keyboards) — treat as unbound here.
-                        OpenGuiHotkey::AltG => false,
-                        OpenGuiHotkey::CmdShiftG => is_cmd_shift(&s.pressed_mods),
-                        OpenGuiHotkey::CtrlShiftG => is_ctrl_shift(&s.pressed_mods),
-                        OpenGuiHotkey::Disabled => false,
-                    };
+                    let on_expected_key = hk.uses_space_key() == (key == RKey::Space);
+                    let matched = on_expected_key
+                        && match hk {
+                            OpenGuiHotkey::CtrlG => is_ctrl_only(&s.pressed_mods),
+                            // Alt+G is a Windows-only binding (Option+G types © on
+                            // macOS keyboards) — treat as unbound here.
+                            OpenGuiHotkey::AltG => false,
+                            OpenGuiHotkey::CmdShiftG => is_cmd_shift(&s.pressed_mods),
+                            OpenGuiHotkey::CtrlShiftG => is_ctrl_shift(&s.pressed_mods),
+                            OpenGuiHotkey::CtrlSpace => is_ctrl_only(&s.pressed_mods),
+                            OpenGuiHotkey::OptSpace => is_opt_only(&s.pressed_mods),
+                            OpenGuiHotkey::Disabled => false,
+                        };
                     if matched {
                         s.latch_ctrl_g = true;
-                        log::info!("⌨️  {} → open GUI", hk.label());
-                        let _ = tx.send(HotkeyTick::OpenGui);
-                        return Some(event);
+                        let action = load_paste_transform_settings().ctrl_space_action;
+                        log::info!("⌨️  {} → {:?}", hk.label(), action);
+                        let tick = match action {
+                            CtrlSpaceAction::OpenGui => HotkeyTick::OpenGui,
+                            CtrlSpaceAction::SlotMemory => HotkeyTick::SlotMemoryHud,
+                            CtrlSpaceAction::CommandPalette => HotkeyTick::CommandPalette,
+                        };
+                        let _ = tx.send(tick);
+                        // Space must be swallowed or it also types into whatever
+                        // had focus. G is passed through, as it always has been.
+                        return if key == RKey::Space {
+                            None
+                        } else {
+                            Some(event)
+                        };
                     }
                 }
 
@@ -3563,24 +4411,24 @@ fn start_macos_hotkey_listener(
                     // Quick letter save: a deliberate double-tap of Cmd+C arms
                     // the letter prefix, so the next letter saves to that slot.
                     // A single Cmd+C is unaffected — normal copy isn't hampered.
-                    let now = Instant::now();
-                    if quick_letter_slots_enabled() {
-                        if let Some(prev) = s.cmd_c_last_press {
-                            if now.duration_since(prev) < QUICK_DOUBLE_WINDOW {
-                                // Match the numeric grace: a letter only counts
-                                // (and cancels slot 2) within the same window.
-                                s.letter_copy_prefix_until = Some(now + QUICK_LETTER_GRACE);
-                                s.letter_paste_prefix_until = None;
-                                log::info!("⌨️  Cmd+C ×2 → quick letter save armed");
-                            }
-                        }
-                        s.cmd_c_last_press = Some(now);
-                    }
+                    // ⌘C stays purely numeric. Hanging letter slots off it
+                    // meant one gesture could mean slot 2 or slot A depending
+                    // on what you did next, which is exactly the ambiguity the
+                    // Option double-tap exists to avoid.
                     let _ = tx.send(HotkeyTick::CmdCTap);
                     return Some(event);
                 }
                 // Cmd+V (just Cmd, no Ctrl/Shift/Option)
                 if is_cmd_only(&s.pressed_mods) && key == RKey::KeyV {
+                    // Deliberately no ⌘V ⌘V letter arming here.
+                    //
+                    // ⌘V ×2 already means "paste slot 2", and unlike the copy
+                    // side that clash cannot be deferred: a double ⌘C can hold
+                    // its numeric commit for half a second and let a following
+                    // letter cancel it, but a paste has already put the content
+                    // into your app by then. There is nothing left to take
+                    // back. Letter paste stays on Ctrl+Option+letter, which is
+                    // one chord, no timing, and collides with nothing.
                     let _ = tx.send(HotkeyTick::CmdVTap);
                     return Some(event);
                 }
@@ -3602,6 +4450,16 @@ fn start_macos_hotkey_listener(
             EventType::KeyRelease(key) => {
                 if is_modifier_key(key) {
                     s.pressed_mods.remove(&key);
+                    // The chord is off the keyboard — a deferred letter paste
+                    // can go now, and lands as a clean ⌘V.
+                    if s.pressed_mods.is_empty() {
+                        if let Some(slot) = s.pending_letter_copy.take() {
+                            let _ = tx.send(HotkeyTick::CopySelectionToSlot(slot));
+                        }
+                        if let Some(slot) = s.pending_letter_paste.take() {
+                            let _ = tx.send(HotkeyTick::PasteFromSlot(slot));
+                        }
+                    }
                     // After Cmd+C the OS often never delivers KeyRelease for C; releasing Command
                     // must arm the next Cmd+C / Cmd+V chord.
                     if matches!(key, RKey::MetaLeft | RKey::MetaRight) {
@@ -3636,6 +4494,9 @@ fn start_macos_hotkey_listener(
                     }
                 }
                 match key {
+                    RKey::KeyS => {
+                        s.latch_ctrl_shift_s = false;
+                    }
                     RKey::KeyV => {
                         s.latch_ctrl_shift_v = false;
                         s.latch_cmd_shift_v = false;
@@ -3646,6 +4507,7 @@ fn start_macos_hotkey_listener(
                         s.latch_ctrl_v = false;
                     }
                     RKey::KeyC => {
+                        s.latch_cmd_opt_c = false;
                         s.latch_ctrl_shift_opt_c = false;
                         s.latch_shift_opt_c = false;
                         s.latch_cmd_ctrl_c = false;
@@ -3655,7 +4517,14 @@ fn start_macos_hotkey_listener(
                     RKey::KeyR => s.latch_ctrl_r = false,
                     RKey::KeyT => s.latch_ctrl_t = false,
                     RKey::KeyG => s.latch_ctrl_g = false,
-                    RKey::Space => s.latch_ctrl_opt_space = false,
+                    RKey::Space => {
+                        s.latch_ctrl_opt_space = false;
+                        // Ctrl+Space shares the open-GUI latch; without this it
+                        // would fire once and never again. Palette Space chords
+                        // reuse latch_cmd_shift_v.
+                        s.latch_ctrl_g = false;
+                        s.latch_cmd_shift_v = false;
+                    }
                     RKey::BackQuote => s.latch_ctrl_opt_backquote = false,
                     RKey::Num1
                     | RKey::Num2
@@ -3695,12 +4564,14 @@ fn start_macos_open_gui_fallback_listener(
     struct State {
         pressed_mods: HashSet<RKey>,
         latch_ctrl_g: bool,
+        latch_palette: bool,
         event_count: u64,
     }
 
     let mut state = State {
         pressed_mods: HashSet::new(),
         latch_ctrl_g: false,
+        latch_palette: false,
         event_count: 0,
     };
 
@@ -3711,7 +4582,17 @@ fn start_macos_open_gui_fallback_listener(
 
         state.event_count += 1;
         if state.event_count == 1 {
-            log::info!("🎹 rdev listen fallback: first event received");
+            log::info!(
+                "🎹 rdev listen fallback: first event received (open-GUI={}, palette={})",
+                load_paste_transform_settings().open_gui_hotkey.label(),
+                load_paste_transform_settings().palette_trigger.label()
+            );
+        }
+        // A HID tap that lost its Input Monitoring grant still gets created and
+        // still reports a first event, then goes quiet. Without a periodic count
+        // that is indistinguishable from "the chord didn't match".
+        if state.event_count % 500 == 0 {
+            log::debug!("🎹 fallback listener alive: {} events", state.event_count);
         }
 
         match event.event_type {
@@ -3721,23 +4602,54 @@ fn start_macos_open_gui_fallback_listener(
                     return;
                 }
 
-                if key == RKey::KeyG
+                // Chorded keys only: logging bare keypresses would turn the log
+                // into a keylogger. Debug-level so it's opt-in when a hotkey
+                // needs diagnosing.
+                if has_cmd(&state.pressed_mods)
+                    || has_ctrl(&state.pressed_mods)
+                    || state.pressed_mods.contains(&RKey::Alt)
+                    || state.pressed_mods.contains(&RKey::AltGr)
+                {
+                    log::debug!("🎹 chord seen: {:?} + {:?}", state.pressed_mods, key);
+                }
+
+                if matches_palette_trigger(key, &state.pressed_mods) && !state.latch_palette {
+                    state.latch_palette = true;
+                    log::info!(
+                        "⌨️  {} → memory palette (fallback)",
+                        load_paste_transform_settings().palette_trigger.label()
+                    );
+                    let _ = tx.send(HotkeyTick::SlotPicker);
+                    return;
+                }
+
+                if matches!(key, RKey::KeyG | RKey::Space)
                     && (has_cmd(&state.pressed_mods) || has_ctrl(&state.pressed_mods))
                     && !state.latch_ctrl_g
                 {
                     let hk = load_paste_transform_settings().open_gui_hotkey;
-                    let matched = match hk {
-                        OpenGuiHotkey::CtrlG => is_ctrl_only(&state.pressed_mods),
-                        // Alt+G is Windows-only — unbound on macOS.
-                        OpenGuiHotkey::AltG => false,
-                        OpenGuiHotkey::CmdShiftG => is_cmd_shift(&state.pressed_mods),
-                        OpenGuiHotkey::CtrlShiftG => is_ctrl_shift(&state.pressed_mods),
-                        OpenGuiHotkey::Disabled => false,
-                    };
+                    let on_expected_key = hk.uses_space_key() == (key == RKey::Space);
+                    let matched = on_expected_key
+                        && match hk {
+                            OpenGuiHotkey::CtrlG => is_ctrl_only(&state.pressed_mods),
+                            // Alt+G is Windows-only — unbound on macOS.
+                            OpenGuiHotkey::AltG => false,
+                            OpenGuiHotkey::CmdShiftG => is_cmd_shift(&state.pressed_mods),
+                            OpenGuiHotkey::CtrlShiftG => is_ctrl_shift(&state.pressed_mods),
+                            OpenGuiHotkey::CtrlSpace => is_ctrl_only(&state.pressed_mods),
+                            OpenGuiHotkey::OptSpace => is_opt_only(&state.pressed_mods),
+                            OpenGuiHotkey::Disabled => false,
+                        };
                     if matched {
                         state.latch_ctrl_g = true;
-                        log::info!("⌨️  {} → open GUI (fallback)", hk.label());
-                        let _ = tx.send(HotkeyTick::OpenGui);
+                        let action = load_paste_transform_settings().ctrl_space_action;
+                        log::info!("⌨️  {} → {:?} (fallback)", hk.label(), action);
+                        let tick = match action {
+                            CtrlSpaceAction::OpenGui => HotkeyTick::OpenGui,
+                            CtrlSpaceAction::SlotMemory => HotkeyTick::SlotMemoryHud,
+                            CtrlSpaceAction::CommandPalette => HotkeyTick::CommandPalette,
+                        };
+                        let _ = tx.send(tick);
                     }
                 }
             }
@@ -3745,8 +4657,11 @@ fn start_macos_open_gui_fallback_listener(
                 if is_modifier_key(key) {
                     state.pressed_mods.remove(&key);
                 }
-                if key == RKey::KeyG {
+                if matches!(key, RKey::KeyG | RKey::Space) {
                     state.latch_ctrl_g = false;
+                }
+                if matches!(key, RKey::KeyV | RKey::Space) {
+                    state.latch_palette = false;
                 }
             }
             _ => {}
@@ -3754,6 +4669,23 @@ fn start_macos_open_gui_fallback_listener(
     })
     .map_err(|e| format!("rdev listen error: {:?}", e))?;
     Ok(())
+}
+
+/// Whether this key+modifier state matches the configured memory-palette shortcut.
+#[cfg(target_os = "macos")]
+fn matches_palette_trigger(key: RKey, pressed_mods: &HashSet<RKey>) -> bool {
+    let settings = load_paste_transform_settings();
+    // `palette_enabled` is honoured for configs written before "Off" existed
+    // in the trigger list; new ones express it as the trigger itself.
+    if !settings.palette_enabled {
+        return false;
+    }
+    match settings.palette_trigger {
+        PaletteTrigger::Off => false,
+        PaletteTrigger::CmdShiftV => is_cmd_shift(pressed_mods) && key == RKey::KeyV,
+        PaletteTrigger::CtrlOptSpace => is_ctrl_opt(pressed_mods) && key == RKey::Space,
+        PaletteTrigger::OptSpace => is_opt_only(pressed_mods) && key == RKey::Space,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3805,6 +4737,12 @@ fn has_ctrl(pressed_mods: &HashSet<RKey>) -> bool {
     pressed_mods.contains(&RKey::ControlLeft) || pressed_mods.contains(&RKey::ControlRight)
 }
 
+/// Option (either side) held, regardless of what else is.
+#[cfg(target_os = "macos")]
+fn has_opt(pressed_mods: &HashSet<RKey>) -> bool {
+    pressed_mods.contains(&RKey::Alt) || pressed_mods.contains(&RKey::AltGr)
+}
+
 /// Ctrl+Shift held (no Cmd, no Option)
 #[cfg(target_os = "macos")]
 fn is_ctrl_shift(pressed_mods: &HashSet<RKey>) -> bool {
@@ -3848,6 +4786,14 @@ fn is_opt_only(pressed_mods: &HashSet<RKey>) -> bool {
         && !pressed_mods.contains(&RKey::ControlRight)
         && !pressed_mods.contains(&RKey::ShiftLeft)
         && !pressed_mods.contains(&RKey::ShiftRight)
+}
+
+/// Cmd+Option+Shift held together.
+#[cfg(target_os = "macos")]
+fn is_cmd_opt_shift(pressed_mods: &HashSet<RKey>) -> bool {
+    (pressed_mods.contains(&RKey::MetaLeft) || pressed_mods.contains(&RKey::MetaRight))
+        && (pressed_mods.contains(&RKey::Alt) || pressed_mods.contains(&RKey::AltGr))
+        && (pressed_mods.contains(&RKey::ShiftLeft) || pressed_mods.contains(&RKey::ShiftRight))
 }
 
 /// Cmd+Option held (no Ctrl, no Shift)
@@ -3966,7 +4912,10 @@ fn letter_capture_active() -> bool {
 }
 
 fn upper_slot_for_taps(taps: u8) -> u8 {
-    (taps + 10).min(MAX_CLIP_SLOT)
+    // Keep the extended numeric bank disjoint from the named A-Z bank, which
+    // starts at slot 31. Without this cap a long Option+C/V multi-tap sequence
+    // could silently overwrite letter slots.
+    taps.saturating_add(10).min(30)
 }
 
 /// Highest slot a Cmd/Ctrl multi-tap can reach. When multi-slot is disabled
@@ -4037,5 +4986,111 @@ fn backfill_embeddings(store: &ClipStore, config: &TransformConfig) {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn counting_taps_is_not_a_drum_roll() {
+        // TAP_WINDOW is the gap allowed between taps, and the count resets
+        // when it lapses. Reaching slot 15 means five taps in a row, so the
+        // window has to suit someone counting rather than someone drumming.
+        assert!(
+            TAP_WINDOW >= Duration::from_millis(500),
+            "at {TAP_WINDOW:?} a deliberate five-tap count commits five times"
+        );
+        // Still short enough that the save does not feel detached from the act.
+        assert!(TAP_WINDOW <= Duration::from_millis(900));
+        // And comfortably above the duplicate-event guard, or taps would be
+        // dropped before they could be counted.
+        assert!(TAP_DEBOUNCE * 4 < TAP_WINDOW);
+    }
+
+    #[test]
+    fn the_letter_gesture_stays_off_the_numeric_keys() {
+        // Letter slots hang off a double-tap of Option, which types nothing on
+        // its own and shares no key with ⌘C / ⌘V. Option+C / Option+V were
+        // tried and are wrong twice over: they emit ç and √, and they already
+        // address the extended 11–30 bank.
+        assert!(
+            QUICK_DOUBLE_WINDOW <= Duration::from_millis(600),
+            "two taps that far apart are two separate presses"
+        );
+        assert!(
+            QUICK_LETTER_GRACE >= Duration::from_millis(1500),
+            "the letter that follows should not be a race"
+        );
+    }
+
+    #[test]
+    fn a_quick_letter_save_is_not_a_race() {
+        // The letter window used to double as a stall on the numeric commit:
+        // press the letter in time and the content went to slot A, miss and it
+        // went to slot 2. One gesture, two outcomes, decided by a stopwatch.
+        //
+        // The letter is additive now — the content goes to both — so nothing is
+        // being held back and the window only has to be comfortable.
+        assert!(
+            QUICK_LETTER_GRACE >= Duration::from_millis(1500),
+            "a window you can miss is a window someone has to think about"
+        );
+        // The numeric path commits on its own timing, untouched by the letter.
+        assert!(TAP_WINDOW < QUICK_LETTER_GRACE);
+    }
+
+    #[test]
+    fn the_hud_steps_aside_only_for_the_island() {
+        // Both surfaces open at the top centre. When the island is the layout
+        // it owns that space, and the HUD is told how much to keep clear.
+        let plain = "STYLE\ttoast\nTITLE\tCopied";
+        assert_eq!(
+            add_hud_clearance(plain, false),
+            plain,
+            "palette layout: nothing to avoid"
+        );
+
+        let moved = add_hud_clearance(plain, true);
+        assert!(moved.starts_with(plain), "the original payload survives intact");
+        assert!(moved.ends_with(&format!("\nAVOIDTOP\t{ISLAND_RESERVED_TOP}")));
+        // One field per line, tab separated — the HUD's parser wants both.
+        assert_eq!(moved.lines().count(), plain.lines().count() + 1);
+        assert_eq!(moved.lines().last().unwrap().split('\t').count(), 2);
+    }
+
+    #[test]
+    fn numbered_multitaps_map_to_slots_one_through_nine() {
+        let settings = PasteTransformSettings::default();
+        assert!(settings.multi_slot_enabled);
+        assert_eq!(primary_slot_for_taps(1, &settings), 1);
+        assert_eq!(primary_slot_for_taps(2, &settings), 2);
+        assert_eq!(primary_slot_for_taps(9, &settings), 9);
+        assert_eq!(primary_slot_for_taps(10, &settings), 9);
+    }
+
+    #[test]
+    fn disabled_numbered_multitaps_fall_back_to_normal_slot_one() {
+        let mut settings = PasteTransformSettings::default();
+        settings.multi_slot_enabled = false;
+        assert_eq!(primary_slot_for_taps(1, &settings), 1);
+        assert_eq!(primary_slot_for_taps(7, &settings), 1);
+    }
+
+    #[test]
+    fn extended_multitaps_map_to_slots_eleven_through_thirty() {
+        assert_eq!(upper_slot_for_taps(1), 11);
+        assert_eq!(upper_slot_for_taps(20), 30);
+        assert_eq!(upper_slot_for_taps(40), 30);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn alphabet_maps_a_through_z_to_slots_thirty_one_through_fifty_six() {
+        assert_eq!(key_to_letter_slot(RKey::KeyA), Some((31, 0, 'A')));
+        assert_eq!(key_to_letter_slot(RKey::KeyM), Some((43, 12, 'M')));
+        assert_eq!(key_to_letter_slot(RKey::KeyZ), Some((56, 25, 'Z')));
+        assert_eq!(key_to_letter_slot(RKey::Num1), None);
     }
 }

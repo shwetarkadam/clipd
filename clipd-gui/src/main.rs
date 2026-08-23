@@ -6,37 +6,66 @@ use clipd_core::{
     available_targets, compute_sessions, detect_sensitive, load_actions, load_custom_colors,
     load_paste_transform_settings, load_privacy_config, load_theme, load_transform_config,
     paste_transforms, run_action, save_actions, save_custom_colors, save_paste_transform_settings,
-    save_privacy_config, save_secret, save_theme, ActionOutput, ActionsConfig, AskAnswer,
-    AskConfig, AskFilters, AskThread, ClipEntry, ClipStore, ContentType, CustomAction,
-    CustomColors, OpenGuiHotkey, PaletteTrigger, PasteTransformSettings, PrivacyConfig, Rgb,
-    SecretEntry, Session, SessionConfig, TfIdfIndex, Theme, TransformKind, VaultTarget,
+    save_privacy_config, save_secret, save_theme, save_transform_config, ActionOutput,
+    ActionsConfig, AskAnswer, AskConfig, AskFilters, AskThread, ClipEntry, ClipStore, ContentType,
+    load_hotkey_status, CtrlSpaceAction, CustomAction, CustomColors, GuiLayout, HotkeyStatus,
+    OpenGuiHotkey, PaletteTrigger, PasteTransformSettings, PrivacyConfig, Rgb, SecretEntry, Session,
+    SessionConfig, TfIdfIndex, Theme, TransformConfig, TransformKind, VaultTarget,
 };
 use eframe::egui::{self, Color32, FontId, Margin, RichText, Rounding, Stroke};
-use std::collections::HashSet;
+
+mod island;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 /// Maximum clips to keep in memory in the GUI. Reduces RAM vs showing all clips.
 const MAX_LOADED_CLIPS: usize = 200;
 
-/// Liquid-glass spacing: roomy rows, big rounding, a leading icon tile.
-const CARD_ROUND: f32 = 12.0;
-const CARD_PAD_X: f32 = 12.0;
-const CARD_PAD_Y: f32 = 8.0;
-/// Gap between rows in the list.
-const ROW_GAP: f32 = 6.0;
+/// Compact spacing: tight rows, moderate rounding, a leading icon tile.
+const CARD_ROUND: f32 = 10.0;
+const CARD_PAD_X: f32 = 10.0;
+const CARD_PAD_Y: f32 = 5.0;
+/// Gap between rows in the list (mockup: ~8–10px between cards).
+const ROW_GAP: f32 = 8.0;
 /// Pill (tag) corner radius and padding.
 const PILL_ROUND: f32 = 6.0;
 const PILL_PAD_X: f32 = 7.0;
 const PILL_PAD_Y: f32 = 2.0;
-const SETTINGS_MAX_WIDTH: f32 = 640.0;
+const SETTINGS_MAX_WIDTH: f32 = 740.0;
+/// Window width while the Settings tab is showing — wide enough that endpoint
+/// URLs and colour rows fit without truncating.
+const SETTINGS_W: f32 = 780.0;
 const SETTINGS_GUTTER_X: f32 = 16.0;
 const SETTINGS_GUTTER_Y: f32 = 14.0;
-// Compact palette by default; double-clicking a row expands the window to
-// EXPANDED_W with the preview inspector attached on the right.
-const COMPACT_W: f32 = 520.0;
+// Compact palette by default (mockup proportions — tall, readable, not wide).
+// Double-clicking a row expands to EXPANDED_W with the preview on the right.
+const COMPACT_W: f32 = 600.0;
 const EXPANDED_W: f32 = 980.0;
-const WIN_H: f32 = 560.0;
+const WIN_H: f32 = 740.0;
+const SHELL_ROUND: f32 = 18.0;
+
+// ── Tray popover (HUD) ──
+//
+// Menu-bar clipboard popover that opens under the tray icon on hover/click.
+const HUD_W: f32 = 380.0;
+const HUD_H: f32 = 480.0;
+/// Gap from the top of the screen. Must clear the macOS menu bar (~25pt): the
+/// menu bar sits at a higher window level, so anything above this is drawn
+/// behind it and simply never appears.
+const HUD_TOP_MARGIN: f32 = 30.0;
+/// Grace period before collapsing, so crossing a gap between chips or
+/// overshooting the edge by a pixel doesn't slam the panel shut mid-read.
+const HUD_COLLAPSE_DELAY: Duration = Duration::from_millis(200);
+/// Keep the popover this far from the screen edges when the tray icon sits
+/// near a corner.
+const POPOVER_EDGE_PAD: f32 = 8.0;
+/// Height the popover reserves for its footer: divider, padding, and the row
+/// of 30pt buttons. Every view above the footer subtracts this, so it lives in
+/// one place rather than being re-guessed per view.
+/// Room for the footer's controls plus the hairline above them. Grew with the
+/// buttons — at the old height a 38pt control had nowhere to sit.
+const POPOVER_FOOTER_H: f32 = 58.0;
 const PINNED_COLLECTION_NAME: &str = "Pinned";
 const LEGACY_STARRED_COLLECTION_NAME: &str = "Starred";
 fn rgb(c: Rgb) -> Color32 {
@@ -55,8 +84,10 @@ fn pill_bg(col: Color32) -> Color32 {
     )
 }
 
-/// A boxed on/off setting row (checkbox + title + description). Returns true if
-/// the value changed this frame, so the caller can persist.
+/// A boxed on/off setting row. Returns true if the value changed this frame.
+///
+/// Lives on the same row language as the tray popover: icon, title, detail,
+/// switch. The card around a run of these is `settings_card`.
 fn settings_toggle(
     ui: &mut egui::Ui,
     c: &clipd_core::ThemeColors,
@@ -64,67 +95,16 @@ fn settings_toggle(
     title: &str,
     subtitle: &str,
 ) -> bool {
-    let mut changed = false;
-    egui::Frame::none()
-        .inner_margin(Margin {
-            left: 0.0,
-            right: 0.0,
-            top: 3.0,
-            bottom: 3.0,
-        })
-        .show(ui, |ui| {
-            // A subtle row — checkbox + title on one line, description muted below.
-            // Light border instead of a bright outline keeps the list calm.
-            egui::Frame::none()
-                .fill(rgb(c.bg_surface))
-                .rounding(Rounding::same(CARD_ROUND))
-                .inner_margin(Margin::symmetric(12.0, 8.0))
-                .stroke(Stroke::new(0.5, rgb(c.border)))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal_top(|ui| {
-                        if ui.checkbox(value, "").changed() {
-                            changed = true;
-                        }
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(title).strong().size(12.5).color(rgb(c.text)),
-                                )
-                                .selectable(false),
-                            );
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(subtitle).size(10.5).color(rgb(c.subtext)),
-                                )
-                                .selectable(false),
-                            );
-                        });
-                    });
-                });
-        });
-    changed
+    settings_toggle_row(ui, c, FooterIcon::Gear, value, title, subtitle)
 }
 
-/// A section header inside the settings list — a divider, then a small caption.
+/// Quiet section label — kept for the unused settings window and pairing copy.
 fn settings_caption(ui: &mut egui::Ui, c: &clipd_core::ThemeColors, text: &str, note: &str) {
-    egui::Frame::none()
-        .inner_margin(Margin {
-            left: 0.0,
-            right: 0.0,
-            top: 16.0,
-            bottom: 6.0,
-        })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.separator();
-            ui.add_space(8.0);
-            ui.label(RichText::new(text).size(11.0).strong().color(rgb(c.accent)));
-            if !note.is_empty() {
-                ui.label(RichText::new(note).size(10.5).color(rgb(c.subtext)));
-            }
-        });
+    settings_section(ui, c, text);
+    if !note.is_empty() {
+        ui.label(RichText::new(note).size(10.5).color(rgb(c.subtext)));
+        ui.add_space(4.0);
+    }
 }
 
 /// One labeled swatch row for the custom-palette editor. Returns true if the
@@ -145,6 +125,1019 @@ fn color_row(ui: &mut egui::Ui, c: &clipd_core::ThemeColors, label: &str, val: &
 
 /// Draw a magnifier icon into a fixed slot in the current layout. Vector-drawn
 /// so it always renders (the `⌕`/`🔍` glyphs are missing in egui's font → tofu).
+// ── Glass affordances ──
+//
+// macOS materials are translucent over their backdrop with a hairline edge
+// catching the light. egui has no blur, so the illusion comes from a
+// low-alpha fill plus a brighter top-edge stroke — enough that these read as
+// floating *over* the list rather than as flat buttons stamped into it.
+
+/// A compact circular control used by the bottom command bar and contextual
+/// row actions. Keeping these icon-only makes the palette feel like a utility,
+/// not a toolbar-heavy application.
+/// Left edge for a popover of `width`, sitting under the menu-bar extra.
+///
+/// The card is centred on the cat icon so the tail points at it. It is only
+/// nudged inward when that would run off a screen edge — never parked against
+/// the right of the display just because the extra is not in a guessed zone.
+fn popover_left(width: f32, screen: egui::Vec2, anchored: bool) -> f32 {
+    let max_left = (screen.x - width - POPOVER_EDGE_PAD).max(POPOVER_EDGE_PAD);
+    let anchor = if anchored {
+        clipd_core::load_tray_anchor().map(|x| x as f32)
+    } else {
+        None
+    };
+    match anchor {
+        Some(x) => (x - width * 0.5).clamp(POPOVER_EDGE_PAD, max_left),
+        None => max_left,
+    }
+}
+
+/// Launch another copy of this binary as the full palette window.
+///
+/// The popover deliberately stays small; anything that needs room (settings,
+/// the full history) opens the real window rather than growing the tray panel
+/// into a second application.
+fn spawn_palette(args: &[&str]) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(exe)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// One settings row inside the popover: title, explanation, optional state
+/// pill on the right. Returns true when clicked.
+///
+/// `state: None` marks an action (it navigates or quits); `Some(bool)` marks a
+/// toggle and shows On/Off, so the two never look alike.
+/// A small pill action, ranked so a row's three verbs are not all equal.
+///
+/// `Copy` is what you came for, `Reveal` is a peek, `Forget` destroys
+/// something — three identical grey rectangles said none of that.
+fn vault_action(
+    ui: &mut egui::Ui,
+    c: &clipd_core::ThemeColors,
+    label: &str,
+    primary: bool,
+    destructive: bool,
+) -> egui::Response {
+    let (fill, text, border) = if primary {
+        (
+            rgb(c.accent).gamma_multiply(0.22),
+            rgb(c.accent),
+            rgb(c.accent).gamma_multiply(0.5),
+        )
+    } else if destructive {
+        (
+            Color32::TRANSPARENT,
+            rgb(c.subtext),
+            rgb(c.border).gamma_multiply(0.7),
+        )
+    } else {
+        (
+            surf(c, c.bg_elevated),
+            rgb(c.text),
+            rgb(c.border).gamma_multiply(0.8),
+        )
+    };
+    ui.add(
+        egui::Button::new(RichText::new(label).size(11.5).color(text))
+            .fill(fill)
+            .stroke(Stroke::new(0.9, border))
+            .rounding(Rounding::same(7.0))
+            .min_size(egui::vec2(0.0, 26.0)),
+    )
+}
+
+/// Trailing control on a settings row.
+#[derive(Clone, Copy, PartialEq)]
+enum RowControl {
+    Toggle(bool),
+    Chevron,
+}
+
+/// A small-caps section heading, as the reference groups its settings.
+fn popover_section_header(ui: &mut egui::Ui, c: &clipd_core::ThemeColors, text: &str) {
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new(text.to_uppercase())
+            .size(10.5)
+            .color(rgb(c.overlay))
+            .strong(),
+    );
+    ui.add_space(5.0);
+}
+
+/// One settings row: icon tile, title over subtitle, and a control on the
+/// right — a switch for something you turn on, a chevron for somewhere you go.
+///
+/// The rows used to be individually bordered cards with the word "On" or "Off"
+/// as their only control, which reads as a list of labels rather than as
+/// settings you operate.
+fn popover_setting_row(
+    ui: &mut egui::Ui,
+    c: &clipd_core::ThemeColors,
+    icon: FooterIcon,
+    title: &str,
+    detail: &str,
+    control: RowControl,
+) -> bool {
+    let height = 56.0;
+    let width = ui.available_width();
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect, Rounding::same(10.0), surf(c, c.bg_hover));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    // Icon tile.
+    let tile = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        egui::vec2(38.0, 38.0),
+    );
+    let lit = matches!(control, RowControl::Toggle(true));
+    painter.rect_filled(
+        tile,
+        Rounding::same(10.0),
+        if lit {
+            rgb(c.accent).gamma_multiply(0.20)
+        } else {
+            surf(c, c.bg_elevated)
+        },
+    );
+    paint_footer_icon(
+        painter,
+        egui::Rect::from_center_size(tile.center(), egui::vec2(18.0, 18.0)),
+        icon,
+        if lit { rgb(c.accent) } else { rgb(c.subtext) },
+    );
+
+    let text_left = rect.left() + 62.0;
+    painter.text(
+        egui::pos2(text_left, rect.center().y - 9.0),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(13.5),
+        rgb(c.text),
+    );
+    painter.text(
+        egui::pos2(text_left, rect.center().y + 9.0),
+        egui::Align2::LEFT_CENTER,
+        detail,
+        egui::FontId::proportional(11.0),
+        rgb(c.subtext),
+    );
+
+    match control {
+        RowControl::Toggle(on) => {
+            let track = egui::Rect::from_center_size(
+                egui::pos2(rect.right() - 34.0, rect.center().y),
+                egui::vec2(42.0, 24.0),
+            );
+            painter.rect_filled(
+                track,
+                Rounding::same(12.0),
+                if on {
+                    rgb(c.accent)
+                } else {
+                    surf(c, c.bg_selected)
+                },
+            );
+            let knob = if on {
+                track.right() - 12.0
+            } else {
+                track.left() + 12.0
+            };
+            painter.circle_filled(
+                egui::pos2(knob, track.center().y),
+                9.0,
+                if on { rgb(c.bg_base) } else { rgb(c.subtext) },
+            );
+        }
+        RowControl::Chevron => {
+            let x = rect.right() - 26.0;
+            let y = rect.center().y;
+            let col = rgb(c.overlay);
+            for (dx, dy) in [(-4.0_f32, -5.0_f32), (-4.0, 5.0)] {
+                painter.line_segment(
+                    [egui::pos2(x + dx, y + dy), egui::pos2(x, y)],
+                    Stroke::new(1.8, col),
+                );
+            }
+        }
+    }
+    response.clicked()
+}
+
+/// Small-caps section heading used by the full Settings pages.
+fn settings_section(ui: &mut egui::Ui, c: &clipd_core::ThemeColors, text: &str) {
+    if ui.cursor().top() > ui.max_rect().top() + 6.0 {
+        ui.add_space(14.0);
+    } else {
+        ui.add_space(2.0);
+    }
+    ui.label(
+        RichText::new(text.to_uppercase())
+            .size(10.5)
+            .color(rgb(c.overlay))
+            .strong()
+            .extra_letter_spacing(0.8),
+    );
+    ui.add_space(5.0);
+}
+
+/// The grouped card every Settings section sits in — same language as the
+/// tray popover: raised surface, 12pt corners, a quiet border.
+fn settings_card<R>(
+    ui: &mut egui::Ui,
+    c: &clipd_core::ThemeColors,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let inner = egui::Frame::none()
+        .fill(surf(c, c.bg_surface))
+        .rounding(Rounding::same(12.0))
+        .stroke(Stroke::new(0.7, rgb(c.border).gamma_multiply(0.8)))
+        .inner_margin(Margin::symmetric(6.0, 4.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        });
+    ui.add_space(2.0);
+    inner.inner
+}
+
+/// Hairline between rows inside a card. Inset so it does not run under the
+/// icon tile or out to the card's rounded corners.
+fn settings_card_divider(ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+    let left = rect.left() + 56.0;
+    let right = rect.right() - 8.0;
+    if left < right {
+        ui.painter().hline(
+            left..=right,
+            rect.center().y,
+            Stroke::new(1.0, rgb(c.border).gamma_multiply(0.45)),
+        );
+    }
+}
+
+/// Padding for freeform content (fields, lists, notes) sitting inside a card.
+fn settings_card_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(8.0);
+        ui.vertical(|ui| {
+            let w = (ui.available_width() - 8.0).max(80.0);
+            ui.set_width(w);
+            add(ui);
+        });
+    });
+    ui.add_space(6.0);
+}
+
+fn settings_card_copy(ui: &mut egui::Ui, c: &clipd_core::ThemeColors, title: &str, note: &str) {
+    settings_card_body(ui, |ui| {
+        ui.label(RichText::new(title).size(13.0).color(rgb(c.text)));
+        if !note.is_empty() {
+            ui.add_space(2.0);
+            ui.label(RichText::new(note).size(11.0).color(rgb(c.subtext)));
+        }
+    });
+}
+
+/// The letter-slot key bindings, written out where the toggle for them lives.
+///
+/// These are chords with no discoverable surface — nothing in the UI hints
+/// that Ctrl+Option+C is a leader key, and a feature you cannot find is a
+/// feature nobody uses. The two platforms genuinely differ: macOS binds the
+/// chords directly, while Windows deliberately does not, because Win/Ctrl/Alt
+/// letter combinations collide with OS shortcuts, browser menus, AltGr layouts
+/// and app accelerators. So Windows routes A–Z through one leader instead.
+fn letter_slot_bindings() -> &'static [(&'static str, &'static str)] {
+    #[cfg(target_os = "windows")]
+    {
+        &[
+            ("Ctrl+`  then a letter", "Paste that letter slot"),
+            ("Ctrl+`  then Shift+letter", "Save the clipboard to it"),
+            ("Ctrl+C ×N", "Numeric slots 1–9 by tap count"),
+        ]
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Shortest first. The two-key path is the one worth learning, and it
+        // was buried under a four-key chord that looks like the main way in.
+        //
+        // Copy has no three-key form because Ctrl+Option+letter is already
+        // paste, and Cmd+Option+letter is claimed across macOS — ⌘⌥I opens web
+        // inspectors, ⌘⌥J consoles. Taking those would break the apps clipd is
+        // used inside, which is why copy carries the extra Shift.
+        // Cmd+Option+C / V, then the letter. Cmd suppresses Option's character
+        // composition, so these emit nothing even if a swallow is missed —
+        // which is what ruled out plain Option+C / Option+V (ç and √), on top
+        // of those already addressing the extended 11–30 bank.
+        //
+        // Cmd+Option+V used to be batch-drain paste; that moved to
+        // Cmd+Option+Shift+V rather than being quietly overridden.
+        &[
+            ("Cmd+Option+C  then a letter", "Copy to that letter slot"),
+            ("Cmd+Option+V  then a letter", "Paste that letter slot"),
+            ("Ctrl+Option+letter", "Paste — one chord, no timing"),
+            ("Ctrl+Shift+Option+letter", "Copy — one chord, no timing"),
+        ]
+    }
+}
+
+/// A read-only row that names a shortcut and says what it does.
+fn settings_shortcut_help(
+    ui: &mut egui::Ui,
+    c: &clipd_core::ThemeColors,
+    keys: &str,
+    what: &str,
+) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::hover());
+    let painter = ui.painter();
+    // The chord in a monospace pill, so it reads as keys rather than prose.
+    let galley = painter.layout_no_wrap(
+        keys.to_string(),
+        egui::FontId::monospace(11.0),
+        rgb(c.text),
+    );
+    let pill = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 14.0, rect.center().y - 11.0),
+        egui::vec2(galley.size().x + 16.0, 22.0),
+    );
+    painter.rect_filled(pill, Rounding::same(6.0), surf(c, c.bg_elevated));
+    painter.text(
+        pill.center(),
+        egui::Align2::CENTER_CENTER,
+        keys,
+        egui::FontId::monospace(11.0),
+        rgb(c.text),
+    );
+    painter.text(
+        egui::pos2(pill.right() + 12.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        what,
+        egui::FontId::proportional(11.0),
+        rgb(c.subtext),
+    );
+}
+
+fn settings_toggle_row(
+    ui: &mut egui::Ui,
+    c: &clipd_core::ThemeColors,
+    icon: FooterIcon,
+    value: &mut bool,
+    title: &str,
+    detail: &str,
+) -> bool {
+    if popover_setting_row(ui, c, icon, title, detail, RowControl::Toggle(*value)) {
+        *value = !*value;
+        true
+    } else {
+        false
+    }
+}
+
+/// Shared chrome for a settings row: icon tile, title, detail. Returns the
+/// allocated rect so the caller can paint a trailing control into it.
+fn settings_pref_shell(
+    ui: &mut egui::Ui,
+    c: &clipd_core::ThemeColors,
+    icon: FooterIcon,
+    title: &str,
+    detail: &str,
+    lit: bool,
+    clickable: bool,
+) -> (egui::Rect, egui::Response) {
+    let height = 56.0;
+    let width = ui.available_width();
+    let sense = if clickable {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), sense);
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect, Rounding::same(10.0), surf(c, c.bg_hover));
+        if clickable {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    let tile = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        egui::vec2(38.0, 38.0),
+    );
+    painter.rect_filled(
+        tile,
+        Rounding::same(10.0),
+        if lit {
+            rgb(c.accent).gamma_multiply(0.20)
+        } else {
+            surf(c, c.bg_elevated)
+        },
+    );
+    paint_footer_icon(
+        painter,
+        egui::Rect::from_center_size(tile.center(), egui::vec2(18.0, 18.0)),
+        icon,
+        if lit { rgb(c.accent) } else { rgb(c.subtext) },
+    );
+    let text_left = rect.left() + 62.0;
+    if detail.is_empty() {
+        painter.text(
+            egui::pos2(text_left, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            title,
+            egui::FontId::proportional(13.5),
+            rgb(c.text),
+        );
+    } else {
+        painter.text(
+            egui::pos2(text_left, rect.center().y - 9.0),
+            egui::Align2::LEFT_CENTER,
+            title,
+            egui::FontId::proportional(13.5),
+            rgb(c.text),
+        );
+        painter.text(
+            egui::pos2(text_left, rect.center().y + 9.0),
+            egui::Align2::LEFT_CENTER,
+            detail,
+            egui::FontId::proportional(11.0),
+            rgb(c.subtext),
+        );
+    }
+    (rect, response)
+}
+
+/// A settings row whose trailing side is a combo, slider, or other widget.
+fn settings_value_row(
+    ui: &mut egui::Ui,
+    c: &clipd_core::ThemeColors,
+    icon: FooterIcon,
+    title: &str,
+    detail: &str,
+    trailing_w: f32,
+    add_trailing: impl FnOnce(&mut egui::Ui),
+) {
+    let (rect, _) = settings_pref_shell(ui, c, icon, title, detail, false, false);
+    let trail = egui::Rect::from_min_size(
+        egui::pos2((rect.right() - trailing_w - 10.0).max(rect.left() + 160.0), rect.top()),
+        egui::vec2(trailing_w.min(rect.width() - 170.0).max(80.0), rect.height()),
+    );
+    ui.allocate_ui_at_rect(trail, |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add_trailing);
+    });
+}
+
+/// The line icons the footer draws instead of emoji.
+///
+/// Emoji arrive with their own weight, colour and baseline — a mixed set of
+/// them under a list of clips reads as clip art, not as controls, which is
+/// exactly what looked wrong however the buttons were sized. These are drawn
+/// from strokes at one weight so the row is consistent.
+#[derive(Clone, Copy, PartialEq)]
+enum FooterIcon {
+    Sparkle,
+    List,
+    Gear,
+    Eye,
+    Power,
+    Clipboard,
+    Lock,
+    Send,
+    Window,
+    Shield,
+    Key,
+    Palette,
+    Keyboard,
+    Sliders,
+    App,
+}
+
+fn paint_footer_icon(painter: &egui::Painter, rect: egui::Rect, icon: FooterIcon, col: Color32) {
+    let c = rect.center();
+    let r = rect.width().min(rect.height()) * 0.5;
+    let w = 1.9;
+    let stroke = Stroke::new(w, col);
+    match icon {
+        FooterIcon::Sparkle => {
+            // A four-point star: two crossed strokes with the diagonals short.
+            for (dx, dy, len) in [(0.0, 1.0, 0.95), (1.0, 0.0, 0.95)] {
+                painter.line_segment(
+                    [
+                        egui::pos2(c.x - dx * r * len, c.y - dy * r * len),
+                        egui::pos2(c.x + dx * r * len, c.y + dy * r * len),
+                    ],
+                    stroke,
+                );
+            }
+            for (dx, dy) in [(0.7, 0.7), (0.7, -0.7)] {
+                painter.line_segment(
+                    [
+                        egui::pos2(c.x - dx * r * 0.55, c.y - dy * r * 0.55),
+                        egui::pos2(c.x + dx * r * 0.55, c.y + dy * r * 0.55),
+                    ],
+                    Stroke::new(w * 0.75, col),
+                );
+            }
+        }
+        FooterIcon::List => {
+            for i in -1..=1 {
+                let y = c.y + i as f32 * r * 0.52;
+                painter.line_segment(
+                    [egui::pos2(c.x - r * 0.72, y), egui::pos2(c.x + r * 0.72, y)],
+                    stroke,
+                );
+            }
+        }
+        FooterIcon::Gear => {
+            // Big ring, short teeth. Long spokes on a small hub read as a
+            // sunburst, and a small ring with tiny teeth reads as a smudge —
+            // the same balance the island's gear needed.
+            painter.circle_stroke(c, r * 0.60, stroke);
+            painter.circle_filled(c, r * 0.20, col);
+            for i in 0..6 {
+                let a = i as f32 * std::f32::consts::PI / 3.0;
+                let (sin, cos) = a.sin_cos();
+                painter.line_segment(
+                    [
+                        egui::pos2(c.x + cos * r * 0.58, c.y + sin * r * 0.58),
+                        egui::pos2(c.x + cos * r * 0.92, c.y + sin * r * 0.92),
+                    ],
+                    Stroke::new(w * 1.2, col),
+                );
+            }
+        }
+        FooterIcon::Clipboard => {
+            let (hw, hh) = (r * 0.52, r * 0.72);
+            painter.rect_stroke(
+                egui::Rect::from_center_size(
+                    egui::pos2(c.x, c.y + r * 0.08),
+                    egui::vec2(hw * 2.0, hh * 2.0),
+                ),
+                Rounding::same(2.5),
+                stroke,
+            );
+            // The clip at the top, drawn wider than the board's shoulder.
+            painter.rect_stroke(
+                egui::Rect::from_center_size(
+                    egui::pos2(c.x, c.y - r * 0.62),
+                    egui::vec2(hw * 1.1, r * 0.38),
+                ),
+                Rounding::same(1.5),
+                Stroke::new(w * 0.9, col),
+            );
+        }
+        FooterIcon::Lock => {
+            let body = egui::Rect::from_center_size(
+                egui::pos2(c.x, c.y + r * 0.28),
+                egui::vec2(r * 1.30, r * 0.95),
+            );
+            painter.rect_stroke(body, Rounding::same(2.5), stroke);
+            // Shackle: a half-arc rising out of the body.
+            let steps = 12;
+            let pts: Vec<egui::Pos2> = (0..=steps)
+                .map(|i| {
+                    let a = std::f32::consts::PI * (i as f32 / steps as f32);
+                    egui::pos2(
+                        c.x - a.cos() * r * 0.44,
+                        body.top() - a.sin() * r * 0.52,
+                    )
+                })
+                .collect();
+            for pair in pts.windows(2) {
+                painter.line_segment([pair[0], pair[1]], Stroke::new(w * 0.9, col));
+            }
+        }
+        FooterIcon::Power => {
+            // An arc with a gap at the top, and the stem rising through it.
+            // Drawing a closed circle with a line poking into it — which is
+            // what this was — reads as a clock hand, not a power symbol.
+            let steps = 22;
+            let (start, sweep) = (-std::f32::consts::FRAC_PI_2 + 0.62, std::f32::consts::TAU - 1.24);
+            let pts: Vec<egui::Pos2> = (0..=steps)
+                .map(|i| {
+                    let a = start + sweep * (i as f32 / steps as f32);
+                    let (sin, cos) = a.sin_cos();
+                    egui::pos2(c.x + cos * r * 0.78, c.y + sin * r * 0.78)
+                })
+                .collect();
+            for pair in pts.windows(2) {
+                painter.line_segment([pair[0], pair[1]], stroke);
+            }
+            painter.line_segment(
+                [
+                    egui::pos2(c.x, c.y - r * 0.92),
+                    egui::pos2(c.x, c.y - r * 0.18),
+                ],
+                stroke,
+            );
+        }
+        FooterIcon::Eye => {
+            // Two arcs meeting at the corners, approximated by short chords.
+            let (hw, hh) = (r * 0.85, r * 0.5);
+            let steps = 10;
+            for sign in [1.0_f32, -1.0] {
+                let pts: Vec<egui::Pos2> = (0..=steps)
+                    .map(|i| {
+                        let t = i as f32 / steps as f32 * 2.0 - 1.0;
+                        egui::pos2(c.x + t * hw, c.y + sign * (1.0 - t * t) * hh)
+                    })
+                    .collect();
+                for pair in pts.windows(2) {
+                    painter.line_segment([pair[0], pair[1]], stroke);
+                }
+            }
+            painter.circle_stroke(c, r * 0.24, Stroke::new(w, col));
+        }
+        FooterIcon::Send => {
+            // Arrow pointing up-right out of a tray.
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.15, c.y + r * 0.20),
+                    egui::pos2(c.x + r * 0.55, c.y - r * 0.55),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x + r * 0.08, c.y - r * 0.55),
+                    egui::pos2(c.x + r * 0.55, c.y - r * 0.55),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x + r * 0.55, c.y - r * 0.08),
+                    egui::pos2(c.x + r * 0.55, c.y - r * 0.55),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.72, c.y + r * 0.55),
+                    egui::pos2(c.x + r * 0.20, c.y + r * 0.55),
+                ],
+                stroke,
+            );
+        }
+        FooterIcon::Window => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(c, egui::vec2(r * 1.55, r * 1.20)),
+                Rounding::same(2.5),
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.78, c.y - r * 0.22),
+                    egui::pos2(c.x + r * 0.78, c.y - r * 0.22),
+                ],
+                stroke,
+            );
+        }
+        FooterIcon::Shield => {
+            let pts = [
+                egui::pos2(c.x, c.y - r * 0.88),
+                egui::pos2(c.x + r * 0.72, c.y - r * 0.42),
+                egui::pos2(c.x + r * 0.62, c.y + r * 0.28),
+                egui::pos2(c.x, c.y + r * 0.88),
+                egui::pos2(c.x - r * 0.62, c.y + r * 0.28),
+                egui::pos2(c.x - r * 0.72, c.y - r * 0.42),
+            ];
+            for i in 0..pts.len() {
+                painter.line_segment([pts[i], pts[(i + 1) % pts.len()]], stroke);
+            }
+        }
+        FooterIcon::Key => {
+            painter.circle_stroke(
+                egui::pos2(c.x - r * 0.38, c.y),
+                r * 0.38,
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x, c.y),
+                    egui::pos2(c.x + r * 0.82, c.y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x + r * 0.82, c.y),
+                    egui::pos2(c.x + r * 0.82, c.y + r * 0.32),
+                ],
+                Stroke::new(w * 0.9, col),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(c.x + r * 0.52, c.y),
+                    egui::pos2(c.x + r * 0.52, c.y + r * 0.22),
+                ],
+                Stroke::new(w * 0.9, col),
+            );
+        }
+        FooterIcon::Palette => {
+            painter.circle_stroke(c, r * 0.78, stroke);
+            painter.circle_filled(egui::pos2(c.x - r * 0.28, c.y - r * 0.18), r * 0.16, col);
+            painter.circle_filled(egui::pos2(c.x + r * 0.22, c.y - r * 0.22), r * 0.14, col);
+            painter.circle_filled(egui::pos2(c.x + r * 0.08, c.y + r * 0.28), r * 0.14, col);
+        }
+        FooterIcon::Keyboard => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(c, egui::vec2(r * 1.70, r * 1.10)),
+                Rounding::same(2.5),
+                stroke,
+            );
+            for i in 0..3 {
+                let x = c.x - r * 0.42 + i as f32 * r * 0.42;
+                painter.circle_filled(egui::pos2(x, c.y - r * 0.12), r * 0.10, col);
+            }
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - r * 0.42, c.y + r * 0.22),
+                    egui::pos2(c.x + r * 0.42, c.y + r * 0.22),
+                ],
+                Stroke::new(w * 0.9, col),
+            );
+        }
+        FooterIcon::Sliders => {
+            for (i, h) in [0.55_f32, 0.85, 0.40].iter().enumerate() {
+                let x = c.x + (i as f32 - 1.0) * r * 0.55;
+                painter.line_segment(
+                    [
+                        egui::pos2(x, c.y - r * h),
+                        egui::pos2(x, c.y + r * 0.78),
+                    ],
+                    stroke,
+                );
+                painter.circle_filled(egui::pos2(x, c.y - r * (h - 0.22)), r * 0.18, col);
+            }
+        }
+        FooterIcon::App => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(c, egui::vec2(r * 1.35, r * 1.35)),
+                Rounding::same(4.0),
+                stroke,
+            );
+            painter.circle_filled(
+                egui::pos2(c.x - r * 0.22, c.y - r * 0.18),
+                r * 0.16,
+                col,
+            );
+        }
+    }
+}
+
+/// An icon button that paints its glyph rather than rendering a character.
+fn glass_line_button(
+    ui: &mut egui::Ui,
+    icon: FooterIcon,
+    active: bool,
+    c: &clipd_core::ThemeColors,
+) -> egui::Response {
+    let size = egui::vec2(38.0, 38.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hovered = response.hovered();
+    let (fill, col) = if active {
+        (rgb(c.accent).gamma_multiply(0.20), rgb(c.accent))
+    } else if hovered {
+        (rgb(c.bg_hover), rgb(c.text))
+    } else {
+        (rgb(c.bg_elevated), rgb(c.subtext))
+    };
+    ui.painter().circle_filled(rect.center(), size.x * 0.5, fill);
+    ui.painter().circle_stroke(
+        rect.center(),
+        size.x * 0.5,
+        Stroke::new(1.0, rgb(c.border).gamma_multiply(0.7)),
+    );
+    paint_footer_icon(
+        ui.painter(),
+        egui::Rect::from_center_size(rect.center(), egui::vec2(17.0, 17.0)),
+        icon,
+        col,
+    );
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+fn glass_icon_button(
+    ui: &mut egui::Ui,
+    icon: &str,
+    active: bool,
+    c: &clipd_core::ThemeColors,
+) -> egui::Response {
+    glass_icon_button_colored(ui, icon, active, c, rgb(c.accent))
+}
+
+/// Pin/star control — uses the theme's spot `green` so concept themes keep
+/// their chrome neutral while the mark still matches the mockups.
+fn glass_pin_button(
+    ui: &mut egui::Ui,
+    pinned: bool,
+    c: &clipd_core::ThemeColors,
+) -> egui::Response {
+    glass_icon_button_colored(
+        ui,
+        if pinned { "★" } else { "☆" },
+        pinned,
+        c,
+        rgb(c.green),
+    )
+}
+
+fn glass_icon_button_colored(
+    ui: &mut egui::Ui,
+    icon: &str,
+    active: bool,
+    c: &clipd_core::ThemeColors,
+    active_col: Color32,
+) -> egui::Response {
+    let (fill, stroke, text) = if active {
+        (
+            pill_bg(active_col),
+            active_col.gamma_multiply(0.62),
+            active_col,
+        )
+    } else {
+        (surf(c, c.bg_elevated), rgb(c.border), rgb(c.subtext))
+    };
+    let response = ui.add(
+        egui::Button::new(RichText::new(icon).size(16.0).color(text))
+            .fill(fill)
+            .rounding(Rounding::same(999.0))
+            .stroke(Stroke::new(0.75, stroke))
+            // Bigger, rounder targets. At 30pt these read as small chips
+            // crowded into the corner; the reference sits closer to 38 with
+            // real space between them, which is what makes a footer look like
+            // a set of controls rather than leftovers under the list.
+            .min_size(egui::vec2(38.0, 38.0)),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// A frosted pill button. `active` fills it with the accent instead.
+fn glass_chip(
+    ui: &mut egui::Ui,
+    icon: &str,
+    label: &str,
+    active: bool,
+    enabled: bool,
+    c: &clipd_core::ThemeColors,
+) -> egui::Response {
+    let text = if icon.is_empty() {
+        label.to_string()
+    } else if label.is_empty() {
+        icon.to_string()
+    } else {
+        format!("{}  {}", icon, label)
+    };
+
+    let (fill, stroke_col, text_col) = if active {
+        (
+            pill_bg(rgb(c.accent)),
+            rgb(c.accent).gamma_multiply(0.62),
+            rgb(c.text),
+        )
+    } else if enabled {
+        (surf(c, c.bg_elevated), rgb(c.border), rgb(c.subtext))
+    } else {
+        (surf(c, c.bg_surface), rgb(c.border), rgb(c.overlay))
+    };
+
+    let button = egui::Button::new(RichText::new(text).size(11.0).color(text_col))
+        .fill(fill)
+        .rounding(Rounding::same(999.0))
+        .stroke(Stroke::new(0.8, stroke_col))
+        .min_size(egui::vec2(0.0, 22.0));
+
+    let resp = ui.add_enabled(enabled, button);
+    if resp.hovered() && enabled {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// A selectable card for one GUI layout. Returns true when clicked.
+///
+/// Two cards rather than a combo: the choice changes what clipd *is* on screen,
+/// which deserves more than a dropdown row the eye slides past.
+fn layout_card(
+    ui: &mut egui::Ui,
+    c: &clipd_core::ThemeColors,
+    layout: GuiLayout,
+    selected: bool,
+) -> bool {
+    // Content width, not card width: the frame adds its own 12pt margins on
+    // each side, and forgetting them made the second card wrap onto its own
+    // line at every window size.
+    const CARD_MARGIN: f32 = 12.0;
+    const CARD_GAP: f32 = 8.0;
+    let width = ((ui.available_width() - CARD_GAP) / 2.0 - CARD_MARGIN * 2.0 - 2.0)
+        .clamp(150.0, 320.0);
+    let mut clicked = false;
+    let response = egui::Frame::none()
+        .fill(if selected {
+            surf(c, c.bg_selected)
+        } else {
+            surf(c, c.bg_elevated)
+        })
+        .rounding(Rounding::same(14.0))
+        .stroke(Stroke::new(
+            if selected { 1.6 } else { 0.7 },
+            if selected { rgb(c.accent) } else { rgb(c.border) },
+        ))
+        .inner_margin(Margin::symmetric(12.0, 10.0))
+        .show(ui, |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing.y = 3.0;
+            let (preview, _) =
+                ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::hover());
+            draw_layout_preview(ui.painter(), preview, layout, c);
+            ui.add_space(3.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(layout.label())
+                        .size(12.5)
+                        .strong()
+                        .color(rgb(c.text)),
+                )
+                .selectable(false),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(layout.detail()).size(10.5).color(rgb(c.subtext)),
+                )
+                .selectable(false),
+            );
+        })
+        .response;
+    let hit = ui.interact(
+        response.rect,
+        egui::Id::new(("layout_card", layout.label())),
+        egui::Sense::click(),
+    );
+    if hit.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        clicked = true;
+    }
+    clicked
+}
+
+/// A tiny wireframe of each layout, so the difference is visible before the
+/// switch rather than after it.
+fn draw_layout_preview(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    layout: GuiLayout,
+    c: &clipd_core::ThemeColors,
+) {
+    let screen = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width() * 0.72, 30.0));
+    painter.rect_stroke(screen, Rounding::same(4.0), Stroke::new(1.0, rgb(c.border)));
+    match layout {
+        GuiLayout::Palette => {
+            // A card floating in the middle of the display.
+            let card = egui::Rect::from_center_size(
+                screen.center(),
+                egui::vec2(screen.width() * 0.42, 18.0),
+            );
+            painter.rect_filled(card, Rounding::same(3.0), rgb(c.accent));
+        }
+        GuiLayout::Notch => {
+            // A slab hanging off the top edge, notch-shaped.
+            let slab = egui::Rect::from_min_size(
+                egui::pos2(screen.center().x - screen.width() * 0.16, screen.top()),
+                egui::vec2(screen.width() * 0.32, 7.0),
+            );
+            painter.rect_filled(
+                slab,
+                Rounding {
+                    nw: 0.0,
+                    ne: 0.0,
+                    sw: 3.0,
+                    se: 3.0,
+                },
+                rgb(c.accent),
+            );
+        }
+    }
+}
+
 fn draw_search_icon(ui: &mut egui::Ui, col: Color32) {
     let (r, _) = ui.allocate_exact_size(egui::vec2(13.0, 16.0), egui::Sense::hover());
     let center = egui::pos2(r.left() + 5.5, r.center().y - 0.5);
@@ -157,6 +1150,172 @@ fn draw_search_icon(ui: &mut egui::Ui, col: Color32) {
         ],
         stroke,
     );
+}
+
+/// The brand mark: clipd's cat, the same art the island shows.
+///
+/// This was a lettered tile — a coloured square with a "C" in it, which is
+/// what an app uses when it has no mark of its own. clipd has one, and the
+/// island was already wearing it while this window introduced the product as
+/// a different app entirely.
+fn draw_brand_mark(ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 22.0), egui::Sense::hover());
+    draw_clipd_mark(ui, rect, rgb(c.accent));
+}
+
+/// Source-app tile: muted rounded square with the app's initial.
+fn draw_source_tile(ui: &mut egui::Ui, source: &str, c: &clipd_core::ThemeColors) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, Rounding::same(8.0), surf(c, c.bg_selected));
+    let letter = source
+        .chars()
+        .find(|ch| ch.is_alphanumeric())
+        .unwrap_or('·')
+        .to_ascii_uppercase()
+        .to_string();
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        letter,
+        FontId::proportional(12.0),
+        rgb(c.subtext),
+    );
+}
+
+/// Minimal header/footer icon — no filled pill, just the glyph.
+fn chrome_icon_button(ui: &mut egui::Ui, icon: &str, active: bool, c: &clipd_core::ThemeColors) -> egui::Response {
+    let col = if active {
+        rgb(c.green)
+    } else {
+        rgb(c.subtext)
+    };
+    let response = ui.add(
+        egui::Button::new(RichText::new(icon).size(14.0).color(col))
+            .fill(Color32::TRANSPARENT)
+            .rounding(Rounding::same(6.0))
+            .stroke(Stroke::NONE)
+            .min_size(egui::vec2(26.0, 26.0)),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// Tiny filter pill used under the search bar in the full GUI.
+/// Active = solid green; idle = outline only (mockup).
+fn tiny_filter_chip(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    theme: Theme,
+    c: &clipd_core::ThemeColors,
+) -> bool {
+    let spotlight = theme == Theme::GlassLight;
+    // Light themes get the same treatment, darkening instead of lifting.
+    let (text_col, fill, stroke) = if active && theme.is_light() {
+        (
+            rgb(c.text),
+            Color32::from_black_alpha(18),
+            Stroke::new(1.0, Color32::from_black_alpha(14)),
+        )
+    } else if active && !spotlight {
+        // A tint, not a slab. These accents are built to be read *as text* on
+        // a dark ground — painted as a saturated fill behind dark text they
+        // jump ~150 luminance levels off the surface and become the loudest
+        // thing in the window, louder than the clips they are filtering.
+        (
+            rgb(c.text),
+            Color32::from_white_alpha(20),
+            Stroke::new(1.0, Color32::from_white_alpha(16)),
+        )
+    } else if active {
+        (
+            if spotlight { Color32::WHITE } else { rgb(c.bg_base) },
+            rgb(c.green),
+            Stroke::NONE,
+        )
+    } else if spotlight {
+        (
+            rgb(c.subtext),
+            Color32::TRANSPARENT,
+            Stroke::new(0.7, Color32::from_rgba_unmultiplied(88, 98, 112, 52)),
+        )
+    } else {
+        (
+            rgb(c.subtext),
+            Color32::TRANSPARENT,
+            Stroke::new(0.9, rgb(c.border)),
+        )
+    };
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(12.0, 4.0);
+        ui.add(
+            egui::Button::new(RichText::new(label).size(11.5).color(text_col))
+                .fill(fill)
+                .rounding(Rounding::same(999.0))
+                .stroke(stroke)
+                .min_size(egui::vec2(0.0, 26.0)),
+        )
+        .clicked()
+    })
+    .inner
+}
+
+/// Simple outline clock glyph (mockup footer centre).
+fn draw_clock_icon_at(painter: &egui::Painter, center: egui::Pos2, col: Color32) {
+    let stroke = Stroke::new(1.35, col);
+    painter.circle_stroke(center, 7.0, stroke);
+    painter.line_segment(
+        [center, egui::pos2(center.x, center.y - 4.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [center, egui::pos2(center.x + 3.2, center.y + 1.8)],
+        stroke,
+    );
+}
+
+/// Footer shortcut chip — quiet outline box like the mockup's ⌘⇧V.
+fn footer_shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeColors) {
+    egui::Frame::none()
+        .fill(Color32::TRANSPARENT)
+        .rounding(Rounding::same(6.0))
+        .stroke(Stroke::new(0.85, rgb(c.border)))
+        .inner_margin(Margin::symmetric(7.0, 3.0))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(text)
+                    .size(11.0)
+                    .family(egui::FontFamily::Monospace)
+                    .color(rgb(c.subtext)),
+            );
+        });
+}
+
+/// Quiet row star: solid green when pinned, outline otherwise.
+fn row_star_quiet(
+    ui: &mut egui::Ui,
+    starred: bool,
+    c: &clipd_core::ThemeColors,
+) -> egui::Response {
+    let (icon, col) = if starred {
+        // Held back from the full accent. A pinned row already reads as
+        // pinned from its filled star; at full strength a couple of them
+        // become the brightest marks in the list, which is more emphasis than
+        // "I saved this" deserves.
+        ("★", rgb(c.green).gamma_multiply(0.72))
+    } else {
+        ("☆", rgb(c.overlay))
+    };
+    ui.add(
+        egui::Button::new(RichText::new(icon).size(15.0).color(col))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE)
+            .min_size(egui::vec2(24.0, 24.0)),
+    )
+    .on_hover_text(if starred { "Unpin" } else { "Pin" })
 }
 
 /// Global mouse position in screen points (top-left origin), used to summon
@@ -188,6 +1347,29 @@ fn relative_time_short(dt: &DateTime<Utc>) -> String {
     dt.format("%b %d").to_string()
 }
 
+fn clip_group_label(_clip: &ClipEntry, starred: bool) -> &'static str {
+    // Full GUI mockup: two sections only — pinned first, everything else Recent.
+    if starred {
+        "Pinned"
+    } else {
+        "Recent"
+    }
+}
+
+fn content_type_label(kind: &ContentType) -> &'static str {
+    match kind {
+        ContentType::Text | ContentType::Unknown => "Text",
+        ContentType::Url => "Link",
+        ContentType::Code => "Code",
+        ContentType::Email => "Mail",
+        // "Path" is a path-shaped string; "File" is a real copied file. Both
+        // exist now, so they can no longer share a label.
+        ContentType::Path => "Path",
+        ContentType::Image => "Image",
+        ContentType::File => "File",
+    }
+}
+
 /// Human-readable byte size for the preview meta rows.
 fn format_size(bytes: usize) -> String {
     if bytes < 1024 {
@@ -208,6 +1390,7 @@ fn type_label(kind: &ContentType) -> &'static str {
         ContentType::Email => "email",
         ContentType::Path => "path",
         ContentType::Image => "image",
+        ContentType::File => "file",
         ContentType::Unknown => "text",
     }
 }
@@ -265,22 +1448,39 @@ fn window_pos_at_cursor(
     screen: Option<egui::Vec2>,
 ) -> egui::Pos2 {
     let mut x = cursor.x - win_size.x * 0.5;
-    let mut y = cursor.y - 24.0;
+    // Keep clear of the island when it owns the top of the screen. Opening
+    // Settings from the island's own gear puts the cursor inside that band,
+    // so without this the window opens directly underneath it.
+    let min_top = if clipd_core::island_layout_active() {
+        clipd_core::ISLAND_RESERVED_TOP
+    } else {
+        8.0
+    };
+    let mut y = (cursor.y - 24.0).max(min_top);
     // Clamp so the whole card stays on the display (never opens half-cut at
     // a screen edge). Screen size is best-effort; without it just avoid <0.
     if let Some(s) = screen {
         x = x.min(s.x - win_size.x - 8.0);
-        y = y.min(s.y - win_size.y - 8.0);
+        // A window too tall to fit below the band sits as low as it can
+        // instead — off the bottom of the screen would be worse than overlap.
+        y = y.min((s.y - win_size.y - 8.0).max(8.0));
     }
     egui::pos2(x.max(8.0), y.max(8.0))
 }
 
-/// Size of the main display in points (used to clamp the palette position
-/// before the first frame, when egui can't tell us yet). macOS only.
+/// Size of the main display in *points* (the same space as `OuterPosition`).
+///
+/// `CGDisplayBounds` is pixels on Retina, which made the HUD think the screen
+/// was twice as wide and dock itself to the right edge. `NSScreen.frame` is
+/// the coordinate space the window actually uses.
 #[cfg(target_os = "macos")]
 fn main_display_size() -> Option<egui::Vec2> {
-    let b = core_graphics::display::CGDisplay::main().bounds();
-    Some(egui::vec2(b.size.width as f32, b.size.height as f32))
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSScreen;
+    let mtm = MainThreadMarker::new()?;
+    let screen = NSScreen::mainScreen(mtm)?;
+    let f = screen.frame();
+    Some(egui::vec2(f.size.width as f32, f.size.height as f32))
 }
 #[cfg(not(target_os = "macos"))]
 fn main_display_size() -> Option<egui::Vec2> {
@@ -289,6 +1489,38 @@ fn main_display_size() -> Option<egui::Vec2> {
 
 /// Tiny clipd logo mark: a clipboard outline with its clip tab, vector-drawn
 /// so it's crisp at any size and always renders (no font glyphs).
+/// The cat, shared with the island — one mark for the whole product.
+///
+/// The island had it and the palette drew a clipboard outline, so the two
+/// windows introduced clipd as two different apps.
+static CAT_PNG: &[u8] = include_bytes!("../assets/cat.png");
+
+fn clipd_cat_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    static CACHE: std::sync::Mutex<Option<Option<egui::TextureHandle>>> =
+        std::sync::Mutex::new(None);
+    let mut slot = CACHE.lock().ok()?;
+    if slot.is_none() {
+        *slot = Some(clipd_core::decode_rgba(CAT_PNG).ok().map(|(w, h, rgba)| {
+            let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            ctx.load_texture("clipd_cat_palette", img, egui::TextureOptions::LINEAR)
+        }));
+    }
+    slot.as_ref().and_then(|t| t.clone())
+}
+
+/// Paint the cat inside `rect`, keeping its proportions; falls back to the
+/// drawn clipboard if the texture cannot be decoded.
+pub(crate) fn draw_clipd_mark(ui: &mut egui::Ui, rect: egui::Rect, col: Color32) {
+    let Some(tex) = clipd_cat_texture(ui.ctx()) else {
+        draw_clipd_logo(ui.painter(), rect, col);
+        return;
+    };
+    let size = tex.size_vec2();
+    let scale = (rect.width() / size.x).min(rect.height() / size.y);
+    let fitted = egui::Rect::from_center_size(rect.center(), size * scale);
+    egui::Image::new((tex.id(), fitted.size())).paint_at(ui, fitted);
+}
+
 fn draw_clipd_logo(painter: &egui::Painter, rect: egui::Rect, col: Color32) {
     let center = rect.center();
     let h = rect.height().min(rect.width() * 1.3);
@@ -339,7 +1571,7 @@ fn tag_pill(ui: &mut egui::Ui, label: &str, col: Color32, c: &clipd_core::ThemeC
 fn pill_button(ui: &mut egui::Ui, label: &str, c: &clipd_core::ThemeColors) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(label).size(11.5).color(rgb(c.text)))
-            .fill(rgb(c.bg_surface))
+            .fill(surf(c, c.bg_surface))
             .rounding(Rounding::same(PILL_ROUND))
             .stroke(Stroke::new(0.5, rgb(c.border)))
             .min_size(egui::vec2(0.0, 23.0)),
@@ -367,22 +1599,23 @@ fn star_button(ui: &mut egui::Ui, starred: bool, c: &clipd_core::ThemeColors) ->
     } else {
         ("📌", "Pin clip")
     };
+    // Spot colour from the concept sheet — not chrome `accent`.
     let col = if starred {
-        rgb(c.accent)
+        rgb(c.green)
     } else {
         rgb(c.overlay)
     };
     ui.add(
         egui::Button::new(RichText::new(label).size(14.0).color(col))
             .fill(if starred {
-                rgb(c.accent).gamma_multiply(0.12)
+                rgb(c.green).gamma_multiply(0.12)
             } else {
                 Color32::TRANSPARENT
             })
             .rounding(Rounding::same(6.0))
             .stroke(Stroke::new(
                 if starred { 0.8 } else { 0.0 },
-                rgb(c.accent).gamma_multiply(0.7),
+                rgb(c.green).gamma_multiply(0.7),
             ))
             .min_size(egui::vec2(30.0, 28.0)),
     )
@@ -403,10 +1636,8 @@ fn row_star_button(
 
 /// Full-width hairline divider in the theme's border color.
 fn hairline(ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 1.0),
-        egui::Sense::hover(),
-    );
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
     ui.painter().hline(
         rect.x_range(),
         rect.center().y,
@@ -420,10 +1651,9 @@ fn mini_switch(ui: &mut egui::Ui, on: bool, c: &clipd_core::ThemeColors) -> bool
     let track = if on {
         rgb(c.accent)
     } else {
-        rgb(c.bg_elevated)
+        surf(c, c.bg_elevated)
     };
-    ui.painter()
-        .rect_filled(rect, Rounding::same(9.5), track);
+    ui.painter().rect_filled(rect, Rounding::same(9.5), track);
     let knob_x = if on {
         rect.right() - 10.0
     } else {
@@ -432,25 +1662,88 @@ fn mini_switch(ui: &mut egui::Ui, on: bool, c: &clipd_core::ThemeColors) -> bool
     let knob_col = if on { rgb(c.bg_base) } else { rgb(c.subtext) };
     ui.painter()
         .circle_filled(egui::pos2(knob_x, rect.center().y), 7.0, knob_col);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+}
+
+/// Compact keyboard hint used by the always-visible core workflow card.
+fn shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeColors) {
+    egui::Frame::none()
+        .fill(surf(c, c.bg_elevated))
+        .rounding(Rounding::same(6.0))
+        .stroke(Stroke::new(0.7, rgb(c.border)))
+        .inner_margin(Margin::symmetric(6.0, 2.0))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(text)
+                    .size(10.0)
+                    .strong()
+                    .family(egui::FontFamily::Monospace)
+                    .color(rgb(c.text)),
+            );
+        });
+}
+
+/// Warning-banner colours that follow the theme.
+///
+/// These were hardcoded to a dark-theme amber, which on a light theme rendered
+/// as tan text on a tan block — the message was there but unreadable, which is
+/// the worst possible outcome for a banner whose whole job is to be read.
+/// Returns `(fill, title, body, button_fill, button_text)`.
+fn warning_colors(light: bool) -> (Color32, Color32, Color32, Color32, Color32) {
+    if light {
+        (
+            Color32::from_rgb(253, 240, 219),
+            Color32::from_rgb(124, 61, 6),
+            Color32::from_rgb(146, 84, 22),
+            Color32::from_rgb(180, 105, 30),
+            Color32::from_rgb(255, 249, 240),
+        )
+    } else {
+        (
+            Color32::from_rgb(90, 50, 20).gamma_multiply(0.55),
+            Color32::from_rgb(255, 200, 120),
+            Color32::from_rgb(230, 190, 140),
+            Color32::from_rgb(120, 70, 30),
+            Color32::from_rgb(255, 220, 160),
+        )
+    }
+}
+
+/// A background surface, honouring the theme's `surface_alpha`.
+///
+/// Solid themes report 255 and this is identical to `rgb`. The glass themes
+/// report less, which is what turns cards and rows into frosted panes the
+/// shell's blur shows through — without it a translucent window still reads as
+/// an opaque white panel, because everything drawn on it is opaque.
+/// Takes the palette by borrow *or* by value: `ThemeColors` is `Copy`, and
+/// call sites hold it both ways.
+fn surf(c: impl std::borrow::Borrow<clipd_core::ThemeColors>, col: clipd_core::Rgb) -> Color32 {
+    Color32::from_rgba_unmultiplied(col.0, col.1, col.2, c.borrow().surface_alpha)
 }
 
 fn tab_chip(ui: &mut egui::Ui, label: &str, active: bool, c: &clipd_core::ThemeColors) -> bool {
-    let text_col = if active {
-        rgb(c.accent)
+    // Fully-rounded pills, the active one filled and outlined so the current
+    // filter is legible at a glance rather than by a faint tint alone.
+    let (text_col, fill, stroke) = if active {
+        (
+            rgb(c.text),
+            rgb(c.green).gamma_multiply(0.20),
+            Stroke::new(0.9, rgb(c.green).gamma_multiply(0.55)),
+        )
     } else {
-        rgb(c.subtext)
+        (
+            rgb(c.subtext),
+            surf(c, c.bg_elevated),
+            Stroke::new(0.7, rgb(c.border)),
+        )
     };
     let response = ui.add(
         egui::Button::new(RichText::new(label).size(11.5).color(text_col))
-            .fill(if active {
-                rgb(c.accent).gamma_multiply(0.14)
-            } else {
-                Color32::TRANSPARENT
-            })
-            .rounding(Rounding::same(8.0))
-            .stroke(Stroke::NONE)
-            .min_size(egui::vec2(0.0, 30.0)),
+            .fill(fill)
+            .rounding(Rounding::same(999.0))
+            .stroke(stroke)
+            .min_size(egui::vec2(0.0, 28.0)),
     );
     response.clicked()
 }
@@ -466,13 +1759,13 @@ fn tab_chip_count(
     c: &clipd_core::ThemeColors,
 ) -> bool {
     let text_col = if active {
-        rgb(c.accent)
+        rgb(c.green)
     } else {
         rgb(c.subtext)
     };
     let inner = egui::Frame::none()
         .fill(if active {
-            rgb(c.accent).gamma_multiply(0.14)
+            rgb(c.green).gamma_multiply(0.14)
         } else {
             Color32::TRANSPARENT
         })
@@ -483,7 +1776,7 @@ fn tab_chip_count(
                 ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(RichText::new(label).size(11.5).color(text_col));
                 egui::Frame::none()
-                    .fill(rgb(c.bg_elevated))
+                    .fill(surf(c, c.bg_elevated))
                     .rounding(Rounding::same(5.0))
                     .inner_margin(Margin::symmetric(5.0, 1.0))
                     .show(ui, |ui| {
@@ -502,18 +1795,6 @@ fn tab_chip_count(
     resp.clicked()
 }
 
-/// A small keycap-style pill (e.g. "esc") used as a subtle, clickable hint in
-/// the header. Muted by default so it reads as chrome, not a primary control.
-fn keycap(ui: &mut egui::Ui, label: &str, c: &clipd_core::ThemeColors) -> egui::Response {
-    ui.add(
-        egui::Button::new(RichText::new(label).size(10.5).color(rgb(c.overlay)))
-            .fill(rgb(c.bg_elevated))
-            .rounding(Rounding::same(6.0))
-            .stroke(Stroke::new(0.6, rgb(c.border).gamma_multiply(0.75)))
-            .min_size(egui::vec2(34.0, 22.0)),
-    )
-}
-
 enum Action {
     None,
     /// Copy to the clipboard only — clipd stays in front (single-click select).
@@ -528,6 +1809,42 @@ enum Action {
     Ask,
     /// Select the clip behind a clicked `[#id]` citation.
     JumpToClip(i64),
+    /// Jump to Settings so a missing API key can be fixed where it's noticed.
+    OpenAiSettings,
+    /// Start an ask scoped to one clip (the row's ✦ chip).
+    AskAboutClip(i64),
+    /// Run the Smart Recommend suggestion at this index on the selected clip.
+    RunSuggestion(usize),
+    /// Send the selected clip to the other Mac (`S`). This is the one thing
+    /// Universal Clipboard can't do: send from *history*, not just whatever is
+    /// on the clipboard right now.
+    Send,
+    /// Take back the last send (`U`), while the other Mac hasn't collected it.
+    UndoSend,
+}
+
+/// Where a pairing has got to.
+///
+/// Discovery blocks for up to a minute, which an immediate-mode UI cannot do,
+/// so it runs on a worker thread and reports back through a channel. This enum
+/// is what the window draws from.
+enum PairingState {
+    Idle,
+    Searching {
+        /// Set to stop the worker when the user cancels or closes the window.
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        result: std::sync::mpsc::Receiver<Result<clipd_core::lan_pair::PairingOffer, String>>,
+    },
+    /// Both machines are showing a code and the user has to compare them.
+    Confirming(clipd_core::lan_pair::PairingOffer),
+    Done(String),
+    Failed(String),
+}
+
+impl PairingState {
+    fn is_busy(&self) -> bool {
+        matches!(self, PairingState::Searching { .. } | PairingState::Confirming(_))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -535,9 +1852,289 @@ enum MainTab {
     Text,
     Collections,
     Settings,
+    /// Encrypted vault — API keys and secrets stored in macOS Keychain.
+    Vault,
+}
+
+/// Top-level Settings pages — one category at a time so nothing is a long scroll.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsCategory {
+    General,
+    Clipboard,
+    Ai,
+    Appearance,
+    Privacy,
+}
+
+impl SettingsCategory {
+    const ALL: [SettingsCategory; 5] = [
+        SettingsCategory::General,
+        SettingsCategory::Clipboard,
+        SettingsCategory::Ai,
+        SettingsCategory::Appearance,
+        SettingsCategory::Privacy,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsCategory::General => "General",
+            SettingsCategory::Clipboard => "Clipboard",
+            SettingsCategory::Ai => "AI",
+            SettingsCategory::Appearance => "Appearance",
+            SettingsCategory::Privacy => "Privacy",
+        }
+    }
+
+    /// Jump to a category from the settings search box.
+    fn from_query(q: &str) -> Option<Self> {
+        let q = q.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return None;
+        }
+        let hits: &[(SettingsCategory, &[&str])] = &[
+            (
+                SettingsCategory::General,
+                &["general", "hud", "surface", "send", "pair", "vault", "snippet", "action"],
+            ),
+            (
+                SettingsCategory::Clipboard,
+                &[
+                    "clipboard",
+                    "paste",
+                    "slot",
+                    "transform",
+                    "shortcut",
+                    "palette",
+                    "multi",
+                    "letter",
+                ],
+            ),
+            (SettingsCategory::Ai, &["ai", "model", "openai", "ollama", "ask"]),
+            (
+                SettingsCategory::Appearance,
+                &["appearance", "theme", "color", "colour", "dark", "light", "paper"],
+            ),
+            (
+                SettingsCategory::Privacy,
+                &["privacy", "secret", "exclude", "credit", "ssn", "password"],
+            ),
+        ];
+        for (cat, keys) in hits {
+            if keys.iter().any(|k| q.contains(k)) {
+                return Some(*cat);
+            }
+        }
+        None
+    }
+}
+
+/// The secondary rail mirrors Finder's content filters.  Keeping this separate
+/// from the primary Clipboard/Pins/Settings navigation makes the palette feel
+/// like a small macOS utility rather than a command launcher.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContentFilter {
+    All,
+    Favorites,
+    Slots,
+    Text,
+    Links,
+    Code,
+    Images,
+    Files,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceMode {
+    Main,
+    Settings,
+    Hud,
+    /// The notch island: a resident black slab at the top of the display that
+    /// hugs the MacBook notch and hosts modules. See `island.rs`.
+    Island,
+    /// Dismiss the popover entirely — used when the tray dropdown opens, so
+    /// the native menu doesn't draw on top of a panel it has no relation to.
+    Hidden,
+    /// Shut this window down. Sent by "Quit clipd" so every surface goes at
+    /// once — and, critically, before the tray host exits, since a surviving
+    /// window would otherwise restart it within seconds.
+    Quit,
+}
+
+impl SurfaceMode {
+    fn from_args(args: &[String]) -> Self {
+        if args.iter().any(|argument| argument == "--hud") {
+            Self::Hud
+        } else if args.iter().any(|argument| argument == "--island") {
+            Self::Island
+        } else if args.iter().any(|argument| argument == "--settings") {
+            Self::Settings
+        } else {
+            Self::Main
+        }
+    }
+
+    fn request_value(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Settings => "settings",
+            Self::Hud => "hud",
+            Self::Island => "island",
+            Self::Hidden => "hidden",
+            Self::Quit => "quit",
+        }
+    }
+
+    fn from_request(value: &str) -> Option<Self> {
+        match value.trim() {
+            "main" => Some(Self::Main),
+            "settings" => Some(Self::Settings),
+            "hud" => Some(Self::Hud),
+            "island" => Some(Self::Island),
+            "hidden" => Some(Self::Hidden),
+            "quit" => Some(Self::Quit),
+            _ => None,
+        }
+    }
+}
+
+fn process_lock_name(mode: SurfaceMode) -> &'static str {
+    match mode {
+        SurfaceMode::Hud => "gui-hud",
+        SurfaceMode::Island => "gui-island",
+        // Main, Settings, Hidden and Quit all target the same primary palette process.
+        _ => "gui-main",
+    }
+}
+
+fn surface_request_path(mode: SurfaceMode) -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("clipd")
+        .join(format!("{}.request", process_lock_name(mode)))
+}
+
+fn send_surface_request(mode: SurfaceMode) {
+    let path = surface_request_path(mode);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, mode.request_value());
+}
+
+fn send_surface_request_to(target: SurfaceMode, mode: SurfaceMode) {
+    let path = surface_request_path(target);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, mode.request_value());
+}
+
+fn take_surface_request_for(mode: SurfaceMode) -> Option<SurfaceMode> {
+    let path = surface_request_path(mode);
+    let request = std::fs::read_to_string(&path).ok();
+    if request.is_some() {
+        let _ = std::fs::remove_file(path);
+    }
+    request.and_then(|value| SurfaceMode::from_request(&value))
+}
+
+/// Persisted current surface so other processes (the tray menu) can tell
+/// whether a given surface is currently visible and toggle it off rather than
+/// re-launching it. Written by `switch_surface` whenever the mode changes.
+fn surface_state_path() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("clipd")
+        .join(format!("{}.state", process_lock_name(SurfaceMode::Main)))
+}
+
+fn hud_state_path() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("clipd")
+        .join(format!("{}.state", process_lock_name(SurfaceMode::Hud)))
+}
+
+fn surface_state_path_for(mode: SurfaceMode) -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("clipd")
+        .join(format!("{}.state", process_lock_name(mode)))
+}
+
+fn save_surface_state(mode: SurfaceMode) {
+    let path = match mode {
+        SurfaceMode::Hud => hud_state_path(),
+        SurfaceMode::Island => surface_state_path_for(SurfaceMode::Island),
+        _ => surface_state_path(),
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, mode.request_value());
+}
+
+impl ContentFilter {
+    /// Full-GUI filter row — includes Images so screenshots aren't buried.
+    const MAIN: [(ContentFilter, &'static str); 6] = [
+        (ContentFilter::All, "All"),
+        (ContentFilter::Links, "Links"),
+        (ContentFilter::Text, "Text"),
+        (ContentFilter::Code, "Code"),
+        (ContentFilter::Images, "Images"),
+        (ContentFilter::Favorites, "Pinned"),
+    ];
+
+    /// Extended set kept for keyboard / settings access (Slots, Files).
+    const ALL: [(ContentFilter, &'static str); 8] = [
+        (ContentFilter::All, "All"),
+        (ContentFilter::Links, "Links"),
+        (ContentFilter::Text, "Text"),
+        (ContentFilter::Code, "Code"),
+        (ContentFilter::Images, "Images"),
+        (ContentFilter::Favorites, "Pinned"),
+        (ContentFilter::Slots, "Slots"),
+        (ContentFilter::Files, "Files"),
+    ];
 }
 
 // ── Entry point ──
+
+fn theme_named(name: &str) -> Option<Theme> {
+    match name.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "system" => Some(Theme::System),
+        "light" | "paper-light" | "light-minimal" => Some(Theme::Light),
+        "dark" | "black" | "mac-black" => Some(Theme::Dark),
+        "midnight" => Some(Theme::Midnight),
+        // Retired: the nearest survivors, so old configs and scripts keep working.
+        "paper" | "paper-dark" => Some(Theme::Dark),
+        "forest" => Some(Theme::Forest),
+        "cocoa" => Some(Theme::Slate),
+        "slate" => Some(Theme::Slate),
+        "glass-light" | "glasslight" => Some(Theme::GlassLight),
+        // Retired: Glass Dark's job — a dark surface with no colour in it —
+        // is what Dark already does, without a translucency layer to fight.
+        "glass-dark" | "glassdark" | "glass" | "glass-minimal" | "glassminimal" => {
+            Some(Theme::Dark)
+        }
+        // Legacy names map to the closest curated theme so existing configs/cli
+        // calls don't break. The old colorful themes are gone, but users land in
+        // a readable palette instead of an error.
+        "catppuccin" | "mocha" => Some(Theme::Catppuccin),
+        "monokai" | "nord" | "dracula" => Some(Theme::Dark),
+        _ => None,
+    }
+}
+
+fn requested_theme(args: &[String]) -> Option<Result<Theme, String>> {
+    let position = args.iter().position(|arg| arg == "--set-theme")?;
+    let name = args.get(position + 1).map(String::as_str).unwrap_or("");
+    Some(theme_named(name).ok_or_else(|| {
+        format!(
+            "Unknown theme '{name}'. Use system, light, dark, midnight, forest, slate, catppuccin, glass-light, or glass-dark."
+        )
+    }))
+}
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -545,31 +2142,102 @@ fn main() -> eframe::Result {
         .format_target(false)
         .init();
 
-    // Single instance: if a clipd-gui window is already open, focus it and
-    // exit instead of spawning a duplicate. This backstops the daemon's own
-    // focus-existing logic against rapid Ctrl+G presses (where a second launch
-    // can race before the first window registers).
-    if focus_existing_instance() {
-        log::info!("clipd-gui already running — focused existing window, exiting");
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(theme_request) = requested_theme(&args) {
+        match theme_request {
+            Ok(theme) => {
+                save_theme(theme);
+                println!("clipd theme set to {}", theme.label());
+            }
+            Err(message) => eprintln!("{message}"),
+        }
         return Ok(());
     }
 
+    let requested_mode = SurfaceMode::from_args(&args);
+    // Each surface mode has its own process lease so the tray HUD popover
+    // and the main palette can coexist. A later invocation of the same mode
+    // posts a tiny request and exits; the existing process handles it.
+    // Different modes run as separate processes.
+    let lock_name = process_lock_name(requested_mode);
+    let _instance_guard = match clipd_core::ProcessLock::try_acquire(lock_name) {
+        Some(guard) => guard,
+        None => {
+            send_surface_request(requested_mode);
+            if matches!(requested_mode, SurfaceMode::Main | SurfaceMode::Settings) {
+                let _ = focus_existing_instance();
+            }
+            log::info!("requested {requested_mode:?} from the existing clipd GUI — exiting");
+            return Ok(());
+        }
+    };
+    // A request left by a launcher racing the first process is superseded by
+    // the explicit mode that won the lease.
+    let _ = take_surface_request_for(requested_mode);
+    save_surface_state(requested_mode);
+
     // Spawn daemon as a child process (rdev's keyboard hook conflicts with
     // eframe's event loop if both run in the same process on macOS).
-    let daemon_child = spawn_daemon_process();
+    // Only clipd-ui owns the daemon/hotkey host. GUI processes (main, HUD)
+    // must NOT spawn their own — that would create multiple clipd-ui instances,
+    // each needing separate Accessibility/Input Monitoring permissions.
+    let daemon_child: Option<std::process::Child> = None;
 
-    let mut viewport = egui::ViewportBuilder::default()
-        // Compact, borderless floating-palette card (expands for preview).
-        .with_inner_size([COMPACT_W, WIN_H])
-        .with_min_inner_size([420.0, 340.0])
-        .with_decorations(false)
-        .with_resizable(true)
-        .with_transparent(true);
-    // Open where the user is working: palette appears at the mouse cursor.
-    // macOS only at startup (CG reports points directly); on Windows the scale
-    // factor isn't known until the first frame, where the focus-gain handler
-    // repositions to the cursor anyway.
-    if cfg!(target_os = "macos") {
+    let hud = requested_mode == SurfaceMode::Hud;
+    let island = requested_mode == SurfaceMode::Island;
+    let open_settings = requested_mode == SurfaceMode::Settings;
+
+    let mut viewport = if island {
+        // The notch island opens at its resting size: the cutout plus a sliver
+        // either side. Everything after this is driven from `drive_island`.
+        let config = clipd_core::load_island_config();
+        let geometry = island::notch_geometry(&config);
+        egui::ViewportBuilder::default()
+            .with_inner_size([geometry.width + 28.0, geometry.height.max(24.0)])
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_always_on_top()
+            .with_transparent(true)
+    } else if hud {
+        // Tray-anchored clipboard popover: opens straight to full size under
+        // the tray icon.
+        egui::ViewportBuilder::default()
+            .with_inner_size([HUD_W, HUD_H])
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_always_on_top()
+            .with_transparent(true)
+    } else {
+        egui::ViewportBuilder::default()
+            // Compact, borderless floating-palette card (expands for preview).
+            .with_inner_size([COMPACT_W, WIN_H])
+            .with_min_inner_size([480.0, 560.0])
+            .with_decorations(false)
+            .with_resizable(true)
+            .with_transparent(true)
+    };
+
+    if hud {
+        // Resident HUD starts off-screen. Showing it at the computed tray
+        // position on launch put a clipboard card in the middle of the menu
+        // bar before anyone had hovered the extra. `show_hud_onscreen` moves
+        // it under the icon when clipd-ui asks.
+        viewport = viewport.with_position([0.0, -4000.0]);
+    } else if island {
+        let config = clipd_core::load_island_config();
+        let geometry = island::notch_geometry(&config);
+        let screen = main_display_size().unwrap_or(egui::vec2(1440.0, 900.0));
+        let width = geometry.width + 28.0;
+        let left = (geometry.center_x - width / 2.0).clamp(0.0, (screen.x - width).max(0.0));
+        // A notched display gets the island flush with the top edge; anywhere
+        // else it tucks under the menu bar so it can't cover the clock.
+        let top = if geometry.real { 0.0 } else { geometry.height + 4.0 };
+        viewport = viewport.with_position([left, top]);
+    } else if cfg!(target_os = "macos") {
+        // Open where the user is working: palette appears at the mouse cursor.
+        // macOS only at startup (CG reports points directly); on Windows the
+        // scale factor isn't known until the first frame, where the focus-gain
+        // handler repositions to the cursor anyway.
         if let Some(cursor) = global_cursor_position() {
             let pos =
                 window_pos_at_cursor(cursor, egui::vec2(COMPACT_W, WIN_H), main_display_size());
@@ -578,6 +2246,10 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport,
+        // Without multisampling every rounded corner, pill and hairline border
+        // is drawn with hard stair-stepped edges — which reads as "pixelated"
+        // and is genuinely tiring to look at on a window this dense.
+        multisampling: 4,
         ..Default::default()
     };
 
@@ -587,7 +2259,30 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             let theme = load_theme();
             apply_theme(&cc.egui_ctx, theme);
-            Ok(Box::new(ClipdGui::new(theme)))
+            // The island yields the top of the screen while a clipd window is
+            // *visible*. The HUD is resident and hidden for most of its life,
+            // so it claims this only when it actually shows itself — claiming
+            // it at startup kept the island hidden permanently.
+            if !island && !hud {
+                // Come forward. The bundle sets LSUIElement, so clipd is a
+                // menu-bar agent and its windows do not activate on their own:
+                // the palette would spawn, exist, and stay behind whatever the
+                // user was looking at. The shortcut fired, a process started,
+                // and nothing appeared to happen.
+                //
+                // Only this surface. The island and the tray popover are
+                // summoned by pointing at them and must never steal the front.
+                activate_for_keyboard_input();
+                clipd_core::set_gui_window_open(true);
+                // Only one way of looking at the clipboard at a time. The
+                // palette, the tray popover and the island are three views of
+                // the same clips; two of them on screen at once is not extra
+                // information, just two windows fighting for the same corner.
+                // The island stands down on the flag above; the popover needs
+                // telling, because it is resident and may be showing already.
+                send_surface_request_to(SurfaceMode::Hud, SurfaceMode::Hidden);
+            }
+            Ok(Box::new(ClipdGui::new(theme, hud, island, open_settings)))
         }),
     );
 
@@ -597,6 +2292,9 @@ fn main() -> eframe::Result {
         let _ = child.wait();
     }
     clipd_core::release_daemon_lock();
+    let _ = std::fs::remove_file(surface_state_path());
+    let _ = std::fs::remove_file(hud_state_path());
+    let _ = std::fs::remove_file(surface_state_path_for(SurfaceMode::Island));
 
     result
 }
@@ -851,6 +2549,49 @@ fn split_from_query(raw: &str) -> (String, String) {
     (raw.to_string(), String::new())
 }
 
+/// Bring clipd forward so one of its windows can take the keyboard.
+///
+/// clipd runs as a menu-bar agent, and an accessory app's windows cannot
+/// become key while the app itself is not active — so `ViewportCommand::Focus`
+/// on the island had nothing to grant. The search field would call
+/// `request_focus`, look focused, and every keystroke would still go to
+/// whatever app was in front.
+///
+/// Only for deliberate, click-initiated input like opening search. Never on
+/// hover: taking the keyboard because a pointer passed over something is how
+/// the tray popover started swallowing what people were typing.
+/// Make this frame's window the key window.
+///
+/// Measured, not assumed: the island's window reports `canBecomeKey=true` and
+/// `isKey=false`, so it is allowed the keyboard and simply never given it —
+/// `ViewportCommand::Focus` did not land for it. Asking AppKit directly does.
+#[cfg(target_os = "macos")]
+pub(crate) fn make_window_key(frame: &eframe::Frame) {
+    use objc2_app_kit::NSView;
+    if let Some(window) = ns_metal_view(frame).and_then(|v| v.window()) {
+        window.makeKeyAndOrderFront(None);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn make_window_key(_frame: &eframe::Frame) {}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn activate_for_keyboard_input() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        #[allow(deprecated)]
+        unsafe {
+            app.activateIgnoringOtherApps(true)
+        };
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn activate_for_keyboard_input() {}
+
 fn resolved_theme(ctx: &egui::Context, theme: Theme) -> Theme {
     if theme != Theme::System {
         return theme;
@@ -858,6 +2599,54 @@ fn resolved_theme(ctx: &egui::Context, theme: Theme) -> Theme {
     match ctx.system_theme() {
         Some(egui::Theme::Light) => Theme::Light,
         _ => Theme::Dark,
+    }
+}
+
+/// Load the macOS system font (San Francisco) into egui so the UI matches
+/// native Mac apps. Falls back silently on non-macOS or if the font is missing.
+fn install_system_font(ctx: &egui::Context) {
+    #[cfg(target_os = "macos")]
+    {
+        let paths = [
+            "/System/Library/Fonts/Optima.ttc",
+            "/System/Library/Fonts/Geneva.ttf",
+            "/System/Library/Fonts/HelveticaNeue.ttc",
+        ];
+        for path in &paths {
+            if let Ok(data) = std::fs::read(path) {
+                let mut fonts = egui::FontDefinitions::default();
+                fonts.font_data.insert(
+                    "system".to_string(),
+                    egui::FontData::from_owned(data).into(),
+                );
+                // Set as the default proportional font family.
+                fonts.families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "system".to_string());
+                // SF Mono, if it loads. The family must name the *key* the
+                // data was registered under — naming the file path here left
+                // the Monospace family pointing at a key with no data behind
+                // it, and epaint panics the moment anything renders monospace,
+                // which took the whole window down.
+                if let Ok(mono_data) = std::fs::read("/System/Library/Fonts/SFNSMono.ttf") {
+                    fonts.font_data.insert(
+                        "sfmono".to_string(),
+                        egui::FontData::from_owned(mono_data).into(),
+                    );
+                    fonts.families
+                        .entry(egui::FontFamily::Monospace)
+                        .or_default()
+                        .insert(0, "sfmono".to_string());
+                }
+                ctx.set_fonts(fonts);
+                return;
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ctx;
     }
 }
 
@@ -872,19 +2661,35 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
     let mut c = effective.colors();
     load_custom_colors().apply_to(&mut c);
 
+    // Soften every edge the tessellator produces. Feathering is what turns a
+    // hard 1px boundary into a blended one; without it the glass themes' low
+    // contrast makes aliasing *more* visible, not less, because the eye has
+    // nothing else to lock onto.
+    ctx.tessellation_options_mut(|t| {
+        t.feathering = true;
+        t.feathering_size_in_pixels = 1.4;
+    });
+
     let mut style = (*ctx.style()).clone();
+    // Paper Light (and any light theme): slightly larger type — warm ivory
+    // softens mid-size glyphs and made the old 14/11.5 stack feel washed out.
+    let (body, heading, small, button) = if effective.is_light() {
+        (15.0, 18.0, 12.5, 13.5)
+    } else {
+        (14.0, 18.0, 11.5, 13.0)
+    };
     style
         .text_styles
-        .insert(egui::TextStyle::Body, FontId::proportional(14.0));
+        .insert(egui::TextStyle::Body, FontId::proportional(body));
     style
         .text_styles
-        .insert(egui::TextStyle::Heading, FontId::proportional(18.0));
+        .insert(egui::TextStyle::Heading, FontId::proportional(heading));
     style
         .text_styles
-        .insert(egui::TextStyle::Small, FontId::proportional(11.5));
+        .insert(egui::TextStyle::Small, FontId::proportional(small));
     style
         .text_styles
-        .insert(egui::TextStyle::Button, FontId::proportional(13.0));
+        .insert(egui::TextStyle::Button, FontId::proportional(button));
     style.spacing.item_spacing = egui::vec2(10.0, 6.0);
     style.spacing.button_padding = egui::vec2(10.0, 5.0);
     style.spacing.window_margin = Margin::symmetric(12.0, 10.0);
@@ -898,31 +2703,578 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
         egui::Visuals::dark()
     };
     v.override_text_color = Some(rgb(c.text));
-    v.panel_fill = rgba(c.bg_base, 198);
-    v.window_fill = rgba(c.bg_base, 205);
-    v.window_stroke = Stroke::new(1.0, rgb(c.border));
+    v.panel_fill = Color32::TRANSPARENT;
+    // Glass themes keep the native window clear so the frosted shell + desktop
+    // show through; opaque themes paint a solid base.
+    v.window_fill = if effective.is_glass() {
+        Color32::TRANSPARENT
+    } else {
+        rgb(c.bg_base)
+    };
+    v.window_stroke = if effective.is_glass() {
+        Stroke::NONE
+    } else {
+        Stroke::new(0.8, rgb(c.border))
+    };
     v.window_shadow = egui::epaint::Shadow {
         offset: egui::vec2(0.0, 4.0),
-        blur: 16.0,
+        blur: if effective.is_glass() { 28.0 } else { 16.0 },
         spread: 0.0,
-        color: Color32::from_black_alpha(60),
+        color: Color32::from_black_alpha(if effective.is_glass() { 80 } else { 60 }),
     };
-    v.window_rounding = Rounding::same(12.0);
-    v.extreme_bg_color = rgba(c.bg_base, 198);
-    v.faint_bg_color = rgba(c.bg_surface, 190);
-    v.widgets.noninteractive.bg_fill = rgba(c.bg_surface, 198);
+    v.window_rounding = Rounding::same(16.0);
+    v.extreme_bg_color = rgb(c.bg_base);
+    v.faint_bg_color = surf(c, c.bg_surface);
+    v.widgets.noninteractive.bg_fill = surf(c, c.bg_surface);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, rgb(c.text));
     v.widgets.noninteractive.bg_stroke = Stroke::NONE;
     v.widgets.noninteractive.rounding = Rounding::same(8.0);
-    v.widgets.inactive.bg_fill = rgb(c.bg_elevated);
+    v.widgets.inactive.bg_fill = surf(c, c.bg_elevated);
     v.widgets.inactive.rounding = Rounding::same(8.0);
-    v.widgets.hovered.bg_fill = rgb(c.bg_hover);
+    v.widgets.hovered.bg_fill = surf(c, c.bg_hover);
     v.widgets.hovered.rounding = Rounding::same(8.0);
-    v.widgets.active.bg_fill = rgb(c.bg_selected);
+    v.widgets.active.bg_fill = surf(c, c.bg_selected);
     v.widgets.active.rounding = Rounding::same(8.0);
-    v.selection.bg_fill = Color32::from_rgba_premultiplied(c.accent.0, c.accent.1, c.accent.2, 50);
-    v.selection.stroke = Stroke::new(1.0, rgb(c.accent));
+    // Text-selection fill sits *behind* glyphs that keep their ink colour, so
+    // the wash has to contrast with that ink. Near-white accents (Dark) and
+    // wrongly-premultiplied greens (Paper Light) both made selected text
+    // unreadable — pick a clear tint per family instead.
+    let (sel_bg, sel_stroke) = text_selection_style(effective, &c);
+    v.selection.bg_fill = sel_bg;
+    v.selection.stroke = sel_stroke;
     ctx.set_visuals(v);
+}
+
+/// Colours for egui's text caret/selection. Glyphs keep `text` colour, so the
+/// fill must never be near that colour (light-on-light or dark-on-dark).
+fn text_selection_style(theme: Theme, c: &clipd_core::ThemeColors) -> (Color32, Stroke) {
+    if theme.is_glass() {
+        // Cool slate wash — keep mint off the selection (chips/pins only).
+        let (r, g, b, a) = if theme == Theme::GlassLight {
+            (120, 150, 190, 130)
+        } else {
+            (90, 120, 170, 140)
+        };
+        (
+            Color32::from_rgba_unmultiplied(r, g, b, a),
+            Stroke::new(1.0, Color32::from_rgb(140, 175, 220)),
+        )
+    } else if theme.is_light() {
+        // Paper Light: solid-enough sage so selected search text is obvious
+        // against ivory (glyphs stay near-black).
+        (
+            Color32::from_rgba_unmultiplied(c.green.0, c.green.1, c.green.2, 160),
+            Stroke::new(1.2, rgb(c.green)),
+        )
+    } else if c.accent.0 > 200 && c.accent.1 > 200 && c.accent.2 > 200 {
+        // Neutral/off-white accent themes (Dark): slate-blue under light glyphs.
+        (
+            Color32::from_rgba_unmultiplied(55, 105, 190, 170),
+            Stroke::new(1.2, Color32::from_rgb(130, 180, 255)),
+        )
+    } else {
+        // Forest / Paper Dark / Midnight / concepts.
+        (
+            Color32::from_rgba_unmultiplied(c.green.0, c.green.1, c.green.2, 150),
+            Stroke::new(1.2, rgb(c.green)),
+        )
+    }
+}
+
+/// Paint the palette as one continuous floating material. Individual panels
+/// stay transparent so opening the preview never produces visible seams or a
+/// stack of differently coloured rectangles.
+///
+/// Glassmorphism shell: native frosted blur + dual soft gradient blooms
+/// (cyan/sky + magenta/lavender) + rim. Not flat transparency, not white orbs.
+fn paint_glass_shell(
+    ctx: &egui::Context,
+    theme: Theme,
+    c: &clipd_core::ThemeColors,
+    native_glass: bool,
+) {
+    let rect = ctx.screen_rect().shrink(0.5);
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let rounding = Rounding::same(SHELL_ROUND);
+
+    if theme.is_glass() {
+        let light = theme == Theme::GlassLight;
+        // Frosted base — translucent enough for blur + blooms to read.
+        let veil = if light {
+            // A real frost plate, not bare transparency. The native clear
+            // material remains visible through roughly a quarter of this
+            // wash, while the cool colour prevents white documents from
+            // turning the whole window into a lightbox.
+            Color32::from_rgba_unmultiplied(130, 136, 146, if native_glass { 72 } else { 150 })
+        } else {
+            // Neutral to match the grounds: a blue veil over neutral surfaces
+            // just puts the cast back on top of the fix.
+            Color32::from_rgba_unmultiplied(12, 12, 14, if native_glass { 142 } else { 186 })
+        };
+        painter.rect_filled(rect, rounding, veil);
+
+        // Dual glassmorphism blooms (clipped to the rounded plate).
+        if let Some((glow_a, glow_b)) = theme.shell_glows() {
+            let glow_painter = painter.with_clip_rect(rect);
+            // A broad corner-to-corner tint keeps Glass Light visibly glassy
+            // even over a white document. Backdrop blur alone necessarily
+            // becomes white over white; the reference carries a persistent
+            // sky-to-lavender wash across the whole plate.
+            paint_glass_corner_gradient(&glow_painter, rect, glow_a, glow_b, light);
+            let radius = rect.width().max(rect.height()) * 0.92;
+            // Strong enough that the plate carries its own tint. Glass shows what
+            // is behind it, so over a plain light desktop a purely backdrop-driven
+            // pane just looks white — the blooms are what keep it looking like
+            // glass regardless of what happens to be underneath.
+            let strength = if light { 0.18 } else { 0.30 };
+            paint_soft_radial_glow(
+                &glow_painter,
+                egui::pos2(
+                    rect.left() + rect.width() * 0.08,
+                    rect.top() + rect.height() * 0.12,
+                ),
+                radius,
+                glow_a,
+                strength,
+            );
+            paint_soft_radial_glow(
+                &glow_painter,
+                egui::pos2(
+                    rect.right() - rect.width() * 0.04,
+                    rect.bottom() - rect.height() * 0.08,
+                ),
+                radius * 0.95,
+                glow_b,
+                strength * 0.92,
+            );
+        }
+
+        // Soft frost veil on top of blooms — diffuses them into glass, not spots.
+        painter.rect_filled(
+            rect,
+            rounding,
+            Color32::from_rgba_unmultiplied(
+                if light { 255 } else { 255 },
+                if light { 255 } else { 255 },
+                if light { 255 } else { 255 },
+                if light {
+                    if native_glass { 10 } else { 20 }
+                } else if native_glass {
+                    6
+                } else {
+                    12
+                },
+            ),
+        );
+
+        // Glass edge + top catch-light.
+        //
+        // Light keeps a real rim: a pale plate over a pale desktop needs an
+        // edge or it has no shape at all. Dark does not — a white line all the
+        // way round a dark plate reads as a drawn border sitting on top of the
+        // material rather than as light catching its edge. The catch-light
+        // along the top does that job on its own.
+        let rim = if light {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 140)
+        } else {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 12)
+        };
+        painter.rect_stroke(rect, rounding, Stroke::new(if light { 1.05 } else { 0.6 }, rim));
+        painter.hline(
+            (rect.left() + SHELL_ROUND)..=(rect.right() - SHELL_ROUND),
+            rect.top() + 1.0,
+            Stroke::new(
+                1.15,
+                Color32::from_rgba_unmultiplied(255, 255, 255, if light { 120 } else { 58 }),
+            ),
+        );
+    } else {
+        painter.rect_filled(rect, rounding, rgb(c.bg_base));
+        painter.rect_filled(rect, rounding, surf(c, c.bg_surface));
+        painter.rect_stroke(rect, rounding, Stroke::new(0.8, rgb(c.border)));
+        painter.hline(
+            (rect.left() + SHELL_ROUND)..=(rect.right() - SHELL_ROUND),
+            rect.top() + 1.0,
+            Stroke::new(0.7, rgb(c.text).gamma_multiply(0.12)),
+        );
+    }
+}
+
+/// One continuous sky-to-lavender wash beneath the frost. Vertex colours are
+/// interpolated by the GPU, so this stays smooth at every window size.
+fn paint_glass_corner_gradient(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    glow_a: Rgb,
+    glow_b: Rgb,
+    light: bool,
+) {
+    let alpha = if light { [34, 24, 26, 36] } else { [40, 26, 28, 44] };
+    let vertex = |pos: egui::Pos2, color: Rgb, a: u8| egui::epaint::Vertex {
+        pos,
+        uv: egui::epaint::WHITE_UV,
+        color: Color32::from_rgba_unmultiplied(color.0, color.1, color.2, a),
+    };
+
+    let mut mesh = egui::Mesh::default();
+    mesh.vertices.push(vertex(rect.left_top(), glow_a, alpha[0]));
+    mesh.vertices.push(vertex(rect.right_top(), glow_b, alpha[1]));
+    mesh.vertices.push(vertex(rect.left_bottom(), glow_a, alpha[2]));
+    mesh.vertices.push(vertex(rect.right_bottom(), glow_b, alpha[3]));
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(2, 1, 3);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Soft glassmorphism bloom — many concentric discs with quadratic falloff
+/// so it reads as a gradient wash, not a hard white circle.
+fn paint_soft_radial_glow(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    color: Rgb,
+    strength: f32,
+) {
+    // Drawn as one vertex-coloured mesh rather than a stack of filled circles.
+    //
+    // Stacking circles quantises the gradient into visible concentric bands —
+    // at this radius even 22 layers puts a hard step every ~40px, which reads
+    // as the whole window being pixelated. A mesh lets the GPU interpolate
+    // alpha smoothly between vertices, so the falloff is continuous no matter
+    // how large the bloom is, and it costs one draw call instead of 22.
+    const SEGMENTS: usize = 96;
+    // Rings are spaced to follow the quadratic falloff the banded version had.
+    // Interpolation handles everything between them, so a handful is plenty.
+    const RINGS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+
+    let alpha_at = |t: f32| -> u8 {
+        let falloff = (1.0 - t) * (1.0 - t);
+        (255.0 * strength * falloff).round().clamp(0.0, 255.0) as u8
+    };
+    let vertex = |pos: egui::Pos2, a: u8| egui::epaint::Vertex {
+        pos,
+        uv: egui::epaint::WHITE_UV,
+        color: Color32::from_rgba_unmultiplied(color.0, color.1, color.2, a),
+    };
+
+    let mut mesh = egui::Mesh::default();
+
+    // Ring 0 is a single centre vertex; the rest are full circles of vertices.
+    mesh.vertices.push(vertex(center, alpha_at(0.0)));
+    for &ring in &RINGS[1..] {
+        let a = alpha_at(ring);
+        for seg in 0..SEGMENTS {
+            let angle = seg as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            mesh.vertices.push(vertex(
+                center + egui::vec2(angle.cos(), angle.sin()) * radius * ring,
+                a,
+            ));
+        }
+    }
+
+    // Fan from the centre out to the first ring.
+    for seg in 0..SEGMENTS {
+        let next = (seg + 1) % SEGMENTS;
+        mesh.add_triangle(0, 1 + seg as u32, 1 + next as u32);
+    }
+    // Quad strips between each pair of rings.
+    for band in 0..RINGS.len() - 2 {
+        let inner = 1 + (band * SEGMENTS) as u32;
+        let outer = inner + SEGMENTS as u32;
+        for seg in 0..SEGMENTS as u32 {
+            let next = (seg + 1) % SEGMENTS as u32;
+            mesh.add_triangle(inner + seg, outer + seg, outer + next);
+            mesh.add_triangle(inner + seg, outer + next, inner + next);
+        }
+    }
+
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Apply / clear native macOS glass for Glass Light / Glass Dark.
+///
+/// On Tahoe and newer, use AppKit's real Liquid Glass first. It must be a
+/// sibling behind winit's render view: putting `NSGlassEffectView` inside the
+/// render view makes it refract clipd's own foreground, washing out the text.
+/// The old implementation used the correct sibling position but chose classic
+/// light vibrancy first, which resolves to the flat white plate we are avoiding.
+/// Older macOS releases fall back to classic vibrancy.
+#[cfg(target_os = "macos")]
+fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>) {
+    let want = theme.is_glass().then_some(theme == Theme::GlassLight);
+    if want == *on {
+        return;
+    }
+
+    clear_sibling_glass(frame);
+    let _ = window_vibrancy::clear_liquid_glass(frame);
+    let _ = window_vibrancy::clear_vibrancy(frame);
+    *on = None;
+
+    let Some(light) = want else {
+        write_glass_status("off", false);
+        return;
+    };
+
+    force_view_transparent(frame);
+
+    match apply_sibling_liquid_glass(frame, light) {
+        Ok(()) => {
+            *on = Some(light);
+            write_glass_status("liquid-regular", light);
+        }
+        Err(err) => {
+            log::info!("Liquid Glass unavailable ({err}); using classic vibrancy");
+            let material = if light {
+                window_vibrancy::NSVisualEffectMaterial::UnderWindowBackground
+            } else {
+                window_vibrancy::NSVisualEffectMaterial::HudWindow
+            };
+            match window_vibrancy::apply_vibrancy(
+                frame,
+                material,
+                Some(window_vibrancy::NSVisualEffectState::Active),
+                Some(SHELL_ROUND as f64),
+            ) {
+                Ok(()) => {
+                    *on = Some(light);
+                    write_glass_status("vibrancy", light);
+                }
+                Err(err) => {
+                    log::warn!("native glass unavailable: {err}");
+                    write_glass_status("failed", light);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn write_glass_status(applied: &str, light: bool) {
+    let status = format!(
+        "glass_native={applied} theme={} light={light}\n",
+        if light { "GlassLight" } else { "Dark" }
+    );
+    if let Some(dir) = dirs::data_dir() {
+        let _ = std::fs::write(dir.join("clipd/glass_native.status"), &status);
+    }
+    eprintln!("[clipd] {status}");
+}
+
+#[cfg(target_os = "macos")]
+fn ns_metal_view(frame: &eframe::Frame) -> Option<&'static objc2_app_kit::NSView> {
+    use objc2_app_kit::NSView;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = frame.window_handle().ok()?;
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return None;
+    };
+    Some(unsafe { appkit.ns_view.cast::<NSView>().as_ref() })
+}
+
+#[cfg(target_os = "macos")]
+fn force_view_transparent(frame: &eframe::Frame) {
+    use objc2_app_kit::NSColor;
+
+    let Some(view) = ns_metal_view(frame) else {
+        return;
+    };
+    view.setWantsLayer(true);
+    if let Some(layer) = view.layer() {
+        layer.setOpaque(false);
+        // The egui panels are independently painted regions. Mask the native
+        // render surface as well as rounding those regions so a resized frame,
+        // antialiased edge, or one-frame panel transition can never leak a
+        // square pixel into the transparent window corners.
+        layer.setCornerRadius(SHELL_ROUND as f64);
+        layer.setMasksToBounds(true);
+    }
+    if let Some(window) = view.window() {
+        window.setOpaque(false);
+        window.setBackgroundColor(Some(&NSColor::clearColor()));
+        window.setHasShadow(true);
+    }
+}
+
+const SIBLING_LIQUID_TAG: isize = 96945937;
+
+/// Tahoe Liquid Glass behind (never around) the egui render surface.
+#[cfg(target_os = "macos")]
+fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool) -> Result<(), String> {
+    use objc2::rc::Retained;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{
+        NSAutoresizingMaskOptions, NSColor, NSView, NSWindowOrderingMode,
+    };
+    use window_vibrancy::NSGlassEffectViewTagged;
+
+    let mtm = MainThreadMarker::new().ok_or("not on main thread")?;
+    let metal = ns_metal_view(frame).ok_or("no ns_view")?;
+    let window = metal.window().ok_or("ns_view has no window yet")?;
+    let content = window.contentView().ok_or("window has no contentView")?;
+    let parent = unsafe { content.superview() }.ok_or("contentView has no superview")?;
+
+    let glass = unsafe {
+        NSGlassEffectViewTagged::initWithFrame(mtm.alloc(), content.frame(), SIBLING_LIQUID_TAG)
+    };
+    // Regular for both. Clear is the lensing variant — it bends and passes the
+    // backdrop through with very little diffusion, so over a window full of
+    // text you read that text straight through the panel and the surface looks
+    // mottled rather than frosted. The same reasoning that put Light on
+    // Regular applies to Dark; it was only ever Clear because a dark tint hid
+    // the problem over a dark desktop.
+    let style = objc2_app_kit::NSGlassEffectViewStyle(
+        window_vibrancy::NSGlassEffectViewStyle::Regular as isize,
+    );
+    let tint = if light {
+        // AppKit's untinted light style approaches pure white. A muted
+        // blue-grey tint keeps it comfortable over bright documents while
+        // remaining translucent over dark windows.
+        NSColor::colorWithRed_green_blue_alpha(0.35, 0.38, 0.42, 0.24)
+    } else {
+        // Denser than it was. A thin tint over Regular glass still let bright
+        // windows behind punch through as patches, which is what made the
+        // panel look uneven rather than like one piece of material.
+        //
+        // Near-equal channels: this tint covers the whole plate, so a blue
+        // ratio here (it was 0.06/0.065/0.08 — a third more blue than red)
+        // tinted everything behind it no matter how neutral the surfaces were.
+        NSColor::colorWithRed_green_blue_alpha(0.048, 0.048, 0.054, 0.42)
+    };
+    glass.setStyle(style);
+    glass.setTintColor(Some(tint.as_ref()));
+    glass.setCornerRadius(SHELL_ROUND as f64);
+    glass.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable
+            | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+
+    let glass_view: Retained<NSView> = Retained::into_super(Retained::into_super(glass));
+    parent.addSubview_positioned_relativeTo(
+        &glass_view,
+        NSWindowOrderingMode::Below,
+        Some(content.as_ref()),
+    );
+
+    window.setOpaque(false);
+    window.setBackgroundColor(Some(&NSColor::clearColor()));
+    force_view_transparent(frame);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_sibling_glass(frame: &eframe::Frame) {
+    let Some(metal) = ns_metal_view(frame) else {
+        return;
+    };
+    let Some(window) = metal.window() else {
+        return;
+    };
+    let Some(content) = window.contentView() else {
+        return;
+    };
+    let Some(parent) = (unsafe { content.superview() }) else {
+        return;
+    };
+    if let Some(view) = parent.viewWithTag(SIBLING_LIQUID_TAG) {
+        view.removeFromSuperview();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_glass_native(_frame: &eframe::Frame, _theme: Theme, _on: &mut Option<bool>) {}
+
+/// Glass selection / hover — soft neutral wash (mint stays on chips/pins).
+fn glass_row_fill(theme: Theme, selected: bool, hovered: bool) -> Option<Color32> {
+    let light = theme == Theme::GlassLight;
+    if selected {
+        Some(if light {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 26)
+        } else {
+            // Keep keyboard focus readable even when Liquid Glass is sampling
+            // a bright window behind clipd. A white wash can turn the row into
+            // a pale slab under white text; this teal-black anchor still lets
+            // the material move while preserving contrast.
+            Color32::from_rgba_unmultiplied(16, 42, 46, 156)
+        })
+    } else if hovered {
+        Some(if light {
+            Color32::from_rgba_unmultiplied(0, 0, 0, 10)
+        } else {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 12)
+        })
+    } else {
+        None
+    }
+}
+
+fn glass_row_stroke(theme: Theme, selected: bool) -> Stroke {
+    if selected {
+        if theme == Theme::GlassLight {
+            Stroke::NONE
+        } else {
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(160, 170, 165, 40))
+        }
+    } else {
+        Stroke::NONE
+    }
+}
+
+/// Stable frost carried by the actual egui panels. Native light glass adapts
+/// toward white over bright apps; this translucent cool plate prevents that
+/// adaptation from erasing the theme while preserving backdrop movement.
+fn glass_panel_frost(theme: Theme) -> Color32 {
+    match theme {
+        // Every layout region receives the exact same translucent slate veil.
+        // With gradients disabled and internal rounding removed, adjacent
+        // regions resolve as one continuous sheet while remaining stable over
+        // both bright and dark apps behind the native glass.
+        Theme::GlassLight => Color32::from_rgba_unmultiplied(126, 134, 146, 178),
+        _ => Color32::TRANSPARENT,
+    }
+}
+
+/// Repaint one low-chroma ambient wash within each panel, underneath its
+/// widgets. Colours are sampled in whole-window coordinates, so a header,
+/// list, preview and footer meet without restarting the gradient at a seam.
+fn paint_panel_glass_gradient(ui: &egui::Ui, theme: Theme) {
+    // Glass Light's reflection is painted once by `paint_glass_shell`; repeating
+    // it in every panel creates seams and visible colour restarts.
+    if theme == Theme::GlassLight {
+        return;
+    }
+    let Some((left, right)) = theme.shell_glows() else {
+        return;
+    };
+    let rect = ui.max_rect();
+    let screen = ui.ctx().screen_rect();
+    let alpha = if theme == Theme::GlassLight { 26 } else { 35 };
+    let sample = |pos: egui::Pos2| {
+        let x = ((pos.x - screen.left()) / screen.width().max(1.0)).clamp(0.0, 1.0);
+        let y = ((pos.y - screen.top()) / screen.height().max(1.0)).clamp(0.0, 1.0);
+        // A gentle diagonal drift; keeping some vertical influence prevents a
+        // large window from looking like two rigid colour columns.
+        let t = (x * 0.72 + y * 0.28).clamp(0.0, 1.0);
+        let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+        Rgb(mix(left.0, right.0), mix(left.1, right.1), mix(left.2, right.2))
+    };
+    let vertex = |pos: egui::Pos2| egui::epaint::Vertex {
+        pos,
+        uv: egui::epaint::WHITE_UV,
+        color: {
+            let color = sample(pos);
+            Color32::from_rgba_unmultiplied(color.0, color.1, color.2, alpha)
+        },
+    };
+    let mut mesh = egui::Mesh::default();
+    mesh.vertices.push(vertex(rect.left_top()));
+    mesh.vertices.push(vertex(rect.left_bottom()));
+    mesh.vertices.push(vertex(rect.right_top()));
+    mesh.vertices.push(vertex(rect.right_bottom()));
+    mesh.add_triangle(0, 2, 1);
+    mesh.add_triangle(1, 2, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
 }
 
 // ── App state ──
@@ -940,12 +3292,22 @@ struct ClipdGui {
     theme: Theme,
     /// User-defined palette that overrides the active theme when enabled.
     custom_colors: CustomColors,
+    /// Full palette and tray HUD are separate long-lived processes. Poll the
+    /// shared appearance preference at a low rate so either surface reflects a
+    /// theme change made in the other without needing to be relaunched.
+    last_shared_appearance_check: Instant,
 
     show_transforms: bool,
     /// On-demand preview pane (Space toggles it). Off = clean single column.
     show_preview: bool,
     /// Inline quick-settings (gear): theme swatches + paste-on-select.
     show_quick_settings: bool,
+    /// Active Settings page (General / Clipboard / AI / …).
+    settings_category: SettingsCategory,
+    /// Search box while Settings is open — jumps to a matching category.
+    settings_query: String,
+    /// Header pin — keep the full GUI above other windows.
+    window_pinned: bool,
     /// Tracks window focus so summoning clipd lands the cursor in search.
     was_focused: bool,
     /// Vault (1Password / Bitwarden / Keychain) "save clipboard as a password" form.
@@ -954,8 +3316,16 @@ struct ClipdGui {
     vault_title: String,
     vault_username: String,
     vault_url: String,
+    /// API key the user typed/pasted directly into the vault save form.
+    vault_password_input: String,
     /// (is_success, message) of the last vault save attempt.
     vault_status: Option<(bool, String)>,
+    /// Cached list of vault secrets (labels only — no plaintext).
+    vault_secrets: Vec<clipd_core::SecretRef>,
+    /// Secret currently being revealed (plaintext shown temporarily).
+    vault_revealed: Option<(usize, String, Instant)>,
+    /// Confirm-delete state for a secret index.
+    vault_confirm_delete: Option<usize>,
     /// Reusable text snippets and the ones matching the current search.
     snippets: Vec<clipd_core::Snippet>,
     matched_snippets: Vec<clipd_core::Snippet>,
@@ -970,6 +3340,12 @@ struct ClipdGui {
     new_action_output: ActionOutput,
     /// Last action result banner in the preview pane: (ok, message).
     action_status: Option<(bool, String)>,
+    /// Where the machine-pairing flow has got to.
+    pairing: PairingState,
+    /// Machines seen on the network, refreshed on a timer rather than every
+    /// frame — it reads files, and Settings repaints constantly.
+    nearby: Vec<clipd_core::sync::Reachable>,
+    nearby_checked: Option<Instant>,
     transforms: Vec<TransformKind>,
     paste_settings: PasteTransformSettings,
 
@@ -978,6 +3354,7 @@ struct ClipdGui {
     sessions: Vec<Session>,
     session_config: SessionConfig,
     active_tab: MainTab,
+    content_filter: ContentFilter,
     show_active_slots_only: bool,
     new_excluded_app: String,
     new_custom_pattern: String,
@@ -995,8 +3372,68 @@ struct ClipdGui {
     new_collection_app: String,
     ai_result: Option<String>,
 
+    /// AI provider settings (Ask, embeddings, transform-on-paste all share these).
+    /// Edited in Settings; previously only reachable by hand-writing JSON, which
+    /// is why Ask looked broken out of the box.
+    ai_config: TransformConfig,
+    /// The key as typed. Kept separate from `ai_config.api_key` so an untouched
+    /// field can show a masked placeholder without overwriting the stored key.
+    ai_key_input: String,
+    /// Result of the last "Test connection", as (ok, message).
+    ai_test_status: Option<(bool, String)>,
+    ai_test_rx: Option<std::sync::mpsc::Receiver<(bool, String)>>,
+
     /// Ask mode — engaged by a leading `?` in the search bar.
     ask: AskState,
+    /// Smart Recommend transform currently running, if any.
+    transform_job: TransformJob,
+
+    /// Set once a quit is in flight, so the daemon watchdog stops reviving the
+    /// tray host we are deliberately shutting down.
+    quitting: bool,
+    /// Gear pressed in the popover: settings replace the clip list in place,
+    /// rather than opening a second window over the first.
+    popover_settings_open: bool,
+    /// Menu-bar clipboard HUD: tray popover that opens expanded on hover.
+    hud: bool,
+    /// The notch island layout. Its own process, its own resident window.
+    island_surface: bool,
+    /// Whether the HUD's request-file watcher thread has been started.
+    hud_watcher_started: bool,
+    /// Clips whose preview is a redaction, so their tooltip stays hidden.
+    masked_clip_ids: HashSet<i64>,
+    /// Set when something asked for the keyboard mid-frame.
+    want_key_window: bool,
+    /// Secret-scan results by clip id, so a reload only scans what is new.
+    secret_scan_cache: HashMap<i64, Option<String>>,
+    /// Last time this window renewed its on-screen claim.
+    last_claim_refresh: Instant,
+    /// Island configuration, live readings and shelf. Present in every process
+    /// because Settings edits it from the palette and the island reads it back
+    /// off disk.
+    island: island::IslandState,
+    /// Whether the HUD pill is currently expanded.
+    hud_expanded: bool,
+    /// When the pointer left the HUD; drives the collapse grace period.
+    hud_left_at: Option<Instant>,
+    /// Grace period after a tray "show" request — don't check hover-leave
+    /// until this instant, so the HUD doesn't instantly hide while the
+    /// cursor is still on the tray icon.
+    hud_grace_until: Option<Instant>,
+    /// Last size we sent to the window manager, to avoid spamming resize commands.
+    last_sent_size: Option<egui::Vec2>,
+    /// Last position we sent to the window manager, to avoid spamming move commands.
+    last_sent_pos: Option<egui::Pos2>,
+    /// Polls the tiny cross-process mode request file at a low frequency. This
+    /// replaces multiple resident GUI processes with one reusable window.
+    last_surface_request_check: Instant,
+    /// Restart the macOS tray/hotkey host if it died while this window stayed open.
+    #[cfg(target_os = "macos")]
+    last_daemon_check: Instant,
+    /// Native macOS glass currently applied. `Some(is_light)` tracks Light vs Dark
+    /// so we re-tint when cycling between Glass Light and Glass Dark.
+    #[cfg(target_os = "macos")]
+    glass_native: Option<bool>,
 }
 
 /// State for `?`-prefixed questions. The request runs on a worker thread and
@@ -1012,6 +3449,17 @@ struct AskState {
     error: Option<String>,
     /// Conversation so far. Follow-ups replay it; it is also written to SQLite.
     thread: AskThread,
+}
+
+/// A Smart Recommend transform in flight. Same reasoning as `AskState`: an
+/// AI transform is an HTTP round trip, and egui redraws on the calling thread.
+#[derive(Default)]
+struct TransformJob {
+    running: bool,
+    /// Chip label, so the spinner can say what it's doing.
+    label: String,
+    rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    result: Option<Result<String, String>>,
 }
 
 impl AskState {
@@ -1050,11 +3498,29 @@ fn ask_query(search: &str) -> Option<&str> {
 }
 
 impl ClipdGui {
-    fn new(theme: Theme) -> Self {
+    fn native_glass_active(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.glass_native.is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    fn new(
+        theme: Theme,
+        hud: bool,
+        island_surface: bool,
+        open_settings: bool,
+    ) -> Self {
         let db_path = ClipStore::default_path();
         let store = ClipStore::new(&db_path).expect("Failed to open clip database");
         let mut clips = store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
         sync_active_slot_labels(&store, &mut clips);
+        let mut secret_scan_cache: HashMap<i64, Option<String>> = HashMap::new();
+        let masked_clip_ids = mask_secret_previews(&mut clips, &mut secret_scan_cache);
         let count = clips.len();
         let session_config = SessionConfig::default();
         let sessions = compute_sessions(&clips, session_config.window_minutes);
@@ -1070,16 +3536,24 @@ impl ClipdGui {
             focus_search: true,
             theme,
             custom_colors: load_custom_colors(),
+            last_shared_appearance_check: Instant::now() - Duration::from_secs(1),
             show_transforms: false,
             show_preview: false,
             show_quick_settings: false,
+            settings_category: SettingsCategory::Clipboard,
+            settings_query: String::new(),
+            window_pinned: false,
             was_focused: true,
             vault_targets: available_targets(),
             vault_selected: available_targets().first().copied(),
             vault_title: String::new(),
             vault_username: String::new(),
             vault_url: String::new(),
+            vault_password_input: String::new(),
             vault_status: None,
+            vault_secrets: Vec::new(),
+            vault_revealed: None,
+            vault_confirm_delete: None,
             snippets: Vec::new(),
             matched_snippets: Vec::new(),
             new_snippet_trigger: String::new(),
@@ -1091,13 +3565,21 @@ impl ClipdGui {
             new_action_auto: String::new(),
             new_action_output: ActionOutput::Clipboard,
             action_status: None,
+            pairing: PairingState::Idle,
+            nearby: Vec::new(),
+            nearby_checked: None,
             transforms: paste_transforms(),
             paste_settings: load_paste_transform_settings(),
             cached_tfidf: None,
             privacy_config: load_privacy_config(),
             sessions,
             session_config,
-            active_tab: MainTab::Text,
+            active_tab: if open_settings {
+                MainTab::Settings
+            } else {
+                MainTab::Text
+            },
+            content_filter: ContentFilter::All,
             show_active_slots_only: false,
             new_excluded_app: String::new(),
             new_custom_pattern: String::new(),
@@ -1110,10 +3592,38 @@ impl ClipdGui {
             new_collection_name: String::new(),
             new_collection_app: String::new(),
             ai_result: None,
+            ai_config: load_transform_config(),
+            ai_key_input: String::new(),
+            ai_test_status: None,
+            ai_test_rx: None,
             ask: AskState::default(),
+            transform_job: TransformJob::default(),
+            hud,
+            island_surface,
+            hud_watcher_started: false,
+            masked_clip_ids,
+            want_key_window: false,
+            secret_scan_cache,
+            last_claim_refresh: Instant::now() - Duration::from_secs(60),
+            island: island::IslandState::default(),
+            quitting: false,
+            popover_settings_open: false,
+            // Resident HUD starts hidden; clipd-ui's show request is what
+            // parks it under the tray extra.
+            hud_expanded: false,
+            hud_left_at: None,
+            hud_grace_until: None,
+            last_sent_size: None,
+            last_sent_pos: None,
+            last_surface_request_check: Instant::now() - Duration::from_secs(1),
+            #[cfg(target_os = "macos")]
+            last_daemon_check: Instant::now(),
+            #[cfg(target_os = "macos")]
+            glass_native: None,
         };
         app.refresh_collections();
         app.refresh_starred();
+        app.apply_filter();
         app
     }
 
@@ -1181,6 +3691,7 @@ impl ClipdGui {
             self.starred_clip_ids.insert(clip_id);
         }
         self.refresh_collections();
+        self.apply_filter();
     }
 
     fn refresh(&mut self) {
@@ -1195,6 +3706,8 @@ impl ClipdGui {
 
         self.clips = self.store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
         sync_active_slot_labels(&self.store, &mut self.clips);
+        self.masked_clip_ids =
+            mask_secret_previews(&mut self.clips, &mut self.secret_scan_cache);
         self.sessions = compute_sessions(&self.clips, self.session_config.window_minutes);
         self.cached_tfidf = None; // invalidate — will be rebuilt lazily on next search
         self.refresh_snippets();
@@ -1216,6 +3729,985 @@ impl ClipdGui {
     }
 
     /// Whether the search bar currently holds a question.
+    fn surface_mode(&self) -> SurfaceMode {
+        if self.island_surface {
+            SurfaceMode::Island
+        } else if self.hud {
+            SurfaceMode::Hud
+        } else if self.active_tab == MainTab::Settings {
+            SurfaceMode::Settings
+        } else {
+            SurfaceMode::Main
+        }
+    }
+
+    fn switch_surface(&mut self, ctx: &egui::Context, mode: SurfaceMode) {
+        self.hud = mode == SurfaceMode::Hud;
+        self.hud_expanded = false;
+        self.hud_left_at = None;
+        self.show_preview = false;
+        self.show_quick_settings = false;
+        self.search_query.clear();
+        self.ask.reset();
+        self.apply_filter();
+        save_surface_state(mode);
+
+        if self.hud {
+            let size = self.panel_expanded_size();
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::AlwaysOnTop,
+            ));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            self.last_sent_size = Some(size);
+            if let Some(screen) = ctx
+                .input(|i| i.viewport().monitor_size)
+                .or_else(main_display_size)
+            {
+                let left = popover_left(size.x, screen, true);
+                let pos = egui::pos2(left, HUD_TOP_MARGIN);
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                self.last_sent_pos = Some(pos);
+            }
+        } else {
+            self.active_tab = if mode == SurfaceMode::Settings {
+                MainTab::Settings
+            } else {
+                MainTab::Text
+            };
+            let width = if mode == SurfaceMode::Settings {
+                SETTINGS_W
+            } else {
+                COMPACT_W
+            };
+            let size = egui::vec2(width, WIN_H);
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::Normal,
+            ));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            if let Some(cursor) = global_cursor_position() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(window_pos_at_cursor(
+                    cursor,
+                    size,
+                    main_display_size(),
+                )));
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.focus_search = mode == SurfaceMode::Main;
+        }
+        ctx.request_repaint();
+    }
+
+    /// Size of the open HUD panel.
+    fn panel_expanded_size(&self) -> egui::Vec2 {
+        egui::vec2(HUD_W, HUD_H)
+    }
+
+    /// Where the surface sits on screen, in points, for the current state.
+    fn surface_screen_rect(&self) -> Option<egui::Rect> {
+        let screen = main_display_size()?;
+        let size = self.panel_expanded_size();
+        // Use the actual window position if available; otherwise fall back to
+        // the tray-anchored position the HUD opens at.
+        let pos = self.last_sent_pos.unwrap_or_else(|| {
+            let left = popover_left(size.x, screen, true);
+            egui::pos2(left, HUD_TOP_MARGIN)
+        });
+        Some(egui::Rect::from_min_size(pos, size))
+    }
+
+    /// The HUD process is controlled by the tray for show/hide, but also
+    /// does its own hover-leave detection so it stays open while the cursor
+    /// is anywhere on the tray icon or the popover, and hides cleanly when
+    /// the cursor leaves both.
+    /// Wake the UI thread the moment the tray writes a show request.
+    ///
+    /// Without this the hidden HUD had to poll for the request itself, and
+    /// polling means repainting: at a responsive interval that cost a quarter
+    /// of a core to sit there doing nothing, and at a cheap interval the
+    /// popover opened a fifth of a second late. A thread that stats one path
+    /// costs neither — the UI thread idles, and this asks for a frame only
+    /// when there is something to act on.
+    fn ensure_hud_request_watcher(&mut self, ctx: &egui::Context) {
+        if self.hud_watcher_started || !self.hud {
+            return;
+        }
+        self.hud_watcher_started = true;
+        let ctx = ctx.clone();
+        let path = surface_request_path(SurfaceMode::Hud);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(15));
+            if path.exists() {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn drive_hud_hover(&mut self, ctx: &egui::Context) {
+        self.ensure_hud_request_watcher(ctx);
+        // Check for a "show" request from the tray.
+        if let Some(mode) = take_surface_request_for(SurfaceMode::Hud) {
+            if mode == SurfaceMode::Quit {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            } else if mode == SurfaceMode::Hidden {
+                let cursor = global_cursor_position();
+                let still_inside = match (cursor, self.surface_screen_rect()) {
+                    (Some(cur), Some(rect)) => {
+                        let mut hot = rect.expand(10.0);
+                        hot.min.y = 0.0;
+                        hot.contains(cur)
+                    }
+                    _ => false,
+                };
+                if !still_inside {
+                    self.hide_hud_offscreen(ctx);
+                    self.hud_left_at = None;
+                }
+                return;
+            } else {
+                self.search_query.clear();
+                self.ask.reset();
+                self.apply_filter();
+                self.hud_left_at = None;
+                self.hud_grace_until = Some(Instant::now() + Duration::from_millis(400));
+                self.show_hud_onscreen(ctx);
+                return;
+            }
+        }
+
+        // Already hidden and nothing asked for it: there is nothing to drive.
+        //
+        // The leave-detection below only means anything while the popover is
+        // up. Left running against a hidden window it cycled forever — start
+        // the leave timer, wait out the collapse delay, hide an already-hidden
+        // window, reset, repeat — repainting every 60ms the whole time. That
+        // was a sixth of a core spent deciding to do nothing.
+        if !self.hud_expanded {
+            self.hud_left_at = None;
+            return;
+        }
+
+        // Grace period right after showing — don't check hover-leave yet.
+        if let Some(until) = self.hud_grace_until {
+            if Instant::now() < until {
+                self.animate_hud(ctx);
+                return;
+            }
+            self.hud_grace_until = None;
+        }
+
+        let cursor = global_cursor_position();
+        let pointer_inside = match (cursor, self.surface_screen_rect()) {
+            (Some(cur), Some(rect)) => {
+                let mut hot = rect.expand(10.0);
+                hot.min.y = 0.0;
+                let global_hit = hot.contains(cur);
+                let egui_hit = ctx.input(|i| i.pointer.hover_pos()).is_some();
+                global_hit || egui_hit
+            }
+            _ => ctx.input(|i| i.pointer.hover_pos()).is_some(),
+        };
+
+        if pointer_inside {
+            self.hud_left_at = None;
+            self.animate_hud(ctx);
+            return;
+        }
+
+        let busy = self.ask.running
+            || self.transform_job.running
+            || !self.search_query.trim().is_empty()
+            || self.ask.answer.is_some();
+        if busy {
+            self.hud_left_at = None;
+            self.animate_hud(ctx);
+            return;
+        }
+
+        match self.hud_left_at {
+            None => {
+                self.hud_left_at = Some(Instant::now());
+                self.animate_hud(ctx);
+            }
+            Some(left) if left.elapsed() >= HUD_COLLAPSE_DELAY => {
+                self.search_query.clear();
+                self.ask.reset();
+                self.apply_filter();
+                self.hide_hud_offscreen(ctx);
+                self.hud_left_at = None;
+            }
+            Some(_) => {
+                self.animate_hud(ctx);
+            }
+        }
+    }
+
+    /// No animation — macOS window server can't handle 60 resizes/second
+    /// without glitching. The HUD appears at full size instantly.
+    fn animate_hud(&mut self, ctx: &egui::Context) {
+        ctx.request_repaint_after(Duration::from_millis(60));
+    }
+
+    fn hide_hud_offscreen(&mut self, ctx: &egui::Context) {
+        // Hide the window, keep the process.
+        //
+        // This used to close outright and let clipd-ui spawn a fresh one per
+        // hover, which meant every single open paid for a process start, a GPU
+        // context and a window before anything could be drawn — hundreds of
+        // milliseconds that no tuning further down the path can win back.
+        // `show_hud_onscreen` was already written for a resident process: it
+        // sets Visible(true) and repositions. This is the other half of that.
+        self.hud_expanded = false;
+        clipd_core::set_gui_window_open(false);
+        // Park it off-screen rather than toggling Visible.
+        //
+        // Hiding the window and showing it again brought it back inert on
+        // macOS — no hover highlight, clicks landing on nothing — because a
+        // re-shown window does not become key the way a freshly created one
+        // does, and Focus alone did not recover it. Moving it off-screen keeps
+        // it a live, ordinary window the whole time, which is what the rest of
+        // this file already assumes: the poll interval decides "hidden" by
+        // testing whether the last sent position was above the screen.
+        if let Some(screen) = main_display_size() {
+            let parked = egui::pos2(0.0, -(screen.y + 200.0));
+            self.last_sent_pos = Some(parked);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(parked));
+        }
+    }
+
+    /// Show the HUD at full size, positioned under the tray icon. No animation —
+    /// instant appearance to avoid macOS window resize glitching.
+    fn show_hud_onscreen(&mut self, ctx: &egui::Context) {
+        self.hud_expanded = true;
+        // Catch up on everything copied while this window was parked.
+        self.refresh();
+        clipd_core::set_gui_window_open(true);
+        if let Some(screen) = ctx
+            .input(|i| i.viewport().monitor_size)
+            .or_else(main_display_size)
+        {
+            let size = egui::vec2(HUD_W, HUD_H);
+            let left = popover_left(HUD_W, screen, true);
+            let pos = egui::pos2(left, HUD_TOP_MARGIN);
+            self.last_sent_size = Some(size);
+            self.last_sent_pos = Some(pos);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::AlwaysOnTop,
+            ));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            // Deliberately no Focus command here. It looked like the fix for
+            // the popover coming back inert, but parking the window off-screen
+            // was the actual cure — and taking focus on a *hover* means the
+            // keys you are typing into your editor land in this search box
+            // instead. A popover you summoned by pointing at something should
+            // not take the keyboard away from you.
+            self.focus_search = true;
+            ctx.request_repaint();
+        }
+    }
+
+    /// Render the HUD popover — always full expanded UI under the tray.
+    fn render_hud_popover(&mut self, ctx: &egui::Context, c: &clipd_core::ThemeColors) {
+        let mut action = Action::None;
+
+        paint_glass_shell(ctx, self.theme, c, self.native_glass_active());
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(glass_panel_frost(self.theme))
+                    .rounding(Rounding::same(SHELL_ROUND)),
+            )
+            .show(ctx, |ui| {
+                paint_panel_glass_gradient(ui, self.theme);
+                self.draw_popover_tail(ui, c);
+
+                let card = egui::Frame::none()
+                    .fill(Color32::TRANSPARENT)
+                    .rounding(Rounding::same(18.0))
+                    .stroke(Stroke::NONE)
+                    // Top padding matches the tail; bottom padding clears the
+                    // shell's rounded corner so the footer doesn't clip.
+                    .inner_margin(Margin {
+                        left: 12.0,
+                        right: 12.0,
+                        top: 7.0,
+                        bottom: 14.0,
+                    });
+
+                card.show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    self.render_hud_expanded(ui, &mut action, c);
+                });
+            });
+
+        self.dispatch(action, ctx);
+    }
+
+    /// The little triangle that points from the popover up at the menu bar.
+    fn draw_popover_tail(&self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        const TAIL_H: f32 = 8.0;
+        const TAIL_HALF_W: f32 = 9.0;
+
+        let width = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, TAIL_H), egui::Sense::hover());
+
+        // Point at the tray icon, not at the middle of the card. Near a screen
+        // edge the card is clamped inward, so those two are not the same place
+        // — and a tail aimed at nothing is worse than no tail.
+        let cx = match (clipd_core::load_tray_anchor(), main_display_size()) {
+            (Some(anchor), Some(screen)) if self.hud => {
+                let card_left = popover_left(self.panel_expanded_size().x, screen, true);
+                // Keep the tail on the card, with room for its own base.
+                (anchor as f32 - card_left + rect.left())
+                    .clamp(rect.left() + 16.0, rect.right() - 16.0)
+            }
+            _ => rect.center().x,
+        };
+        // Overlap the card by a hair so the shared edge has no seam.
+        let base = rect.bottom() + 1.0;
+
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(cx, rect.top()),
+                egui::pos2(cx - TAIL_HALF_W, base),
+                egui::pos2(cx + TAIL_HALF_W, base),
+            ],
+            surf(c, c.bg_surface),
+            Stroke::new(0.8, rgb(c.border)),
+        ));
+    }
+
+    /// Shut clipd down completely: other windows, the tray host, the daemon.
+    ///
+    /// The GUI cannot reach clipd-ui through the surface-request channel (that
+    /// is GUI-only), so the tray host is signalled through the daemon lock it
+    /// holds. Without that step clipd-ui survives, and its watchdog would put
+    /// a GUI straight back.
+    fn quit_everything(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        // Quit every surface process, not just the current one.
+        send_surface_request_to(SurfaceMode::Main, SurfaceMode::Quit);
+        send_surface_request_to(SurfaceMode::Hud, SurfaceMode::Quit);
+        send_surface_request_to(SurfaceMode::Island, SurfaceMode::Quit);
+
+        #[cfg(unix)]
+        if let Some(pid) = clipd_core::daemon_lock_pid() {
+            if pid != std::process::id() {
+                // SIGTERM, not SIGKILL: clipd-ui stops the daemon and releases
+                // its lock on the way out.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            }
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Footer, pinned to the bottom of whichever view is showing.
+    fn render_hud_footer_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        action: &mut Action,
+        c: &clipd_core::ThemeColors,
+    ) {
+        // Push the row to the bottom so it sits in the same place whether the
+        // view above it fills the panel or not. The reserved height covers the
+        // divider, the breathing room either side of it, and the 30pt buttons.
+        let slack = (ui.available_height() - POPOVER_FOOTER_H).max(0.0);
+        ui.add_space(slack.min(ui.available_height()));
+        hairline(ui, c);
+        // The list already ends with a rule, so the footer does not need to
+        // draw its own — adding one stacked two hairlines a few points apart,
+        // which reads as a mistake rather than as a divider.
+        ui.add_space(9.0);
+        self.render_hud_footer(ui, action, c);
+        // Keep the buttons off the card's rounded edge.
+        ui.add_space(3.0);
+    }
+
+    /// Settings, rendered in place of the clip list.
+    ///
+    /// These are the same controls the tray dropdown carries. Holding them
+    /// here means the popover is the only surface: no second window landing on
+    /// top of this one, and no two copies of the same toggle to keep in step.
+    fn render_hud_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        egui::ScrollArea::vertical()
+            .id_salt("hud_settings")
+            // Leave room for the footer. With too little reserved the scroll
+            // area eats it, taking the gear — the one control that gets you
+            // back out of settings — with it.
+            .max_height((ui.available_height() - POPOVER_FOOTER_H).max(60.0))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(2.0);
+
+                // Grouped like the reference: a small-caps heading, then the
+                // rows that belong under it in one card.
+                let mut settings_dirty = false;
+
+                popover_section_header(ui, c, "Behavior");
+                let group = |ui: &mut egui::Ui| {
+                    egui::Frame::none()
+                        .fill(surf(c, c.bg_surface))
+                        .rounding(Rounding::same(12.0))
+                        .stroke(Stroke::new(0.7, rgb(c.border).gamma_multiply(0.8)))
+                        .inner_margin(Margin::symmetric(6.0, 4.0))
+                };
+
+                let hover_on = self.paste_settings.hover_opens_hud;
+                let feedback_on = self.paste_settings.hud_enabled;
+                group(ui).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if popover_setting_row(
+                        ui,
+                        c,
+                        FooterIcon::Eye,
+                        "Show clips on hover",
+                        "Open the clipboard palette on hover",
+                        RowControl::Toggle(hover_on),
+                    ) {
+                        self.paste_settings.hover_opens_hud = !hover_on;
+                        settings_dirty = true;
+                    }
+                    hairline(ui, c);
+                    if popover_setting_row(
+                        ui,
+                        c,
+                        FooterIcon::Sparkle,
+                        "Slot copy feedback",
+                        "Flash a small confirmation when copied",
+                        RowControl::Toggle(feedback_on),
+                    ) {
+                        self.paste_settings.hud_enabled = !feedback_on;
+                        settings_dirty = true;
+                    }
+                });
+
+                if settings_dirty {
+                    save_paste_transform_settings(&self.paste_settings);
+                }
+
+                popover_section_header(ui, c, "Preferences");
+                group(ui).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if popover_setting_row(
+                        ui,
+                        c,
+                        FooterIcon::Gear,
+                        "All settings",
+                        "Themes, privacy, snippets, actions, AI model",
+                        RowControl::Chevron,
+                    ) {
+                        spawn_palette(&["--settings"]);
+                        self.popover_settings_open = false;
+                    }
+                });
+
+                popover_section_header(ui, c, "Clipboard");
+                group(ui).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if popover_setting_row(
+                        ui,
+                        c,
+                        FooterIcon::Clipboard,
+                        "Open full clipboard",
+                        "View all clips, collections & previews",
+                        RowControl::Chevron,
+                    ) {
+                        spawn_palette(&[]);
+                        self.popover_settings_open = false;
+                    }
+                });
+
+                popover_section_header(ui, c, "App");
+                group(ui).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if popover_setting_row(
+                        ui,
+                        c,
+                        FooterIcon::Power,
+                        "Quit Clipd",
+                        "Close all windows and stop the daemon",
+                        RowControl::Chevron,
+                    ) {
+                        self.quit_everything(ui.ctx());
+                    }
+                });
+
+                ui.add_space(4.0);
+            });
+    }
+
+    /// Footer: one row of round glass buttons, the way a menu-bar popover ends.
+    ///
+    /// The old footer mixed a text label with word chips, which made the panel
+    /// bottom-heavy and read like a status bar. Icons keep the weight on the
+    /// clips above, and every button here maps to something clipd actually
+    /// does — no decorative controls.
+    fn render_hud_footer(
+        &mut self,
+        ui: &mut egui::Ui,
+        action: &mut Action,
+        c: &clipd_core::ThemeColors,
+    ) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+
+            if glass_line_button(ui, FooterIcon::Sparkle, self.in_ask_mode(), c)
+                .on_hover_text("Ask about your clips")
+                .clicked()
+            {
+                self.toggle_ask_mode();
+            }
+
+            if glass_line_button(ui, FooterIcon::List, false, c)
+                .on_hover_text("Open the full clipboard window")
+                .clicked()
+            {
+                spawn_palette(&[]);
+            }
+
+            // Settings open *inside* the popover. Spawning the palette here
+            // put a second window in the same corner of the screen as this
+            // one, which is the overlap the tray dropdown already caused.
+            if glass_line_button(ui, FooterIcon::Gear, self.popover_settings_open, c)
+                .on_hover_text(if self.popover_settings_open {
+                    "Back to clips"
+                } else {
+                    "Settings"
+                })
+                .clicked()
+            {
+                self.popover_settings_open = !self.popover_settings_open;
+            }
+
+            let feedback_on = self.paste_settings.hud_enabled;
+            if glass_line_button(ui, FooterIcon::Eye, feedback_on, c)
+                .on_hover_text(if feedback_on {
+                    "Slot copy feedback is on"
+                } else {
+                    "Slot copy feedback is off"
+                })
+                .clicked()
+            {
+                self.paste_settings.hud_enabled = !feedback_on;
+                save_paste_transform_settings(&self.paste_settings);
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Built exactly like its neighbours. It used to allocate 30pt
+                // against their 38 and paint no circle behind it, so it sat off
+                // the row's centre line and read as a stray mark rather than a
+                // button — which is what made the footer look crooked.
+                let resp = glass_line_button(ui, FooterIcon::Power, false, c)
+                    .on_hover_text("Quit clipd — closes every window and stops the daemon");
+                if resp.clicked() {
+                    self.quit_everything(ui.ctx());
+                }
+            });
+        });
+        let _ = action;
+    }
+
+    fn render_hud_expanded(
+        &mut self,
+        ui: &mut egui::Ui,
+        action: &mut Action,
+        c: &clipd_core::ThemeColors,
+    ) {
+        // Search + Ask chip, held in one quiet inset surface like a native
+        // menu-bar popover search field.
+        egui::Frame::none()
+            .fill(surf(c, c.bg_elevated))
+            .rounding(Rounding::same(12.0))
+            .stroke(Stroke::new(0.7, rgb(c.border)))
+            .inner_margin(Margin::symmetric(10.0, 7.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    draw_search_icon(ui, rgb(c.accent).gamma_multiply(0.9));
+                    ui.add_space(6.0);
+
+                    let asking = self.in_ask_mode();
+                    let field_w = (ui.available_width() - 68.0).max(80.0);
+                    let search = ui.add_sized(
+                        [field_w, 20.0],
+                        egui::TextEdit::singleline(&mut self.search_query)
+                            .id(egui::Id::new("hud_search"))
+                            .hint_text(if asking {
+                                "Ask, then press Enter"
+                            } else {
+                                "Search clipboard…"
+                            })
+                            .frame(false)
+                            .font(egui::TextStyle::Body),
+                    );
+                    if self.focus_search {
+                        search.request_focus();
+                        self.focus_search = false;
+                    }
+                    if search.changed() {
+                        if asking {
+                            self.ask.clear_answer();
+                        }
+                        self.apply_filter();
+                    }
+                    if search.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        && asking
+                    {
+                        *action = Action::Ask;
+                    }
+                });
+            });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // The body swaps between three views; the footer belongs to all of
+        // them. Returning early here left settings and ask mode with no
+        // visible way back — the gear that toggles them lives in the footer.
+        if self.in_ask_mode() {
+            render_ask_panel(ui, &self.ask, action, c);
+            self.render_hud_footer_row(ui, action, c);
+            return;
+        }
+
+        if self.popover_settings_open {
+            self.render_hud_settings(ui, c);
+            self.render_hud_footer_row(ui, action, c);
+            return;
+        }
+
+        // Compact clip list.
+        // Stop short of the card's bottom edge. Without this the list scrolls
+        // right off the window and the rounded corner is sliced away by a
+        // half-drawn row.
+        let list_h = (ui.available_height() - POPOVER_FOOTER_H).max(60.0);
+        egui::ScrollArea::vertical()
+            .id_salt("hud_list")
+            .max_height(list_h)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.filtered.is_empty() {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new("Nothing here yet — copy something.")
+                                .size(12.0)
+                                .color(rgb(c.subtext)),
+                        );
+                    });
+                    return;
+                }
+
+                let rows: Vec<(usize, i64, String, String, String, Option<u8>)> = self
+                    .filtered
+                    .iter()
+                    .take(40)
+                    .filter_map(|&i| self.clips.get(i).map(|clip| (i, clip)))
+                    .map(|(i, clip)| {
+                        // Some clips (images, whitespace-only copies) carry an
+                        // empty preview. A blank row reads as a rendering bug,
+                        // so fall back to the content, then to a label.
+                        let mut text = one_line_preview(&clip.preview, 58);
+                        if text.is_empty() {
+                            text = one_line_preview(&clip.content, 58);
+                        }
+                        if text.is_empty() {
+                            text = match clip.content_type {
+                                ContentType::Image => "Image".to_string(),
+                                _ => "(empty)".to_string(),
+                            };
+                        }
+                        (
+                            i,
+                            clip.id,
+                            text,
+                            clip.source_app.clone().unwrap_or_default(),
+                            relative_time_short(&clip.timestamp),
+                            clip.slot,
+                        )
+                    })
+                    .collect();
+
+                for (pos, (_idx, clip_id, preview, app, time, slot)) in
+                    rows.into_iter().enumerate()
+                {
+                    let selected = self.selected == pos;
+                    let starred = self.starred_clip_ids.contains(&clip_id);
+                    let mut star_clicked = false;
+                    let (row_fill, row_stroke) = if self.theme.is_glass() {
+                        (
+                            glass_row_fill(self.theme, selected, false).unwrap_or(Color32::TRANSPARENT),
+                            glass_row_stroke(self.theme, selected),
+                        )
+                    } else if selected {
+                        // Selection is the accent, not a slightly lighter grey:
+                        // a wash over the card and a proper edge, so the row you
+                        // are on is obvious while scanning the list.
+                        (
+                            surf(c, c.bg_selected),
+                            Stroke::new(1.2, rgb(c.accent).gamma_multiply(0.55)),
+                        )
+                    } else if slot.is_some() {
+                        // Held in an active slot: the same edge at a third
+                        // strength. Enough to find at a glance, not enough to
+                        // compete with the row you are actually on.
+                        (
+                            Color32::TRANSPARENT,
+                            Stroke::new(1.0, rgb(c.accent).gamma_multiply(0.34)),
+                        )
+                    } else {
+                        (Color32::TRANSPARENT, Stroke::new(0.0, rgb(c.border)))
+                    };
+                    let frame = egui::Frame::none()
+                        .fill(row_fill)
+                        .rounding(Rounding::same(10.0))
+                        .stroke(row_stroke)
+                        .inner_margin(Margin::symmetric(10.0, 5.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let (rail, _) = ui.allocate_exact_size(
+                                    egui::vec2(3.0, 28.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    rail,
+                                    Rounding::same(2.0),
+                                    if selected {
+                                        // Theme spot (sage / cyan / lilac / …).
+                                        rgb(c.green)
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    },
+                                );
+                                ui.add_space(8.0);
+                                ui.vertical(|ui| {
+                                    // Reserve room for the star, and for the
+                                    // slot badge when there is one. Reserving
+                                    // only the star meant a long title on a
+                                    // slotted row truncated against the full
+                                    // width and printed underneath the ⌘N.
+                                    let trailing =
+                                        if slot.is_some() { 42.0 + 48.0 } else { 42.0 };
+                                    ui.set_width((ui.available_width() - trailing).max(80.0));
+                                    // Same ink rules as the full GUI: white only
+                                    // on Glass Minimal frost — Paper Light and
+                                    // other themes keep theme text so selection
+                                    // stays readable.
+                                    // Glass Dark keeps light ink on frost; Glass Light
+                                    // (and everything else) uses the theme text colours.
+                                    let title_col = rgb(c.text);
+                                    let meta_col = rgb(c.subtext);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&preview)
+                                                .size(13.6)
+                                                .strong()
+                                                .color(title_col),
+                                        )
+                                        .truncate(),
+                                    );
+                                    ui.add_space(1.0);
+                                    let meta = if app.is_empty() {
+                                        time.clone()
+                                    } else {
+                                        format!("{}  ·  {}", app, time)
+                                    };
+                                    ui.label(
+                                        RichText::new(meta)
+                                            .size(11.3)
+                                            .color(meta_col),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if glass_pin_button(ui, starred, c)
+                                            .on_hover_text("Pin clip")
+                                            .clicked()
+                                        {
+                                            star_clicked = true;
+                                        }
+                                        // The slot's number, next to the ring
+                                        // that marks the row.
+                                        //
+                                        // The ring alone said "this row is
+                                        // different" without saying how, which
+                                        // reads as a rendering fault rather
+                                        // than as information. The number is
+                                        // the useful half: it is what you press
+                                        // to paste this clip back.
+                                        if let Some(n) = slot {
+                                            ui.add_space(2.0);
+                                            let badge = clipd_core::slot_badge(n);
+                                            let text = format!("⌘{badge}");
+                                            let galley = ui.painter().layout_no_wrap(
+                                                text.clone(),
+                                                egui::FontId::proportional(11.0),
+                                                rgb(c.accent),
+                                            );
+                                            let (rect, resp) = ui.allocate_exact_size(
+                                                egui::vec2(galley.size().x + 14.0, 22.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                Rounding::same(6.0),
+                                                rgb(c.accent).gamma_multiply(0.18),
+                                            );
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                text,
+                                                egui::FontId::proportional(11.0),
+                                                rgb(c.accent),
+                                            );
+                                            resp.on_hover_text(format!(
+                                                "Held in slot {badge} — ⌘{badge} pastes it"
+                                            ));
+                                        }
+                                    },
+                                );
+                            });
+                        });
+
+                    if star_clicked {
+                        self.selected = pos;
+                        *action = Action::ToggleStar(clip_id);
+                    }
+                    let hit = ui.interact(
+                        egui::Rect::from_min_max(
+                            frame.response.rect.min,
+                            egui::pos2(
+                                frame.response.rect.right() - 42.0,
+                                frame.response.rect.bottom(),
+                            ),
+                        ),
+                        egui::Id::new(("hud_row", clip_id)),
+                        egui::Sense::click(),
+                    );
+                    if hit.clicked() && !star_clicked {
+                        self.selected = pos;
+                        *action = Action::Copy;
+                    }
+                    if hit.double_clicked() && !star_clicked {
+                        self.selected = pos;
+                        *action = Action::Paste;
+                    }
+                    ui.add_space(2.0);
+                }
+            });
+
+        self.render_hud_footer_row(ui, action, c);
+    }
+
+    /// Run a transform off the UI thread and report back through a channel.
+    fn start_transform(&mut self, kind: TransformKind, input: String, ctx: &egui::Context) {
+        if self.transform_job.running {
+            return;
+        }
+        let config = load_transform_config();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        let job_kind = kind.clone();
+
+        std::thread::spawn(move || {
+            let result = clipd_core::apply_transform(&job_kind, &input, &config);
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+
+        self.transform_job = TransformJob {
+            running: true,
+            label: kind.label().to_string(),
+            rx: Some(rx),
+            result: None,
+        };
+    }
+
+    /// Collect a finished transform, if one landed since the last frame.
+    fn poll_transform(&mut self) {
+        let Some(rx) = &self.transform_job.rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.transform_job.running = false;
+                self.transform_job.rx = None;
+                self.transform_job.result = Some(result);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.transform_job.running = false;
+                self.transform_job.rx = None;
+                self.transform_job.result =
+                    Some(Err("The transform worker stopped unexpectedly.".into()));
+            }
+        }
+    }
+
+    /// The ✦ chip on a row: ask about that specific clip. Seeds the question
+    /// from the clip's own preview so the retriever has real terms to match on
+    /// — "tell me about this" alone retrieves nothing.
+    fn ask_about_clip(&mut self, clip_id: i64, ctx: &egui::Context) {
+        let Some(clip) = self.clips.iter().find(|c| c.id == clip_id) else {
+            return;
+        };
+        let hint = one_line_preview(&clip.preview, 60);
+        self.search_query = format!("? what is this, and where did I copy it from: {}", hint);
+        self.ask.reset();
+        self.start_ask(ctx);
+    }
+
+    /// Run a Smart Recommend chip. Transforms go through the existing
+    /// background-action path; Ask suggestions just steer the search bar.
+    fn run_suggestion(&mut self, idx: usize, ctx: &egui::Context) {
+        let Some(clip) = self.selected_clip().cloned() else {
+            return;
+        };
+        let suggestions = clipd_core::suggest_for(&clip);
+        let Some(suggestion) = suggestions.get(idx).cloned() else {
+            return;
+        };
+
+        match suggestion.kind {
+            clipd_core::SuggestionKind::Ask(question) => {
+                self.search_query = format!("? {}", question);
+                self.ask.reset();
+                self.start_ask(ctx);
+            }
+            clipd_core::SuggestionKind::Transform(kind) => {
+                self.start_transform(kind, clip.content.clone(), ctx);
+            }
+        }
+    }
+
+    /// Flip between search and ask, preserving whatever the user has typed —
+    /// a half-typed query is usually the thing they want to ask about.
+    fn toggle_ask_mode(&mut self) {
+        if self.in_ask_mode() {
+            self.search_query = self
+                .search_query
+                .trim_start_matches('?')
+                .trim_start()
+                .to_string();
+            self.ask.reset();
+            self.apply_filter();
+        } else {
+            self.search_query = format!("? {}", self.search_query.trim());
+        }
+        self.focus_search = true;
+    }
+
     fn in_ask_mode(&self) -> bool {
         self.search_query.trim().starts_with('?') || ask_query(&self.search_query).is_some()
     }
@@ -1305,11 +4797,9 @@ impl ClipdGui {
         }
         self.filtered = ranked;
 
-        match keep_selected.and_then(|id| {
-            self.filtered
-                .iter()
-                .position(|&i| self.clips[i].id == id)
-        }) {
+        match keep_selected
+            .and_then(|id| self.filtered.iter().position(|&i| self.clips[i].id == id))
+        {
             // Held our place — don't yank the scroll position out from under
             // someone who is reading.
             Some(pos) => self.selected = pos,
@@ -1357,6 +4847,29 @@ impl ClipdGui {
         } else {
             (0..self.clips.len()).collect()
         };
+
+        // Content rail. Favorites is intentionally a filter rather than a
+        // separate data screen so search, keyboard navigation and paste retain
+        // identical behaviour in every category.
+        let content_filter = self.content_filter;
+        let starred = &self.starred_clip_ids;
+        base_indices.retain(|&i| {
+            let clip = &self.clips[i];
+            match content_filter {
+                ContentFilter::All => true,
+                ContentFilter::Favorites => starred.contains(&clip.id),
+                ContentFilter::Slots => clip.slot.is_some(),
+                ContentFilter::Text => {
+                    matches!(clip.content_type, ContentType::Text | ContentType::Unknown)
+                }
+                ContentFilter::Links => {
+                    matches!(clip.content_type, ContentType::Url | ContentType::Email)
+                }
+                ContentFilter::Code => clip.content_type == ContentType::Code,
+                ContentFilter::Images => clip.content_type == ContentType::Image,
+                ContentFilter::Files => clip.content_type == ContentType::Path,
+            }
+        });
 
         // Recall-by-source: "from chrome", "json from chrome", or "app:chrome"
         // filter to clips copied from that app — so you never need a slot number.
@@ -1429,6 +4942,11 @@ impl ClipdGui {
 
             self.filtered = ordered;
         }
+
+        // Pinned clips form the first visual section, matching the reference.
+        // sort_by_key is stable, so recency is preserved within both groups.
+        self.filtered
+            .sort_by_key(|&i| !self.starred_clip_ids.contains(&self.clips[i].id));
         // Top result is selected so Enter pastes the best match immediately.
         self.selected = 0;
         if self.selected >= self.filtered.len() {
@@ -1492,16 +5010,311 @@ impl ClipdGui {
         false
     }
 
+    /// Put a file clip's files back on the clipboard, so Cmd+V in Finder
+    /// pastes the actual files rather than their paths as text.
+    fn set_clipboard_files(&mut self, clip: &ClipEntry) -> bool {
+        // Files whose blob was pruned *and* whose original has moved can't be
+        // pasted; paste the ones that survive rather than failing outright.
+        let paths: Vec<std::path::PathBuf> =
+            clip.files.iter().filter_map(|f| f.resolve()).collect();
+        if paths.is_empty() {
+            return false;
+        }
+        if clipd_core::clipboard_write_file_urls(&paths).is_ok() {
+            self.copied_at = Some(Instant::now());
+            return true;
+        }
+        false
+    }
+
+    /// The "Sending" settings group: which machines this one can send to, and
+    /// the pairing flow that authorises new ones.
+    fn render_sending_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        match &self.pairing {
+            PairingState::Searching { .. } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new("Looking for the other machine…")
+                            .size(12.0)
+                            .color(rgb(c.text)),
+                    );
+                });
+                settings_card_copy(
+                    ui,
+                    c,
+                    "Start pairing on the other machine too",
+                    "Open clipd there and click Pair a machine, or run `clipd pair`.",
+                );
+                ui.add_space(6.0);
+                if vault_action(ui, c, "Cancel", false, false).clicked() {
+                    self.cancel_pairing();
+                }
+            }
+
+            PairingState::Confirming(offer) => {
+                let (code, name) = (offer.confirmation_code.clone(), offer.name.clone());
+                ui.label(
+                    RichText::new(format!("Found {name}"))
+                        .size(12.0)
+                        .color(rgb(c.text)),
+                );
+                ui.add_space(8.0);
+                // The code is the security of the whole step, so it gets the
+                // visual weight of the thing the user is actually meant to do.
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(&code)
+                            .size(34.0)
+                            .strong()
+                            .monospace()
+                            .color(rgb(c.text)),
+                    );
+                });
+                ui.add_space(8.0);
+                settings_card_copy(
+                    ui,
+                    c,
+                    &format!("This code must be showing on {name} right now"),
+                    "If the two don't match, something is intercepting — choose Don't match.",
+                );
+                ui.add_space(8.0);
+
+                let mut decision: Option<bool> = None;
+                ui.horizontal(|ui| {
+                    if ui.button("They match — pair").clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Don't match").clicked() {
+                        decision = Some(false);
+                    }
+                });
+
+                match decision {
+                    Some(true) => {
+                        // Borrow ends here, so the offer can be consumed.
+                        let PairingState::Confirming(offer) =
+                            std::mem::replace(&mut self.pairing, PairingState::Idle)
+                        else {
+                            unreachable!("just matched Confirming")
+                        };
+                        self.pairing = match offer.accept() {
+                            Ok(()) => PairingState::Done(format!("Paired with {name}.")),
+                            Err(e) => PairingState::Failed(e),
+                        };
+                    }
+                    Some(false) => {
+                        self.pairing = PairingState::Failed(
+                            "Cancelled — nothing was paired. Try again somewhere \
+                             you trust the network."
+                                .to_string(),
+                        );
+                    }
+                    None => {}
+                }
+            }
+
+            PairingState::Done(msg) | PairingState::Failed(msg) => {
+                let ok = matches!(self.pairing, PairingState::Done(_));
+                ui.label(
+                    RichText::new(format!("{} {msg}", if ok { "✅" } else { "⚠" }))
+                        .size(12.0)
+                        .color(rgb(if ok { c.text } else { c.subtext })),
+                );
+                ui.add_space(6.0);
+                if ui.button("OK").clicked() {
+                    self.pairing = PairingState::Idle;
+                }
+            }
+
+            PairingState::Idle => {
+                let paired = clipd_core::lan_identity::trusted_peers();
+                let mut forget: Option<(String, String)> = None;
+
+                if paired.is_empty() {
+                    settings_card_copy(
+                        ui,
+                        c,
+                        "No machines paired yet",
+                        "Pair another computer to send clips, links and files straight to it.",
+                    );
+                } else {
+                    let mut first = true;
+                    for p in paired.values() {
+                        if !first {
+                            settings_card_divider(ui, c);
+                        }
+                        first = false;
+                        settings_value_row(
+                            ui,
+                            c,
+                            FooterIcon::Send,
+                            &p.name,
+                            "Paired — clips send here",
+                            80.0,
+                            |ui| {
+                                if ui.small_button("Forget").clicked() {
+                                    forget = Some((p.device_id.clone(), p.name.clone()));
+                                }
+                            },
+                        );
+                    }
+                }
+
+                if let Some((device_id, name)) = forget {
+                    self.pairing = match clipd_core::lan_identity::forget_peer(&device_id) {
+                        Ok(_) => PairingState::Done(format!(
+                            "Forgot {name}. Pair again to send to it."
+                        )),
+                        Err(e) => PairingState::Failed(e),
+                    };
+                }
+
+                // Surface machines that are visible but unusable. Without this
+                // the only symptom is a send that fails, long after the moment
+                // when pairing would have been obvious.
+                let unpaired: Vec<String> = self
+                    .nearby_machines()
+                    .iter()
+                    .filter(|r| r.lan.is_some() && !paired.contains_key(&r.device_id))
+                    .map(|r| r.name.clone())
+                    .collect();
+                if !unpaired.is_empty() {
+                    ui.add_space(6.0);
+                    settings_card_copy(
+                        ui,
+                        c,
+                        &format!("{} on this network, not paired", unpaired.join(", ")),
+                        "Pair to send clips there.",
+                    );
+                }
+
+                ui.add_space(4.0);
+                settings_card_divider(ui, c);
+                if popover_setting_row(
+                    ui,
+                    c,
+                    FooterIcon::Send,
+                    "Pair a machine…",
+                    "Both machines show a six-digit code — they must match",
+                    RowControl::Chevron,
+                ) {
+                    self.begin_pairing();
+                }
+            }
+        }
+    }
+
+    /// Start looking for another machine to pair with.
+    ///
+    /// The search runs on a worker thread — it blocks for up to a minute, and
+    /// the window has to keep drawing (and offer Cancel) throughout.
+    fn begin_pairing(&mut self) {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_stop = stop.clone();
+
+        match std::thread::Builder::new()
+            .name("clipd-gui-pairing".into())
+            .spawn(move || {
+                let _ = tx.send(clipd_core::lan_pair::discover_and_exchange(worker_stop));
+            }) {
+            Ok(_) => self.pairing = PairingState::Searching { stop, result: rx },
+            Err(e) => self.pairing = PairingState::Failed(format!("Couldn't start pairing: {e}")),
+        }
+    }
+
+    /// Advance the pairing state machine. Called every frame while Settings is
+    /// showing; cheap unless a search is actually running.
+    fn poll_pairing(&mut self, ctx: &egui::Context) {
+        let PairingState::Searching { result, .. } = &self.pairing else {
+            return;
+        };
+        match result.try_recv() {
+            Ok(Ok(offer)) => self.pairing = PairingState::Confirming(offer),
+            Ok(Err(e)) => self.pairing = PairingState::Failed(e),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Keep animating the spinner and re-checking, even with no
+                // input events arriving.
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pairing =
+                    PairingState::Failed("Pairing stopped unexpectedly.".to_string());
+            }
+        }
+    }
+
+    /// Cancel a search in flight. Dropping the state also drops the offer, and
+    /// with it the machine-wide pairing lock.
+    fn cancel_pairing(&mut self) {
+        if let PairingState::Searching { stop, .. } = &self.pairing {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.pairing = PairingState::Idle;
+    }
+
+    /// Machines reachable right now, re-read at most every couple of seconds.
+    fn nearby_machines(&mut self) -> &[clipd_core::sync::Reachable] {
+        let stale = self
+            .nearby_checked
+            .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(2));
+        if stale {
+            self.nearby = clipd_core::sync::reachable_devices();
+            self.nearby_checked = Some(Instant::now());
+        }
+        &self.nearby
+    }
+
+    /// Send the selected clip to the other Mac.
+    ///
+    /// Result goes to the status banner rather than a modal: a send that needs
+    /// dismissing costs more attention than the send itself saved.
+    fn do_send(&mut self) {
+        let Some(clip) = self.selected_clip().cloned() else {
+            self.action_status = Some((false, "No clip selected.".into()));
+            return;
+        };
+        match clipd_core::sync::send_clip(&clip, None) {
+            Ok(device) => {
+                self.action_status =
+                    Some((true, format!("Sent to {} · U to undo", device.name)));
+            }
+            Err(e) => self.action_status = Some((false, e)),
+        }
+    }
+
+    /// Take back the last send, if the other Mac hasn't collected it yet.
+    fn do_undo_send(&mut self) {
+        match clipd_core::sync::recall_last() {
+            Ok((last, true)) => {
+                self.action_status =
+                    Some((true, format!("Took it back before {} got it", last.device_name)));
+            }
+            Ok((last, false)) => {
+                // Honest rather than reassuring: it is in their history now,
+                // and pretending otherwise would be worse than saying so.
+                self.action_status =
+                    Some((false, format!("Too late — {} already has it", last.device_name)));
+            }
+            Err(e) => self.action_status = Some((false, e)),
+        }
+    }
+
     fn do_copy(&mut self) -> bool {
         let Some(clip) = self.selected_clip().cloned() else {
             return false;
         };
-        // Image clips go to the clipboard as pixels; everything else as text.
+        // Image clips go to the clipboard as pixels, file clips as file URLs;
+        // everything else as text.
         if clip.content_type == ContentType::Image {
             if let Some(path) = clip.image_path.as_deref() {
                 return self.set_clipboard_image(path);
             }
             return false;
+        }
+        if clip.content_type == ContentType::File && !clip.files.is_empty() {
+            return self.set_clipboard_files(&clip);
         }
         self.set_clipboard(&clip.content)
     }
@@ -1577,23 +5390,31 @@ impl ClipdGui {
         }
     }
 
-    /// Read the live clipboard and save it as a password to the selected vault.
-    /// clipd stores nothing — the secret goes straight to the vault backend.
+    /// Save a secret to the vault. Uses the password field if filled;
+    /// otherwise falls back to the live clipboard.
     fn save_clipboard_to_vault(&mut self) {
         let Some(target) = self.vault_selected else {
             self.vault_status = Some((false, "No vault backend available.".into()));
             return;
         };
-        let password = match Clipboard::new().and_then(|mut c| c.get_text()) {
-            Ok(t) if !t.trim().is_empty() => t,
-            Ok(_) => {
-                self.vault_status =
-                    Some((false, "Clipboard is empty — copy a password first.".into()));
-                return;
-            }
-            Err(e) => {
-                self.vault_status = Some((false, format!("Couldn't read clipboard: {e}")));
-                return;
+        // Prefer the explicit password field; fall back to clipboard.
+        let password = if !self.vault_password_input.trim().is_empty() {
+            std::mem::take(&mut self.vault_password_input)
+        } else {
+            match Clipboard::new().and_then(|mut c| c.get_text()) {
+                Ok(t) if !t.trim().is_empty() => t,
+                Ok(_) => {
+                    self.vault_status = Some((
+                        false,
+                        "Paste your API key into the field above, or copy it to clipboard first."
+                            .into(),
+                    ));
+                    return;
+                }
+                Err(e) => {
+                    self.vault_status = Some((false, format!("Couldn't read clipboard: {e}")));
+                    return;
+                }
             }
         };
         let entry = SecretEntry {
@@ -1609,9 +5430,307 @@ impl ClipdGui {
                 self.vault_title.clear();
                 self.vault_username.clear();
                 self.vault_url.clear();
+                self.vault_password_input.clear();
+                self.refresh_vault_secrets();
             }
             Err(e) => self.vault_status = Some((false, e)),
         }
+    }
+
+    /// Refresh the cached list of vault secrets (labels only — no plaintext).
+    fn refresh_vault_secrets(&mut self) {
+        match clipd_core::list_secrets() {
+            Ok(secrets) => self.vault_secrets = secrets,
+            Err(e) => {
+                self.vault_status = Some((false, format!("Couldn't list vault: {e}")));
+                self.vault_secrets.clear();
+            }
+        }
+    }
+
+    /// Render the Vault tab — list, reveal, copy, forget, and save new secrets.
+    /// All secrets are encrypted in the macOS Keychain; clipd never stores
+    /// plaintext keys in its database.
+    fn render_vault_panel(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        ui.add_space(4.0);
+
+        // ── Security banner ──
+        egui::Frame::none()
+            .fill(surf(c, c.bg_elevated))
+            .rounding(Rounding::same(10.0))
+            .inner_margin(Margin::symmetric(14.0, 10.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(RichText::new("🔐").size(16.0));
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Encrypted Vault")
+                                .size(13.0)
+                                .strong()
+                                .color(rgb(c.text)),
+                        );
+                        ui.label(
+                            RichText::new("API keys and secrets are stored in macOS Keychain. They are never saved to clipd's clipboard history or database.")
+                                .size(11.0)
+                                .color(rgb(c.subtext)),
+                        );
+                    });
+                });
+            });
+
+        ui.add_space(12.0);
+
+        // ── Save new secret ──
+        let save_open = ui.collapsing("Save new secret", |ui| {
+            ui.add_space(4.0);
+            egui::Frame::none()
+                .fill(surf(c, c.bg_elevated))
+                .rounding(Rounding::same(10.0))
+                .inner_margin(Margin::symmetric(12.0, 10.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Title").size(12.0).color(rgb(c.subtext)));
+                        ui.add_space(4.0);
+                        ui.text_edit_singleline(&mut self.vault_title);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("API key").size(12.0).color(rgb(c.subtext)));
+                        ui.add_space(4.0);
+                        ui.add_sized(
+                            [ui.available_width().max(120.0), 18.0],
+                            egui::TextEdit::singleline(&mut self.vault_password_input)
+                                .password(true)
+                                .hint_text("Paste your API key here")
+                                .frame(true),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("URL").size(12.0).color(rgb(c.subtext)));
+                        ui.add_space(28.0);
+                        ui.add_space(4.0);
+                        ui.text_edit_singleline(&mut self.vault_url);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Backend").size(12.0).color(rgb(c.subtext)),
+                        );
+                        ui.add_space(4.0);
+                        egui::ComboBox::from_id_salt("vault_backend")
+                            .selected_text(
+                                self.vault_selected
+                                    .map(|t| t.label().to_string())
+                                    .unwrap_or_default(),
+                            )
+                            .show_ui(ui, |ui| {
+                                for t in clipd_core::available_targets() {
+                                    ui.selectable_value(
+                                        &mut self.vault_selected,
+                                        Some(t),
+                                        t.label(),
+                                    );
+                                }
+                            });
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save to vault").clicked() {
+                            self.save_clipboard_to_vault();
+                        }
+                        if let Some((ok, msg)) = &self.vault_status {
+                            let col = if *ok { rgb(c.green) } else { rgb(c.accent) };
+                            ui.label(RichText::new(msg).size(11.5).color(col));
+                        }
+                    });
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("Copy your API key first, then click Save — the clipboard content is encrypted and stored in the Keychain, not in clipd's history.")
+                            .size(10.5)
+                            .color(rgb(c.subtext)),
+                    );
+                });
+        });
+
+        ui.add_space(12.0);
+
+        // ── Secrets list ──
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("Saved secrets ({})", self.vault_secrets.len()))
+                    .size(13.0)
+                    .strong()
+                    .color(rgb(c.text)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Refresh").clicked() {
+                    self.refresh_vault_secrets();
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        if self.vault_secrets.is_empty() {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("No saved secrets yet")
+                        .size(13.0)
+                        .color(rgb(c.subtext)),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Copy an API key, then expand \"Save new secret\" above.")
+                        .size(11.0)
+                        .color(rgb(c.subtext)),
+                );
+            });
+            return;
+        }
+
+        // Clear expired reveal.
+        if let Some((_, _, ts)) = &self.vault_revealed {
+            if ts.elapsed() > Duration::from_secs(30) {
+                self.vault_revealed = None;
+            }
+        }
+
+        let scroll_h = ui.available_height() - 20.0;
+        let vault_revealed = self.vault_revealed.clone();
+        let vault_confirm = self.vault_confirm_delete;
+        let secrets = self.vault_secrets.clone();
+        egui::ScrollArea::vertical()
+            .id_salt("vault_list")
+            .max_height(scroll_h.max(80.0))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, secret) in secrets.iter().enumerate() {
+                    let is_revealed = vault_revealed.as_ref().map_or(false, |(idx, _, _)| *idx == i);
+                    let is_confirm = vault_confirm == Some(i);
+
+                    let frame = egui::Frame::none()
+                        .fill(surf(c, c.bg_elevated))
+                        .rounding(Rounding::same(10.0))
+                        .stroke(Stroke::new(0.5, rgb(c.border)))
+                        .inner_margin(Margin::symmetric(12.0, 8.0));
+
+                    frame.show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let (tile, _) =
+                                ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+                            ui.painter().rect_filled(
+                                tile,
+                                Rounding::same(8.0),
+                                rgb(c.accent).gamma_multiply(0.16),
+                            );
+                            paint_footer_icon(
+                                ui.painter(),
+                                egui::Rect::from_center_size(tile.center(), egui::vec2(15.0, 15.0)),
+                                FooterIcon::Lock,
+                                rgb(c.accent),
+                            );
+                            ui.vertical(|ui| {
+                                ui.set_width(ui.available_width() - 120.0);
+                                ui.label(
+                                    RichText::new(&secret.title)
+                                        .size(13.0)
+                                        .strong()
+                                        .color(rgb(c.text)),
+                                );
+                                // Skip the note when it only restates the
+                                // title. Every captured secret carries
+                                // "Captured by clipd (OpenAI)." under a title
+                                // that already ends in "— OpenAI", so the
+                                // second line told you nothing and made each
+                                // row twice as tall. Suppressed at display
+                                // time because it is baked into every entry
+                                // already saved.
+                                let boilerplate = secret.note.starts_with("Captured by clipd");
+                                if !boilerplate && !secret.note.trim().is_empty() {
+                                    ui.add_space(1.0);
+                                    ui.label(
+                                        RichText::new(&secret.note)
+                                            .size(10.5)
+                                            .color(rgb(c.subtext)),
+                                    );
+                                }
+                                if is_revealed {
+                                    ui.add_space(4.0);
+                                    let (_, plaintext, _) = self.vault_revealed.as_ref().unwrap();
+                                    ui.label(
+                                        RichText::new(plaintext)
+                                            .size(12.0)
+                                            .family(egui::FontFamily::Monospace)
+                                            .color(rgb(c.accent)),
+                                    );
+                                    ui.label(
+                                        RichText::new("Auto-hides in 30s")
+                                            .size(9.5)
+                                            .color(rgb(c.overlay)),
+                                    );
+                                }
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if is_confirm {
+                                        if vault_action(ui, c, "Confirm delete", true, false).clicked() {
+                                            if let Err(e) = clipd_core::forget_secret(secret) {
+                                                self.vault_status =
+                                                    Some((false, format!("Delete failed: {e}")));
+                                            } else {
+                                                self.vault_status =
+                                                    Some((true, "Secret deleted.".into()));
+                                                self.refresh_vault_secrets();
+                                            }
+                                            self.vault_confirm_delete = None;
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            self.vault_confirm_delete = None;
+                                        }
+                                    } else {
+                                        if vault_action(ui, c, "Copy", true, false).clicked() {
+                                            match clipd_core::reveal_secret(secret) {
+                                                Ok(plaintext) => {
+                                                    let _ = Clipboard::new()
+                                                        .and_then(|mut c| c.set_text(&plaintext));
+                                                    self.vault_revealed =
+                                                        Some((i, plaintext, Instant::now()));
+                                                }
+                                                Err(e) => {
+                                                    self.vault_status =
+                                                        Some((false, format!("Reveal failed: {e}")));
+                                                }
+                                            }
+                                        }
+                                        if vault_action(ui, c, "Reveal", false, false).clicked() {
+                                            match clipd_core::reveal_secret(secret) {
+                                                Ok(plaintext) => {
+                                                    self.vault_revealed =
+                                                        Some((i, plaintext, Instant::now()));
+                                                }
+                                                Err(e) => {
+                                                    self.vault_status = Some((
+                                                        false,
+                                                        format!("Reveal failed: {e}"),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        if vault_action(ui, c, "Forget", false, true).clicked() {
+                                            self.vault_confirm_delete = Some(i);
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+            });
     }
 
     /// Open/close the preview inspector, resizing the window so the palette
@@ -1647,30 +5766,220 @@ impl ClipdGui {
         save_theme(self.theme);
         apply_theme(ctx, self.theme);
     }
+
+    /// Pull appearance changes made by another Clipd GUI process.
+    ///
+    /// The tray HUD is intentionally kept alive for instant opening, so its
+    /// `self.theme` otherwise stays at the value loaded during startup. The
+    /// 150ms interval is fast enough to feel immediate while avoiding a disk
+    /// read on every HUD repaint.
+    fn sync_shared_appearance(&mut self, ctx: &egui::Context) {
+        const APPEARANCE_POLL: Duration = Duration::from_millis(150);
+        if self.last_shared_appearance_check.elapsed() < APPEARANCE_POLL {
+            return;
+        }
+        self.last_shared_appearance_check = Instant::now();
+
+        let shared_theme = load_theme();
+        let shared_custom_colors = load_custom_colors();
+        if shared_theme == self.theme && shared_custom_colors == self.custom_colors {
+            return;
+        }
+
+        self.theme = shared_theme;
+        self.custom_colors = shared_custom_colors;
+        apply_theme(ctx, self.theme);
+        // `sync_glass_native` runs immediately after this method. A changed
+        // Glass Light/Dark/solid state therefore clears and reapplies the
+        // correct AppKit material in the same frame.
+        ctx.request_repaint();
+    }
 }
 
 // ── Rendering ──
 
 impl eframe::App for ClipdGui {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Hand the top of the screen back to the island on the way out.
+        if !self.island_surface {
+            clipd_core::set_gui_window_open(false);
+        }
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Fully transparent so the rounded card corners show the desktop behind
         // (the card surface is painted by the panels).
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.theme == Theme::System {
-            apply_theme(ctx, self.theme);
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // A surface asked for the keyboard while it was drawing, where the
+        // frame is not in hand. Grant it here.
+        if self.want_key_window {
+            self.want_key_window = false;
+            activate_for_keyboard_input();
+            make_window_key(frame);
         }
-        if self.last_refresh.elapsed() > Duration::from_secs(3) {
-            self.refresh();
+        self.sync_shared_appearance(ctx);
+        // Keep our "a window is on screen" claim from expiring. It carries a
+        // timestamp so a crashed window cannot pin the island shut, which
+        // means a live one has to say so periodically.
+        if !self.island_surface
+            && (!self.hud || self.hud_expanded)
+            && self.last_claim_refresh.elapsed() >= Duration::from_secs(1)
+        {
+            self.last_claim_refresh = Instant::now();
+            clipd_core::refresh_gui_window_claim();
         }
-        ctx.request_repaint_after(Duration::from_secs(3));
+        // Re-apply every frame so selection/ink colours can't stick on a stale
+        // visuals snapshot after a theme change or System appearance flip.
+        apply_theme(ctx, self.theme);
+        // Native Liquid Glass / vibrancy for Glass Light & Glass Dark. Must
+        // stay in sync as the user cycles themes or blur leaks onto solids.
+        #[cfg(target_os = "macos")]
+        sync_glass_native(frame, self.theme, &mut self.glass_native);
+        // Every frame, not just while Settings is showing: a pairing started
+        // there must still complete if the user navigates away mid-search.
+        self.poll_pairing(ctx);
+
+        // One-shot render-scale diagnostic. "Everything looks pixelated"
+        // usually means the framebuffer is 1x on a 2x display, which no amount
+        // of anti-aliasing can fix — so measure it rather than guess.
+        if std::env::var("CLIPD_DEBUG_SCALE").is_ok() {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let native = ctx.input(|i| i.viewport().native_pixels_per_point);
+                eprintln!(
+                    "[clipd scale] native_pixels_per_point={:?} ctx.pixels_per_point={} zoom={}",
+                    native,
+                    ctx.pixels_per_point(),
+                    ctx.zoom_factor()
+                );
+            }
+        }
+        // The HUD process polls for show/hide requests at 30ms so the tray
+        // popover feels instant. The main window keeps the slower 250ms poll.
+        // Hidden is now a visibility flag, not a position: the HUD stays put
+        // and toggles Visible. Testing the old off-screen position here meant
+        // a hidden HUD looked "shown" and took the fast poll — repainting an
+        // invisible window 30 times a second for the life of the process.
+        let hud_hidden = self.hud && !self.hud_expanded;
+        let poll_interval = if hud_hidden {
+            // Hidden, waiting to be summoned. `ensure_hud_request_watcher`
+            // wakes this thread when a request lands, so this only has to be a
+            // backstop — polling fast enough to feel instant meant repainting
+            // a hidden window 30 times a second for the life of the process.
+            400
+        } else if self.hud {
+            30 // Tray-driven surface: a show request has to land instantly.
+        } else {
+            // The island and the main window are resident. Nothing waits on
+            // their request file, and a 30ms poll here pinned a repaint at
+            // 33fps for the whole life of the process — which cost the island
+            // about a tenth of a core while it was doing nothing at all.
+            250
+        };
+        if self.last_surface_request_check.elapsed() >= Duration::from_millis(poll_interval) {
+            self.last_surface_request_check = Instant::now();
+            // Don't process surface requests here for HUD — drive_hud_hover
+            // handles show/hide/quit itself. Processing them here would close
+            // the HUD before drive_hud_hover can hide it off-screen.
+            if !self.hud {
+                if let Some(mode) = take_surface_request_for(self.surface_mode()) {
+                    if mode == SurfaceMode::Quit {
+                        self.quitting = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else if mode == SurfaceMode::Hidden {
+                        // No persistent surface to hide now that the pill is
+                        // gone; the HUD handles its own hide via drive_hud_hover.
+                    } else {
+                        self.switch_surface(ctx, mode);
+                    }
+                }
+            }
+        }
+        // Only clipd-ui owns the daemon. GUI processes don't restart it.
+        #[cfg(target_os = "macos")]
+        if self.last_daemon_check.elapsed() >= Duration::from_secs(5) {
+            self.last_daemon_check = Instant::now();
+        }
+        // Keep the repaint ticking at the poll interval so the HUD wakes up
+        // fast enough to catch tray requests.
+        ctx.request_repaint_after(Duration::from_millis(poll_interval));
+        // A parked popover does not need fresh clips.
+        //
+        // `refresh()` reloads the whole 200-clip window from SQLite, rebuilds
+        // sessions and re-runs the filter. Doing that every three seconds in a
+        // window nobody can see is pure cost — and it is paid twice, because
+        // the island is a second resident process doing the same. The popover
+        // reloads when it is shown instead, which is the only moment its
+        // contents can matter.
+        //
+        // The island keeps polling: it is how a new copy gets noticed and
+        // announced, so for that surface the work is the feature.
+        let needs_fresh_clips = !self.hud || self.hud_expanded;
+        if needs_fresh_clips && self.last_refresh.elapsed() > Duration::from_secs(3) {
+            // The island polls for one reason: to notice a new copy and
+            // announce it. Loading two hundred rows to answer "is there a new
+            // one?" asks a cheap question expensively — and it is the only
+            // work this process does at rest. Read the newest row, and reload
+            // the rest only when the answer changed.
+            let only_watching = self.island_surface
+                && self.island.phase == island::IslandPhase::Hidden;
+            if only_watching {
+                let newest = self
+                    .store
+                    .get_recent(1)
+                    .ok()
+                    .and_then(|mut v| v.pop())
+                    .map(|c| c.id);
+                if newest != self.clips.first().map(|c| c.id) {
+                    self.refresh();
+                } else {
+                    self.last_refresh = Instant::now();
+                }
+            } else {
+                self.refresh();
+            }
+        }
+        if needs_fresh_clips {
+            ctx.request_repaint_after(Duration::from_secs(3));
+        }
 
         self.poll_ask();
+        self.poll_transform();
+        if self.transform_job.running {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
         if self.ask.running {
             // Keep the spinner moving and pick the answer up promptly.
             ctx.request_repaint_after(Duration::from_millis(80));
+        }
+
+        self.poll_ai_test();
+        if self.ai_test_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+
+        // The island owns its whole window: it sizes, positions and paints
+        // itself, and shares nothing with the palette chrome below.
+        if self.island_surface {
+            self.drive_island(ctx, frame);
+            if !self.quitting {
+                self.render_island(ctx);
+            }
+            return;
+        }
+
+        // The HUD is a tray-anchored popover that opens directly expanded and
+        // closes when the pointer leaves.
+        if self.hud {
+            let mut c = resolved_theme(ctx, self.theme).colors();
+            self.custom_colors.apply_to(&mut c);
+            self.drive_hud_hover(ctx);
+            self.render_hud_popover(ctx, &c);
+            return;
         }
 
         // When the window is summoned (gains focus), drop the cursor into search
@@ -1716,14 +6025,28 @@ impl eframe::App for ClipdGui {
         {
             let win_w = ctx.input(|i| i.screen_rect().width());
             let want_wide = self.show_preview && self.active_tab == MainTab::Text;
+            // Settings needs its own width: at the compact palette size the
+            // endpoint URL and colour rows are clipped mid-field, which reads
+            // as a broken form rather than a narrow window.
+            let want_settings = self.active_tab == MainTab::Settings;
             let win_h = ctx.input(|i| i.screen_rect().height());
-            if !want_wide && win_w > COMPACT_W + 40.0 {
+            let target_w = if want_wide {
+                EXPANDED_W
+            } else if want_settings {
+                SETTINGS_W
+            } else {
+                COMPACT_W
+            };
+            // Settings/preview keep whatever height the user has; the compact
+            // palette snaps to the mockup size so it stays tall-and-narrow.
+            let target_h = if want_settings || want_wide {
+                win_h.max(WIN_H)
+            } else {
+                WIN_H
+            };
+            if (win_w - target_w).abs() > 40.0 || (win_h - target_h).abs() > 40.0 {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                    COMPACT_W, win_h,
-                )));
-            } else if want_wide && win_w < EXPANDED_W - 40.0 {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                    EXPANDED_W, win_h,
+                    target_w, target_h,
                 )));
             }
         }
@@ -1784,6 +6107,10 @@ impl eframe::App for ClipdGui {
             if i.key_pressed(egui::Key::Space) && !search_has_focus {
                 toggle_preview = true;
             }
+            // `/` focuses search — matches the hint badge in the search field.
+            if i.key_pressed(egui::Key::Slash) && !search_has_focus && !i.modifiers.any() {
+                self.focus_search = true;
+            }
             if i.key_pressed(egui::Key::Delete)
                 || (i.key_pressed(egui::Key::D) && i.modifiers.command)
             {
@@ -1802,6 +6129,16 @@ impl eframe::App for ClipdGui {
                 if let Some(clip) = self.selected_clip() {
                     action = Action::ToggleStar(clip.id);
                 }
+            }
+            // S sends the selected clip to the other Mac. No picker and no
+            // confirmation — with one other Mac there is nothing to choose.
+            if i.key_pressed(egui::Key::S) && !i.modifiers.command && !search_has_focus {
+                action = Action::Send;
+            }
+            // U takes the last send back. Undo is what buys the send its lack
+            // of a confirmation dialog, so it has to be as cheap as the send.
+            if i.key_pressed(egui::Key::U) && !i.modifiers.command && !search_has_focus {
+                action = Action::UndoSend;
             }
             // Cmd+1-9 pastes the numbered row — the badge/footer promise.
             if i.modifiers.command && self.active_tab == MainTab::Text {
@@ -1866,51 +6203,57 @@ impl eframe::App for ClipdGui {
             self.thumb_textures.get(&clip.id).cloned().flatten()
         });
 
-        // ── Footer bar — always rendered so the card's bottom corners stay
-        // rounded on every tab; gesture hints only show on the Text list. ──
-        egui::TopBottomPanel::bottom("footer_hints")
+        paint_glass_shell(ctx, self.theme, &c, self.native_glass_active());
+
+        // ── Full-GUI chrome: brand → search → tiny filters (mockup stack). ──
+        egui::TopBottomPanel::top("search_header")
+            .show_separator_line(self.theme != Theme::GlassLight)
             .frame(
                 egui::Frame::none()
-                    .fill(rgb(c.bg_surface))
+                    .fill(glass_panel_frost(self.theme))
+                    // This panel owns the two upper window corners. Leaving
+                    // its fill square covers the rounded shell underneath.
+                    .rounding(egui::Rounding {
+                        nw: SHELL_ROUND,
+                        ne: SHELL_ROUND,
+                        sw: 0.0,
+                        se: 0.0,
+                    })
+                    .inner_margin(Margin::symmetric(16.0, 14.0)),
+            )
+            .show(ctx, |ui| {
+                paint_panel_glass_gradient(ui, self.theme);
+                self.render_brand_header(ui, &c);
+                ui.add_space(12.0);
+                self.render_search_bar(ui, &mut action, &c);
+                if self.active_tab == MainTab::Text {
+                    ui.add_space(12.0);
+                    self.render_filter_pills(ui, &c);
+                } else if self.active_tab == MainTab::Settings {
+                    ui.add_space(12.0);
+                    self.render_settings_category_tabs(ui, &c);
+                }
+            });
+
+        // ── Footer: Capturing · clock · ⌘⇧V (mockup minimal bar) ──
+        egui::TopBottomPanel::bottom("footer_hints")
+            .show_separator_line(self.theme != Theme::GlassLight)
+            .exact_height(44.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(glass_panel_frost(self.theme))
+                    // Mirror the header: the footer owns the lower corners.
                     .rounding(egui::Rounding {
                         nw: 0.0,
                         ne: 0.0,
-                        sw: 18.0,
-                        se: 18.0,
+                        sw: SHELL_ROUND,
+                        se: SHELL_ROUND,
                     })
-                    .inner_margin(Margin::symmetric(14.0, 8.0)),
+                    .inner_margin(Margin::symmetric(16.0, 0.0)),
             )
             .show(ctx, |ui| {
-                // Hints on the left (Text tab only) + a watermark-subtle
-                // "clipd" wordmark on the right: identity without chrome.
-                ui.horizontal(|ui| {
-                    // "cmd" is the Cmd key on macOS; egui maps the same
-                    // modifier to Ctrl on Windows/Linux, so label accordingly.
-                    // macOS shows the ⌘ glyph; other platforms spell out Ctrl.
-                    let modk = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
-                    let hints = if self.active_tab == MainTab::Text {
-                        format!("↩  paste      {modk}1-9  slot      {modk}P  pin")
-                    } else {
-                        format!("esc  back      {modk},  settings")
-                    };
-                    ui.label(
-                        RichText::new(hints)
-                            .size(10.0)
-                            .color(rgb(c.overlay).gamma_multiply(0.85)),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("clipd")
-                                .size(10.0)
-                                .strong()
-                                .color(rgb(c.overlay).gamma_multiply(0.7)),
-                        );
-                        ui.add_space(1.0);
-                        let (mark, _) =
-                            ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        draw_clipd_logo(ui.painter(), mark, rgb(c.accent).gamma_multiply(0.9));
-                    });
-                });
+                paint_panel_glass_gradient(ui, self.theme);
+                self.render_bottom_bar(ui, &mut action, &c);
             });
 
         // Ask mode always needs the inspector — that's where the answer goes.
@@ -1925,28 +6268,35 @@ impl eframe::App for ClipdGui {
                 .exact_width(380.0)
                 .frame(
                     egui::Frame::none()
-                        .fill(rgb(c.bg_surface))
+                        .fill(glass_panel_frost(self.theme))
                         .inner_margin(Margin::symmetric(16.0, 14.0))
-                        .rounding(egui::Rounding {
-                            nw: 0.0,
-                            ne: 18.0,
-                            sw: 0.0,
-                            se: 0.0,
-                        }),
+                        // The inspector sits between the rounded header and
+                        // footer; rounding it creates seams rather than an
+                        // outer window corner.
+                        .rounding(Rounding::same(0.0)),
                 )
                 .show(ctx, |ui| {
+                    paint_panel_glass_gradient(ui, self.theme);
                     if self.in_ask_mode() {
                         render_ask_panel(ui, &self.ask, &mut action, &c);
                     } else if let Some(clip) = &preview_data {
                         let is_starred = self.starred_clip_ids.contains(&clip.id);
+                        // Prefer the real multi-slot number when this clip is
+                        // saved to one; otherwise fall back to list position.
+                        let preview_slot = clip
+                            .slot
+                            .map(|s| s as usize)
+                            .unwrap_or(self.selected + 1);
                         render_preview(
                             ui,
                             clip,
-                            self.selected + 1,
+                            preview_slot,
                             is_starred,
                             preview_thumb.clone(),
                             &self.custom_actions,
                             self.action_status.clone(),
+                            &self.transform_job,
+                            clipd_core::can_synthesize(&self.ai_config),
                             &mut action,
                             &c,
                         );
@@ -1960,42 +6310,27 @@ impl eframe::App for ClipdGui {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
-                    .fill(rgb(c.bg_surface))
-                    .rounding(egui::Rounding {
-                        nw: 18.0,
-                        // The preview pane owns the top-right corner when open.
-                        ne: if self.active_tab == MainTab::Text && self.show_preview {
-                            0.0
-                        } else {
-                            18.0
-                        },
-                        sw: 0.0,
-                        se: 0.0,
-                    })
+                    .fill(glass_panel_frost(self.theme))
+                    // The center region is sandwiched between the header and
+                    // footer, so it must meet them flush. Only those outer
+                    // panels own the actual window corners.
+                    .rounding(Rounding::same(0.0))
                     .inner_margin(Margin::symmetric(
                         if self.active_tab == MainTab::Text {
-                            14.0
+                            16.0
                         } else {
                             0.0
                         },
-                        10.0,
+                        8.0,
                     )),
             )
             .show(ctx, |ui| {
-                // The header (search + Pins + gear) renders on EVERY tab —
-                // without it there is no way back from Pins/Settings.
-                // The panel has no horizontal margin off the Text tab, so pad
-                // the header itself there to keep it aligned.
-                let header_pad = if self.active_tab == MainTab::Text {
-                    0.0
-                } else {
-                    14.0
-                };
-                egui::Frame::none()
-                    .inner_margin(Margin::symmetric(header_pad, 0.0))
-                    .show(ui, |ui| {
-                        self.render_top_bar(ui, &mut action, &c);
-                    });
+                paint_panel_glass_gradient(ui, self.theme);
+                // Accessibility / quick-settings banners stay below the chrome.
+                // Brand, search, and filters live in the top panel now.
+                if self.active_tab == MainTab::Text {
+                    self.render_text_banners(ui, &c);
+                }
 
                 match self.active_tab {
                     MainTab::Text => {
@@ -2011,6 +6346,9 @@ impl eframe::App for ClipdGui {
                     MainTab::Settings => {
                         self.render_settings_panel(ui, &c);
                     }
+                    MainTab::Vault => {
+                        self.render_vault_panel(ui, &c);
+                    }
                 }
             });
 
@@ -2018,6 +6356,14 @@ impl eframe::App for ClipdGui {
             self.render_transform_window(ctx, &c);
         }
 
+        self.dispatch(action, ctx);
+    }
+}
+
+impl ClipdGui {
+    /// Apply one user action. Shared by the palette window and the HUD so
+    /// both surfaces behave identically.
+    fn dispatch(&mut self, action: Action, ctx: &egui::Context) {
         match action {
             Action::Copy => {
                 self.do_copy();
@@ -2029,6 +6375,8 @@ impl eframe::App for ClipdGui {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Action::Delete => self.do_delete(),
+            Action::Send => self.do_send(),
+            Action::UndoSend => self.do_undo_send(),
             Action::ToggleStar(clip_id) => {
                 self.toggle_starred(clip_id);
                 ctx.request_repaint();
@@ -2053,12 +6401,24 @@ impl eframe::App for ClipdGui {
                 }
                 ctx.request_repaint();
             }
+            Action::OpenAiSettings => {
+                // Re-read from disk in case the file changed since launch.
+                self.ai_config = load_transform_config();
+                self.active_tab = MainTab::Settings;
+                ctx.request_repaint();
+            }
+            Action::AskAboutClip(clip_id) => {
+                self.ask_about_clip(clip_id, ctx);
+                ctx.request_repaint();
+            }
+            Action::RunSuggestion(idx) => {
+                self.run_suggestion(idx, ctx);
+                ctx.request_repaint();
+            }
             Action::None => {}
         }
     }
-}
 
-impl ClipdGui {
     fn export_path(ext: &str) -> std::path::PathBuf {
         let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let filename = format!("clipd_history_{}.{}", ts, ext);
@@ -2142,8 +6502,7 @@ impl ClipdGui {
         action: &mut Action,
         c: &clipd_core::ThemeColors,
     ) {
-        // Header labels removed for a cleaner, search-first list (clip count
-        // lives in the top bar; the click hint is in the footer).
+        // Breath between filter row and first section header (mockup rhythm).
         ui.add_space(10.0);
 
         let visible_indices = self.filtered.clone();
@@ -2159,7 +6518,12 @@ impl ClipdGui {
                 if clip.content_type == ContentType::Image
                     && !self.thumb_textures.contains_key(&clip.id)
                 {
-                    clip.thumb_path.clone().map(|p| (clip.id, p))
+                    // Prefer the list thumb; fall back to the full image so
+                    // older clips without a thumb still show something.
+                    clip.thumb_path
+                        .clone()
+                        .or_else(|| clip.image_path.clone())
+                        .map(|p| (clip.id, p))
                 } else {
                     None
                 }
@@ -2223,37 +6587,101 @@ impl ClipdGui {
                     let clip_id_value = clip.id;
                     let is_selected = display_idx == self.selected;
                     let is_starred = self.starred_clip_ids.contains(&clip_id_value);
+                    let group = clip_group_label(clip, is_starred);
+                    let previous_group = display_idx.checked_sub(1).and_then(|previous| {
+                        let previous_clip = self.clips.get(visible_indices[previous])?;
+                        Some(clip_group_label(
+                            previous_clip,
+                            self.starred_clip_ids.contains(&previous_clip.id),
+                        ))
+                    });
+                    if previous_group != Some(group) {
+                        // Mockup: roomy gap before "Recent", then header, then cards.
+                        ui.add_space(if display_idx == 0 { 4.0 } else { 18.0 });
+                        ui.label(
+                            RichText::new(group)
+                                .size(12.0)
+                                .strong()
+                                .color(rgb(c.overlay)),
+                        );
+                        ui.add_space(8.0);
+                    }
                     let mut star_clicked = false;
                     let clip_id = egui::Id::new(("clip", display_idx));
                     let hover_id = egui::Id::new(("cliphover", display_idx));
                     // Was the pointer over this row last frame? Read from a
-                    // full-width hover region (see below) so the pin stays
-                    // visible while you move onto it. contains_pointer ignores
-                    // occlusion by the pin button on top.
+                    // full-width hover region so the star stays visible while
+                    // you move onto it.
                     let row_hovered = ui
                         .ctx()
                         .read_response(hover_id)
                         .map_or(false, |r| r.contains_pointer());
 
-                    let type_color = match clip.content_type {
-                        ContentType::Code => rgb(c.code),
-                        ContentType::Url => rgb(c.url),
-                        ContentType::Email => rgb(c.email),
-                        ContentType::Path => rgb(c.path),
-                        _ => rgb(c.overlay),
-                    };
+                    // A clip held in an active slot is ringed in the accent.
+                    //
+                    // Same shape and weight as the row's own selection edge, so
+                    // it reads as this row in a different state rather than as
+                    // a differently-built row — the accent at a third strength
+                    // is enough to find while scanning without competing with
+                    // the row under the pointer. Selection and hover still win:
+                    // where you are now matters more than where a slot is.
+                    let slot_ring = clip
+                        .slot
+                        .is_some()
+                        .then(|| Stroke::new(1.0, rgb(c.accent).gamma_multiply(0.34)));
 
-                    // Selected row: quiet elevated surface — the accent lives
-                    // only in the slot number (mockup style).
-                    let (bg, border) = if is_selected {
-                        (rgb(c.bg_selected).gamma_multiply(0.85), Stroke::NONE)
+                    // Almost-flat cards: soft fill + hairline. Glass themes
+                    // keep a translucent cool selection wash.
+                    let (bg, border) = if self.theme.is_glass() {
+                        match glass_row_fill(self.theme, is_selected, row_hovered) {
+                            Some(fill) => {
+                                let stroke = glass_row_stroke(self.theme, is_selected);
+                                match slot_ring {
+                                    Some(ring) if !is_selected && !row_hovered => (fill, ring),
+                                    _ => (fill, stroke),
+                                }
+                            }
+                            None => match slot_ring {
+                                Some(ring) if !is_selected && !row_hovered => {
+                                    (Color32::TRANSPARENT, ring)
+                                }
+                                _ => (Color32::TRANSPARENT, Stroke::NONE),
+                            },
+                        }
+                    } else if is_selected {
+                        // Selection is the accent, not a slightly lighter grey.
+                        // A wash of it over the card plus a proper edge, so the
+                        // row you are on is obvious at a glance down the list
+                        // rather than something you have to look for.
+                        (
+                            surf(c, c.bg_selected),
+                            Stroke::new(1.2, rgb(c.accent).gamma_multiply(0.55)),
+                        )
                     } else if row_hovered {
-                        (rgb(c.bg_hover).gamma_multiply(0.6), Stroke::NONE)
+                        (surf(c, c.bg_hover), Stroke::new(0.5, rgb(c.border)))
+                    } else if let Some(ring) = slot_ring {
+                        (surf(c, c.bg_elevated), ring)
                     } else {
-                        (Color32::TRANSPARENT, Stroke::NONE)
+                        // Almost-flat: soft card fill, quiet separator edge.
+                        (
+                            surf(c, c.bg_elevated),
+                            Stroke::new(0.5, rgb(c.border).gamma_multiply(0.55)),
+                        )
                     };
 
-                    let preview = clip.preview.trim().replace('\n', " ");
+                    let is_image = clip.content_type == ContentType::Image;
+                    let preview = if is_image {
+                        let ocr = clip.ocr_text.as_deref().map(str::trim).unwrap_or("");
+                        if !ocr.is_empty() {
+                            ocr.replace('\n', " ")
+                        } else if !clip.preview.trim().is_empty() {
+                            clip.preview.trim().replace('\n', " ")
+                        } else {
+                            "Image".into()
+                        }
+                    } else {
+                        clip.preview.trim().replace('\n', " ")
+                    };
                     let truncated: String = preview.chars().take(200).collect();
                     let suffix = if preview.chars().count() > 200 {
                         "…"
@@ -2261,111 +6689,138 @@ impl ClipdGui {
                         ""
                     };
                     let time = relative_time_short(&clip.timestamp);
+                    let source = clip
+                        .source_app
+                        .as_deref()
+                        .filter(|source| !source.trim().is_empty())
+                        .unwrap_or(content_type_label(&clip.content_type));
                     let is_sensitive =
                         !detect_sensitive(&clip.content, &self.privacy_config).is_empty();
-                    // Image clips draw a thumbnail tile in place of the type dot.
-                    let thumb_tex = if clip.content_type == ContentType::Image {
+                    let thumb_tex = if is_image {
                         self.thumb_textures.get(&clip_id_value).cloned().flatten()
                     } else {
                         None
                     };
 
-                    // Gap between rows.
                     ui.add_space(ROW_GAP);
 
-                    // One clean line per clip (mockup): index number, the
-                    // content, then pin + time on the right.
+                    // Mockup row: app tile · title/meta · thumb · star.
                     let frame_resp = egui::Frame::none()
                         .fill(bg)
-                        .rounding(Rounding::same(10.0))
+                        .rounding(Rounding::same(12.0))
                         .stroke(border)
-                        .inner_margin(Margin::symmetric(CARD_PAD_X, 9.0))
+                        .inner_margin(Margin::symmetric(12.0, 10.0))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
+                                ui.spacing_mut().item_spacing.x = 10.0;
 
-                                // Plain index number — accent for the active
-                                // row (mirrors the ⌘1-9 hint), muted otherwise.
-                                let badge_no = display_idx + 1;
-                                let (numr, _) = ui.allocate_exact_size(
-                                    egui::vec2(22.0, 20.0),
-                                    egui::Sense::hover(),
-                                );
-                                if badge_no < 100 {
-                                    ui.painter().text(
-                                        egui::pos2(numr.left() + 2.0, numr.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        badge_no.to_string(),
-                                        FontId::monospace(11.5),
-                                        if is_selected {
-                                            rgb(c.accent)
-                                        } else {
-                                            type_color.gamma_multiply(0.8)
-                                        },
-                                    );
-                                }
-                                ui.add_space(4.0);
-
-                                if let Some(tex) = &thumb_tex {
-                                    // Image clips: small thumbnail before the text.
-                                    let (tile, _) = ui.allocate_exact_size(
-                                        egui::vec2(30.0, 20.0),
+                                // Every theme gets the rail, not just glass.
+                                // It is the clearest signal of which row is
+                                // selected — a bar at the leading edge is
+                                // visible while scanning, where a background
+                                // tint alone is not.
+                                {
+                                    let (rail, _) = ui.allocate_exact_size(
+                                        egui::vec2(3.0, 34.0),
                                         egui::Sense::hover(),
                                     );
                                     ui.painter().rect_filled(
-                                        tile,
-                                        Rounding::same(4.0),
-                                        rgb(c.bg_elevated),
+                                        rail,
+                                        Rounding::same(2.0),
+                                        if is_selected {
+                                            rgb(c.green)
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        },
                                     );
-                                    let size = tex.size_vec2();
-                                    let scale = (tile.width() / size.x).min(tile.height() / size.y);
-                                    let draw = egui::vec2(size.x * scale, size.y * scale);
-                                    let img_rect =
-                                        egui::Rect::from_center_size(tile.center(), draw);
-                                    ui.painter().image(
-                                        tex.id(),
-                                        img_rect,
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(0.0, 0.0),
-                                            egui::pos2(1.0, 1.0),
-                                        ),
-                                        Color32::WHITE,
-                                    );
-                                    ui.add_space(8.0);
                                 }
 
-                                let right_w = 76.0;
+                                draw_source_tile(ui, source, c);
+
+                                let thumb_slot = if is_image { 52.0 } else { 0.0 };
+                                let right_w = 28.0
+                                    + thumb_slot
+                                    + if is_sensitive { 12.0 } else { 0.0 };
                                 let content_w = (ui.available_width() - right_w).max(60.0);
-                                ui.allocate_ui(egui::vec2(content_w, 20.0), |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(format!("{}{}", truncated, suffix))
-                                                .size(13.0)
-                                                .color(if is_selected {
-                                                    rgb(c.text)
-                                                } else {
-                                                    rgb(c.text).gamma_multiply(0.92)
-                                                }),
-                                        )
-                                        .truncate(),
-                                    );
+                                ui.allocate_ui(egui::vec2(content_w, 36.0), |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 1.0;
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(format!("{}{}", truncated, suffix))
+                                                    .size(13.0)
+                                                    .strong()
+                                                    .color(rgb(c.text)),
+                                            )
+                                            .truncate(),
+                                        );
+                                        let meta = if let Some(slot) = clip.slot {
+                                            format!("slot {}  ·  {}  ·  {}", slot, source, time)
+                                        } else if is_image {
+                                            format!("Image  ·  {}  ·  {}", source, time)
+                                        } else {
+                                            format!("{}  ·  {}", source, time)
+                                        };
+                                        ui.label(
+                                            RichText::new(meta)
+                                                .size(10.5)
+                                                .color(rgb(c.subtext)),
+                                        );
+                                    });
                                 });
 
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        ui.label(
-                                            RichText::new(&time).size(10.5).color(rgb(c.overlay)),
-                                        );
-                                        ui.add_space(6.0);
-                                        if is_starred || is_selected || row_hovered {
-                                            if row_star_button(ui, is_starred, c).clicked() {
+                                        // Star: always when pinned; otherwise hover-only.
+                                        if is_starred || row_hovered {
+                                            if row_star_quiet(ui, is_starred, c).clicked() {
                                                 star_clicked = true;
+                                            }
+                                        } else {
+                                            ui.add_space(24.0);
+                                        }
+                                        if is_image {
+                                            let (tile, _) = ui.allocate_exact_size(
+                                                egui::vec2(48.0, 36.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                tile,
+                                                Rounding::same(7.0),
+                                                surf(c, c.bg_selected),
+                                            );
+                                            if let Some(tex) = &thumb_tex {
+                                                let size = tex.size_vec2();
+                                                let scale = (tile.width() / size.x)
+                                                    .min(tile.height() / size.y);
+                                                let draw =
+                                                    egui::vec2(size.x * scale, size.y * scale);
+                                                let img_rect = egui::Rect::from_center_size(
+                                                    tile.center(),
+                                                    draw,
+                                                );
+                                                ui.painter().image(
+                                                    tex.id(),
+                                                    img_rect,
+                                                    egui::Rect::from_min_max(
+                                                        egui::pos2(0.0, 0.0),
+                                                        egui::pos2(1.0, 1.0),
+                                                    ),
+                                                    Color32::WHITE,
+                                                );
+                                            } else {
+                                                ui.painter().text(
+                                                    tile.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    "IMG",
+                                                    FontId::proportional(10.0),
+                                                    rgb(c.overlay),
+                                                );
                                             }
                                         }
                                         if is_sensitive {
-                                            ui.add_space(6.0);
                                             ui.label(
                                                 RichText::new("•").size(11.0).color(rgb(c.accent2)),
                                             );
@@ -2380,15 +6835,13 @@ impl ClipdGui {
                         *action = Action::ToggleStar(clip_id_value);
                     }
 
-                    // Whole row (minus the pin zone on the right) is clickable.
+                    // Whole row (minus the star zone) is clickable.
                     let full = frame_resp.response.rect;
                     let row_rect = egui::Rect::from_min_max(
                         full.min,
-                        egui::pos2(full.max.x - 68.0, full.max.y),
+                        egui::pos2(full.max.x - 36.0, full.max.y),
                     );
                     let resp = ui.interact(row_rect, clip_id, egui::Sense::click());
-                    // Hover is tracked over the *full* row (including the pin
-                    // zone) so moving onto the pin doesn't make it vanish.
                     ui.interact(full, hover_id, egui::Sense::hover());
 
                     // Single click selects (and copies, per the "copy on select"
@@ -2475,7 +6928,7 @@ impl ClipdGui {
                     };
 
                     egui::Frame::none()
-                        .fill(rgb(c.bg_surface))
+                        .fill(surf(c, c.bg_surface))
                         .rounding(Rounding::same(10.0))
                         .inner_margin(Margin::symmetric(14.0, 12.0))
                         .stroke(Stroke::new(1.0, rgb(c.border)))
@@ -2509,12 +6962,12 @@ impl ClipdGui {
                                     session_color,
                                     c,
                                 );
-                                tag_pill(ui, &dur_str, rgb(c.bg_elevated), c);
+                                tag_pill(ui, &dur_str, surf(c, c.bg_elevated), c);
                                 if !session.top_apps.is_empty() {
                                     tag_pill(
                                         ui,
                                         &session.top_apps.join(", "),
-                                        rgb(c.bg_elevated),
+                                        surf(c, c.bg_elevated),
                                         c,
                                     );
                                 }
@@ -2546,219 +6999,89 @@ impl ClipdGui {
         ui: &mut egui::Ui,
         c: &clipd_core::ThemeColors,
     ) {
-        let accent = Color32::from_rgb(255, 160, 50);
+        let mut dirty = false;
 
-        settings_caption(
-            ui,
-            c,
-            "PASTE TRANSFORM",
-            "Configure smart paste here. Normal Cmd+V remains unchanged.",
-        );
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.enabled,
-            "Transform on paste",
-            "Use Ctrl+Shift+V to apply selected transforms before pasting.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.smart_mode,
-            "Smart mode",
-            "Auto-detect content type and choose the best transform for JSON, HTML, code, and text.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
+        settings_section(ui, c, "General");
+        settings_card(ui, c, |ui| {
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Clipboard,
+                &mut self.paste_settings.return_focus_after_copy,
+                "Paste into previous app",
+                "Jump back and paste after you pick a clip",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::List,
+                &mut self.paste_settings.copy_on_select,
+                "Copy when selecting a row",
+                "Single-click copies. Double-click / Enter still work",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Clipboard,
+                &mut self.paste_settings.remember_clipboard,
+                "Remember copied items",
+                "Save Cmd+C history in Clipd",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Sliders,
+                &mut self.paste_settings.multi_slot_enabled,
+                "Multi-slot copy/paste",
+                "Repeated Cmd+C / Cmd+V fills numbered slots",
+            );
+        });
 
-        egui::Frame::none()
-            .inner_margin(Margin::symmetric(0.0, 6.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Active transforms")
-                            .size(12.0)
-                            .strong()
-                            .color(rgb(c.text)),
-                    );
-                    ui.label(
-                        RichText::new("applied on Ctrl+Shift+V")
-                            .size(10.5)
-                            .color(rgb(c.subtext)),
-                    );
-                });
-                ui.add_space(4.0);
-
-                let transforms = self.transforms.clone();
-                let categories: &[(&str, Color32)] = &[
-                    ("FORMAT", Color32::from_rgb(130, 170, 255)),
-                    ("CASE", Color32::from_rgb(100, 200, 160)),
-                    ("AI ✨", accent),
-                ];
-
-                for (cat_key, cat_color) in categories {
-                    let cat_transforms: Vec<&TransformKind> = transforms
-                        .iter()
-                        .filter(|t| t.category() == *cat_key)
-                        .collect();
-                    if cat_transforms.is_empty() {
-                        continue;
-                    }
-
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(*cat_key)
-                            .size(9.5)
-                            .strong()
-                            .color(rgb(c.overlay)),
-                    );
-
-                    for t in cat_transforms {
-                        let is_active = self.paste_settings.active_transforms.contains(t);
-                        let fill = if is_active {
-                            pill_bg(*cat_color)
-                        } else {
-                            rgb(c.bg_surface)
-                        };
-                        let text_col = if is_active {
-                            rgb(c.text)
-                        } else {
-                            rgb(c.subtext)
-                        };
-
-                        let resp = egui::Frame::none()
-                            .fill(fill)
-                            .rounding(Rounding::same(CARD_ROUND))
-                            .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_PAD_Y))
-                            .stroke(Stroke::new(
-                                0.7,
-                                if is_active { *cat_color } else { rgb(c.border) },
-                            ))
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(if is_active { "✓" } else { "○" })
-                                            .size(12.0)
-                                            .color(if is_active {
-                                                *cat_color
-                                            } else {
-                                                rgb(c.overlay)
-                                            }),
-                                    );
-                                    ui.label(
-                                        RichText::new(format!("{} {}", t.icon(), t.label()))
-                                            .size(11.5)
-                                            .color(text_col),
-                                    );
-                                    if t.is_ai() {
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.label(
-                                                    RichText::new("AI")
-                                                        .size(9.5)
-                                                        .strong()
-                                                        .color(accent),
-                                                );
-                                            },
-                                        );
-                                    }
-                                });
-                            })
-                            .response;
-
-                        if ui
-                            .interact(
-                                resp.rect,
-                                egui::Id::new(("settings_transform", t.label())),
-                                egui::Sense::click(),
-                            )
-                            .clicked()
-                        {
-                            if is_active {
-                                self.paste_settings.active_transforms.retain(|x| x != t);
-                            } else {
-                                self.paste_settings.active_transforms.push((*t).clone());
+        settings_section(ui, c, "Shortcuts");
+        settings_card(ui, c, |ui| {
+            settings_value_row(ui, c, FooterIcon::Keyboard, "Open Clipd", "Hotkey for the palette", 180.0, |ui| {
+                let prev = self.paste_settings.open_gui_hotkey;
+                egui::ComboBox::from_id_salt("settings_open_gui_hotkey")
+                    .selected_text(self.paste_settings.open_gui_hotkey.label())
+                    .width(160.0)
+                    .show_ui(ui, |ui| {
+                        for hk in OpenGuiHotkey::ALL {
+                            if hk == OpenGuiHotkey::AltG && !cfg!(target_os = "windows") {
+                                continue;
                             }
-                            save_paste_transform_settings(&self.paste_settings);
+                            ui.selectable_value(
+                                &mut self.paste_settings.open_gui_hotkey,
+                                hk,
+                                hk.label(),
+                            );
                         }
-                        ui.add_space(2.0);
-                    }
+                    });
+                if self.paste_settings.open_gui_hotkey != prev {
+                    dirty = true;
                 }
             });
-
-        egui::Frame::none()
-            .inner_margin(Margin::symmetric(0.0, 6.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new("AI transform prompt")
-                        .size(12.0)
-                        .strong()
-                        .color(rgb(c.text)),
-                );
-                ui.label(
-                    RichText::new("Optional. Leave empty to keep smart paste fully rule-based.")
-                        .size(10.5)
-                        .color(rgb(c.subtext)),
-                );
-                ui.add_space(4.0);
-                let resp = ui.add_sized(
-                    [ui.available_width(), 26.0],
-                    egui::TextEdit::singleline(&mut self.paste_settings.default_ai_prompt)
-                        .hint_text("e.g. Fix grammar, convert to table, summarize")
-                        .font(egui::TextStyle::Body),
-                );
-                if resp.changed() || resp.lost_focus() {
-                    save_paste_transform_settings(&self.paste_settings);
-                }
-            });
-
-        settings_caption(
-            ui,
-            c,
-            "CLIPBOARD MEMORY",
-            "Control what clipd remembers and how quickly you can recall it.",
-        );
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.remember_clipboard,
-            "Remember copied items automatically",
-            "Cmd+C stores items in clipd memory. Off means system copy only, no history.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.palette_enabled,
-            "Enable memory palette",
-            "Open a searchable palette to recall copied items by content, source, time, or alias.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
-        egui::Frame::none()
-            .inner_margin(Margin::symmetric(0.0, 6.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Palette shortcut")
-                            .size(12.0)
-                            .color(rgb(c.text)),
-                    );
+            settings_card_divider(ui, c);
+            settings_value_row(
+                ui,
+                c,
+                FooterIcon::Sparkle,
+                "Memory palette",
+                "Searchable recall by content, source, or time",
+                180.0,
+                |ui| {
                     let prev = self.paste_settings.palette_trigger;
                     egui::ComboBox::from_id_salt("settings_palette_trigger")
                         .selected_text(self.paste_settings.palette_trigger.label())
+                        .width(160.0)
                         .show_ui(ui, |ui| {
                             for t in [
                                 PaletteTrigger::CmdShiftV,
                                 PaletteTrigger::CtrlOptSpace,
                                 PaletteTrigger::OptSpace,
+                                PaletteTrigger::Off,
                             ] {
                                 ui.selectable_value(
                                     &mut self.paste_settings.palette_trigger,
@@ -2768,178 +7091,232 @@ impl ClipdGui {
                             }
                         });
                     if self.paste_settings.palette_trigger != prev {
-                        save_paste_transform_settings(&self.paste_settings);
+                        dirty = true;
+                    }
+                },
+            );
+        });
+
+        settings_section(ui, c, "Paste transforms");
+        settings_card(ui, c, |ui| {
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Sparkle,
+                &mut self.paste_settings.enabled,
+                "Transform on paste",
+                "Applied with ⌘⇧V — normal Cmd+V is unchanged",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Sparkle,
+                &mut self.paste_settings.smart_mode,
+                "Smart mode",
+                "Pick a transform from the content type",
+            );
+            settings_card_divider(ui, c);
+            settings_card_body(ui, |ui| {
+                ui.label(
+                    RichText::new("Active transforms")
+                        .size(11.0)
+                        .color(rgb(c.subtext)),
+                );
+                ui.add_space(6.0);
+                let transforms = self.transforms.clone();
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                    for t in &transforms {
+                        let is_active = self.paste_settings.active_transforms.contains(t);
+                        let fill = if is_active {
+                            rgb(c.green).gamma_multiply(0.22)
+                        } else {
+                            surf(c, c.bg_elevated)
+                        };
+                        let stroke = if is_active {
+                            Stroke::new(0.9, rgb(c.green).gamma_multiply(0.7))
+                        } else {
+                            Stroke::new(0.6, rgb(c.border))
+                        };
+                        let text_col = if is_active {
+                            rgb(c.text)
+                        } else {
+                            rgb(c.subtext)
+                        };
+                        let label = t.label();
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(label).size(11.5).color(text_col))
+                                    .fill(fill)
+                                    .stroke(stroke)
+                                    .rounding(Rounding::same(8.0))
+                                    .min_size(egui::vec2(0.0, 28.0)),
+                            )
+                            .clicked()
+                        {
+                            if is_active {
+                                self.paste_settings.active_transforms.retain(|x| x != t);
+                            } else {
+                                self.paste_settings.active_transforms.push(t.clone());
+                            }
+                            dirty = true;
+                        }
                     }
                 });
-                if self.paste_settings.palette_trigger == PaletteTrigger::OptSpace {
-                    ui.label(
-                        RichText::new(
-                            "Option+Space normally inserts a non-breaking space on macOS.",
-                        )
-                        .size(10.5)
-                        .color(Color32::from_rgb(230, 170, 60)),
-                    );
+                ui.add_space(8.0);
+                let resp = ui.add_sized(
+                    [ui.available_width(), 26.0],
+                    egui::TextEdit::singleline(&mut self.paste_settings.default_ai_prompt)
+                        .hint_text("Optional AI prompt for transform…")
+                        .font(egui::TextStyle::Body),
+                );
+                if resp.changed() || resp.lost_focus() {
+                    dirty = true;
                 }
             });
-        egui::Frame::none()
-            .inner_margin(Margin::symmetric(0.0, 6.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
+        });
+
+        settings_section(ui, c, "Advanced");
+        settings_card(ui, c, |ui| {
+            #[cfg(target_os = "macos")]
+            if load_hotkey_status() == HotkeyStatus::NeedsAccessibility {
+                settings_card_body(ui, |ui| {
                     ui.label(
-                        RichText::new("Open clipd shortcut")
-                            .size(12.0)
-                            .color(rgb(c.text)),
+                        RichText::new("Global shortcuts need keyboard access in System Settings.")
+                            .size(11.0)
+                            .color(rgb(c.overlay)),
                     );
-                    let prev = self.paste_settings.open_gui_hotkey;
-                    egui::ComboBox::from_id_salt("settings_open_gui_hotkey")
-                        .selected_text(self.paste_settings.open_gui_hotkey.label())
-                        .show_ui(ui, |ui| {
-                            for hk in OpenGuiHotkey::ALL {
-                                // Alt+G is Windows-only (Option+G types © on
-                                // macOS) — hide it where it can't work.
-                                if hk == OpenGuiHotkey::AltG && !cfg!(target_os = "windows") {
-                                    continue;
-                                }
-                                ui.selectable_value(
-                                    &mut self.paste_settings.open_gui_hotkey,
-                                    hk,
-                                    hk.label(),
-                                );
-                            }
-                        });
-                    if self.paste_settings.open_gui_hotkey != prev {
-                        save_paste_transform_settings(&self.paste_settings);
+                    ui.add_space(6.0);
+                    if ui.button("Open Privacy Settings").clicked() {
+                        clipd_core::request_keyboard_permissions();
+                        clipd_core::open_keyboard_permission_settings();
                     }
                 });
-                ui.label(
-                    RichText::new(
-                        "Global hotkey to summon this window from anywhere. Takes effect immediately.",
-                    )
-                    .size(10.5)
-                    .color(rgb(c.subtext)),
+                settings_card_divider(ui, c);
+            }
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Keyboard,
+                &mut self.paste_settings.letter_slots_enabled,
+                "Letter slots A–Z",
+                "Named slots for faster recall",
+            );
+            if self.paste_settings.letter_slots_enabled {
+                for (keys, what) in letter_slot_bindings() {
+                    settings_shortcut_help(ui, c, keys, what);
+                }
+            }
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Sliders,
+                &mut self.paste_settings.extended_slots_enabled,
+                "Extended slots 11–30",
+                "Option+C/V multi-tap for higher slots",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Eye,
+                &mut self.paste_settings.hud_enabled,
+                "HUD notifications",
+                "Flash a small confirmation when copying to a slot",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::List,
+                &mut self.paste_settings.palette_aliases_enabled,
+                "Letter aliases in palette",
+                "List letter slots in the palette as @A rows",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Keyboard,
+                &mut self.paste_settings.quick_letter_slots_enabled,
+                "Quick letter save",
+                "Double-tap Cmd+C then a letter",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Keyboard,
+                &mut self.paste_settings.direct_letter_shortcuts_enabled,
+                "Direct A–Z shortcuts",
+                "Ctrl+Option+C/V then A–Z",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Sliders,
+                &mut self.paste_settings.batch_drain_enabled,
+                "Batch-drain paste",
+                "Paste every filled slot in order",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Clipboard,
+                &mut self.paste_settings.copy_multi_tap_restore,
+                "Restore clipboard after multi-tap copy",
+                "After Cmd+C × N, restore slot 1's content",
+            );
+            if self.paste_settings.open_gui_hotkey == OpenGuiHotkey::CtrlSpace {
+                settings_card_divider(ui, c);
+                settings_value_row(
+                    ui,
+                    c,
+                    FooterIcon::Keyboard,
+                    "Ctrl+Space action",
+                    "What Ctrl+Space does when it opens Clipd",
+                    180.0,
+                    |ui| {
+                        let prev = self.paste_settings.ctrl_space_action;
+                        egui::ComboBox::from_id_salt("settings_ctrl_space_action")
+                            .selected_text(self.paste_settings.ctrl_space_action.label())
+                            .width(160.0)
+                            .show_ui(ui, |ui| {
+                                for action in CtrlSpaceAction::ALL {
+                                    ui.selectable_value(
+                                        &mut self.paste_settings.ctrl_space_action,
+                                        action,
+                                        action.label(),
+                                    );
+                                }
+                            });
+                        if self.paste_settings.ctrl_space_action != prev {
+                            dirty = true;
+                        }
+                    },
                 );
-            });
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.palette_aliases_enabled,
-            "Letter aliases in palette",
-            "Show letter slots as @A rows so you can recall them without memorizing chords.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
+            }
+        });
 
-        settings_caption(
-            ui,
-            c,
-            "SHORTCUTS & FEEDBACK",
-            "Power-user paste modes. Keep these off if you only want normal copy/paste plus search.",
-        );
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.hud_enabled,
-            "HUD notifications",
-            "Show a floating overlay when copying or pasting to slots.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.copy_on_select,
-            "Copy when selecting a row",
-            "Single-clicking a history row copies it immediately. Turn off for select-only rows; double-click and Enter still copy.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.return_focus_after_copy,
-            "Paste into previous app on select",
-            "After you pick a clip, jump back to the app you summoned clipd from (e.g. Cursor) and paste it. Needs Accessibility permission for clipd; otherwise it just returns focus and you press Cmd+V.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.multi_slot_enabled,
-            "Multi-slot copy/paste",
-            "Cmd+C x2 copies to slot 2, Cmd+V x2 pastes it, and so on.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.extended_slots_enabled,
-            "Extended slots 11-30",
-            "Option+C/V multi-tap reaches higher-numbered slots.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.letter_slots_enabled,
-            "Letter slots A-Z",
-            "Adds letter slots for faster named recall.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.quick_letter_slots_enabled,
-            "Quick letter save",
-            "Double-tap Cmd+C then a letter to save to that letter slot.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.direct_letter_shortcuts_enabled,
-            "Direct A-Z shortcuts",
-            "Enable global Ctrl+Option+C/V then A-Z chords.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.batch_drain_enabled,
-            "Batch-drain paste",
-            "Cmd+Option+V pastes collected clips one at a time in order.",
-        ) {
-            save_paste_transform_settings(&self.paste_settings);
-        }
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.paste_settings.copy_multi_tap_restore,
-            "Restore clipboard after multi-tap copy",
-            "After Cmd+C x N, restore the clipboard to slot 1's content.",
-        ) {
+        if dirty {
             save_paste_transform_settings(&self.paste_settings);
         }
     }
 
     fn render_actions_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
-        settings_caption(
-            ui,
-            c,
-            "CUSTOM ACTIONS",
-            "Run any shell command or script on a clip. The clip is piped in as \
-             input; the output can replace your clipboard or become a new clip. \
-             Run them from a clip's preview pane (press Space on a clip).",
-        );
-        egui::Frame::none()
-            .inner_margin(Margin::symmetric(0.0, 6.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
+        settings_section(ui, c, "Custom actions");
+        settings_card(ui, c, |ui| {
+            settings_card_body(ui, |ui| {
+                ui.label(
+                    RichText::new("Shell command on a clip — run from preview (Space).")
+                        .size(11.0)
+                        .color(rgb(c.subtext)),
+                );
+                ui.add_space(8.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.new_action_name)
                         .hint_text("name (e.g. Pretty JSON)")
@@ -2996,68 +7373,43 @@ impl ClipdGui {
                     });
                 });
             });
+        });
 
         if self.custom_actions.is_empty() {
-            ui.label(
-                RichText::new("No actions yet — add one above.")
-                    .size(11.0)
-                    .color(rgb(c.subtext)),
-            );
             return;
         }
 
         let mut to_delete: Option<usize> = None;
         let mut changed = false;
-        for (i, a) in self.custom_actions.iter_mut().enumerate() {
-            egui::Frame::none()
-                .inner_margin(Margin::symmetric(0.0, 3.0))
-                .show(ui, |ui| {
-                    egui::Frame::none()
-                        .fill(rgb(c.bg_surface))
-                        .rounding(Rounding::same(CARD_ROUND))
-                        .inner_margin(Margin::symmetric(12.0, 8.0))
-                        .stroke(Stroke::new(0.5, rgb(c.border)))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                if ui.checkbox(&mut a.enabled, "").changed() {
-                                    changed = true;
-                                }
-                                ui.add_space(2.0);
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new(&a.name)
-                                            .size(12.5)
-                                            .strong()
-                                            .color(rgb(c.text)),
-                                    );
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&a.command)
-                                                .font(FontId::monospace(11.0))
-                                                .color(rgb(c.subtext)),
-                                        )
-                                        .truncate(),
-                                    );
-                                });
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if pill_button(ui, "Delete", c).clicked() {
-                                            to_delete = Some(i);
-                                        }
-                                        ui.add_space(6.0);
-                                        ui.label(
-                                            RichText::new(a.output.label())
-                                                .size(10.0)
-                                                .color(rgb(c.overlay)),
-                                        );
-                                    },
-                                );
-                            });
-                        });
-                });
-        }
+        settings_card(ui, c, |ui| {
+            let count = self.custom_actions.len();
+            for i in 0..count {
+                if i > 0 {
+                    settings_card_divider(ui, c);
+                }
+                let enabled = self.custom_actions[i].enabled;
+                let name = self.custom_actions[i].name.clone();
+                let command = self.custom_actions[i].command.clone();
+                let output = self.custom_actions[i].output.label().to_string();
+                settings_value_row(
+                    ui,
+                    c,
+                    FooterIcon::Sparkle,
+                    &name,
+                    &format!("{command}  ·  {output}"),
+                    90.0,
+                    |ui| {
+                        if pill_button(ui, "Delete", c).clicked() {
+                            to_delete = Some(i);
+                        }
+                        if mini_switch(ui, enabled, c) {
+                            self.custom_actions[i].enabled = !enabled;
+                            changed = true;
+                        }
+                    },
+                );
+            }
+        });
         if let Some(i) = to_delete {
             self.custom_actions.remove(i);
             changed = true;
@@ -3068,16 +7420,15 @@ impl ClipdGui {
     }
 
     fn render_snippets_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
-        settings_caption(
-            ui,
-            c,
-            "SNIPPETS",
-            "Reusable text. Type its trigger in search, then Enter to paste it.",
-        );
-        egui::Frame::none()
-            .inner_margin(Margin::symmetric(0.0, 6.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
+        settings_section(ui, c, "Snippets");
+        settings_card(ui, c, |ui| {
+            settings_card_body(ui, |ui| {
+                ui.label(
+                    RichText::new("Reusable text. Type its trigger in search, then Enter to paste it.")
+                        .size(11.0)
+                        .color(rgb(c.subtext)),
+                );
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.new_snippet_trigger)
@@ -3124,86 +7475,280 @@ impl ClipdGui {
                     self.refresh_snippets();
                 }
             });
+        });
 
         let snippets = self.snippets.clone();
         if snippets.is_empty() {
-            ui.label(
-                RichText::new("No snippets yet.")
-                    .size(11.0)
+            return;
+        }
+        let mut delete_id: Option<i64> = None;
+        settings_card(ui, c, |ui| {
+            for (i, s) in snippets.iter().enumerate() {
+                if i > 0 {
+                    settings_card_divider(ui, c);
+                }
+                let preview = s.preview();
+                settings_value_row(
+                    ui,
+                    c,
+                    FooterIcon::List,
+                    &s.trigger,
+                    &preview,
+                    80.0,
+                    |ui| {
+                        if pill_button(ui, "Delete", c).clicked() {
+                            delete_id = Some(s.id);
+                        }
+                    },
+                );
+            }
+        });
+        if let Some(id) = delete_id {
+            let _ = self.store.delete_snippet(id);
+            self.refresh_snippets();
+        }
+    }
+
+
+    /// AI provider settings. Ask, embeddings and transform-on-paste all read the
+    /// same `transform.json`; before this existed the only way to set a key was
+    /// to hand-write that file, so Ask silently fell back to retrieval-only and
+    /// looked broken.
+    fn render_ai_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        let has_key = self
+            .ai_config
+            .api_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty());
+        let local = clipd_core::transform::is_local_endpoint(&self.ai_config.api_url);
+
+        settings_section(ui, c, "Provider");
+        settings_card(ui, c, |ui| {
+            if popover_setting_row(
+                ui,
+                c,
+                FooterIcon::Sparkle,
+                "Hosted",
+                "OpenAI-compatible API — needs a key",
+                if local {
+                    RowControl::Chevron
+                } else {
+                    RowControl::Toggle(true)
+                },
+            ) && local
+            {
+                self.ai_config.api_url = "https://api.openai.com/v1/chat/completions".into();
+                self.ai_config.model = "gpt-4o-mini".into();
+                self.ai_test_status = None;
+            }
+            settings_card_divider(ui, c);
+            if popover_setting_row(
+                ui,
+                c,
+                FooterIcon::Window,
+                "Local model",
+                "Ollama or LM Studio — nothing leaves this machine",
+                if local {
+                    RowControl::Toggle(true)
+                } else {
+                    RowControl::Chevron
+                },
+            ) && !local
+            {
+                self.ai_config.api_url = "http://localhost:11434/v1/chat/completions".into();
+                self.ai_config.model = "llama3.2".into();
+                self.ai_test_status = None;
+            }
+        });
+
+        settings_section(ui, c, "Connection");
+        settings_card(ui, c, |ui| {
+            settings_card_body(ui, |ui| {
+                if local {
+                    ui.label(
+                        RichText::new(
+                            "Local endpoints need no API key — leave it blank. Install Ollama, run \
+                             `ollama pull llama3.2`, and Test connection.",
+                        )
+                        .size(10.5)
+                        .color(rgb(c.subtext)),
+                    );
+                    ui.add_space(8.0);
+                }
+                let row = |ui: &mut egui::Ui, label: &str| {
+                    ui.add_sized(
+                        [76.0, 18.0],
+                        egui::Label::new(RichText::new(label).size(11.5).color(rgb(c.subtext))),
+                    );
+                };
+
+                ui.horizontal(|ui| {
+                    row(ui, "API key");
+                    let hint = if has_key {
+                        "saved — type to replace"
+                    } else if local {
+                        "not needed for a local model"
+                    } else {
+                        "sk-..."
+                    };
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ai_key_input)
+                            .desired_width(ui.available_width())
+                            .password(true)
+                            .hint_text(hint),
+                    );
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    row(ui, "Endpoint");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ai_config.api_url)
+                            .desired_width(ui.available_width())
+                            .hint_text("https://api.openai.com/v1/chat/completions"),
+                    );
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    row(ui, "Model");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ai_config.model)
+                            .desired_width(ui.available_width())
+                            .hint_text("gpt-4o-mini"),
+                    );
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        let typed = self.ai_key_input.trim();
+                        if !typed.is_empty() {
+                            self.ai_config.api_key = Some(typed.to_string());
+                            self.ai_key_input.clear();
+                        }
+                        if self.ai_config.api_url.trim().is_empty() {
+                            self.ai_config.api_url =
+                                "https://api.openai.com/v1/chat/completions".into();
+                        }
+                        if self.ai_config.model.trim().is_empty() {
+                            self.ai_config.model = "gpt-4o-mini".into();
+                        }
+                        save_transform_config(&self.ai_config);
+                        self.ai_test_status = Some((true, "Saved.".into()));
+                    }
+
+                    let can_test = has_key || !self.ai_key_input.trim().is_empty() || local;
+                    if ui
+                        .add_enabled(
+                            can_test && self.ai_test_rx.is_none(),
+                            egui::Button::new("Test connection"),
+                        )
+                        .on_hover_text("Send a one-token request to check the key and endpoint")
+                        .clicked()
+                    {
+                        self.start_ai_test(ui.ctx());
+                    }
+
+                    if self.ai_test_rx.is_some() {
+                        ui.spinner();
+                    }
+
+                    if ui
+                        .add_enabled(has_key, egui::Button::new("Remove key"))
+                        .clicked()
+                    {
+                        self.ai_config.api_key = None;
+                        self.ai_key_input.clear();
+                        save_transform_config(&self.ai_config);
+                        self.ai_test_status = Some((true, "Key removed.".into()));
+                    }
+                });
+
+                if let Some((ok, msg)) = &self.ai_test_status {
+                    ui.add_space(4.0);
+                    let color = if *ok { rgb(c.green) } else { rgb(c.accent2) };
+                    ui.label(RichText::new(msg).size(11.0).color(color));
+                }
+
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Any OpenAI-compatible endpoint works. Stored in {}",
+                        clipd_core::transform_config_path().display()
+                    ))
+                    .size(10.5)
                     .color(rgb(c.subtext)),
-            );
-        } else {
-            for s in &snippets {
-                egui::Frame::none()
-                    .inner_margin(Margin::symmetric(0.0, 3.0))
-                    .show(ui, |ui| {
-                        egui::Frame::none()
-                            .fill(rgb(c.bg_surface))
-                            .rounding(Rounding::same(CARD_ROUND))
-                            .inner_margin(Margin::symmetric(12.0, 8.0))
-                            .stroke(Stroke::new(0.5, rgb(c.border)))
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    tag_pill(ui, &s.trigger, rgb(c.accent), c);
-                                    ui.add_space(6.0);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(s.preview())
-                                                .size(12.0)
-                                                .color(rgb(c.subtext)),
-                                        )
-                                        .truncate(),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if pill_button(ui, "Delete", c).clicked() {
-                                                let _ = self.store.delete_snippet(s.id);
-                                                self.refresh_snippets();
-                                            }
-                                        },
-                                    );
-                                });
-                            });
-                    });
+                );
+            });
+        });
+    }
+
+
+    /// Verify the key and endpoint with a minimal request, on a worker thread so
+    /// the window doesn't freeze for the round trip.
+    fn start_ai_test(&mut self, ctx: &egui::Context) {
+        let mut api = self.ai_config.clone();
+        let typed = self.ai_key_input.trim();
+        if !typed.is_empty() {
+            api.api_key = Some(typed.to_string());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = match clipd_core::transform::probe_api(&api) {
+                Ok(model) => (true, format!("Works — responded as “{model}”.")),
+                Err(e) => (false, e),
+            };
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        self.ai_test_rx = Some(rx);
+        self.ai_test_status = None;
+    }
+
+    fn poll_ai_test(&mut self) {
+        let Some(rx) = &self.ai_test_rx else { return };
+        match rx.try_recv() {
+            Ok(status) => {
+                self.ai_test_status = Some(status);
+                self.ai_test_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.ai_test_status = Some((false, "The test stopped unexpectedly.".into()));
+                self.ai_test_rx = None;
             }
         }
     }
 
     fn render_vault_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
-        settings_caption(
-            ui,
-            c,
-            "PASSWORD VAULT",
-            "clipd never stores passwords. Save a copied password straight into a real vault instead.",
-        );
+        settings_section(ui, c, "Saved passwords");
+        settings_card(ui, c, |ui| {
+            if settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Lock,
+                &mut self.privacy_config.offer_vault_on_secret,
+                "Offer to vault detected passwords",
+                "When a copied password is detected, prompt to save it",
+            ) {
+                save_privacy_config(&self.privacy_config);
+            }
 
-        if settings_toggle(
-            ui,
-            c,
-            &mut self.privacy_config.offer_vault_on_secret,
-            "Offer to vault detected passwords",
-            "When clipd detects a copied password, pop a prompt to save it to a vault.",
-        ) {
-            save_privacy_config(&self.privacy_config);
-        }
+            if self.vault_targets.is_empty() {
+                settings_card_divider(ui, c);
+                settings_card_copy(
+                    ui,
+                    c,
+                    "No vault backend found",
+                    "Install the 1Password CLI (`op`) or Bitwarden CLI (`bw`). Keychain is available on macOS.",
+                );
+                return;
+            }
 
-        if self.vault_targets.is_empty() {
-            ui.label(
-                RichText::new(
-                    "No vault backend found. Install the 1Password CLI (`op`) or Bitwarden CLI (`bw`). The macOS Keychain is available on macOS.",
-                )
-                .size(11.5)
-                .color(rgb(c.subtext)),
-            );
-            return;
-        }
-
-        egui::Frame::none()
-            .inner_margin(Margin::symmetric(0.0, 6.0))
-            .show(ui, |ui| {
-                // Backend picker (only those usable on this machine).
+            settings_card_divider(ui, c);
+            settings_card_body(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Save to").size(12.0).color(rgb(c.text)));
                     let selected_label = self
@@ -3220,7 +7765,6 @@ impl ClipdGui {
                 });
 
                 ui.add_space(4.0);
-                // Optional metadata — the password itself comes from the clipboard.
                 let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
                     ui.horizontal(|ui| {
                         ui.add_sized(
@@ -3242,12 +7786,12 @@ impl ClipdGui {
                 ui.horizontal(|ui| {
                     let save = ui.add(
                         egui::Button::new(
-                            RichText::new("🔐 Save clipboard to vault")
+                            RichText::new("Save clipboard to vault")
                                 .size(12.0)
                                 .color(rgb(c.bg_base)),
                         )
                         .fill(rgb(c.accent))
-                        .rounding(Rounding::same(6.0)),
+                        .rounding(Rounding::same(8.0)),
                     );
                     if save.clicked() {
                         self.save_clipboard_to_vault();
@@ -3278,28 +7822,26 @@ impl ClipdGui {
                     .color(rgb(c.subtext)),
                 );
             });
+        });
     }
 
     /// "Build your own palette" — accent / background / text pickers that
     /// override whatever base theme is active. Saved and applied live.
     fn render_custom_colors_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
-        settings_caption(
-            ui,
-            c,
-            "CUSTOM COLORS",
-            "Build your own palette. When on, these override the theme above.",
-        );
-        let mut changed = settings_toggle(
-            ui,
-            c,
-            &mut self.custom_colors.enabled,
-            "Use custom colors",
-            "Pick your own accent, background, and text — surfaces are derived to match.",
-        );
-        if self.custom_colors.enabled {
-            egui::Frame::none()
-                .inner_margin(Margin::symmetric(0.0, 4.0))
-                .show(ui, |ui| {
+        let mut changed = false;
+        settings_section(ui, c, "Custom colors");
+        settings_card(ui, c, |ui| {
+            changed |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Palette,
+                &mut self.custom_colors.enabled,
+                "Use custom colors",
+                "Overrides the theme swatches above",
+            );
+            if self.custom_colors.enabled {
+                settings_card_divider(ui, c);
+                settings_card_body(ui, |ui| {
                     changed |= color_row(ui, c, "Accent", &mut self.custom_colors.accent);
                     changed |= color_row(ui, c, "Background", &mut self.custom_colors.background);
                     changed |= color_row(ui, c, "Text", &mut self.custom_colors.text);
@@ -3320,158 +7862,322 @@ impl ClipdGui {
                         changed = true;
                     }
                 });
-        }
+            }
+        });
         if changed {
             save_custom_colors(&self.custom_colors);
             apply_theme(ui.ctx(), self.theme);
         }
     }
 
-    /// Search bar + Pins chip + Settings gear. Rendered on every tab so
-    /// navigation is always available (gear and Pins both toggle back).
-    fn render_top_bar(&mut self, ui: &mut egui::Ui, action: &mut Action, c: &clipd_core::ThemeColors) {
+    /// Quiet navigation rail. Search is intentionally kept in the bottom
+    /// command bar so the content begins immediately under this header.
+    /// Compact brand row: green "C" + Clipd · pin / settings / close.
+    /// In Settings: "Clipd" + "Settings" title, close returns to the list.
+    fn render_brand_header(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         ui.horizontal(|ui| {
-            let controls_width = 96.0;
-            let gap = 8.0;
-            let search_width = (ui.available_width() - controls_width - gap).max(120.0);
-
-            ui.allocate_ui_with_layout(
-                egui::vec2(search_width, 36.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    // Frameless: the search sits directly on the card — the
-                    // hairline divider below is the only separation.
-                    egui::Frame::none()
-                        .inner_margin(Margin::symmetric(2.0, 6.0))
-                        .show(ui, |ui| {
-                            ui.set_width((search_width - 6.0).max(80.0));
-                            ui.horizontal(|ui| {
-                                draw_search_icon(ui, rgb(c.accent).gamma_multiply(0.9));
-                                ui.add_space(8.0);
-                                let hint = match self.active_tab {
-                                    MainTab::Collections => "Search pins and collections...",
-                                    MainTab::Settings => "Settings",
-                                    MainTab::Text if self.in_ask_mode() => {
-                                        "Ask about your clips, then press Enter"
-                                    }
-                                    MainTab::Text => {
-                                        "Search, 'from chrome', or ? to ask..."
-                                    }
-                                };
-                                let search = ui.add_sized(
-                                    [ui.available_width(), 18.0],
-                                    egui::TextEdit::singleline(&mut self.search_query)
-                                        .id(egui::Id::new("clip_search"))
-                                        .hint_text(hint)
-                                        .frame(false)
-                                        .font(egui::TextStyle::Body),
-                                );
-                                if self.focus_search {
-                                    search.request_focus();
-                                    self.focus_search = false;
-                                }
-                                if search.changed() {
-                                    // Editing the question invalidates the
-                                    // answer sitting under it.
-                                    if self.in_ask_mode() {
-                                        self.ask.clear_answer();
-                                    }
-                                    self.apply_filter();
-                                }
-                                // Enter asks in ask mode, pastes otherwise —
-                                // Text tab only.
-                                if self.active_tab == MainTab::Text
-                                    && search.lost_focus()
-                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                {
-                                    if self.in_ask_mode() {
-                                        *action = Action::Ask;
-                                    } else if !self.filtered.is_empty() {
-                                        *action = Action::Paste;
-                                    }
-                                }
-                            });
-                        });
-                },
+            ui.spacing_mut().item_spacing.x = 8.0;
+            draw_brand_mark(ui, c);
+            ui.label(
+                RichText::new("Clipd")
+                    .size(15.0)
+                    .strong()
+                    .color(rgb(c.text)),
             );
-            ui.add_space(gap);
-
-            ui.allocate_ui_with_layout(
-                egui::vec2(controls_width, 36.0),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    let settings_active = self.active_tab == MainTab::Settings;
-                    let gear_col = if settings_active || self.show_quick_settings {
-                        rgb(c.accent)
-                    } else {
-                        rgb(c.overlay)
-                    };
-                    let gear = ui.add(
-                        egui::Button::new(RichText::new("⚙").size(15.0).color(gear_col))
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(Stroke::NONE)
-                            .min_size(egui::vec2(26.0, 30.0)),
-                    );
-                    if gear.clicked() {
-                        if settings_active {
-                            self.active_tab = MainTab::Text;
-                        } else {
-                            self.active_tab = MainTab::Text;
-                            self.show_quick_settings = !self.show_quick_settings;
-                        }
-                    }
-                    gear.on_hover_text(if settings_active {
-                        "Back to clips"
-                    } else {
-                        "Quick settings"
-                    });
-                    // "esc" keycap — backs out one level (Pins/Settings → Clips,
-                    // Clips → hide), mirroring the Escape key.
-                    if keycap(ui, "esc", &c)
-                        .on_hover_text("Back")
-                        .clicked()
-                    {
-                        if self.active_tab != MainTab::Text {
-                            self.active_tab = MainTab::Text;
-                        } else if self.show_preview {
-                            let ctx = ui.ctx().clone();
-                            self.set_preview_open(&ctx, false);
-                        } else {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    }
-                },
-            );
-        });
-
-        // ── Tab row: All / Pins N — sits under the search field so the
-        // palette reads top-down (find, then filter), matching the design. ──
-        ui.add_space(4.0);
-        hairline(ui, c);
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let text_active = self.active_tab == MainTab::Text;
-            if tab_chip(ui, "All", text_active, c) {
-                self.active_tab = MainTab::Text;
+            if self.active_tab == MainTab::Settings {
+                ui.label(RichText::new("Settings").size(15.0).color(rgb(c.subtext)));
             }
-            let pins_active = self.active_tab == MainTab::Collections;
-            if tab_chip_count(ui, "Pins", self.starred_clip_ids.len(), pins_active, c) {
-                if pins_active {
-                    self.active_tab = MainTab::Text;
+            if self.active_tab == MainTab::Vault {
+                ui.label(RichText::new("Vault").size(15.0).color(rgb(c.subtext)));
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let close = chrome_icon_button(ui, "×", false, c).on_hover_text(if self
+                    .active_tab
+                    == MainTab::Settings
+                {
+                    "Back to clipboard  ·  Esc"
                 } else {
-                    self.active_tab = MainTab::Collections;
-                    self.refresh_collections();
+                    "Close  ·  Esc"
+                });
+                if close.clicked() {
+                    if self.active_tab != MainTab::Text || self.show_preview {
+                        self.active_tab = MainTab::Text;
+                        let ctx = ui.ctx().clone();
+                        self.set_preview_open(&ctx, false);
+                    } else {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                if self.active_tab != MainTab::Settings && self.active_tab != MainTab::Vault {
+                    let vault =
+                        chrome_icon_button(ui, "🔐", false, c).on_hover_text("Vault  ·  encrypted API keys");
+                    if vault.clicked() {
+                        self.active_tab = MainTab::Vault;
+                        self.refresh_vault_secrets();
+                    }
+                    let settings =
+                        chrome_icon_button(ui, "⚙", false, c).on_hover_text("Settings  ·  ⌘,");
+                    if settings.clicked() {
+                        self.active_tab = MainTab::Settings;
+                    }
+                    let pin = chrome_icon_button(ui, "📌", self.window_pinned, c).on_hover_text(
+                        if self.window_pinned {
+                            "Unpin window"
+                        } else {
+                            "Keep window on top"
+                        },
+                    );
+                    if pin.clicked() {
+                        self.window_pinned = !self.window_pinned;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                            if self.window_pinned {
+                                egui::WindowLevel::AlwaysOnTop
+                            } else {
+                                egui::WindowLevel::Normal
+                            },
+                        ));
+                    }
+                }
+            });
+        });
+    }
+
+    /// Settings category pills — General / Clipboard / AI / Appearance / Privacy.
+    fn render_settings_category_tabs(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+            for cat in SettingsCategory::ALL {
+                if tiny_filter_chip(ui, cat.label(), self.settings_category == cat, self.theme, c) {
+                    self.settings_category = cat;
                 }
             }
         });
-        ui.add_space(8.0);
-        hairline(ui, c);
+    }
 
-        if self.show_quick_settings && self.active_tab == MainTab::Text {
+    /// Filter row — All / Links / Text / Code / Images / Pinned.
+    fn render_filter_pills(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+            for (filter, label) in ContentFilter::MAIN {
+                if tiny_filter_chip(ui, label, self.content_filter == filter, self.theme, c) {
+                    self.content_filter = filter;
+                    self.apply_filter();
+                }
+            }
+        });
+    }
+
+    /// Accessibility + quick-settings banners under the chrome (Text tab).
+    fn render_text_banners(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        #[cfg(target_os = "macos")]
+        if load_hotkey_status() == HotkeyStatus::NeedsAccessibility {
+            let (warn_fill, warn_title, warn_body, warn_btn_fill, warn_btn_text) =
+                warning_colors(self.theme.is_light());
+            egui::Frame::none()
+                .fill(warn_fill)
+                .rounding(Rounding::same(8.0))
+                .inner_margin(Margin::symmetric(10.0, 8.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        RichText::new("Multi-slot copy & HUD need keyboard access")
+                            .size(11.5)
+                            .strong()
+                            .color(warn_title),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "Enable Clipd under {} in System Settings → Privacy & Security. \
+                             The daemon retries automatically once toggled on.",
+                            clipd_core::missing_keyboard_permission_label()
+                        ))
+                        .size(10.5)
+                        .color(warn_body),
+                    );
+                    ui.add_space(4.0);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Open Privacy Settings")
+                                    .size(11.0)
+                                    .color(warn_btn_text),
+                            )
+                            .fill(warn_btn_fill),
+                        )
+                        .clicked()
+                    {
+                        clipd_core::request_keyboard_permissions();
+                        clipd_core::open_keyboard_permission_settings();
+                    }
+                });
+            ui.add_space(8.0);
+        }
+
+        if self.show_quick_settings {
             self.render_quick_settings(ui, c);
         }
+        let _ = c;
+    }
+
+    /// Search field with magnifier and a trailing `/` shortcut hint.
+    /// In Settings this searches settings categories instead of clips.
+    fn render_search_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        action: &mut Action,
+        c: &clipd_core::ThemeColors,
+    ) {
+        let search_w = ui.available_width();
+        let asking = self.in_ask_mode();
+        let in_settings = self.active_tab == MainTab::Settings;
+        let spotlight = self.theme == Theme::GlassLight;
+        let search_frame = egui::Frame::none()
+            .fill(if spotlight {
+                Color32::from_rgba_unmultiplied(248, 250, 252, 112)
+            } else {
+                surf(c, c.bg_elevated)
+            })
+            .rounding(Rounding::same(if spotlight { 13.0 } else { 10.0 }))
+            .stroke(Stroke::new(
+                if spotlight { 0.7 } else { 0.8 },
+                if asking && !in_settings {
+                    rgb(c.accent).gamma_multiply(0.72)
+                } else if spotlight {
+                    Color32::from_rgba_unmultiplied(92, 103, 117, 68)
+                } else {
+                    rgb(c.border)
+                },
+            ))
+            .inner_margin(Margin::symmetric(10.0, 7.0));
+
+        search_frame.show(ui, |ui| {
+            ui.set_width(search_w);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                draw_search_icon(ui, rgb(c.subtext));
+                let hint = match self.active_tab {
+                    MainTab::Collections => "Search pins and collections…",
+                    MainTab::Settings => "Search settings...",
+                    MainTab::Vault => "Search vault…",
+                    MainTab::Text if asking => "Ask, then press Enter",
+                    MainTab::Text => "Search clips, links, code...",
+                };
+                let slash_w = if in_settings { 0.0 } else { 28.0 };
+                // Constrain the text field so it never pushes the `/` badge
+                // off the edge or overflows the search frame.
+                let field_w = (ui.available_width() - slash_w).max(60.0).min(search_w - 40.0);
+                if in_settings {
+                    let search = ui.add_sized(
+                        [field_w, 18.0],
+                        egui::TextEdit::singleline(&mut self.settings_query)
+                            .id(egui::Id::new("settings_search"))
+                            .hint_text(hint)
+                            .frame(false)
+                            .font(egui::TextStyle::Body),
+                    );
+                    if self.focus_search {
+                        search.request_focus();
+                        self.focus_search = false;
+                    }
+                    if search.changed() {
+                        if let Some(cat) = SettingsCategory::from_query(&self.settings_query) {
+                            self.settings_category = cat;
+                        }
+                    }
+                } else {
+                    let search = ui.add_sized(
+                        [field_w, 18.0],
+                        egui::TextEdit::singleline(&mut self.search_query)
+                            .id(egui::Id::new("clip_search"))
+                            .hint_text(hint)
+                            .frame(false)
+                            .font(egui::TextStyle::Body),
+                    );
+                    if self.focus_search {
+                        search.request_focus();
+                        self.focus_search = false;
+                    }
+                    if search.changed() {
+                        if self.in_ask_mode() {
+                            self.ask.clear_answer();
+                        }
+                        self.apply_filter();
+                    }
+                    if self.active_tab == MainTab::Text
+                        && search.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        *action = if self.in_ask_mode() {
+                            Action::Ask
+                        } else {
+                            Action::Paste
+                        };
+                    }
+                    egui::Frame::none()
+                        .fill(surf(c, c.bg_selected))
+                        .rounding(Rounding::same(5.0))
+                        .inner_margin(Margin::symmetric(5.0, 1.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("/")
+                                    .size(10.5)
+                                    .strong()
+                                    .family(egui::FontFamily::Monospace)
+                                    .color(rgb(c.overlay)),
+                            );
+                        });
+                }
+            });
+        });
+    }
+
+    fn render_bottom_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        _action: &mut Action,
+        c: &clipd_core::ThemeColors,
+    ) {
+        // Mockup footer: green Capturing (left) · outline clock (true centre) ·
+        // ⌘⇧V chip (right). One slim row, space-between alignment.
+        let row_h = 28.0;
+        let full_w = ui.available_width();
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(full_w, row_h), egui::Sense::hover());
+
+        // Left — status.
+        let left = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.top()),
+            egui::vec2(full_w * 0.4, row_h),
+        );
+        ui.allocate_ui_at_rect(left, |ui| {
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (dot, _) =
+                    ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter()
+                    .circle_filled(dot.center(), 3.5, rgb(c.green));
+                ui.label(
+                    RichText::new("Capturing")
+                        .size(12.0)
+                        .color(rgb(c.subtext)),
+                );
+            });
+        });
+
+        // Centre — clock, painted at the exact midpoint.
+        draw_clock_icon_at(ui.painter(), rect.center(), rgb(c.overlay));
+
+        // Right — shortcut hint.
+        let right = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - full_w * 0.4, rect.top()),
+            egui::vec2(full_w * 0.4, row_h),
+        );
+        ui.allocate_ui_at_rect(right, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                footer_shortcut_badge(ui, "⌘ ⇧ V", c);
+            });
+        });
     }
 
     /// Inline quick-settings rows (mockup style): theme swatches, the
@@ -3487,37 +8193,60 @@ impl ClipdGui {
         };
 
         row(ui, "Theme", &mut |ui| {
-            ui.spacing_mut().item_spacing.x = 7.0;
-            // Swatches render right-to-left; reverse so they read in order.
-            for theme in Theme::ALL.iter().rev() {
-                let tc = theme.colors();
-                let active = self.theme == *theme;
-                let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(18.0, 18.0),
-                    egui::Sense::click(),
-                );
-                let center = rect.center();
-                ui.painter().circle_filled(center, 8.0, rgb(tc.bg_base));
-                ui.painter().circle_stroke(
-                    center,
-                    8.0,
-                    if active {
-                        Stroke::new(2.0, rgb(c.accent))
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            // Wrap so Glass Light / Glass Dark never clip off a narrow HUD.
+            ui.horizontal_wrapped(|ui| {
+                for theme in Theme::ALL {
+                    let tc = theme.colors();
+                    let active = self.theme == theme;
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                    let center = rect.center();
+                    ui.painter().circle_filled(center, 8.0, rgb(tc.bg_base));
+                    if theme.is_glass() {
+                        if let Some((tl, br)) = theme.shell_glows() {
+                            ui.painter().circle_filled(
+                                egui::pos2(center.x - 2.5, center.y - 2.0),
+                                3.5,
+                                rgba(tl, 200),
+                            );
+                            ui.painter().circle_filled(
+                                egui::pos2(center.x + 2.5, center.y + 2.0),
+                                3.5,
+                                rgba(br, 200),
+                            );
+                        }
+                        ui.painter().circle_filled(center, 2.4, rgb(tc.green));
+                        // Pale rim so glass swatches don't look like solid darks.
+                        ui.painter().circle_stroke(
+                            center,
+                            8.0,
+                            Stroke::new(1.2, Color32::from_rgba_unmultiplied(220, 230, 245, 160)),
+                        );
                     } else {
-                        Stroke::new(1.0, rgb(c.border))
-                    },
-                );
-                // A hint of the theme's accent inside the swatch.
-                ui.painter().circle_filled(center, 3.0, rgb(tc.accent));
-                let resp = resp
-                    .on_hover_text(theme.label())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if resp.clicked() {
-                    self.theme = *theme;
-                    save_theme(self.theme);
-                    apply_theme(ui.ctx(), self.theme);
+                        ui.painter().circle_filled(center, 3.0, rgb(tc.green));
+                    }
+                    ui.painter().circle_stroke(
+                        center,
+                        8.0,
+                        if active {
+                            Stroke::new(2.0, rgb(c.accent))
+                        } else if !theme.is_glass() {
+                            Stroke::new(1.0, rgb(c.border))
+                        } else {
+                            Stroke::NONE
+                        },
+                    );
+                    let resp = resp
+                        .on_hover_text(theme.label())
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if resp.clicked() {
+                        self.theme = theme;
+                        save_theme(self.theme);
+                        apply_theme(ui.ctx(), self.theme);
+                    }
                 }
-            }
+            });
         });
         hairline(ui, c);
 
@@ -3554,210 +8283,485 @@ impl ClipdGui {
         hairline(ui, c);
     }
 
+    fn render_surface_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        settings_section(ui, c, "Surface");
+        settings_card(ui, c, |ui| {
+            if popover_setting_row(
+                ui,
+                c,
+                FooterIcon::Clipboard,
+                "Clipboard HUD",
+                "Search and pick recent clips from the menu bar",
+                RowControl::Chevron,
+            ) {
+                self.switch_surface(ui.ctx(), SurfaceMode::Hud);
+            }
+        });
+    }
+
     fn render_settings_panel(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         egui::Frame::none()
             .inner_margin(Margin {
                 left: SETTINGS_GUTTER_X,
                 right: SETTINGS_GUTTER_X,
-                top: SETTINGS_GUTTER_Y,
+                top: 4.0,
                 bottom: SETTINGS_GUTTER_Y,
             })
             .show(ui, |ui| {
-                // Clamp to the *actual* available width (never wider than the
-                // window) so the compact window doesn't clip cards on the right.
                 let content_w = ui.available_width().min(SETTINGS_MAX_WIDTH);
                 ui.set_max_width(content_w);
-                ui.label(
-                    RichText::new("Settings")
-                        .size(18.0)
-                        .strong()
-                        .color(rgb(c.text)),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Appearance, privacy, and clipboard behavior.")
-                        .size(12.0)
-                        .color(rgb(c.subtext)),
-                );
-                ui.add_space(8.0);
 
                 egui::ScrollArea::vertical()
-                    .id_salt("settings_scroll")
+                    .id_salt(("settings_scroll", self.settings_category.label()))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let content_w = ui.available_width().min(SETTINGS_MAX_WIDTH);
                         ui.set_max_width(content_w);
-                        let mut dirty = false;
-
-                        settings_caption(
-                            ui,
-                            c,
-                            "APPEARANCE",
-                            "Use System to follow macOS, or choose an explicit Light/Dark theme.",
-                        );
-                        egui::Frame::none()
-                            .inner_margin(Margin::symmetric(0.0, 6.0))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("Theme").size(12.0).color(rgb(c.text)));
-                                    let prev = self.theme;
-                                    egui::ComboBox::from_id_salt("theme_selector")
-                                        .selected_text(self.theme.label())
-                                        .show_ui(ui, |ui| {
-                                            for theme in Theme::ALL {
-                                                ui.selectable_value(
-                                                    &mut self.theme,
-                                                    theme,
-                                                    theme.label(),
-                                                );
-                                            }
-                                        });
-                                    if self.theme != prev {
-                                        save_theme(self.theme);
-                                        apply_theme(ui.ctx(), self.theme);
-                                    }
-                                });
-                                ui.label(
-                                    RichText::new(
-                                        "Shortcut: Cmd+T cycles System, Light, Dark, and named themes.",
-                                    )
-                                    .size(10.5)
-                                    .color(rgb(c.subtext)),
-                                );
-                            });
-
-                        self.render_custom_colors_settings(ui, c);
-
-                        self.render_clipboard_behavior_settings(ui, c);
-
-                        self.render_snippets_settings(ui, c);
-
-                        self.render_actions_settings(ui, c);
-
-                        self.render_vault_settings(ui, c);
-
-                        settings_caption(
-                            ui,
-                            c,
-                            "PRIVACY",
-                            "Control what clipd saves and how sensitive content is handled.",
-                        );
-                        if settings_toggle(
-                            ui,
-                            c,
-                            &mut self.privacy_config.enabled,
-                            "Enable privacy protection",
-                            "Detect secrets and prevent excluded apps from being stored.",
-                        ) {
-                            dirty = true;
-                        }
-
-                        ui.label(
-                            RichText::new("Detection rules")
-                                .size(13.0)
-                                .strong()
-                                .color(rgb(c.accent)),
-                        );
-                        ui.add_space(6.0);
-
-                        ui.add_enabled_ui(self.privacy_config.enabled, |ui| {
-                            if ui
-                                .checkbox(
-                                    &mut self.privacy_config.detect_api_keys,
-                                    "API keys (OpenAI, AWS, GitHub, Stripe, Slack…)",
-                                )
-                                .changed()
-                            {
-                                dirty = true;
+                        match self.settings_category {
+                            SettingsCategory::General => self.render_settings_general(ui, c),
+                            SettingsCategory::Clipboard => {
+                                self.render_clipboard_behavior_settings(ui, c);
                             }
-                            if ui
-                                .checkbox(
-                                    &mut self.privacy_config.detect_credentials,
-                                    "Passwords, secrets & database URLs",
-                                )
-                                .changed()
-                            {
-                                dirty = true;
+                            SettingsCategory::Ai => self.render_ai_settings(ui, c),
+                            SettingsCategory::Appearance => {
+                                self.render_settings_appearance(ui, c);
                             }
-                            if ui
-                                .checkbox(
-                                    &mut self.privacy_config.detect_credit_cards,
-                                    "Credit card numbers",
-                                )
-                                .changed()
-                            {
-                                dirty = true;
-                            }
-                            if ui
-                                .checkbox(
-                                    &mut self.privacy_config.detect_ssn,
-                                    "Social Security numbers",
-                                )
-                                .changed()
-                            {
-                                dirty = true;
-                            }
-                        });
-
-                        ui.add_space(12.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-
-                        ui.label(
-                            RichText::new("Excluded apps")
-                                .size(13.0)
-                                .strong()
-                                .color(rgb(c.accent)),
-                        );
-                        ui.label(
-                            RichText::new("Copies from these apps are never saved.")
-                                .size(11.0)
-                                .color(rgb(c.subtext)),
-                        );
-                        ui.add_space(6.0);
-
-                        let mut remove_app: Option<usize> = None;
-                        for (i, app_name) in self.privacy_config.excluded_apps.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(app_name).size(12.0).color(rgb(c.text)));
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.small_button("Remove").clicked() {
-                                            remove_app = Some(i);
-                                        }
-                                    },
-                                );
-                            });
-                        }
-                        if let Some(i) = remove_app {
-                            self.privacy_config.excluded_apps.remove(i);
-                            dirty = true;
-                        }
-
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.new_excluded_app)
-                                    .hint_text("App name…")
-                                    .desired_width(200.0),
-                            );
-                            if ui.button("Add").clicked()
-                                && !self.new_excluded_app.trim().is_empty()
-                            {
-                                self.privacy_config
-                                    .excluded_apps
-                                    .push(self.new_excluded_app.trim().to_string());
-                                self.new_excluded_app.clear();
-                                dirty = true;
-                            }
-                        });
-
-                        if dirty {
-                            save_privacy_config(&self.privacy_config);
+                            SettingsCategory::Privacy => self.render_settings_privacy(ui, c),
                         }
                     });
             });
+    }
+
+    fn render_settings_general(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        self.render_surface_settings(ui, c);
+
+        settings_section(ui, c, "Sending");
+        settings_card(ui, c, |ui| {
+            self.render_sending_settings(ui, c);
+        });
+
+        self.render_snippets_settings(ui, c);
+        self.render_actions_settings(ui, c);
+        self.render_vault_settings(ui, c);
+    }
+
+    /// The layout switch, and everything the island needs configuring.
+    ///
+    /// Lives in Appearance because that is where someone goes to change how
+    /// clipd *looks*; the island is a different-shaped clipd, not a different
+    /// clipboard.
+    fn render_layout_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        let current = self.paste_settings.gui_layout;
+        let mut chosen: Option<GuiLayout> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            for layout in GuiLayout::ALL {
+                if layout_card(ui, c, layout, current == layout) {
+                    chosen = Some(layout);
+                }
+            }
+        });
+        if let Some(layout) = chosen {
+            if layout != current {
+                self.set_gui_layout(layout);
+            }
+        }
+    }
+
+    /// Switch layouts, and start or stop the island process to match.
+    ///
+    /// The island is a separate process (it owns a window that outlives the
+    /// palette), so the setting alone would leave the old layout on screen.
+    fn set_gui_layout(&mut self, layout: GuiLayout) {
+        self.paste_settings.gui_layout = layout;
+        save_paste_transform_settings(&self.paste_settings);
+        match layout {
+            GuiLayout::Notch => island::start_island(),
+            GuiLayout::Palette => island::stop_island(),
+        }
+    }
+
+    fn render_island_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        let mut dirty = false;
+
+        settings_section(ui, c, "Island");
+        settings_card(ui, c, |ui| {
+            let mut hover = self.island.config.expand_on_hover;
+            if settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Eye,
+                &mut hover,
+                "Open on hover",
+                "Off means the island only opens when you click it",
+            ) {
+                self.island.config.expand_on_hover = hover;
+                dirty = true;
+            }
+            settings_card_divider(ui, c);
+            let mut live = self.island.config.live_activity;
+            if settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Sparkle,
+                &mut live,
+                "Announce copies",
+                "Flash each new clip in the island for a couple of seconds",
+            ) {
+                self.island.config.live_activity = live;
+                dirty = true;
+            }
+            settings_card_divider(ui, c);
+            let mut anchor = self.island.config.anchor;
+            settings_value_row(ui, c, FooterIcon::Window, "Position", "Where the island sits", 160.0, |ui| {
+                let resp = egui::ComboBox::from_id_salt("island_anchor")
+                    .selected_text(anchor.label())
+                    .show_ui(ui, |ui| {
+                        for option in clipd_core::IslandAnchor::ALL {
+                            ui.selectable_value(&mut anchor, option, option.label());
+                        }
+                    });
+                if resp.response.changed() {
+                    dirty = true;
+                }
+            });
+            if anchor != self.island.config.anchor {
+                self.island.config.anchor = anchor;
+                dirty = true;
+            }
+            settings_card_divider(ui, c);
+            let mut width = self.island.config.notch_width;
+            settings_value_row(
+                ui,
+                c,
+                FooterIcon::Sliders,
+                "Resting width",
+                "Auto measures the real notch",
+                180.0,
+                |ui| {
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut width, 0.0..=420.0)
+                                .step_by(2.0)
+                                .custom_formatter(|v, _| {
+                                    if v < 1.0 {
+                                        "Auto".to_string()
+                                    } else {
+                                        format!("{v:.0} pt")
+                                    }
+                                }),
+                        )
+                        .changed()
+                    {
+                        dirty = true;
+                    }
+                },
+            );
+            if (width - self.island.config.notch_width).abs() > f32::EPSILON {
+                self.island.config.notch_width = width;
+                dirty = true;
+            }
+            settings_card_divider(ui, c);
+            let mut rows = self.island.config.clip_rows as u32;
+            settings_value_row(ui, c, FooterIcon::List, "Clips shown", "How many clips the island lists", 120.0, |ui| {
+                if ui.add(egui::Slider::new(&mut rows, 1..=8)).changed() {
+                    dirty = true;
+                }
+            });
+            if rows as usize != self.island.config.clip_rows {
+                self.island.config.clip_rows = rows as usize;
+                dirty = true;
+            }
+        });
+
+        settings_section(ui, c, "Modules");
+        let mut toggle: Option<(clipd_core::IslandModule, bool)> = None;
+        let mut shift: Option<(clipd_core::IslandModule, isize)> = None;
+        settings_card(ui, c, |ui| {
+            for (i, module) in clipd_core::IslandModule::ALL.iter().copied().enumerate() {
+                if i > 0 {
+                    settings_card_divider(ui, c);
+                }
+                let on = self.island.config.has(module);
+                let supported = module.supported();
+                let detail = if supported {
+                    module.detail().to_string()
+                } else {
+                    format!("{} macOS only.", module.detail())
+                };
+                let title = if module.uses_network() {
+                    format!("{}  ·  network", module.label())
+                } else {
+                    module.label().to_string()
+                };
+                ui.add_enabled_ui(supported, |ui| {
+                    settings_value_row(ui, c, FooterIcon::App, &title, &detail, 110.0, |ui| {
+                        if mini_switch(ui, on, c) {
+                            toggle = Some((module, !on));
+                        }
+                        if on {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("▼").size(10.0).color(rgb(c.subtext)),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("Move down")
+                                .clicked()
+                            {
+                                shift = Some((module, 1));
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("▲").size(10.0).color(rgb(c.subtext)),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text("Move up")
+                                .clicked()
+                            {
+                                shift = Some((module, -1));
+                            }
+                        }
+                    });
+                });
+            }
+        });
+        if let Some((module, on)) = toggle {
+            self.island.config.set(module, on);
+            dirty = true;
+        }
+        if let Some((module, delta)) = shift {
+            self.island.config.shift(module, delta);
+            dirty = true;
+        }
+
+        settings_card(ui, c, |ui| {
+            if popover_setting_row(
+                ui,
+                c,
+                FooterIcon::Power,
+                "Restart island",
+                "Recover a wedged window, or move it after a display change",
+                RowControl::Chevron,
+            ) {
+                island::stop_island();
+                island::start_island();
+            }
+        });
+
+        if dirty {
+            clipd_core::save_island_config(&self.island.config);
+            self.island.invalidate();
+        }
+    }
+
+    fn render_settings_appearance(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        settings_section(ui, c, "Layout");
+        settings_card(ui, c, |ui| {
+            settings_card_body(ui, |ui| {
+                ui.label(
+                    RichText::new("Which surface clipd lives in. The hotkey still opens the palette either way.")
+                        .size(11.0)
+                        .color(rgb(c.subtext)),
+                );
+                ui.add_space(8.0);
+                self.render_layout_settings(ui, c);
+            });
+        });
+
+        if self.paste_settings.gui_layout == GuiLayout::Notch {
+            self.render_island_settings(ui, c);
+        }
+
+        settings_section(ui, c, "Theme");
+        settings_card(ui, c, |ui| {
+            settings_card_body(ui, |ui| {
+                ui.label(
+                    RichText::new("Cmd+T cycles themes.")
+                        .size(11.0)
+                        .color(rgb(c.subtext)),
+                );
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
+                    for theme in Theme::ALL {
+                        let tc = theme.colors();
+                        let active = self.theme == theme;
+                        ui.vertical(|ui| {
+                            ui.set_min_width(70.0);
+                            let (rect, resp) =
+                                ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+                            let center = rect.center();
+                            ui.painter().circle_filled(center, 12.0, rgb(tc.bg_base));
+                            if theme.is_glass() {
+                                if let Some((tl, br)) = theme.shell_glows() {
+                                    ui.painter().circle_filled(
+                                        egui::pos2(center.x - 3.5, center.y - 3.0),
+                                        5.0,
+                                        rgba(tl, 210),
+                                    );
+                                    ui.painter().circle_filled(
+                                        egui::pos2(center.x + 3.5, center.y + 3.0),
+                                        5.0,
+                                        rgba(br, 200),
+                                    );
+                                }
+                                ui.painter().circle_stroke(
+                                    center,
+                                    12.0,
+                                    Stroke::new(1.4, Color32::from_rgba_unmultiplied(220, 230, 245, 170)),
+                                );
+                            }
+                            ui.painter().circle_filled(center, 4.5, rgb(tc.green));
+                            ui.painter().circle_stroke(
+                                center,
+                                12.0,
+                                if active {
+                                    Stroke::new(2.0, rgb(c.green))
+                                } else if !theme.is_glass() {
+                                    Stroke::new(1.0, rgb(c.border))
+                                } else {
+                                    Stroke::NONE
+                                },
+                            );
+                            if resp
+                                .on_hover_text(theme.label())
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                self.theme = theme;
+                                save_theme(self.theme);
+                                apply_theme(ui.ctx(), self.theme);
+                            }
+                            ui.label(
+                                RichText::new(theme.label())
+                                    .size(10.0)
+                                    .color(if active { rgb(c.text) } else { rgb(c.subtext) }),
+                            );
+                        });
+                    }
+                });
+            });
+        });
+
+        self.render_custom_colors_settings(ui, c);
+    }
+
+    fn render_settings_privacy(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        let mut dirty = false;
+        settings_section(ui, c, "Protection");
+        settings_card(ui, c, |ui| {
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Lock,
+                &mut self.privacy_config.enabled,
+                "Privacy protection",
+                "Detect secrets and skip excluded apps",
+            );
+        });
+
+        settings_section(ui, c, "Detect");
+        settings_card(ui, c, |ui| {
+            ui.add_enabled_ui(self.privacy_config.enabled, |ui| {
+                dirty |= settings_toggle_row(
+                    ui,
+                    c,
+                    FooterIcon::Key,
+                    &mut self.privacy_config.detect_api_keys,
+                    "API keys",
+                    "Flag copied tokens and credentials that look like keys",
+                );
+                settings_card_divider(ui, c);
+                dirty |= settings_toggle_row(
+                    ui,
+                    c,
+                    FooterIcon::Lock,
+                    &mut self.privacy_config.detect_credentials,
+                    "Passwords & secrets",
+                    "Catch password-like strings before they land in history",
+                );
+                settings_card_divider(ui, c);
+                dirty |= settings_toggle_row(
+                    ui,
+                    c,
+                    FooterIcon::Shield,
+                    &mut self.privacy_config.detect_credit_cards,
+                    "Credit cards",
+                    "Skip PAN-looking numbers",
+                );
+                settings_card_divider(ui, c);
+                dirty |= settings_toggle_row(
+                    ui,
+                    c,
+                    FooterIcon::Shield,
+                    &mut self.privacy_config.detect_ssn,
+                    "SSNs",
+                    "Skip social-security-number patterns",
+                );
+            });
+        });
+
+        settings_section(ui, c, "Excluded apps");
+        settings_card(ui, c, |ui| {
+            let mut remove_app: Option<usize> = None;
+            let apps = self.privacy_config.excluded_apps.clone();
+            if apps.is_empty() {
+                settings_card_copy(
+                    ui,
+                    c,
+                    "None yet",
+                    "Never save copies from these apps.",
+                );
+            } else {
+                for (i, app_name) in apps.iter().enumerate() {
+                    if i > 0 {
+                        settings_card_divider(ui, c);
+                    }
+                    settings_value_row(
+                        ui,
+                        c,
+                        FooterIcon::App,
+                        app_name,
+                        "Copies from this app are not saved",
+                        80.0,
+                        |ui| {
+                            if ui.small_button("Remove").clicked() {
+                                remove_app = Some(i);
+                            }
+                        },
+                    );
+                }
+            }
+            if let Some(i) = remove_app {
+                self.privacy_config.excluded_apps.remove(i);
+                dirty = true;
+            }
+            settings_card_divider(ui, c);
+            settings_card_body(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_excluded_app)
+                            .hint_text("App name…")
+                            .desired_width(220.0),
+                    );
+                    if ui.button("Add").clicked() && !self.new_excluded_app.trim().is_empty() {
+                        self.privacy_config
+                            .excluded_apps
+                            .push(self.new_excluded_app.trim().to_string());
+                        self.new_excluded_app.clear();
+                        dirty = true;
+                    }
+                });
+            });
+        });
+
+        if dirty {
+            save_privacy_config(&self.privacy_config);
+        }
     }
 }
 
@@ -3824,7 +8828,7 @@ impl ClipdGui {
                             };
 
                             egui::Frame::none()
-                                .fill(rgb(c.bg_surface))
+                                .fill(surf(c, c.bg_surface))
                                 .rounding(Rounding::same(10.0))
                                 .inner_margin(Margin::symmetric(12.0, 10.0))
                                 .stroke(Stroke::new(1.0, session_color))
@@ -3845,7 +8849,7 @@ impl ClipdGui {
 
                                         let meta_pill = |ui: &mut egui::Ui, text: &str| {
                                             egui::Frame::none()
-                                                .fill(rgb(c.bg_elevated))
+                                                .fill(surf(c, c.bg_elevated))
                                                 .rounding(Rounding::same(4.0))
                                                 .inner_margin(Margin::symmetric(5.0, 1.0))
                                                 .stroke(Stroke::new(0.5, rgb(c.border)))
@@ -4176,7 +9180,7 @@ impl ClipdGui {
                                     .size(12.0)
                                     .color(rgb(c.text)),
                             )
-                            .fill(rgb(c.bg_elevated))
+                            .fill(surf(c, c.bg_elevated))
                             .rounding(Rounding::same(6.0)),
                         )
                         .clicked()
@@ -4248,7 +9252,7 @@ impl ClipdGui {
                                 });
                             });
 
-                            ui.add_space(10.0);
+                            ui.add_space(6.0);
 
                             let tips = [
                                 ("📋 Copy anything", "HTML, code, JSON, messy text"),
@@ -4341,7 +9345,7 @@ impl ClipdGui {
                                     .fill(if self.paste_settings.enabled {
                                         rgb(c.green)
                                     } else {
-                                        rgb(c.bg_elevated)
+                                        surf(c, c.bg_elevated)
                                     })
                                     .rounding(Rounding::same(12.0))
                                     .stroke(Stroke::new(
@@ -4408,7 +9412,7 @@ impl ClipdGui {
 
                         // Smart mode toggle
                         egui::Frame::none()
-                            .fill(rgb(c.bg_surface))
+                            .fill(surf(c, c.bg_surface))
                             .rounding(Rounding::same(10.0))
                             .inner_margin(Margin::symmetric(14.0, 10.0))
                             .stroke(Stroke::new(
@@ -4515,6 +9519,7 @@ impl ClipdGui {
                                         PaletteTrigger::CmdShiftV,
                                         PaletteTrigger::CtrlOptSpace,
                                         PaletteTrigger::OptSpace,
+                                        PaletteTrigger::Off,
                                     ] {
                                         ui.selectable_value(
                                             &mut self.paste_settings.palette_trigger,
@@ -4654,7 +9659,7 @@ impl ClipdGui {
                                                 *cat_color,
                                             )
                                         } else {
-                                            (rgb(c.bg_surface), rgb(c.border))
+                                            (surf(c, c.bg_surface), rgb(c.border))
                                         };
 
                                         egui::Frame::none()
@@ -4758,7 +9763,7 @@ impl ClipdGui {
                                 // Optional AI step on paste (not the slot HUD — separate feature)
                                 ui.add_space(8.0);
                                 egui::Frame::none()
-                                    .fill(rgb(c.bg_surface))
+                                    .fill(surf(c, c.bg_surface))
                                     .rounding(Rounding::same(10.0))
                                     .inner_margin(Margin::symmetric(14.0, 10.0))
                                     .stroke(Stroke::new(1.0, accent))
@@ -4782,8 +9787,8 @@ impl ClipdGui {
                                         );
                                         ui.label(
                                             RichText::new(
-                                                "Requires api_key in ~/.local/share/clipd/transform.json \
-                                                 (OpenAI-compatible endpoint). Not related to the slot HUD.",
+                                                "Needs an API key — set one under Settings ▸ Ask AI. \
+                                                 Not related to the slot HUD.",
                                             )
                                             .size(10.0)
                                             .color(rgb(c.subtext)),
@@ -4791,7 +9796,7 @@ impl ClipdGui {
                                         ui.add_space(4.0);
 
                                         egui::Frame::none()
-                                            .fill(rgb(c.bg_elevated))
+                                            .fill(surf(c, c.bg_elevated))
                                             .rounding(Rounding::same(8.0))
                                             .inner_margin(Margin::symmetric(8.0, 6.0))
                                             .show(ui, |ui| {
@@ -4927,7 +9932,7 @@ impl ClipdGui {
                                                 egui::Button::new(
                                                     RichText::new("Cancel").size(12.0).color(rgb(c.text)),
                                                 )
-                                                .fill(rgb(c.bg_elevated))
+                                                .fill(surf(c, c.bg_elevated))
                                                 .rounding(Rounding::same(6.0)),
                                             )
                                             .clicked()
@@ -4942,7 +9947,7 @@ impl ClipdGui {
                                                 .size(12.0)
                                                 .color(Color32::from_rgb(255, 100, 100)),
                                         )
-                                        .fill(rgb(c.bg_elevated))
+                                        .fill(surf(c, c.bg_elevated))
                                         .rounding(Rounding::same(6.0))
                                         .stroke(Stroke::new(1.0, Color32::from_rgb(180, 40, 40))),
                                     )
@@ -5001,7 +10006,7 @@ impl ClipdGui {
                     c,
                 );
 
-                ui.add_space(10.0);
+                ui.add_space(6.0);
 
                 egui::CollapsingHeader::new(
                     RichText::new("Other collections")
@@ -5040,7 +10045,7 @@ impl ClipdGui {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             egui::Frame::none()
-                                .fill(rgb(c.bg_elevated))
+                                .fill(surf(c, c.bg_elevated))
                                 .rounding(Rounding::same(CARD_ROUND))
                                 .inner_margin(Margin::symmetric(12.0, 10.0))
                                 .stroke(Stroke::new(0.7, rgb(c.accent).gamma_multiply(0.4)))
@@ -5456,19 +10461,77 @@ impl ClipdGui {
     }
 }
 
-/// The history row's slot column is best-effort metadata and can lose a race
-/// with the clipboard watcher. The dedicated active-slot table is authoritative,
-/// so use it to keep the GUI's slot badges/filter in sync with what will paste.
-fn sync_active_slot_labels(store: &ClipStore, clips: &mut [ClipEntry]) {
-    let active_by_content: std::collections::HashMap<String, u8> = store
-        .list_active_slots()
-        .unwrap_or_default()
-        .into_iter()
+/// Keep the GUI's slot badges/filter in sync with the authoritative
+/// `active_slots` table — and pull slotted clips into the loaded window even
+/// when they fall outside the recent-N history cap (otherwise a slot saved
+/// weeks ago silently vanishes from the palette).
+/// Replace the preview of any clip that holds a secret.
+///
+/// Scanning is cached by clip id. `refresh()` runs every three seconds on the
+/// UI thread and hands this the whole loaded window — 200 clips — and secret
+/// detection is not cheap: it tests 22 key prefixes against every whitespace
+/// word of every clip, then looks for credentials, card numbers and SSNs on
+/// top. Re-deriving that for clips it had already seen stalled all three
+/// windows on a three-second beat.
+///
+/// A clip's content never changes once stored, so a result keyed by id stays
+/// correct for the life of the process.
+fn mask_secret_previews(
+    clips: &mut [ClipEntry],
+    cache: &mut HashMap<i64, Option<String>>,
+) -> HashSet<i64> {
+    let cfg = clipd_core::load_privacy_config();
+    let mut masked = HashSet::new();
+    if !cfg.enabled {
+        cache.clear();
+        return masked;
+    }
+    // Keep the cache near the size of the window it serves; ids that scrolled
+    // out of history are never asked about again.
+    if cache.len() > MAX_LOADED_CLIPS * 4 {
+        cache.clear();
+    }
+    for clip in clips.iter_mut() {
+        let safe = cache
+            .entry(clip.id)
+            .or_insert_with(|| clipd_core::redacted_display(&clip.content, &cfg));
+        if let Some(safe) = safe {
+            clip.preview = safe.clone();
+            masked.insert(clip.id);
+        }
+    }
+    masked
+}
+
+fn sync_active_slot_labels(store: &ClipStore, clips: &mut Vec<ClipEntry>) {
+    let active = store.list_active_slots().unwrap_or_default();
+    let active_by_content: std::collections::HashMap<String, u8> = active
+        .iter()
         .filter(|(slot, _)| *slot > 0)
-        .map(|(slot, content)| (content, slot))
+        .map(|(slot, content)| (content.clone(), *slot))
         .collect();
-    for clip in clips {
+
+    for clip in clips.iter_mut() {
         clip.slot = active_by_content.get(&clip.content).copied();
+    }
+
+    // Pull slotted clips that fell outside the recent-N window back into the
+    // loaded set so badges / the Slots filter still find them. Insert at the
+    // front (by slot number) without reshuffling the rest of history.
+    let present: HashSet<&str> = clips.iter().map(|c| c.content.as_str()).collect();
+    let mut extras: Vec<ClipEntry> = Vec::new();
+    for (slot, content) in &active {
+        if *slot == 0 || present.contains(content.as_str()) {
+            continue;
+        }
+        if let Ok(Some(mut clip)) = store.find_by_content(content) {
+            clip.slot = Some(*slot);
+            extras.push(clip);
+        }
+    }
+    extras.sort_by_key(|c| c.slot.unwrap_or(u8::MAX));
+    for (i, clip) in extras.into_iter().enumerate() {
+        clips.insert(i, clip);
     }
 }
 
@@ -5510,7 +10573,7 @@ fn pin_group_index(content: &str) -> usize {
         ContentType::Url => 0,
         ContentType::Code => 1,
         ContentType::Text => 2,
-        ContentType::Path => 3,
+        ContentType::Path | ContentType::File => 3,
         ContentType::Email => 4,
         ContentType::Image | ContentType::Unknown => 5,
     }
@@ -5535,6 +10598,7 @@ fn collection_item_icon(kind: &ContentType) -> &'static str {
         ContentType::Path => "PATH",
         ContentType::Text => "TXT",
         ContentType::Image => "IMG",
+        ContentType::File => "FILE",
         ContentType::Unknown => "...",
     }
 }
@@ -5589,6 +10653,8 @@ fn render_preview(
     thumb: Option<egui::TextureHandle>,
     actions: &[CustomAction],
     action_status: Option<(bool, String)>,
+    job: &TransformJob,
+    can_ai: bool,
     action: &mut Action,
     c: &clipd_core::ThemeColors,
 ) {
@@ -5602,7 +10668,7 @@ fn render_preview(
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             egui::Frame::none()
-                .fill(rgb(c.bg_elevated))
+                .fill(surf(c, c.bg_elevated))
                 .rounding(Rounding::same(6.0))
                 .inner_margin(Margin::symmetric(8.0, 3.0))
                 .show(ui, |ui| {
@@ -5615,6 +10681,97 @@ fn render_preview(
         });
     });
     ui.add_space(10.0);
+
+    // ── Smart Recommend: what clipd offers to do with THIS clip ──
+    //
+    // This row is the whole point of the affordance work. The capabilities
+    // already existed; without a chip sitting next to the content nobody ever
+    // found them.
+    let suggestions = clipd_core::suggest_for(clip);
+    if !suggestions.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            for (idx, s) in suggestions
+                .iter()
+                .take(clipd_core::VISIBLE_SUGGESTIONS)
+                .enumerate()
+            {
+                // A model-backed chip with no key configured stays visible but
+                // disabled — showing what clipd *could* do is the nudge to go
+                // set a key, whereas hiding it teaches nothing.
+                let usable = !s.needs_ai || can_ai;
+                let chip = glass_chip(ui, s.icon, s.label, false, usable && !job.running, c);
+                if chip.clicked() {
+                    *action = Action::RunSuggestion(idx);
+                }
+                if usable {
+                    chip.on_hover_text(match &s.kind {
+                        clipd_core::SuggestionKind::Ask(q) => format!("Ask: {}", q),
+                        clipd_core::SuggestionKind::Transform(t) => t.label().to_string(),
+                    });
+                } else {
+                    chip.on_hover_text("Needs an API key — set one in Settings");
+                }
+            }
+        });
+        ui.add_space(8.0);
+    }
+
+    // ── Result of the last Smart Recommend run ──
+    if job.running {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("{}…", job.label))
+                    .size(11.5)
+                    .color(rgb(c.subtext)),
+            );
+        });
+        ui.add_space(8.0);
+    } else if let Some(result) = &job.result {
+        let (body, ok) = match result {
+            Ok(text) => (text.clone(), true),
+            Err(e) => (e.clone(), false),
+        };
+        egui::Frame::none()
+            .fill(surf(c, c.bg_elevated))
+            .rounding(Rounding::same(CARD_ROUND))
+            .inner_margin(Margin::symmetric(10.0, 8.0))
+            .stroke(Stroke::new(
+                0.7,
+                if ok {
+                    rgb(c.accent).gamma_multiply(0.4)
+                } else {
+                    rgb(c.overlay)
+                },
+            ))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(&job.label)
+                        .size(10.0)
+                        .strong()
+                        .color(rgb(c.subtext)),
+                );
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("suggestion_result")
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(&body).size(12.0).color(rgb(c.text)));
+                    });
+                if ok {
+                    ui.add_space(6.0);
+                    if glass_chip(ui, "📋", "Copy result", false, true, c).clicked() {
+                        if let Ok(mut cb) = Clipboard::new() {
+                            let _ = cb.set_text(body.clone());
+                        }
+                    }
+                }
+            });
+        ui.add_space(8.0);
+    }
 
     // ── Content box: fixed-height inset card; everything below it (meta,
     // actions, buttons) keeps a stable position at the bottom of the pane. ──
@@ -5654,8 +10811,7 @@ fn render_preview(
                             let scale = (avail / size.x).min(1.6);
                             let draw = egui::vec2(size.x * scale, size.y * scale);
                             ui.add(
-                                egui::Image::new((tex.id(), draw))
-                                    .rounding(Rounding::same(8.0)),
+                                egui::Image::new((tex.id(), draw)).rounding(Rounding::same(8.0)),
                             );
                         } else {
                             ui.label(
@@ -5665,7 +10821,7 @@ fn render_preview(
                             );
                         }
                         let ocr = clip.ocr_text.as_deref().map(str::trim).unwrap_or("");
-                        ui.add_space(10.0);
+                        ui.add_space(6.0);
                         if ocr.is_empty() {
                             ui.label(
                                 RichText::new("No text recognized.")
@@ -5680,7 +10836,7 @@ fn render_preview(
                                     .strong()
                                     .color(rgb(c.accent)),
                             );
-                            ui.add_space(3.0);
+                        ui.add_space(2.0);
                             ui.label(
                                 RichText::new(ocr)
                                     .font(FontId::monospace(12.5))
@@ -5733,7 +10889,7 @@ fn render_preview(
             for (i, a) in &enabled {
                 let btn = ui.add(
                     egui::Button::new(RichText::new(&a.name).size(11.0).color(rgb(c.text)))
-                        .fill(rgb(c.bg_elevated))
+                        .fill(surf(c, c.bg_elevated))
                         .rounding(Rounding::same(7.0))
                         .stroke(Stroke::new(0.6, rgb(c.border))),
                 );
@@ -5777,7 +10933,7 @@ fn render_preview(
         let pin = ui.add_sized(
             [pin_w, 36.0],
             egui::Button::new(RichText::new(pin_label).size(12.0).color(rgb(c.text)))
-                .fill(rgb(c.bg_elevated))
+                .fill(surf(c, c.bg_elevated))
                 .rounding(Rounding::same(10.0))
                 .stroke(Stroke::new(0.6, rgb(c.border))),
         );
@@ -5875,7 +11031,7 @@ fn render_ask_panel(
 
     if let Some(err) = &ask.error {
         egui::Frame::none()
-            .fill(rgb(c.bg_elevated))
+            .fill(surf(c, c.bg_elevated))
             .rounding(Rounding::same(CARD_ROUND))
             .inner_margin(Margin::symmetric(12.0, 10.0))
             .show(ui, |ui| {
@@ -5920,25 +11076,39 @@ fn render_ask_panel(
                     .italics()
                     .color(rgb(c.subtext)),
             );
-            ui.add_space(10.0);
+            ui.add_space(6.0);
 
             if answer.retrieval_only {
                 egui::Frame::none()
-                    .fill(rgb(c.bg_elevated))
+                    .fill(surf(c, c.bg_elevated))
                     .rounding(Rounding::same(CARD_ROUND))
                     .inner_margin(Margin::symmetric(12.0, 10.0))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(
                             RichText::new(
-                                "No API key set — these are the clips clipd found, ranked. \
-                                 Nothing left your machine.",
+                                "No model configured — these are the clips clipd found, \
+                                 ranked. Nothing left your machine.",
                             )
                             .size(11.5)
                             .color(rgb(c.subtext)),
                         );
+                        ui.add_space(6.0);
+                        // The single most common reason Ask looks broken, so make
+                        // the fix reachable from where the user notices it.
+                        if ui
+                            .button(
+                                RichText::new("Set up a model in Settings")
+                                    .size(11.5)
+                                    .color(rgb(c.accent)),
+                            )
+                            .on_hover_text("Use an API key, or a local model that needs none")
+                            .clicked()
+                        {
+                            *action = Action::OpenAiSettings;
+                        }
                     });
-                ui.add_space(10.0);
+                ui.add_space(6.0);
             } else {
                 // Prose with inline, clickable citations.
                 ui.horizontal_wrapped(|ui| {
@@ -5946,9 +11116,7 @@ fn render_ask_panel(
                     for part in split_citations(&answer.answer) {
                         match part {
                             AnswerPart::Text(text) => {
-                                ui.label(
-                                    RichText::new(text).size(13.0).color(rgb(c.text)),
-                                );
+                                ui.label(RichText::new(text).size(13.0).color(rgb(c.text)));
                             }
                             AnswerPart::Citation(id) => {
                                 let chip = ui.add(
@@ -5957,12 +11125,9 @@ fn render_ask_panel(
                                             .size(11.0)
                                             .color(rgb(c.accent)),
                                     )
-                                    .fill(rgb(c.bg_elevated))
+                                    .fill(surf(c, c.bg_elevated))
                                     .rounding(Rounding::same(PILL_ROUND))
-                                    .stroke(Stroke::new(
-                                        0.7,
-                                        rgb(c.accent).gamma_multiply(0.5),
-                                    )),
+                                    .stroke(Stroke::new(0.7, rgb(c.accent).gamma_multiply(0.5))),
                                 );
                                 if chip.clicked() {
                                     *action = Action::JumpToClip(id);
@@ -6030,11 +11195,7 @@ fn render_ask_panel(
 
             if !answer.retrieval_only {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Confidence")
-                            .size(10.5)
-                            .color(rgb(c.subtext)),
-                    );
+                    ui.label(RichText::new("Confidence").size(10.5).color(rgb(c.subtext)));
                     ui.label(
                         RichText::new(answer.confidence.label())
                             .size(11.0)
@@ -6082,7 +11243,7 @@ fn render_ask_panel(
                 .on_hover_text("The model cited clip ids that were never in its context");
             }
 
-            ui.add_space(10.0);
+            ui.add_space(6.0);
         });
 }
 
@@ -6098,7 +11259,7 @@ fn render_source_row(
     c: &clipd_core::ThemeColors,
 ) {
     let row = egui::Frame::none()
-        .fill(rgb(c.bg_elevated))
+        .fill(surf(c, c.bg_elevated))
         .rounding(Rounding::same(PILL_ROUND))
         .inner_margin(Margin::symmetric(10.0, 7.0))
         .show(ui, |ui| {
@@ -6241,6 +11402,109 @@ mod tests {
         assert_eq!(ask_query("?"), None, "bare ? is not yet a question");
         assert_eq!(ask_query("?   "), None);
         assert_eq!(ask_query("stripe"), None, "plain search is not ask mode");
+    }
+
+    #[test]
+    fn theme_switch_accepts_curated_and_legacy_names() {
+        assert_eq!(theme_named("dark"), Some(Theme::Dark));
+        assert_eq!(theme_named("black"), Some(Theme::Dark));
+        assert_eq!(theme_named("mac_black"), Some(Theme::Dark));
+        assert_eq!(theme_named("midnight"), Some(Theme::Midnight));
+        assert_eq!(theme_named("forest"), Some(Theme::Forest));
+        assert_eq!(theme_named("cocoa"), Some(Theme::Slate));
+        assert_eq!(theme_named("slate"), Some(Theme::Slate));
+        assert_eq!(theme_named("paper-light"), Some(Theme::Light));
+        assert_eq!(theme_named("paper-dark"), Some(Theme::Dark));
+        assert_eq!(theme_named("light-minimal"), Some(Theme::Light));
+        // `catppuccin` used to fall back to Dark, from when no such theme
+        // existed. It does now, and a config asking for it by name should get
+        // the real thing rather than a stand-in.
+        assert_eq!(theme_named("catppuccin"), Some(Theme::Catppuccin));
+        assert_eq!(theme_named("mocha"), Some(Theme::Catppuccin));
+        // The other retired names still land somewhere readable.
+        assert_eq!(theme_named("nord"), Some(Theme::Dark));
+        assert_eq!(theme_named("dracula"), Some(Theme::Dark));
+    }
+
+    #[test]
+    fn a_window_opened_at_the_cursor_stays_below_the_island() {
+        let screen = Some(egui::vec2(1280.0, 832.0));
+        let size = egui::vec2(420.0, 360.0);
+        // The gear that opens Settings lives *in* the island, so the pointer
+        // is near the top of the screen when the window is placed.
+        let at_the_notch = egui::pos2(640.0, 40.0);
+        let pos = window_pos_at_cursor(at_the_notch, size, screen);
+        if clipd_core::island_layout_active() {
+            assert!(
+                pos.y >= clipd_core::ISLAND_RESERVED_TOP,
+                "opened at {} — inside the island's band",
+                pos.y
+            );
+        }
+        // Whatever the layout, the window stays fully on the display.
+        assert!(pos.x >= 8.0 && pos.x + size.x <= 1280.0);
+        assert!(pos.y + size.y <= 832.0);
+    }
+
+    #[test]
+    fn letter_slot_help_matches_the_platform_that_ships_it() {
+        let rows = letter_slot_bindings();
+        assert!(!rows.is_empty(), "the chords are undiscoverable without this");
+
+        let keys: String = rows.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(" | ");
+        if cfg!(target_os = "windows") {
+            // Windows deliberately binds no direct Win/Ctrl/Alt letter chords —
+            // they collide with OS shortcuts, browser menus and AltGr layouts —
+            // so A–Z goes through the Ctrl+` leader instead.
+            assert!(keys.contains("Ctrl+`"), "Windows routes letters through the leader");
+            assert!(
+                !keys.contains("Option"),
+                "Option is not a Windows modifier: {keys}"
+            );
+        } else {
+            // Both leaders are named, whether on one row or two.
+            assert!(keys.contains("Ctrl+Option+C"), "the copy leader");
+            assert!(
+                keys.contains("Ctrl+Option+V") || keys.contains("Ctrl+Option+C / V"),
+                "the paste leader must be named: {keys}"
+            );
+            // Copy has a double-tap form; paste deliberately does not, because
+            // ⌘V ×2 already means slot 2 and a paste cannot be taken back.
+            // Letter slots must not borrow the numeric multi-tap keys. A
+            // gesture built on ⌘C or ⌘V can always be mistaken for a slot
+            // count, whichever way the timing is tuned.
+            assert!(
+                !keys.contains("\u{2318}C \u{2318}C") && !keys.contains("\u{2318}V \u{2318}V"),
+                "letter slots must stay off the numeric keys: {keys}"
+            );
+            // The gesture must not be built on a key that types something.
+            // Option+C emits ç and Option+V emits √, so a missed swallow puts
+            // a character in the user's document.
+            // Never build a letter gesture on plain Option+letter: Option+C
+            // emits ç and Option+V emits √, so a missed swallow types into the
+            // user's document. Cmd in the chord suppresses that.
+            assert!(
+                !keys.contains("Option+C  Option+C") && !keys.contains("Option+V  Option+V"),
+                "letter gestures must not use keys that emit characters: {keys}"
+            );
+            assert!(keys.contains("Cmd+Option+C"), "letter copy leader");
+            assert!(keys.contains("Cmd+Option+V"), "letter paste leader");
+            // The two-key path leads, because it is the one worth learning.
+            assert!(
+                rows[0].0.starts_with("\u{2318}C \u{2318}C"),
+                "the shortest path should be first, got {}",
+                rows[0].0
+            );
+            assert!(!keys.contains("Ctrl+`"), "that leader is Windows-only");
+        }
+        // Every row explains itself; a bare chord list teaches nothing.
+        assert!(rows.iter().all(|(_, what)| !what.trim().is_empty()));
+    }
+
+    #[test]
+    fn theme_switch_reports_unknown_names() {
+        let args = vec!["clipd-gui".into(), "--set-theme".into(), "neon".into()];
+        assert!(requested_theme(&args).expect("theme flag").is_err());
     }
 
     #[test]

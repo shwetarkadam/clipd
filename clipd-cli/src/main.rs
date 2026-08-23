@@ -139,6 +139,52 @@ enum Commands {
         action: SnippetAction,
     },
 
+    /// Send a clip to your other Mac
+    ///
+    /// With one other Mac signed into the same Apple ID there's nothing to
+    /// choose, so `clipd send` on its own sends what you just copied.
+    Send {
+        /// Which Mac to send to (name or id). Omit when you only have one.
+        target: Option<String>,
+
+        /// Send clip #ID from history instead of the current clipboard
+        #[arg(long)]
+        id: Option<i64>,
+
+        /// Send these files instead of the clipboard
+        #[arg(long, num_args = 1..)]
+        file: Vec<std::path::PathBuf>,
+
+        /// Take back the last send, if the other Mac hasn't collected it yet
+        #[arg(long)]
+        undo: bool,
+    },
+
+    /// Pair with another machine on this network (run on both, at the same time)
+    Pair,
+
+    /// Stop trusting a paired machine
+    Unpair {
+        /// Machine to forget (name or id). Omit to list what's paired.
+        target: Option<String>,
+    },
+
+    /// List the Macs clipd can send to
+    Devices,
+
+    /// Show or set the folder clipd syncs through
+    ///
+    /// Defaults to iCloud Drive, but any folder both machines can see works —
+    /// a mounted network share, a USB stick, Dropbox, Syncthing.
+    SyncRoot {
+        /// Folder to use. Omit to show the current one.
+        path: Option<String>,
+
+        /// Go back to the default (iCloud Drive)
+        #[arg(long)]
+        reset: bool,
+    },
+
     /// Check for updates (or update in-place)
     Update,
 }
@@ -180,6 +226,31 @@ enum VaultAction {
         /// The password. If omitted, read from stdin (safer — keeps it out of shell history).
         #[arg(long)]
         password: Option<String>,
+    },
+    /// List the passwords clipd has saved to the system store
+    List,
+    /// Copy a saved password to the clipboard (auto-clears after 30s)
+    Copy {
+        /// Row number from `clipd vault list`, or part of the entry's name
+        which: String,
+        /// Print the password to stdout instead of copying it
+        #[arg(long)]
+        show: bool,
+        /// Leave the password on the clipboard instead of clearing it
+        #[arg(long)]
+        keep: bool,
+    },
+    /// Give a saved password a meaningful name
+    Rename {
+        /// Row number from `clipd vault list`, or part of the entry's name
+        which: String,
+        /// The new name
+        name: String,
+    },
+    /// Delete a saved password from the system store
+    Rm {
+        /// Row number from `clipd vault list`, or part of the entry's name
+        which: String,
     },
 }
 
@@ -316,6 +387,35 @@ fn main() {
 
         Some(Commands::Snippet { action }) => {
             cmd_snippet(action);
+        }
+
+        Some(Commands::Send {
+            target,
+            id,
+            file,
+            undo,
+        }) => {
+            if undo {
+                cmd_send_undo();
+            } else {
+                cmd_send(target.as_deref(), id, &file);
+            }
+        }
+
+        Some(Commands::Pair) => {
+            cmd_pair();
+        }
+
+        Some(Commands::Unpair { target }) => {
+            cmd_unpair(target.as_deref());
+        }
+
+        Some(Commands::Devices) => {
+            cmd_devices();
+        }
+
+        Some(Commands::SyncRoot { path, reset }) => {
+            cmd_sync_root(path.as_deref(), reset);
         }
 
         Some(Commands::Update) => {
@@ -491,6 +591,150 @@ fn cmd_vault(action: VaultAction) {
                     std::process::exit(1);
                 }
             }
+        }
+
+        VaultAction::List => {
+            let secrets = vault_list();
+            if secrets.is_empty() {
+                println!("  🔐 No saved passwords yet.");
+                println!("     clipd offers to save one whenever it detects a password on the clipboard.");
+                return;
+            }
+            println!("  🔐 Saved passwords ({}):\n", secrets.len());
+            for (i, s) in secrets.iter().enumerate() {
+                let when = s
+                    .saved_at
+                    .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                    .map(|dt| {
+                        dt.with_timezone(&chrono::Local)
+                            .format("%b %-d, %Y %-I:%M %p")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "unknown date".into());
+                println!("  {:>3}. {}", i + 1, s.title);
+                println!("       {}", when);
+            }
+            println!("\n  Copy one with:  clipd vault copy <number>");
+        }
+
+        VaultAction::Copy { which, show, keep } => {
+            let secret = vault_pick(&which);
+            let password = match clipd_core::reveal_secret(&secret) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("  ❌ {e}");
+                    std::process::exit(1);
+                }
+            };
+            if show {
+                println!("{password}");
+                return;
+            }
+            // Blocking, not backgrounded: a wipe thread would die the moment
+            // this command exits, leaving the password on the clipboard.
+            let clear_after = if keep {
+                Some(std::time::Duration::ZERO)
+            } else {
+                None
+            };
+            let title = secret.title.clone();
+            let announce = || {
+                if keep {
+                    println!("  ✅ Copied “{title}” — it will stay on the clipboard.");
+                } else {
+                    println!(
+                        "  ✅ Copied “{title}” — paste it now; clearing in {}s (Ctrl+C to keep it).",
+                        clipd_core::DEFAULT_CLEAR_AFTER.as_secs()
+                    );
+                }
+            };
+            if let Err(e) = clipd_core::copy_secret_blocking(&password, clear_after, announce) {
+                eprintln!("  ❌ {e}");
+                std::process::exit(1);
+            }
+            if !keep {
+                println!("  🧹 Clipboard cleared.");
+            }
+        }
+
+        VaultAction::Rename { which, name } => {
+            let secret = vault_pick(&which);
+            match clipd_core::rename_secret(&secret, &name) {
+                Ok(()) => println!("  ✅ Renamed “{}” to “{}”.", secret.title, name.trim()),
+                Err(e) => {
+                    eprintln!("  ❌ {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        VaultAction::Rm { which } => {
+            let secret = vault_pick(&which);
+            match clipd_core::forget_secret(&secret) {
+                Ok(()) => println!("  ✅ Deleted “{}”.", secret.title),
+                Err(e) => {
+                    eprintln!("  ❌ {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+fn vault_list() -> Vec<clipd_core::SecretRef> {
+    match clipd_core::list_secrets() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("  ❌ {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Resolve a user-supplied selector — a row number from `vault list`, or a
+/// case-insensitive fragment of the entry's name — to exactly one secret.
+/// Exits with an explanation rather than guessing when the choice is unclear.
+fn vault_pick(which: &str) -> clipd_core::SecretRef {
+    let secrets = vault_list();
+    if secrets.is_empty() {
+        eprintln!("  ❌ No saved passwords yet.");
+        std::process::exit(1);
+    }
+
+    if let Ok(n) = which.trim().parse::<usize>() {
+        return match secrets.get(n.wrapping_sub(1)) {
+            Some(s) if n >= 1 => s.clone(),
+            _ => {
+                eprintln!(
+                    "  ❌ There's no row {n} — `clipd vault list` shows {}.",
+                    match secrets.len() {
+                        1 => "1 password".to_string(),
+                        n => format!("{n} passwords"),
+                    }
+                );
+                std::process::exit(1);
+            }
+        };
+    }
+
+    let needle = which.trim().to_lowercase();
+    let matches: Vec<_> = secrets
+        .iter()
+        .filter(|s| s.title.to_lowercase().contains(&needle))
+        .collect();
+    match matches.len() {
+        1 => matches[0].clone(),
+        0 => {
+            eprintln!("  ❌ Nothing saved matches “{which}”. Try `clipd vault list`.");
+            std::process::exit(1);
+        }
+        n => {
+            eprintln!("  ❌ “{which}” matches {n} saved passwords:");
+            for m in &matches {
+                eprintln!("       {}", m.title);
+            }
+            eprintln!("     Use the row number from `clipd vault list` instead.");
+            std::process::exit(1);
         }
     }
 }
@@ -973,6 +1217,316 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
             .collect()
     };
     parse(latest) > parse(current)
+}
+
+/// `clipd send` — put a clip on another Mac.
+fn cmd_send(target: Option<&str>, id: Option<i64>, files: &[std::path::PathBuf]) {
+    let clip = match build_clip_to_send(id, files) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match clipd_core::sync::send_clip(&clip, target) {
+        Ok(device) => {
+            println!("📤 Sent to {} — {}", device.name, clip.preview);
+            // The other Mac's daemon has to be running to collect it; say so
+            // once rather than leaving someone watching a folder.
+            println!("   It'll appear in clipd on that Mac within a few seconds.");
+            println!("   Wrong Mac? `clipd send --undo` takes it back.");
+        }
+        Err(e) => {
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Work out what `clipd send` is actually sending: explicit files, a clip from
+/// history, or whatever is on the clipboard right now.
+fn build_clip_to_send(
+    id: Option<i64>,
+    files: &[std::path::PathBuf],
+) -> Result<clipd_core::ClipEntry, String> {
+    if !files.is_empty() {
+        if let Some(missing) = files.iter().find(|p| !p.exists()) {
+            return Err(format!("{} doesn't exist.", missing.display()));
+        }
+        let refs = clipd_core::save_files(files);
+        if refs.is_empty() {
+            return Err("None of those files could be read.".into());
+        }
+        return Ok(clipd_core::ClipEntry::new_files(refs, None));
+    }
+
+    if let Some(id) = id {
+        let store = ClipStore::new(&ClipStore::default_path())
+            .map_err(|e| format!("Couldn't open the clip store: {e}"))?;
+        return store
+            .get_by_id(id)
+            .map_err(|_| format!("No clip #{id} in history."));
+    }
+
+    // Nothing named: send what's on the clipboard. Files first, for the same
+    // reason the watcher checks them first — a Finder copy also carries text.
+    let copied = clipd_core::clipboard_read_file_urls();
+    if !copied.is_empty() {
+        let refs = clipd_core::save_files(&copied);
+        if refs.is_empty() {
+            return Err("The copied files couldn't be read.".into());
+        }
+        return Ok(clipd_core::ClipEntry::new_files(refs, None));
+    }
+
+    match clipd_core::clipboard_read_text() {
+        Some(text) if !text.trim().is_empty() => Ok(clipd_core::ClipEntry::new(text, None, None)),
+        _ => Err("Nothing on the clipboard to send. Copy something first, \
+                  or use --id to send from history."
+            .into()),
+    }
+}
+
+/// `clipd send --undo` — take back the last send.
+fn cmd_send_undo() {
+    match clipd_core::sync::recall_last() {
+        Ok((last, true)) => {
+            println!("↩️  Took it back before {} picked it up.", last.device_name);
+        }
+        Ok((last, false)) => {
+            println!("⚠️  Too late — {} already has it.", last.device_name);
+            println!("   Delete it from clipd on that Mac if it shouldn't be there.");
+        }
+        Err(e) => {
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `clipd pair` — trust another machine on this network.
+fn cmd_pair() {
+    use std::io::Write;
+
+    println!("Pairing this machine: {}", clipd_core::device_name());
+    println!();
+    println!("Run `clipd pair` on the other machine too, now.");
+    println!("Looking for it on the network…");
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let offer = match clipd_core::lan_pair::discover_and_exchange(stop) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!();
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
+    };
+
+    println!();
+    println!("  Found: {}", offer.name);
+    println!();
+    println!("      ┌────────────┐");
+    println!("      │   {}   │", offer.confirmation_code);
+    println!("      └────────────┘");
+    println!();
+    // The comparison is the security. Say so, rather than implying the number
+    // is a password to be typed somewhere.
+    println!("This exact code must be showing on {} right now.", offer.name);
+    println!("If the two don't match, something is intercepting — answer no.");
+    println!();
+    print!("Do the codes match? [y/N] ");
+    let _ = std::io::stdout().flush();
+
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        eprintln!("❌ Couldn't read your answer — nothing was paired.");
+        std::process::exit(1);
+    }
+    if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+        println!();
+        println!("Cancelled. Nothing was paired.");
+        std::process::exit(1);
+    }
+
+    match offer.accept() {
+        Ok(()) => {
+            println!();
+            println!("✅ Paired with {}.", offer.name);
+            println!("   Copy something, then press Ctrl+Shift+S to send it there.");
+        }
+        Err(e) => {
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `clipd unpair` — stop trusting a machine.
+fn cmd_unpair(target: Option<&str>) {
+    let paired = clipd_core::lan_identity::trusted_peers();
+
+    let Some(target) = target.map(str::trim).filter(|t| !t.is_empty()) else {
+        if paired.is_empty() {
+            println!("No machines are paired with this one.");
+            println!("Run `clipd pair` on both machines to pair.");
+            return;
+        }
+        println!("Paired machines:");
+        for p in paired.values() {
+            println!(
+                "  {} · paired {}",
+                p.name,
+                p.paired_at.format("%-d %b %Y")
+            );
+        }
+        println!();
+        println!("Forget one with: clipd unpair <name>");
+        return;
+    };
+
+    let peer = match clipd_core::lan_identity::resolve_trusted(target) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match clipd_core::lan_identity::forget_peer(&peer.device_id) {
+        Ok(true) => {
+            println!("✅ Forgot {}.", peer.name);
+            println!("   It can no longer send clips here, and this machine can't send to it.");
+            println!("   Run `clipd pair` on both to set it up again.");
+        }
+        // resolve_trusted just found it, so this means something else removed
+        // it in between — worth saying rather than claiming success.
+        Ok(false) => println!("{} was already forgotten.", peer.name),
+        Err(e) => {
+            eprintln!("❌ {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `clipd sync-root` — show or set the folder clipd syncs through.
+fn cmd_sync_root(path: Option<&str>, reset: bool) {
+    if reset {
+        match clipd_core::devices::save_sync_root(None) {
+            Ok(()) => println!("✅ Back to the default (iCloud Drive)."),
+            Err(e) => {
+                eprintln!("❌ {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if let Some(path) = path {
+        match clipd_core::devices::save_sync_root(Some(std::path::Path::new(path))) {
+            Ok(()) => {
+                println!("✅ clipd now syncs through {path}");
+                println!("   Set the same folder on your other machine, then run `clipd devices`.");
+                println!("   Restart clipd so the daemon picks it up.");
+            }
+            Err(e) => {
+                eprintln!("❌ {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    match clipd_core::sync_root() {
+        Some(root) => {
+            let source = if std::env::var_os("CLIPD_SYNC_ROOT").is_some() {
+                "from CLIPD_SYNC_ROOT"
+            } else if clipd_core::devices::load_sync_root().is_some() {
+                "chosen with `clipd sync-root <path>`"
+            } else {
+                "default (iCloud Drive)"
+            };
+            println!("Syncing through: {}", root.display());
+            println!("  {source}");
+            if !root.exists() {
+                println!("  ⚠️  That folder doesn't exist yet — it'll be created on first use.");
+            }
+        }
+        None => {
+            println!("No sync folder set, and iCloud Drive is off.");
+            println!();
+            println!("Pick any folder both machines can see:");
+            println!("  clipd sync-root /Volumes/shared/clipd");
+        }
+    }
+}
+
+/// `clipd devices` — the Macs this one can send to.
+fn cmd_devices() {
+    let me = clipd_core::this_device();
+    println!("This machine: {} ({})", me.name, &me.id[..6]);
+
+    let reachable = clipd_core::sync::reachable_devices();
+    if reachable.is_empty() {
+        println!();
+        println!("No other machines found.");
+        println!();
+        println!("Over the network: run clipd on the other machine, on the same Wi-Fi,");
+        println!("  then `clipd pair` on both.");
+        println!("Through a folder: set the same folder on both with `clipd sync-root`.");
+        return;
+    }
+
+    let trusted = clipd_core::lan_identity::trusted_peers();
+    println!();
+    println!("Can send to:");
+    for r in &reachable {
+        let route = match (&r.lan, r.via_folder) {
+            (Some(addr), true) => format!("network ({addr}) + folder"),
+            (Some(addr), false) => format!("network ({addr})"),
+            (None, _) => "folder".to_string(),
+        };
+        // A machine on the network that hasn't been paired can be seen but not
+        // sent to, which is confusing unless it is spelled out.
+        let needs_pairing = r.lan.is_some() && !trusted.contains_key(&r.device_id);
+        println!("  {} · {route}", r.name);
+        if needs_pairing {
+            println!("      ⚠️  not paired yet — run `clipd pair` on both machines");
+        }
+    }
+
+    let sendable: Vec<&clipd_core::sync::Reachable> = reachable
+        .iter()
+        .filter(|r| r.via_folder || trusted.contains_key(&r.device_id))
+        .collect();
+    if sendable.len() == 1 {
+        println!();
+        println!("`clipd send` goes to {} — no need to name it.", sendable[0].name);
+    }
+
+    // Keep the last-seen detail available for the folder transport, where
+    // "when did that machine last check in" is the only liveness signal.
+    if let Some(root) = clipd_core::sync_root() {
+        let folder_peers = clipd_core::peers(&root);
+        if !folder_peers.is_empty() {
+            println!();
+            println!("Folder check-ins:");
+            for d in &folder_peers {
+                let ago = Utc::now() - d.last_seen;
+                let seen = if ago < Duration::minutes(2) {
+                    "now".to_string()
+                } else if ago < Duration::hours(1) {
+                    format!("{}m ago", ago.num_minutes())
+                } else if ago < Duration::days(1) {
+                    format!("{}h ago", ago.num_hours())
+                } else {
+                    format!("{}d ago", ago.num_days())
+                };
+                println!("  {} · {seen}", d.name);
+            }
+        }
+    }
 }
 
 fn cmd_update() {
