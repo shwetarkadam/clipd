@@ -199,7 +199,29 @@ PLISTEOF
   ok "Auto-start configured (LaunchAgent)"
 }
 
+# Stop anything already running before we replace it.
+#
+# clipd is a resident menu-bar agent. Copying a new build over the old one
+# does not disturb the running processes, so the tray icon, the island and the
+# popover all keep serving the previous version — and an update looks like it
+# did nothing at all. The LaunchAgent brings the new build straight back up.
+stop_running_clipd() {
+  local found=0
+  for proc in clipd-ui clipd-gui clipd-hud clipd-overlay; do
+    if pgrep -x "$proc" >/dev/null 2>&1; then
+      found=1
+      pkill -x "$proc" 2>/dev/null || true
+    fi
+  done
+  if [ "$found" = "1" ]; then
+    # Give the agent a moment to release its lock files and tray item.
+    sleep 1
+    ok "Stopped the running Clipd"
+  fi
+}
+
 install_macos() {
+  stop_running_clipd
   if [ -d "$SRC/Clipd.app" ]; then
     if sudo rm -rf "/Applications/Clipd.app" 2>/dev/null && sudo cp -R "$SRC/Clipd.app" "/Applications/" 2>/dev/null; then
       ok "Copied Clipd.app → /Applications/"
@@ -241,7 +263,8 @@ install_macos() {
   echo ""
   echo "  Next steps:"
   if [ -n "$APP_PATH" ]; then
-    echo "    1. Open Clipd from Applications or Spotlight"
+    echo "    1. Open Clipd from Applications or Spotlight
+       (any previously running copy was stopped, so this launches the new one)"
   fi
   echo "    2. macOS will ask for permissions — grant them:"
   echo "       - Accessibility (System Settings → Privacy & Security → Accessibility)"
