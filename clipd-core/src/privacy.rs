@@ -26,6 +26,19 @@ impl SensitiveKind {
             Self::ExcludedApp => "Excluded App",
         }
     }
+
+    /// True for the credential kinds a person means by "API key".
+    ///
+    /// Deliberately narrower than "sensitive": a credit card and an SSN are
+    /// both secrets worth hiding, but nobody goes looking for them under a
+    /// filter called API keys. Tokens and private keys do belong — they are
+    /// the same thing wearing a different name.
+    pub fn is_api_key(&self) -> bool {
+        matches!(
+            self,
+            Self::ApiKey(_) | Self::AwsKey | Self::PrivateKey | Self::JwtToken
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -440,6 +453,31 @@ mod tests {
 
     fn cfg() -> PrivacyConfig {
         PrivacyConfig::default()
+    }
+
+    #[test]
+    fn the_api_key_filter_takes_keys_and_leaves_the_rest_of_the_secrets() {
+        // The "API keys" category asks this question of every clip, so what
+        // counts has to be narrower than "sensitive". A card number and an SSN
+        // are secrets worth redacting and are not what anyone is looking for
+        // under that filter; tokens and private keys are.
+        let is_key = |content: &str| {
+            detect_sensitive(content, &cfg())
+                .iter()
+                .any(|m| m.kind.is_api_key())
+        };
+
+        assert!(is_key("sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCD"));
+        assert!(is_key("AKIAIOSFODNN7EXAMPLE"));
+        assert!(is_key(
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
+        ));
+
+        // Detected as sensitive, deliberately not collected here.
+        assert!(!is_key("4111 1111 1111 1111"));
+        assert!(!is_key("123-45-6789"));
+        // And ordinary text stays out of it entirely.
+        assert!(!is_key("the quick brown fox"));
     }
 
     #[test]

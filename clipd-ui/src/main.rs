@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use clipd_core::{
-    load_paste_transform_settings, save_paste_transform_settings, CtrlSpaceAction, OpenGuiHotkey,
-    PaletteTrigger, SecretRef,
+    load_paste_transform_settings, save_paste_transform_settings, CtrlSpaceAction, GuiLayout,
+    OpenGuiHotkey, PaletteTrigger, SecretRef,
 };
 use clipd_core::{ClipEntry, ClipStore, ContentType};
 use tao::event::Event;
@@ -35,6 +35,7 @@ const MENU_ID_QUIT: &str = "quit";
 const MENU_ID_SETTINGS: &str = "settings";
 const MENU_ID_FIX_KEYBOARD: &str = "fix_keyboard";
 const MENU_ID_HOVER: &str = "hover_opens_hud";
+const MENU_ID_ISLAND: &str = "island_layout";
 /// Menu ids for saved passwords are `vault:<row>`, indexing into the snapshot
 /// the menu was last built from.
 const MENU_ID_VAULT_PREFIX: &str = "vault:";
@@ -497,6 +498,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         true,
         None,
     );
+    let item_island = MenuItem::with_id(
+        MENU_ID_ISLAND,
+        island_tray_label(clipd_core::island_layout_active()),
+        true,
+        None,
+    );
     let item_quit = IconMenuItem::with_id_and_native_icon(
         MENU_ID_QUIT,
         "Quit clipd",
@@ -539,6 +546,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings_menu = Submenu::new("Settings", true);
     settings_menu.append(&item_hud_view)?;
     settings_menu.append(&item_hover)?;
+    settings_menu.append(&item_island)?;
     settings_menu.append(&PredefinedMenuItem::separator())?;
     settings_menu.append(&item_settings)?;
     settings_menu.append(&item_search)?;
@@ -771,6 +779,10 @@ Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi
             // to look rather than remember — otherwise it offers to show
             // something already on screen.
             item_hud_view.set_text(hud_view_label(hud_currently_visible()));
+            // Same reason: the layout can also be switched from the Settings
+            // window, and a tray row offering to show an island already at the
+            // notch is worse than no row at all.
+            item_island.set_text(island_tray_label(clipd_core::island_layout_active()));
             last_clip_refresh = std::time::Instant::now();
         }
 
@@ -913,6 +925,26 @@ Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi
                         s.hover_opens_hud = !s.hover_opens_hud;
                         save_paste_transform_settings(&s);
                         item_hover.set_text(hover_tray_label(s.hover_opens_hud));
+                    }
+                    MENU_ID_ISLAND => {
+                        // Two things to flip, not one: the layout lives in
+                        // paste_transform.json, but the island is its own
+                        // process — saving the setting alone leaves the old
+                        // surface on screen until the next login.
+                        let mut s = load_paste_transform_settings();
+                        let showing = s.gui_layout == GuiLayout::Notch;
+                        s.gui_layout = if showing {
+                            GuiLayout::Palette
+                        } else {
+                            GuiLayout::Notch
+                        };
+                        save_paste_transform_settings(&s);
+                        if showing {
+                            send_surface_request_to("island", "quit");
+                        } else {
+                            let _ = open_gui_island();
+                        }
+                        item_island.set_text(island_tray_label(!showing));
                     }
                     MENU_ID_SETTINGS => {
                         open_gui_settings();
@@ -1184,6 +1216,11 @@ fn save_tui_mode(enabled: bool) {
 fn process_lock_name(mode: &str) -> &'static str {
     match mode {
         "hud" => "gui-hud",
+        // The island is its own process with its own request file. Without
+        // this arm every request aimed at it landed on the palette instead,
+        // so the island ignored both "hide the island" and Quit and stayed at
+        // the notch after the rest of clipd was gone.
+        "island" => "gui-island",
         _ => "gui-main",
     }
 }
@@ -1222,6 +1259,16 @@ fn hover_tray_label(on: bool) -> &'static str {
         "✓ Hover shows clipboard — disable"
     } else {
         "Hover shows clipboard — enable"
+    }
+}
+
+/// The island is one of two layouts, not a separate feature, so turning it
+/// off has to put the palette back — otherwise the user is left with neither.
+fn island_tray_label(on: bool) -> &'static str {
+    if on {
+        "✓ Dynamic Island — hide"
+    } else {
+        "Dynamic Island — show"
     }
 }
 
