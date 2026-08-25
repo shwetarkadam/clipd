@@ -3046,7 +3046,7 @@ fn paint_glass_shell(
             // At (168,175,186)@44 it washed to rgb(250,255,255), i.e. back to
             // white: light paint on this material loses very quickly, so the
             // usable range between "grey" and "white" is narrow.
-            Color32::from_rgba_unmultiplied(146, 153, 165, if native_glass { 47 } else { 136 })
+            Color32::from_rgba_unmultiplied(178, 186, 200, if native_glass { 44 } else { 130 })
         } else {
             // Neutral to match the grounds: a blue veil over neutral surfaces
             // just puts the cast back on top of the fix.
@@ -3275,6 +3275,19 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
 
     force_view_transparent(frame);
 
+    // Both modes go through the sibling Liquid Glass view.
+    //
+    // Light was briefly routed to classic vibrancy instead, to get away from
+    // the Regular style resolving toward white. That produced a popover with
+    // no UI in it at all: `apply_vibrancy` inserts its NSVisualEffectView
+    // *into* the content view, which puts it on top of eframe's render
+    // surface and hides everything drawn there. The sibling approach below is
+    // exactly what avoids that — the material goes behind the content view,
+    // not inside it — which is why the liquid path was written this way.
+    //
+    // The whiteness that prompted the switch is handled where it belongs: in
+    // the tint on the glass view, and in the single frost layer painted over
+    // it, neither of which can hide the UI.
     match apply_sibling_liquid_glass(frame, light) {
         Ok(()) => {
             *on = Some(light);
@@ -3282,8 +3295,18 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
         }
         Err(err) => {
             log::info!("Liquid Glass unavailable ({err}); using classic vibrancy");
+            // A vibrancy material renders in the *window's* appearance, and
+            // this machine's system appearance is Dark. Left alone, a light
+            // glass theme got a dark panel with its dark ink drawn into it —
+            // the popover came out an empty black rectangle.
+            //
+            // So pin the appearance to match the theme, then pick a material
+            // that belongs to it: Popover is the light menu/panel frost,
+            // HudWindow is the dark HUD one. Choosing HudWindow for light was
+            // the mistake: it is dark by definition, whatever the appearance.
+            force_glass_appearance(frame, light);
             let material = if light {
-                window_vibrancy::NSVisualEffectMaterial::UnderWindowBackground
+                window_vibrancy::NSVisualEffectMaterial::Popover
             } else {
                 window_vibrancy::NSVisualEffectMaterial::HudWindow
             };
@@ -3304,6 +3327,34 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
             }
         }
     }
+}
+
+/// Pin the window's appearance so a vibrancy material renders in the theme's
+/// mode rather than the system's.
+///
+/// Without this the material follows the OS: on a Mac set to Dark, the light
+/// glass theme was handed a dark frost, and dark ink on a dark frost is an
+/// empty panel.
+#[cfg(target_os = "macos")]
+fn force_glass_appearance(frame: &eframe::Frame, light: bool) {
+    use objc2_app_kit::{
+        NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua,
+        NSAppearanceNameDarkAqua,
+    };
+
+    let Some(view) = ns_metal_view(frame) else {
+        return;
+    };
+    let Some(window) = view.window() else {
+        return;
+    };
+    let name = if light {
+        unsafe { NSAppearanceNameAqua }
+    } else {
+        unsafe { NSAppearanceNameDarkAqua }
+    };
+    let appearance = unsafe { NSAppearance::appearanceNamed(name) };
+    unsafe { window.setAppearance(appearance.as_deref()) };
 }
 
 #[cfg(target_os = "macos")]
@@ -3398,7 +3449,7 @@ fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool) -> Result<(), 
         // means. Deeper and cooler: the material now has a colour of its own
         // that survives a white backdrop, and over anything darker it still
         // passes the backdrop through.
-        NSColor::colorWithRed_green_blue_alpha(0.71, 0.74, 0.79, 0.35)
+        NSColor::colorWithRed_green_blue_alpha(0.78, 0.81, 0.86, 0.30)
     } else {
         // Denser than it was. A thin tint over Regular glass still let bright
         // windows behind punch through as patches, which is what made the
