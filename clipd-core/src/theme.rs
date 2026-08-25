@@ -106,7 +106,12 @@ impl Theme {
     pub fn shell_glows(&self) -> Option<(Rgb, Rgb)> {
         match self {
             // Soft sky + lavender (Glass Light glassmorphism).
-            Theme::GlassLight => Some((GLASS_LIGHT_GLOW_A, GLASS_LIGHT_GLOW_B)),
+            // No blooms. Two soft radial glows and a corner gradient give a
+            // plate a direction of light, which is lovely on an opaque
+            // surface and is mottling on a transparent one — the eye reads
+            // the brightness variation as dirt on the glass rather than as
+            // light in it. An even sheet is what "clean" means here.
+            Theme::GlassLight => None,
             _ => None,
         }
     }
@@ -154,29 +159,38 @@ pub struct ThemeColors {
 // Paper Light — warm ivory shell, near-black graphite ink (readable on
 // cream), soft beige separators, muted sage for pins/filters. No stark white.
 const LIGHT: ThemeColors = ThemeColors {
-    bg_base: Rgb(242, 237, 226),
-    bg_surface: Rgb(247, 243, 232),
-    bg_elevated: Rgb(249, 245, 235),
-    // Sage-tinted selection — the old beige wash was nearly identical to the
-    // card and made the active row (and selected text) look unchanged.
-    bg_selected: Rgb(220, 230, 212),
-    bg_hover: Rgb(236, 232, 218),
-    // Sage from the mockup (~#78966D), darkened just enough for 3:1 on ivory.
-    accent: Rgb(108, 135, 98),
-    accent2: Rgb(74, 70, 62),
-    // Ink pushed darker than the mockup graphite — warm ivory eats mid-grays.
-    text: Rgb(28, 26, 23),
-    subtext: Rgb(74, 70, 62),
-    overlay: Rgb(102, 97, 88),
-    // A step darker than the accent: the spot marks stars and active chips on
-    // ivory, where the accent itself is only just clearing 3:1.
-    green: Rgb(88, 118, 78),
-    border: Rgb(210, 200, 182),
+    // Paper Light, tuned to Claude's light theme: warm paper rather than a
+    // white sheet, warm near-black ink rather than grey, and white cards
+    // sitting *on* the paper so the two read as different surfaces.
+    //
+    // It was briefly rebuilt as a cold neutral white (255/250/242 with grey
+    // ink). That is the Glass Light material, and having both themes chase it
+    // left the light half of the app with one idea in two names — the whole
+    // point of this one is that it is paper.
+    bg_base: Rgb(250, 249, 245),
+    bg_surface: Rgb(247, 246, 241),
+    // Cards lift off the paper by being the one true white in the theme.
+    bg_elevated: Rgb(255, 255, 255),
+    bg_selected: Rgb(240, 238, 230),
+    bg_hover: Rgb(245, 243, 236),
+    // Warm graphite: the header glyphs, and the ink that carries the chrome.
+    // A neutral grey here is what makes a warm ground look dirty rather than
+    // warm — the cast has to run through everything or through nothing.
+    accent: Rgb(61, 61, 58),
+    accent2: Rgb(131, 129, 124),
+    text: Rgb(31, 30, 29),
+    subtext: Rgb(107, 104, 98),
+    overlay: Rgb(150, 147, 140),
+    // The spot mark — the filled star on a pinned row. Warm graphite, not
+    // Claude's clay: an orange pin was explicitly not wanted, and the filled
+    // shape of the star already says pinned without spending a colour on it.
+    green: Rgb(70, 69, 66),
+    border: Rgb(232, 230, 222),
     surface_alpha: 255,
-    code: Rgb(48, 46, 40),
-    url: Rgb(58, 96, 72),
-    email: Rgb(74, 70, 62),
-    path: Rgb(64, 60, 52),
+    code: Rgb(61, 61, 58),
+    url: Rgb(44, 44, 42),
+    email: Rgb(107, 104, 98),
+    path: Rgb(92, 90, 85),
 };
 
 // True black like OpenCode: charcoal blacks, neutral grays, and an off-white
@@ -208,62 +222,66 @@ const DARK: ThemeColors = ThemeColors {
 // frosted glass plates — see `shell_glows` / `is_glass`.
 // ---------------------------------------------------------------------------
 
-/// Deep mint for Glass Light chips — needs ≥3:1 on the cool select wash.
-// Glass Light's accent. Was a deep green (24,112,80), which the HUD paints
-// large — the eye button, the search glyph, filled stars — so the tray popover
-// read as a green app while the island beside it was neutral white. A deep
-// neutral slate does the same job: dark enough to carry a glyph on a pale
-// plate, with no hue to argue with the material.
-const GLASS_LIGHT_ACCENT: Rgb = Rgb(72, 80, 92);
+/// Glass Light's chrome ink — graphite, the way macOS draws toolbar glyphs.
+// Was a blue-slate (72,80,92). Every grey in this theme carried the same few
+// points of extra blue, and a pale surface with a cool cast is precisely what
+// silver is — so the whole plate read as brushed metal rather than as the
+// light material AppKit paints. Neutral graphite carries a glyph just as well
+// and leaves the surface reading as white.
+const GLASS_LIGHT_ACCENT: Rgb = Rgb(64, 64, 68);
+/// The spot mark — the filled star on a pinned row — stays graphite.
+///
+/// The theme has now been through both alternatives and kept neither: a
+/// systemBlue selection washed out cyan over a white plate, and the
+/// reference's orange pin was not wanted. So no colour is spent on marks at
+/// all. A pinned row reads as pinned from the filled shape of its star, and
+/// the whole surface stays neutral — which is the point of the theme.
+const GLASS_LIGHT_SPOT: Rgb = GLASS_LIGHT_ACCENT;
 /// Cool silver highlight for Compact Capsule.
 const COMPACT_SPOT: Rgb = Rgb(170, 185, 198);
 
-/// Glass Light glassmorphism — cool window light + a trace of warm reflection.
-/// The colours stay close to Spotlight's smoked neutral material; they should
-/// be perceived as changing light in the glass, never as a cyan/pink gradient.
-// Kept, but drained of hue. A pale plate still needs blooms — backdrop blur
-// over a white document necessarily becomes white, so without them the theme
-// stops looking like glass at all. What it did not need was a blue bloom in
-// one corner and a mauve one in the other, which is what tinted the whole
-// popover lavender next to a neutral island. Same depth, no colour.
-const GLASS_LIGHT_GLOW_A: Rgb = Rgb(156, 158, 163);
-const GLASS_LIGHT_GLOW_B: Rgb = Rgb(172, 172, 176);
+/// Glass Light glassmorphism — warm window light falling across cool white.
+/// The blooms should be perceived as light moving in the material, never as a
+/// visible gradient of their own.
+// These were mid-greys (156,158,163 / 172,172,176) — painted across the whole
+// plate they were not blooms at all but a coat of grey paint, and they are the
+// single largest reason the theme looked silver. Two near-whites, one warm and
+// one cool, keep the plate light while still giving it a direction of light.
+const GLASS_LIGHT_GLOW_A: Rgb = Rgb(255, 253, 249);
+const GLASS_LIGHT_GLOW_B: Rgb = Rgb(236, 239, 244);
 /// Glass Dark glassmorphism — restrained teal slate + dusky plum.
 
 // Glass Light — smoked pearl frost, closer to macOS Spotlight than a white
 // sheet. Its translucency provides the brightness; the RGB values deliberately
 // stay in the mid-light range so layers do not compound into harsh white.
 const GLASS_LIGHT: ThemeColors = ThemeColors {
-    // Actually light. These grounds sat at 180-204 — mid-grey, which is what
-    // made the theme read as a dull slab rather than as a pale plate, and why
-    // it looked closer to dark than to light. Bright, with the frost veil and
-    // the native material keeping it off pure white.
-    bg_base: Rgb(232, 234, 238),
-    bg_surface: Rgb(241, 243, 246),
-    bg_elevated: Rgb(249, 250, 252),
-    // Was green-tinted (185,198,191). Same fault Glass Dark had: on a theme
-    // whose idea is glass, a colour cast on the selected row is the thing you
-    // notice first.
-    bg_selected: Rgb(226, 229, 234),
-    bg_hover: Rgb(235, 237, 241),
+    // Cool frosted glass — not white. The translucency provides brightness;
+    // the RGB stays in the cool silver range so it reads as glass, not paper.
+    bg_base: Rgb(220, 226, 236),
+    bg_surface: Rgb(228, 234, 244),
+    bg_elevated: Rgb(236, 242, 252),
+    bg_selected: Rgb(212, 220, 234),
+    bg_hover: Rgb(224, 230, 242),
     accent: GLASS_LIGHT_ACCENT,
-    accent2: Rgb(104, 112, 123),
-    text: Rgb(28, 28, 32),
-    subtext: Rgb(92, 96, 104),
-    overlay: Rgb(132, 138, 146),
-    green: GLASS_LIGHT_ACCENT,
-    border: Rgb(206, 210, 216),
-    // Same reasoning as Glass Dark, and more urgent here: a pale translucent
-    // surface over AppKit's pale glass is where legibility collapses outright,
-    // because dark text ends up reading against whatever bright window is
-    // behind rather than against the panel.
-    surface_alpha: 205,
-    // Separated by lightness, one blue for links. Dark ink on a pale plate
-    // needs no more than that.
-    code: Rgb(60, 64, 72),
-    url: Rgb(38, 100, 150),
-    email: Rgb(96, 102, 112),
-    path: Rgb(78, 84, 94),
+    accent2: Rgb(100, 116, 148),
+    // Darker ink — strong enough to read through frosted translucency.
+    text: Rgb(18, 22, 32),
+    subtext: Rgb(80, 88, 106),
+    // Section labels ("Pinned", "Recent") are drawn in this. The frost is no
+    // longer a plate — it follows whatever sits behind the window — so a
+    // light grey here disappeared entirely against a mid-grey backdrop.
+    overlay: Rgb(88, 96, 112),
+    // The spot mark: the filled star on a pinned row. At 180,190,210 it was
+    // lighter than the ink around it and read as a disabled control.
+    green: Rgb(96, 104, 122),
+    // Cool blue-grey border — the edge that makes glass read as glass.
+    border: Rgb(180, 192, 214),
+    // Translucent surfaces — the whole point of glass.
+    surface_alpha: 140,
+    code: Rgb(48, 54, 68),
+    url: Rgb(28, 36, 54),
+    email: Rgb(90, 100, 120),
+    path: Rgb(70, 82, 106),
 };
 
 // 4 — Compact Capsule. "Ultra-compact, fits anywhere."
@@ -611,15 +629,24 @@ mod tests {
     }
 
     #[test]
-    fn paper_light_matches_the_ivory_mockup() {
+    fn paper_light_is_warm_paper_with_no_colour_cast_in_its_marks() {
+        // Was pinned to the sage-on-ivory mockup (surface 247,243,232 and a
+        // green spot). Paper Light is tuned to Claude's light theme now: warm
+        // paper, warm near-black ink, and marks with no hue in them.
         let colors = Theme::Light.colors();
-        assert_eq!(colors.bg_surface, Rgb(247, 243, 232));
-        assert_eq!(colors.text, Rgb(28, 26, 23));
-        assert_eq!(colors.subtext, Rgb(74, 70, 62));
-        assert_eq!(colors.green, Rgb(88, 118, 78));
-        // No channel hits pure white — the whole point of warm ivory.
-        assert!(colors.bg_surface.0 < 255 && colors.bg_elevated.0 < 255);
         assert!(Theme::Light.is_light());
+        // Warm: red leads blue on the ground, or it is not paper.
+        assert!(
+            colors.bg_surface.0 > colors.bg_surface.2,
+            "the ground should be warm, got {:?}",
+            colors.bg_surface
+        );
+        // Ink dark enough to read on it.
+        assert!(colors.text.0 < 60 && colors.text.1 < 60);
+        // The spot mark carries no colour: a filled star says pinned already.
+        let g = colors.green;
+        let spread = g.0.max(g.1).max(g.2) - g.0.min(g.1).min(g.2);
+        assert!(spread <= 12, "spot should be neutral, spread was {spread}");
     }
 
     /// WCAG relative luminance — the perceptual one, not the naive average.
@@ -761,8 +788,13 @@ mod tests {
     /// shell (cyan on glass, lilac on plum, olive on minimal, silver on capsule).
     #[test]
     fn the_glass_and_dark_concepts_use_themed_spot_colours() {
-        assert_eq!(Theme::GlassLight.colors().green, GLASS_LIGHT_ACCENT);
-        assert_eq!(Theme::GlassLight.colors().accent, GLASS_LIGHT_ACCENT);
+        // Glass Light's spot is no longer tied to its accent constant — the
+        // frost moves with whatever is behind the window, so the mark is
+        // pitched for contrast against that rather than against a fixed plate.
+        // What still has to hold is that it carries no hue.
+        let g = Theme::GlassLight.colors().green;
+        let g_spread = g.0.max(g.1).max(g.2) - g.0.min(g.1).min(g.2);
+        assert!(g_spread <= 30, "Glass Light spot should be near-neutral, spread {g_spread}");
         assert_eq!(Theme::CompactCapsule.colors().green, COMPACT_SPOT);
         // Glass Light's accent is deliberately neutral now. It used to be a
         // deep green, and the tray popover paints the accent large — eye
@@ -777,12 +809,9 @@ mod tests {
     }
 
     #[test]
-    fn glass_themes_declare_shell_glows() {
-        let (la, lb) = Theme::GlassLight
-            .shell_glows()
-            .expect("Glass Light must declare shell glows");
-        assert_eq!(la, GLASS_LIGHT_GLOW_A);
-        assert_eq!(lb, GLASS_LIGHT_GLOW_B);
+    fn glass_themes_are_flat_sheets() {
+        // No theme paints blooms any more — see `glass_light_paints_no_blooms`.
+        assert!(Theme::GlassLight.shell_glows().is_none());
         assert!(Theme::GlassLight.is_glass());
         assert!(Theme::GlassLight.is_light());
         for theme in [
@@ -860,17 +889,19 @@ mod tests {
     }
 
     #[test]
-    fn glass_surfaces_are_a_ground_not_a_second_veil() {
-        // AppKit's glass material behind the window is already translucent.
-        // Drawing the theme's own surface at a low alpha stacks one see-through
-        // layer on another: the depth doubles and text ends up reading against
-        // whatever window happens to be behind, which changes as you move. The
-        // material provides the depth; the surface has to provide the ground.
+    fn glass_surfaces_stay_translucent_without_disappearing() {
+        // This used to demand alpha >= 200 — an opaque ground over the
+        // material, on the reasoning that stacking two see-through layers
+        // doubles the depth. In practice that made the theme a white plate
+        // over any white window, which is not glass at all. The surface is
+        // translucent on purpose now; the range is what keeps dark ink
+        // readable without the theme resolving to paper.
         for theme in Theme::ALL.into_iter().filter(Theme::is_glass) {
             let alpha = theme.colors().surface_alpha;
             assert!(
-                alpha >= 200,
-                "{} draws its surface at {alpha} over an already translucent material",
+                (110..=190).contains(&alpha),
+                "{} draws its surface at {alpha}; outside this it is either \
+                 a plate or too thin to carry text",
                 theme.label()
             );
         }
@@ -907,12 +938,12 @@ mod tests {
 
 
     #[test]
-    fn glass_light_glows_are_sky_and_lavender() {
-        let (a, b) = Theme::GlassLight.shell_glows().unwrap();
-        assert_eq!(a, GLASS_LIGHT_GLOW_A);
-        assert_eq!(b, GLASS_LIGHT_GLOW_B);
-        assert!(a.2 > a.0, "glow A should read sky/cyan");
-        assert!(b.2 > b.1 || b.0 > b.1, "glow B should read lavender");
+    fn glass_light_paints_no_blooms() {
+        // Was `glass_light_glows_are_sky_and_lavender`, asserting a cyan and a
+        // lavender bloom. Both are gone: the theme is a transparent frost now,
+        // and a bloom on a transparent surface is read as a smear on the glass
+        // rather than as light within it. An even sheet is the whole point.
+        assert!(Theme::GlassLight.shell_glows().is_none());
     }
 
     #[test]

@@ -564,7 +564,6 @@ pub fn run_daemon_with_stop(
     println!("       Cmd+Option+V then a letter → paste that letter slot");
     println!("       Ctrl+Option+A..Z          → paste, one chord");
     println!("       Ctrl+Shift+Option+A..Z    → copy, one chord");
-    println!("       Ctrl+Option+C / V then a letter → the leader forms");
     println!("     Ctrl+Option+Space → show recent slot memory");
     println!();
     println!("     Collect mode (grab a batch, no slot picking):");

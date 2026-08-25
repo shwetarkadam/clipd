@@ -1183,6 +1183,187 @@ fn draw_source_tile(ui: &mut egui::Ui, source: &str, c: &clipd_core::ThemeColors
     );
 }
 
+
+/// The row's leading glyph: what the clip *is*, drawn as a bare line icon.
+///
+/// It used to be a letter — the initial of the app it came from — inside a
+/// filled rounded tile. The letter repeated what the meta line already says,
+/// and the tile made a plain list look like a grid of buttons. The reference
+/// draws the glyph alone, with nothing behind it.
+fn draw_type_tile(
+    ui: &mut egui::Ui,
+    kind: &ContentType,
+    sensitive: bool,
+    boxed: bool,
+    c: &clipd_core::ThemeColors,
+) {
+    let (rect, _) = ui.allocate_exact_size(
+        if boxed {
+            egui::vec2(34.0, 34.0)
+        } else {
+            egui::vec2(26.0, 30.0)
+        },
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    if boxed {
+        // A frosted tile, as in the reference: the glyph's own small pane.
+        // Without it the icon floats and the row loses its left edge.
+        painter.rect_filled(rect, Rounding::same(10.0), surf(c, c.bg_elevated));
+        painter.rect_stroke(rect, Rounding::same(10.0), Stroke::new(0.8, rgb(c.border)));
+    }
+    let ink = rgb(c.text).gamma_multiply(0.78);
+    let s = Stroke::new(1.5, ink);
+    let (cx, cy) = (rect.center().x, rect.center().y);
+    // A secret is a key whatever its content type — it is the thing you want
+    // to recognise before you read the row, not after.
+    if sensitive {
+        // A key lies flat: bow on the left, shaft to the right, teeth down
+        // off the end. Drawn on the diagonal — bow up-left, stem down-right —
+        // it is a magnifying glass, which is what this was and what it read
+        // as next to a search field.
+        painter.circle_stroke(egui::pos2(cx - 6.0, cy), 4.2, s);
+        painter.line_segment([egui::pos2(cx - 1.8, cy), egui::pos2(cx + 8.5, cy)], s);
+        painter.line_segment(
+            [egui::pos2(cx + 4.5, cy), egui::pos2(cx + 4.5, cy + 4.0)],
+            s,
+        );
+        painter.line_segment(
+            [egui::pos2(cx + 7.6, cy), egui::pos2(cx + 7.6, cy + 3.0)],
+            s,
+        );
+        return;
+    }
+    match kind {
+        ContentType::Url => {
+            // Two links of a chain meeting on the diagonal.
+            for (dx, dy) in [(-3.0_f32, 3.0_f32), (3.0, -3.0)] {
+                let r = egui::Rect::from_center_size(
+                    egui::pos2(cx + dx, cy + dy),
+                    egui::vec2(11.0, 7.0),
+                );
+                painter.rect_stroke(r, Rounding::same(3.5), s);
+            }
+        }
+        ContentType::Code => {
+            // A terminal: a rounded frame with a prompt in it.
+            let r = egui::Rect::from_center_size(rect.center(), egui::vec2(18.0, 16.0));
+            painter.rect_stroke(r, Rounding::same(3.5), s);
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 4.0, r.top() + 4.5),
+                    egui::pos2(r.left() + 7.5, cy),
+                ],
+                s,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 7.5, cy),
+                    egui::pos2(r.left() + 4.0, r.bottom() - 4.5),
+                ],
+                s,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 9.5, r.bottom() - 4.5),
+                    egui::pos2(r.right() - 4.0, r.bottom() - 4.5),
+                ],
+                s,
+            );
+        }
+        ContentType::Image => {
+            let r = egui::Rect::from_center_size(rect.center(), egui::vec2(18.0, 15.0));
+            painter.rect_stroke(r, Rounding::same(3.0), s);
+            painter.circle_filled(egui::pos2(r.left() + 4.8, r.top() + 4.4), 1.6, ink);
+            painter.line_segment(
+                [
+                    egui::pos2(r.left() + 2.0, r.bottom() - 2.0),
+                    egui::pos2(cx - 0.5, r.center().y),
+                ],
+                s,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(cx - 0.5, r.center().y),
+                    egui::pos2(r.right() - 2.0, r.bottom() - 2.0),
+                ],
+                s,
+            );
+        }
+        ContentType::File | ContentType::Path => {
+            // A page with its corner turned.
+            let r = egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 18.0));
+            let fold = 5.5;
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    egui::pos2(r.left(), r.top()),
+                    egui::pos2(r.right() - fold, r.top()),
+                    egui::pos2(r.right(), r.top() + fold),
+                    egui::pos2(r.right(), r.bottom()),
+                    egui::pos2(r.left(), r.bottom()),
+                ],
+                s,
+            ));
+            painter.line_segment(
+                [
+                    egui::pos2(r.right() - fold, r.top()),
+                    egui::pos2(r.right() - fold, r.top() + fold),
+                ],
+                s,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(r.right() - fold, r.top() + fold),
+                    egui::pos2(r.right(), r.top() + fold),
+                ],
+                s,
+            );
+        }
+        _ => {
+            // Text: a stack of sheets, the reference's glyph for plain copy.
+            for (i, w) in [16.0_f32, 16.0, 10.0].iter().enumerate() {
+                let y = cy - 6.0 + i as f32 * 6.0;
+                painter.line_segment(
+                    [egui::pos2(cx - 8.0, y), egui::pos2(cx - 8.0 + w, y)],
+                    s,
+                );
+            }
+        }
+    }
+}
+
+/// The reference's per-row copy button — two stacked sheets in a quiet
+/// outlined tile. The row already copies when clicked; this gives that action
+/// a target you can hit without first making the row the selected one.
+fn row_copy_button(ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    let face = if hovered {
+        surf(c, c.bg_hover)
+    } else {
+        surf(c, c.bg_elevated)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, Rounding::same(8.0), face);
+    painter.rect_stroke(rect, Rounding::same(8.0), Stroke::new(0.7, rgb(c.border)));
+    let s = Stroke::new(1.2, rgb(c.subtext));
+    let back = egui::Rect::from_min_size(
+        egui::pos2(rect.center().x - 6.0, rect.center().y - 7.0),
+        egui::vec2(8.5, 8.5),
+    );
+    let front = egui::Rect::from_min_size(
+        egui::pos2(rect.center().x - 2.5, rect.center().y - 3.5),
+        egui::vec2(8.5, 8.5),
+    );
+    painter.rect_stroke(back, Rounding::same(2.2), s);
+    painter.rect_filled(front, Rounding::same(2.2), face);
+    painter.rect_stroke(front, Rounding::same(2.2), s);
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text("Copy")
+}
+
 /// Minimal header/footer icon — no filled pill, just the glyph.
 fn chrome_icon_button(ui: &mut egui::Ui, icon: &str, active: bool, c: &clipd_core::ThemeColors) -> egui::Response {
     let col = if active {
@@ -1214,11 +1395,23 @@ fn tiny_filter_chip(
 ) -> bool {
     let spotlight = theme == Theme::GlassLight;
     // Light themes get the same treatment, darkening instead of lifting.
-    let (text_col, fill, stroke) = if active && theme.is_light() {
+    let (text_col, fill, stroke) = if active && spotlight {
+        // On glass the selected segment is its own frosted pane with an edge,
+        // matching the rows. A smudge of black is a shadow, and there are no
+        // shadows inside glass.
         (
             rgb(c.text),
-            Color32::from_black_alpha(18),
-            Stroke::new(1.0, Color32::from_black_alpha(14)),
+            Color32::from_rgba_unmultiplied(252, 253, 255, 200),
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(188, 198, 214, 180)),
+        )
+    } else if active && theme.is_light() {
+        // Filled, unoutlined — the reference's selected segment. The hairline
+        // that used to ring it made every pill look like a control; only the
+        // active one is meant to.
+        (
+            rgb(c.text),
+            Color32::from_black_alpha(20),
+            Stroke::NONE,
         )
     } else if active && !spotlight {
         // A tint, not a slab. These accents are built to be read *as text* on
@@ -1237,11 +1430,15 @@ fn tiny_filter_chip(
             Stroke::NONE,
         )
     } else if spotlight {
-        (
-            rgb(c.subtext),
-            Color32::TRANSPARENT,
-            Stroke::new(0.7, Color32::from_rgba_unmultiplied(88, 98, 112, 52)),
-        )
+        // No ring. macOS leaves unselected segments as plain grey text and
+        // spends the contrast on the selected one; a hairline round every
+        // chip competes with the pill that actually means something — and
+        // this one was blue-grey, part of the cast the theme is losing.
+        (rgb(c.subtext), Color32::TRANSPARENT, Stroke::NONE)
+    } else if theme.is_light() {
+        // Unselected filters are plain grey text in the reference, on every
+        // light material — not just on glass.
+        (rgb(c.subtext), Color32::TRANSPARENT, Stroke::NONE)
     } else {
         (
             rgb(c.subtext),
@@ -1254,7 +1451,9 @@ fn tiny_filter_chip(
         ui.add(
             egui::Button::new(RichText::new(label).size(11.5).color(text_col))
                 .fill(fill)
-                .rounding(Rounding::same(999.0))
+                // Softly rounded, not a capsule: the reference's segments are
+                // rectangles with the corners taken off.
+                .rounding(Rounding::same(9.0))
                 .stroke(stroke)
                 .min_size(egui::vec2(0.0, 26.0)),
         )
@@ -1295,6 +1494,20 @@ fn footer_shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeCol
 }
 
 /// Quiet row star: solid green when pinned, outline otherwise.
+/// The "Capturing" dot stays green even where the theme's spot mark is not.
+///
+/// In the Light and Glass Light references the dot is green and the pinned
+/// star is orange — two different marks saying two different things, and the
+/// spot colour can only be one of them. The spot goes to the star, which is
+/// the one the user chose; liveness keeps the green it has in every other
+/// theme.
+fn capture_dot_color(theme: Theme, c: &clipd_core::ThemeColors) -> Color32 {
+    match theme {
+        Theme::Light | Theme::GlassLight => Color32::from_rgb(52, 168, 83),
+        _ => rgb(c.green),
+    }
+}
+
 fn row_star_quiet(
     ui: &mut egui::Ui,
     starred: bool,
@@ -1321,8 +1534,6 @@ fn row_star_quiet(
 /// Global mouse position in screen points (top-left origin), used to summon
 /// the palette at the cursor. macOS-only; other platforms fall back to the
 /// window manager's default placement.
-/// Draw a small type glyph for a clip row: three text lines for text-ish
-
 /// Compact relative time for list rows: "now", "5m", "2h", "3d", "2w".
 fn relative_time_short(dt: &DateTime<Utc>) -> String {
     let secs = Utc::now().signed_duration_since(*dt).num_seconds();
@@ -1941,6 +2152,10 @@ enum ContentFilter {
     Code,
     Images,
     Files,
+    /// Keys, tokens and private keys — the things you copy out of a dashboard
+    /// once and then hunt for twenty minutes later. They are scattered across
+    /// Text and Code by content type, so no existing filter collects them.
+    ApiKeys,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2076,22 +2291,24 @@ fn save_surface_state(mode: SurfaceMode) {
 
 impl ContentFilter {
     /// Full-GUI filter row — includes Images so screenshots aren't buried.
-    const MAIN: [(ContentFilter, &'static str); 6] = [
+    const MAIN: [(ContentFilter, &'static str); 7] = [
         (ContentFilter::All, "All"),
         (ContentFilter::Links, "Links"),
         (ContentFilter::Text, "Text"),
         (ContentFilter::Code, "Code"),
         (ContentFilter::Images, "Images"),
+        (ContentFilter::ApiKeys, "API keys"),
         (ContentFilter::Favorites, "Pinned"),
     ];
 
     /// Extended set kept for keyboard / settings access (Slots, Files).
-    const ALL: [(ContentFilter, &'static str); 8] = [
+    const ALL: [(ContentFilter, &'static str); 9] = [
         (ContentFilter::All, "All"),
         (ContentFilter::Links, "Links"),
         (ContentFilter::Text, "Text"),
         (ContentFilter::Code, "Code"),
         (ContentFilter::Images, "Images"),
+        (ContentFilter::ApiKeys, "API keys"),
         (ContentFilter::Favorites, "Pinned"),
         (ContentFilter::Slots, "Slots"),
         (ContentFilter::Files, "Files"),
@@ -2607,10 +2824,18 @@ fn resolved_theme(ctx: &egui::Context, theme: Theme) -> Theme {
 fn install_system_font(ctx: &egui::Context) {
     #[cfg(target_os = "macos")]
     {
+        // SF Pro first — the face every other macOS window is set in.
+        //
+        // Optima led this list, and it is a thin humanist face with high
+        // stroke contrast: at 13pt on a pale surface its verticals thin out
+        // until the text looks washed rather than quiet, which is what made
+        // the light themes read as faded. The fallbacks stay for machines
+        // that lack SFNS.
         let paths = [
-            "/System/Library/Fonts/Optima.ttc",
-            "/System/Library/Fonts/Geneva.ttf",
+            "/System/Library/Fonts/SFNS.ttf",
             "/System/Library/Fonts/HelveticaNeue.ttc",
+            "/System/Library/Fonts/Geneva.ttf",
+            "/System/Library/Fonts/Optima.ttc",
         ];
         for path in &paths {
             if let Ok(data) = std::fs::read(path) {
@@ -2751,7 +2976,9 @@ fn text_selection_style(theme: Theme, c: &clipd_core::ThemeColors) -> (Color32, 
     if theme.is_glass() {
         // Cool slate wash — keep mint off the selection (chips/pins only).
         let (r, g, b, a) = if theme == Theme::GlassLight {
-            (120, 150, 190, 130)
+            // selectedTextBackgroundColor — the exact pale blue macOS puts
+            // behind selected text in light mode.
+            (179, 215, 255, 200)
         } else {
             (90, 120, 170, 140)
         };
@@ -2802,10 +3029,24 @@ fn paint_glass_shell(
         // Frosted base — translucent enough for blur + blooms to read.
         let veil = if light {
             // A real frost plate, not bare transparency. The native clear
-            // material remains visible through roughly a quarter of this
-            // wash, while the cool colour prevents white documents from
-            // turning the whole window into a lightbox.
-            Color32::from_rgba_unmultiplied(130, 136, 146, if native_glass { 72 } else { 150 })
+            // material still shows through, but the wash is now near-white:
+            // the old grey-blue (130,136,146) was doing the same thing the
+            // panel frost was, and two coats of grey is what silver is.
+            //
+            // A white plate over a white document does lose its edge — that
+            // is what the rim and the shadow below are for, and it is how
+            // macOS lands its own light material on a white page.
+            // Without the native material there is no blur at all, so the
+            // veil has to carry the whole surface and stays heavier there.
+            // The whole surface, in one even coat. Clear glass does almost
+            // no diffusion of its own, so this layer is what stands between
+            // the reader and whatever is behind the window.
+            // Between the two measured settings. At (126,133,144)@50 the panel
+            // sat at rgb(156,163,171) — clean, but heavy over a dark desktop.
+            // At (168,175,186)@44 it washed to rgb(250,255,255), i.e. back to
+            // white: light paint on this material loses very quickly, so the
+            // usable range between "grey" and "white" is narrow.
+            Color32::from_rgba_unmultiplied(146, 153, 165, if native_glass { 47 } else { 136 })
         } else {
             // Neutral to match the grounds: a blue veil over neutral surfaces
             // just puts the cast back on top of the fix.
@@ -2826,7 +3067,9 @@ fn paint_glass_shell(
             // is behind it, so over a plain light desktop a purely backdrop-driven
             // pane just looks white — the blooms are what keep it looking like
             // glass regardless of what happens to be underneath.
-            let strength = if light { 0.18 } else { 0.30 };
+            // Same reason as the corner wash: a white bloom at 0.18 is 18%
+            // of the plate's opacity spent on nothing but white.
+            let strength = if light { 0.05 } else { 0.30 };
             paint_soft_radial_glow(
                 &glow_painter,
                 egui::pos2(
@@ -2858,7 +3101,7 @@ fn paint_glass_shell(
                 if light { 255 } else { 255 },
                 if light { 255 } else { 255 },
                 if light {
-                    if native_glass { 10 } else { 20 }
+                    if native_glass { 5 } else { 16 }
                 } else if native_glass {
                     6
                 } else {
@@ -2874,8 +3117,18 @@ fn paint_glass_shell(
         // way round a dark plate reads as a drawn border sitting on top of the
         // material rather than as light catching its edge. The catch-light
         // along the top does that job on its own.
+        // Light draws its edge the way macOS does — a dark hairline at about
+        // ten percent, not a white one. White-on-white had no edge at all
+        // once the plate stopped being grey, and the shape of the window came
+        // entirely from the shadow.
+        // Glass catches light along its edge, and that highlight is most of
+        // what makes a translucent panel read as a pane rather than a hole in
+        // the screen. The dark hairline here was drawn for an opaque white
+        // plate, where it was the only way to find the edge; on a translucent
+        // one it is a pencil line round the window. Depth comes from the
+        // shadow underneath instead.
         let rim = if light {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 140)
+            Color32::from_rgba_unmultiplied(255, 255, 255, 190)
         } else {
             Color32::from_rgba_unmultiplied(255, 255, 255, 12)
         };
@@ -2909,7 +3162,11 @@ fn paint_glass_corner_gradient(
     glow_b: Rgb,
     light: bool,
 ) {
-    let alpha = if light { [34, 24, 26, 36] } else { [40, 26, 28, 44] };
+    // Light's blooms were written when they were coloured — a sky and a
+    // mauve, where 34/255 reads as a tint. They are near-whites now, so the
+    // same alpha is simply more white paint on a surface that already has too
+    // much. A third of it still gives the plate a direction of light.
+    let alpha = if light { [11, 8, 9, 12] } else { [40, 26, 28, 44] };
     let vertex = |pos: egui::Pos2, color: Rgb, a: u8| egui::epaint::Vertex {
         pos,
         uv: egui::epaint::WHITE_UV,
@@ -3124,14 +3381,24 @@ fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool) -> Result<(), 
     // mottled rather than frosted. The same reasoning that put Light on
     // Regular applies to Dark; it was only ever Clear because a dark tint hid
     // the problem over a dark desktop.
+    // Regular for both — the diffusing style. Clear was tried for light and
+    // is a lens, not frost: it passes the backdrop through with so little
+    // diffusion that browser tabs and photo captions behind the window stay
+    // legible through the panel, which reads as a dirty, uneven surface.
+    // Regular resolves toward white only when what is painted on top of it is
+    // near-white too; with translucent rows and one even frost it stays a
+    // proper frosted sheet.
     let style = objc2_app_kit::NSGlassEffectViewStyle(
         window_vibrancy::NSGlassEffectViewStyle::Regular as isize,
     );
     let tint = if light {
-        // AppKit's untinted light style approaches pure white. A muted
-        // blue-grey tint keeps it comfortable over bright documents while
-        // remaining translucent over dark windows.
-        NSColor::colorWithRed_green_blue_alpha(0.35, 0.38, 0.42, 0.24)
+        // AppKit's untinted light style approaches pure white, and clipd is
+        // nearly always over a white document — so at 0.24 the panel was
+        // white with a hint of grey, which is what "still white, no glass"
+        // means. Deeper and cooler: the material now has a colour of its own
+        // that survives a white backdrop, and over anything darker it still
+        // passes the backdrop through.
+        NSColor::colorWithRed_green_blue_alpha(0.71, 0.74, 0.79, 0.35)
     } else {
         // Denser than it was. A thin tint over Regular glass still let bright
         // windows behind punch through as patches, which is what made the
@@ -3188,9 +3455,47 @@ fn sync_glass_native(_frame: &eframe::Frame, _theme: Theme, _on: &mut Option<boo
 /// Glass selection / hover — soft neutral wash (mint stays on chips/pins).
 fn glass_row_fill(theme: Theme, selected: bool, hovered: bool) -> Option<Color32> {
     let light = theme == Theme::GlassLight;
+    if light {
+        // Every row is its own frosted pane, lit by how much white it holds:
+        // resting, under the pointer, selected. Rows used to be transparent
+        // until selected, so the list was floating text on one undifferentiated
+        // sheet — and the selected row then had to be marked with black, which
+        // is a shadow on glass rather than light in it.
+        // Cool white, not plain white. Over a photo this is frost; over a
+        // white window it still separates from the plate, because it is
+        // fractionally bluer than the paper behind it.
+        // Measured, not guessed. Every value before this was subtle enough to
+        // vanish: a white pane at alpha 62 over a plate that was itself
+        // near-white differs from it by three levels, so the list read as one
+        // flat sheet no matter how correct the intent was.
+        return Some(Color32::from_rgba_unmultiplied(
+            255,
+            255,
+            255,
+            if selected {
+                72
+            } else if hovered {
+                52
+            } else {
+                34
+            },
+        ));
+    }
     if selected {
         Some(if light {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 26)
+            // Grey, by lightness alone — Spotlight's selected row, and what
+            // macOS falls back to for any list it is not actively focused on.
+            // A systemBlue wash was tried here and had to come out: over a
+            // white plate it blended toward cyan, and a coloured band across
+            // the row is the loudest thing in a window this pale.
+            //
+            // A white wash on a white plate is not a selection either, which
+            // is why this cannot simply go back to what it was.
+            // Measured, not guessed: at alpha 26 the composited row came out
+            // 14 levels under the plate, because the row's own card is drawn
+            // over part of this wash. macOS's unemphasized selection sits
+            // about 25 under its window colour, and this alpha lands there.
+            Color32::from_black_alpha(46)
         } else {
             // Keep keyboard focus readable even when Liquid Glass is sampling
             // a bright window behind clipd. A white wash can turn the row into
@@ -3210,9 +3515,29 @@ fn glass_row_fill(theme: Theme, selected: bool, hovered: bool) -> Option<Color32
 }
 
 fn glass_row_stroke(theme: Theme, selected: bool) -> Stroke {
+    if theme == Theme::GlassLight {
+        // The lit edge of each pane. Every row carries one: a rim is what
+        // separates two translucent surfaces stacked on each other, where a
+        // fill alone only makes a slightly brighter fog.
+        // The edge does the work. A white highlight reads as glass only when
+        // something darker sits behind it — over a white app it is invisible
+        // and the whole list flattens into one sheet. A cool grey rim is an
+        // edge on both.
+        return Stroke::new(
+            1.0,
+            if selected {
+                Color32::from_rgba_unmultiplied(144, 160, 186, 225)
+            } else {
+                Color32::from_rgba_unmultiplied(176, 188, 208, 205)
+            },
+        );
+    }
     if selected {
         if theme == Theme::GlassLight {
-            Stroke::NONE
+            // A hairline the fill alone cannot provide: 9% grey on white is
+            // legible as a band but has no edge, and the rows around it are
+            // white cards with edges of their own.
+            Stroke::new(1.0, Color32::from_black_alpha(30))
         } else {
             Stroke::new(1.0, Color32::from_rgba_unmultiplied(160, 170, 165, 40))
         }
@@ -3222,15 +3547,28 @@ fn glass_row_stroke(theme: Theme, selected: bool) -> Stroke {
 }
 
 /// Stable frost carried by the actual egui panels. Native light glass adapts
-/// toward white over bright apps; this translucent cool plate prevents that
-/// adaptation from erasing the theme while preserving backdrop movement.
+/// toward white over bright apps; this translucent plate keeps the theme from
+/// being erased by that adaptation while preserving backdrop movement.
 fn glass_panel_frost(theme: Theme) -> Color32 {
     match theme {
-        // Every layout region receives the exact same translucent slate veil.
-        // With gradients disabled and internal rounding removed, adjacent
-        // regions resolve as one continuous sheet while remaining stable over
-        // both bright and dark apps behind the native glass.
-        Theme::GlassLight => Color32::from_rgba_unmultiplied(126, 134, 146, 178),
+        // Every layout region receives the exact same veil, so adjacent
+        // regions resolve as one continuous sheet.
+        //
+        // This was a mid-slate (126,134,146) at 70% — two thirds of a grey
+        // card laid over the entire window, and the main reason the theme
+        // read as brushed metal. A near-white at slightly higher opacity does
+        // the stabilising job just as well: over a dark app behind, the
+        // composite still lands light instead of collapsing to grey.
+        // Thin. This is the layer that decides whether the theme is glass at
+        // all, and it had been pushed to 214/255 of a near-white — a sheet of
+        // paint over the blur, which is why the window came out flat white
+        // whatever was behind it. At this alpha the native material and the
+        // desktop behind actually reach the eye; the rims and row fills below
+        // are what keep dark ink legible instead.
+        // Nothing. The shell's veil is the single frost layer now; painting
+        // it again per panel is what made the surface uneven from region to
+        // region, because the panels do not all cover the same area.
+        Theme::GlassLight => Color32::TRANSPARENT,
         _ => Color32::TRANSPARENT,
     }
 }
@@ -4186,6 +4524,32 @@ impl ClipdGui {
                         self.paste_settings.hud_enabled = !feedback_on;
                         settings_dirty = true;
                     }
+                    hairline(ui, c);
+                    // Two things to flip, not one: the layout lives in
+                    // paste_transform.json, but the island is its own process
+                    // — saving the setting alone would leave the old surface
+                    // on screen until the next login.
+                    let island_on = self.paste_settings.gui_layout == GuiLayout::Notch;
+                    if popover_setting_row(
+                        ui,
+                        c,
+                        FooterIcon::List,
+                        "Dynamic Island",
+                        "Show the slab that hugs the notch",
+                        RowControl::Toggle(island_on),
+                    ) {
+                        self.paste_settings.gui_layout = if island_on {
+                            GuiLayout::Palette
+                        } else {
+                            GuiLayout::Notch
+                        };
+                        settings_dirty = true;
+                        if island_on {
+                            island::stop_island();
+                        } else {
+                            island::start_island();
+                        }
+                    }
                 });
 
                 if settings_dirty {
@@ -4407,7 +4771,19 @@ impl ClipdGui {
                     return;
                 }
 
-                let rows: Vec<(usize, i64, String, String, String, Option<u8>)> = self
+                // Type and sensitivity travel with the row now: the
+                // reference leads every row with a glyph for what the clip is,
+                // and that cannot be worked out from the preview text.
+                let rows: Vec<(
+                    usize,
+                    i64,
+                    String,
+                    String,
+                    String,
+                    Option<u8>,
+                    ContentType,
+                    bool,
+                )> = self
                     .filtered
                     .iter()
                     .take(40)
@@ -4433,153 +4809,178 @@ impl ClipdGui {
                             clip.source_app.clone().unwrap_or_default(),
                             relative_time_short(&clip.timestamp),
                             clip.slot,
+                            clip.content_type.clone(),
+                            !detect_sensitive(&clip.content, &self.privacy_config).is_empty(),
                         )
                     })
                     .collect();
 
-                for (pos, (_idx, clip_id, preview, app, time, slot)) in
+                // Ruled rows that share edges, so the list reads as one sheet.
+                let row_count = rows.len();
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for (pos, (_idx, clip_id, preview, _app, time, slot, kind, sensitive)) in
                     rows.into_iter().enumerate()
                 {
                     let selected = self.selected == pos;
                     let starred = self.starred_clip_ids.contains(&clip_id);
                     let mut star_clicked = false;
-                    let (row_fill, row_stroke) = if self.theme.is_glass() {
+                    let mut copy_clicked = false;
+                    // Hover decides what the row's right-hand end shows, so it
+                    // has to be read before the row is built.
+                    let hover_id = egui::Id::new(("hud_row_hover", clip_id));
+                    let hovered = ui
+                        .ctx()
+                        .read_response(hover_id)
+                        .map_or(false, |r| r.contains_pointer());
+                    let lit = selected || hovered;
+                    // Flat ruled rows on an opaque theme; frosted panes with
+                    // lit rims on glass. On glass a full-width fill with no
+                    // edge is just a brighter patch of fog — the rim is what
+                    // makes it a surface.
+                    let glass_rows = self.theme.is_glass();
+                    let (row_fill, row_stroke) = if glass_rows {
                         (
-                            glass_row_fill(self.theme, selected, false).unwrap_or(Color32::TRANSPARENT),
+                            glass_row_fill(self.theme, selected, hovered)
+                                .unwrap_or(Color32::TRANSPARENT),
                             glass_row_stroke(self.theme, selected),
                         )
-                    } else if selected {
-                        // Selection is the accent, not a slightly lighter grey:
-                        // a wash over the card and a proper edge, so the row you
-                        // are on is obvious while scanning the list.
-                        (
-                            surf(c, c.bg_selected),
-                            Stroke::new(1.2, rgb(c.accent).gamma_multiply(0.55)),
-                        )
-                    } else if slot.is_some() {
-                        // Held in an active slot: the same edge at a third
-                        // strength. Enough to find at a glance, not enough to
-                        // compete with the row you are actually on.
-                        (
-                            Color32::TRANSPARENT,
-                            Stroke::new(1.0, rgb(c.accent).gamma_multiply(0.34)),
-                        )
+                    } else if lit {
+                        (surf(c, c.bg_selected), Stroke::NONE)
                     } else {
-                        (Color32::TRANSPARENT, Stroke::new(0.0, rgb(c.border)))
+                        (Color32::TRANSPARENT, Stroke::NONE)
                     };
+                    if glass_rows {
+                        ui.add_space(3.0);
+                    }
                     let frame = egui::Frame::none()
                         .fill(row_fill)
-                        .rounding(Rounding::same(10.0))
+                        .rounding(if glass_rows {
+                            Rounding::same(10.0)
+                        } else {
+                            Rounding::ZERO
+                        })
                         .stroke(row_stroke)
-                        .inner_margin(Margin::symmetric(10.0, 5.0))
+                        .inner_margin(Margin::symmetric(12.0, 9.0))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                let (rail, _) = ui.allocate_exact_size(
-                                    egui::vec2(3.0, 28.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(
-                                    rail,
-                                    Rounding::same(2.0),
-                                    if selected {
-                                        // Theme spot (sage / cyan / lilac / …).
-                                        rgb(c.green)
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    },
-                                );
-                                ui.add_space(8.0);
-                                ui.vertical(|ui| {
-                                    // Reserve room for the star, and for the
-                                    // slot badge when there is one. Reserving
-                                    // only the star meant a long title on a
-                                    // slotted row truncated against the full
-                                    // width and printed underneath the ⌘N.
-                                    let trailing =
-                                        if slot.is_some() { 42.0 + 48.0 } else { 42.0 };
-                                    ui.set_width((ui.available_width() - trailing).max(80.0));
-                                    // Same ink rules as the full GUI: white only
-                                    // on Glass Minimal frost — Paper Light and
-                                    // other themes keep theme text so selection
-                                    // stays readable.
-                                    // Glass Dark keeps light ink on frost; Glass Light
-                                    // (and everything else) uses the theme text colours.
-                                    let title_col = rgb(c.text);
-                                    let meta_col = rgb(c.subtext);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&preview)
-                                                .size(13.6)
-                                                .strong()
-                                                .color(title_col),
-                                        )
-                                        .truncate(),
-                                    );
-                                    ui.add_space(1.0);
-                                    let meta = if app.is_empty() {
-                                        time.clone()
-                                    } else {
-                                        format!("{}  ·  {}", app, time)
-                                    };
-                                    ui.label(
-                                        RichText::new(meta)
-                                            .size(11.3)
-                                            .color(meta_col),
-                                    );
+                                draw_type_tile(ui, &kind, sensitive, false, c);
+                                ui.add_space(10.0);
+                                // One line, not two. The source app and the
+                                // time used to sit under the title; the
+                                // reference puts the time at the right-hand
+                                // end and drops the app, which halves the row
+                                // height and lets the list show twice as much.
+                                //
+                                // The title goes in a sub-ui of its own. It
+                                // was written straight into this horizontal
+                                // layout after a `set_width`, and `set_width`
+                                // on a horizontal ui re-anchors that ui rather
+                                // than reserving a slot in it — so the label
+                                // was laid out from the row's left edge and
+                                // printed on top of the glyph, with Copy and
+                                // the pin landing on top of the title in turn.
+                                let trailing = if lit { 96.0 } else { 52.0 };
+                                let content_w = (ui.available_width() - trailing).max(70.0);
+                                ui.allocate_ui(egui::vec2(content_w, 22.0), |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&preview)
+                                                    .size(13.4)
+                                                    .color(rgb(c.text)),
+                                            )
+                                            .truncate(),
+                                        );
+                                        if starred {
+                                            let (dot, _) = ui.allocate_exact_size(
+                                                egui::vec2(6.0, 6.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().circle_filled(
+                                                dot.center(),
+                                                2.6,
+                                                rgb(c.overlay),
+                                            );
+                                        }
+                                    });
                                 });
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if glass_pin_button(ui, starred, c)
-                                            .on_hover_text("Pin clip")
-                                            .clicked()
-                                        {
-                                            star_clicked = true;
-                                        }
-                                        // The slot's number, next to the ring
-                                        // that marks the row.
-                                        //
-                                        // The ring alone said "this row is
-                                        // different" without saying how, which
-                                        // reads as a rendering fault rather
-                                        // than as information. The number is
-                                        // the useful half: it is what you press
-                                        // to paste this clip back.
-                                        if let Some(n) = slot {
+                                        if lit {
+                                            // The live row trades its
+                                            // timestamp for what you can do
+                                            // to it — the reference's Copy
+                                            // and pin.
+                                            // The small star, not the
+                                            // footer's circular pin: that one
+                                            // is built at footer size and put
+                                            // a 44pt disc in the middle of a
+                                            // 34pt row.
+                                            if row_star_quiet(ui, starred, c).clicked() {
+                                                star_clicked = true;
+                                            }
                                             ui.add_space(2.0);
-                                            let badge = clipd_core::slot_badge(n);
-                                            let text = format!("⌘{badge}");
-                                            let galley = ui.painter().layout_no_wrap(
-                                                text.clone(),
-                                                egui::FontId::proportional(11.0),
-                                                rgb(c.accent),
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new("Copy")
+                                                            .size(11.5)
+                                                            .color(rgb(c.subtext)),
+                                                    )
+                                                    .fill(Color32::TRANSPARENT)
+                                                    .stroke(Stroke::NONE),
+                                                )
+                                                .clicked()
+                                            {
+                                                copy_clicked = true;
+                                            }
+                                        } else if let Some(n) = slot {
+                                            // A slotted row keeps its number:
+                                            // that is the key you press to
+                                            // paste it back.
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "⌘{}",
+                                                    clipd_core::slot_badge(n)
+                                                ))
+                                                .size(11.0)
+                                                .color(rgb(c.accent)),
                                             );
-                                            let (rect, resp) = ui.allocate_exact_size(
-                                                egui::vec2(galley.size().x + 14.0, 22.0),
-                                                egui::Sense::hover(),
+                                        } else {
+                                            ui.label(
+                                                RichText::new(&time)
+                                                    .size(11.5)
+                                                    .color(rgb(c.subtext)),
                                             );
-                                            ui.painter().rect_filled(
-                                                rect,
-                                                Rounding::same(6.0),
-                                                rgb(c.accent).gamma_multiply(0.18),
-                                            );
-                                            ui.painter().text(
-                                                rect.center(),
-                                                egui::Align2::CENTER_CENTER,
-                                                text,
-                                                egui::FontId::proportional(11.0),
-                                                rgb(c.accent),
-                                            );
-                                            resp.on_hover_text(format!(
-                                                "Held in slot {badge} — ⌘{badge} pastes it"
-                                            ));
                                         }
                                     },
                                 );
                             });
                         });
 
+                    // The rule between rows, drawn on every row but the last
+                    // — and only where the rows share edges. On glass each
+                    // pane has its own rim, so a rule as well would draw two
+                    // lines in the same place.
+                    {
+                        let r = frame.response.rect;
+                        if pos + 1 < row_count && !glass_rows {
+                            ui.painter().hline(
+                                (r.left() + 12.0)..=(r.right() - 12.0),
+                                r.bottom(),
+                                Stroke::new(0.6, rgb(c.border)),
+                            );
+                        }
+                        ui.interact(r, hover_id, egui::Sense::hover());
+                    }
+
+                    if copy_clicked {
+                        self.selected = pos;
+                        *action = Action::Copy;
+                    }
                     if star_clicked {
                         self.selected = pos;
                         *action = Action::ToggleStar(clip_id);
@@ -4588,22 +4989,21 @@ impl ClipdGui {
                         egui::Rect::from_min_max(
                             frame.response.rect.min,
                             egui::pos2(
-                                frame.response.rect.right() - 42.0,
+                                frame.response.rect.right() - 96.0,
                                 frame.response.rect.bottom(),
                             ),
                         ),
                         egui::Id::new(("hud_row", clip_id)),
                         egui::Sense::click(),
                     );
-                    if hit.clicked() && !star_clicked {
+                    if hit.clicked() && !star_clicked && !copy_clicked {
                         self.selected = pos;
                         *action = Action::Copy;
                     }
-                    if hit.double_clicked() && !star_clicked {
+                    if hit.double_clicked() && !star_clicked && !copy_clicked {
                         self.selected = pos;
                         *action = Action::Paste;
                     }
-                    ui.add_space(2.0);
                 }
             });
 
@@ -4853,6 +5253,10 @@ impl ClipdGui {
         // identical behaviour in every category.
         let content_filter = self.content_filter;
         let starred = &self.starred_clip_ids;
+        // Borrowed alongside the others: the API-keys filter asks the same
+        // detector that decides whether a row wears the key glyph, so the two
+        // can never disagree about what counts as a key.
+        let privacy = &self.privacy_config;
         base_indices.retain(|&i| {
             let clip = &self.clips[i];
             match content_filter {
@@ -4868,6 +5272,9 @@ impl ClipdGui {
                 ContentFilter::Code => clip.content_type == ContentType::Code,
                 ContentFilter::Images => clip.content_type == ContentType::Image,
                 ContentFilter::Files => clip.content_type == ContentType::Path,
+                ContentFilter::ApiKeys => detect_sensitive(&clip.content, privacy)
+                    .iter()
+                    .any(|m| m.kind.is_api_key()),
             }
         });
 
@@ -6582,6 +6989,9 @@ impl ClipdGui {
                     ui.add_space(ROW_GAP);
                 }
 
+                // Rows in a run share edges, so nothing may be inserted
+                // between them. Section headers add their own space.
+                ui.spacing_mut().item_spacing.y = 0.0;
                 for (display_idx, &clip_idx) in visible_indices.iter().enumerate() {
                     let clip = &self.clips[clip_idx];
                     let clip_id_value = clip.id;
@@ -6607,6 +7017,36 @@ impl ClipdGui {
                         ui.add_space(8.0);
                     }
                     let mut star_clicked = false;
+                    let mut copy_clicked = false;
+                    let mut delete_clicked = false;
+                    // Where this row sits in its run decides its corners. The
+                    // reference draws a section as one card with the rows
+                    // ruled inside it, not as a stack of separate cards — so
+                    // only the first and last row of a run are rounded, and
+                    // the rest butt together into a single edge.
+                    let next_group = visible_indices.get(display_idx + 1).and_then(|&next| {
+                        let next_clip = self.clips.get(next)?;
+                        Some(clip_group_label(
+                            next_clip,
+                            self.starred_clip_ids.contains(&next_clip.id),
+                        ))
+                    });
+                    let first_in_group = previous_group != Some(group);
+                    let last_in_group = next_group != Some(group);
+                    // Glass rows are separate panes, each with its own lit
+                    // rim, so they keep all four corners and stand apart.
+                    // Opaque themes rule them together into one card.
+                    let glass_rows = self.theme.is_glass();
+                    let row_rounding = if glass_rows {
+                        Rounding::same(10.0)
+                    } else {
+                        Rounding {
+                            nw: if first_in_group { 12.0 } else { 0.0 },
+                            ne: if first_in_group { 12.0 } else { 0.0 },
+                            sw: if last_in_group { 12.0 } else { 0.0 },
+                            se: if last_in_group { 12.0 } else { 0.0 },
+                        }
+                    };
                     let clip_id = egui::Id::new(("clip", display_idx));
                     let hover_id = egui::Id::new(("cliphover", display_idx));
                     // Was the pointer over this row last frame? Read from a
@@ -6649,16 +7089,16 @@ impl ClipdGui {
                             },
                         }
                     } else if is_selected {
-                        // Selection is the accent, not a slightly lighter grey.
-                        // A wash of it over the card plus a proper edge, so the
-                        // row you are on is obvious at a glance down the list
-                        // rather than something you have to look for.
+                        // A fill and the same hairline every other row has.
+                        // The old heavy accent edge was drawn for rows that
+                        // floated separately; inside one ruled card it boxes
+                        // a single row and reads as a dialog, not a selection.
                         (
                             surf(c, c.bg_selected),
-                            Stroke::new(1.2, rgb(c.accent).gamma_multiply(0.55)),
+                            Stroke::new(0.7, rgb(c.border)),
                         )
                     } else if row_hovered {
-                        (surf(c, c.bg_hover), Stroke::new(0.5, rgb(c.border)))
+                        (surf(c, c.bg_hover), Stroke::new(0.7, rgb(c.border)))
                     } else if let Some(ring) = slot_ring {
                         (surf(c, c.bg_elevated), ring)
                     } else {
@@ -6702,12 +7142,20 @@ impl ClipdGui {
                         None
                     };
 
-                    ui.add_space(ROW_GAP);
+                    // No gap inside a run — the rows are meant to share
+                    // edges. The space before a section header is added with
+                    // the header itself. Glass panes do not share edges, so
+                    // they get a gap of their own.
+                    if glass_rows {
+                        ui.add_space(4.0);
+                    } else if first_in_group {
+                        ui.add_space(2.0);
+                    }
 
-                    // Mockup row: app tile · title/meta · thumb · star.
+                    // Reference row: type tile · title/meta · copy · pin · ⋮
                     let frame_resp = egui::Frame::none()
                         .fill(bg)
-                        .rounding(Rounding::same(12.0))
+                        .rounding(row_rounding)
                         .stroke(border)
                         .inner_margin(Margin::symmetric(12.0, 10.0))
                         .show(ui, |ui| {
@@ -6715,31 +7163,19 @@ impl ClipdGui {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 10.0;
 
-                                // Every theme gets the rail, not just glass.
-                                // It is the clearest signal of which row is
-                                // selected — a bar at the leading edge is
-                                // visible while scanning, where a background
-                                // tint alone is not.
-                                {
-                                    let (rail, _) = ui.allocate_exact_size(
-                                        egui::vec2(3.0, 34.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().rect_filled(
-                                        rail,
-                                        Rounding::same(2.0),
-                                        if is_selected {
-                                            rgb(c.green)
-                                        } else {
-                                            Color32::TRANSPARENT
-                                        },
-                                    );
-                                }
-
-                                draw_source_tile(ui, source, c);
+                                // No selection rail. The reference marks the
+                                // selected row by filling it, and inside a
+                                // single ruled card a bar at the leading edge
+                                // reads as a fourth vertical line rather than
+                                // as emphasis.
+                                draw_type_tile(ui, &clip.content_type, is_sensitive, true, c);
 
                                 let thumb_slot = if is_image { 52.0 } else { 0.0 };
-                                let right_w = 28.0
+                                // Copy (28) + pin (24) + ⋮ (22) + the spacing
+                                // between them. This was still reserving the
+                                // 28pt the lone star used to need, so a long
+                                // title ran underneath the new controls.
+                                let right_w = 104.0
                                     + thumb_slot
                                     + if is_sensitive { 12.0 } else { 0.0 };
                                 let content_w = (ui.available_width() - right_w).max(60.0);
@@ -6773,13 +7209,57 @@ impl ClipdGui {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        // Star: always when pinned; otherwise hover-only.
-                                        if is_starred || row_hovered {
-                                            if row_star_quiet(ui, is_starred, c).clicked() {
-                                                star_clicked = true;
+                                        // Right-to-left: added first sits
+                                        // rightmost, so this is ⋮ · pin · copy
+                                        // on screen, the reference's order.
+                                        // A blank button with the dots
+                                        // painted on: the ⋮ character is not
+                                        // in the bundled font and came out as
+                                        // an empty box.
+                                        let more = egui::menu::menu_custom_button(
+                                            ui,
+                                            egui::Button::new("")
+                                                .fill(Color32::TRANSPARENT)
+                                                .stroke(Stroke::NONE)
+                                                .min_size(egui::vec2(22.0, 28.0)),
+                                            |ui| {
+                                                if ui.button("Copy").clicked() {
+                                                    copy_clicked = true;
+                                                    ui.close_menu();
+                                                }
+                                                if ui
+                                                    .button(if is_starred { "Unpin" } else { "Pin" })
+                                                    .clicked()
+                                                {
+                                                    star_clicked = true;
+                                                    ui.close_menu();
+                                                }
+                                                if ui.button("Delete").clicked() {
+                                                    delete_clicked = true;
+                                                    ui.close_menu();
+                                                }
+                                            },
+                                        );
+                                        {
+                                            let r = more.response.rect;
+                                            for dy in [-4.6_f32, 0.0, 4.6] {
+                                                ui.painter().circle_filled(
+                                                    egui::pos2(r.center().x, r.center().y + dy),
+                                                    1.5,
+                                                    rgb(c.overlay),
+                                                );
                                             }
-                                        } else {
-                                            ui.add_space(24.0);
+                                        }
+                                        // The pin holds its place whether or
+                                        // not it is filled: a control that
+                                        // appears on hover moves the two
+                                        // beside it every time the pointer
+                                        // crosses a row.
+                                        if row_star_quiet(ui, is_starred, c).clicked() {
+                                            star_clicked = true;
+                                        }
+                                        if row_copy_button(ui, c).clicked() {
+                                            copy_clicked = true;
                                         }
                                         if is_image {
                                             let (tile, _) = ui.allocate_exact_size(
@@ -6834,12 +7314,26 @@ impl ClipdGui {
                         self.selected = display_idx;
                         *action = Action::ToggleStar(clip_id_value);
                     }
+                    // Copy and Delete both act on the selected clip, so the
+                    // row has to become the selection before the action runs
+                    // — otherwise the button on row four copies row one.
+                    if copy_clicked {
+                        self.selected = display_idx;
+                        *action = Action::Copy;
+                    }
+                    if delete_clicked {
+                        self.selected = display_idx;
+                        *action = Action::Delete;
+                    }
 
-                    // Whole row (minus the star zone) is clickable.
+                    // Whole row minus the controls is clickable. The excluded
+                    // strip grew with them: at 36pt the copy button and the ⋮
+                    // sat inside the row's own click target, so pressing
+                    // either one also fired the row.
                     let full = frame_resp.response.rect;
                     let row_rect = egui::Rect::from_min_max(
                         full.min,
-                        egui::pos2(full.max.x - 36.0, full.max.y),
+                        egui::pos2(full.max.x - 104.0, full.max.y),
                     );
                     let resp = ui.interact(row_rect, clip_id, egui::Sense::click());
                     ui.interact(full, hover_id, egui::Sense::hover());
@@ -8035,7 +8529,9 @@ impl ClipdGui {
         let spotlight = self.theme == Theme::GlassLight;
         let search_frame = egui::Frame::none()
             .fill(if spotlight {
-                Color32::from_rgba_unmultiplied(248, 250, 252, 112)
+                // Frosted, not solid: at 216 alpha this was a white slab sunk
+                // into the glass. Its rim is what separates it.
+                Color32::from_white_alpha(96)
             } else {
                 surf(c, c.bg_elevated)
             })
@@ -8045,7 +8541,7 @@ impl ClipdGui {
                 if asking && !in_settings {
                     rgb(c.accent).gamma_multiply(0.72)
                 } else if spotlight {
-                    Color32::from_rgba_unmultiplied(92, 103, 117, 68)
+                    Color32::from_rgba_unmultiplied(188, 198, 214, 190)
                 } else {
                     rgb(c.border)
                 },
@@ -8156,7 +8652,7 @@ impl ClipdGui {
                 let (dot, _) =
                     ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                 ui.painter()
-                    .circle_filled(dot.center(), 3.5, rgb(c.green));
+                    .circle_filled(dot.center(), 3.5, capture_dot_color(self.theme, c));
                 ui.label(
                     RichText::new("Capturing")
                         .size(12.0)
@@ -11462,24 +11958,36 @@ mod tests {
                 "Option is not a Windows modifier: {keys}"
             );
         } else {
-            // Both leaders are named, whether on one row or two.
-            assert!(keys.contains("Ctrl+Option+C"), "the copy leader");
+            // The leaders are Cmd+Option, not Ctrl+Option.
+            //
+            // This test had rotted into contradicting itself: it required the
+            // pre-move Ctrl+Option leaders, asserted Cmd+Option a few lines
+            // later, and demanded that row 0 begin with "⌘C ⌘C" while another
+            // assertion forbade that string anywhere in the list. It had been
+            // failing on main as a result. The contract below is the one the
+            // daemon actually binds (`is_cmd_opt` + C/V in daemon.rs).
+            assert!(keys.contains("Cmd+Option+C"), "the copy leader must be named");
+            assert!(keys.contains("Cmd+Option+V"), "the paste leader must be named");
+
+            // The one-chord forms need no timing at all, so help that lists
+            // only the leaders hides the easier path.
             assert!(
-                keys.contains("Ctrl+Option+V") || keys.contains("Ctrl+Option+C / V"),
-                "the paste leader must be named: {keys}"
+                keys.contains("Ctrl+Option+letter"),
+                "the one-chord paste form must be named: {keys}"
             );
-            // Copy has a double-tap form; paste deliberately does not, because
-            // ⌘V ×2 already means slot 2 and a paste cannot be taken back.
-            // Letter slots must not borrow the numeric multi-tap keys. A
+            assert!(
+                keys.contains("Ctrl+Shift+Option+letter"),
+                "the one-chord copy form must be named: {keys}"
+            );
+
+            // Letter slots must not borrow the numeric multi-tap keys: a
             // gesture built on ⌘C or ⌘V can always be mistaken for a slot
             // count, whichever way the timing is tuned.
             assert!(
                 !keys.contains("\u{2318}C \u{2318}C") && !keys.contains("\u{2318}V \u{2318}V"),
                 "letter slots must stay off the numeric keys: {keys}"
             );
-            // The gesture must not be built on a key that types something.
-            // Option+C emits ç and Option+V emits √, so a missed swallow puts
-            // a character in the user's document.
+
             // Never build a letter gesture on plain Option+letter: Option+C
             // emits ç and Option+V emits √, so a missed swallow types into the
             // user's document. Cmd in the chord suppresses that.
@@ -11487,14 +11995,16 @@ mod tests {
                 !keys.contains("Option+C  Option+C") && !keys.contains("Option+V  Option+V"),
                 "letter gestures must not use keys that emit characters: {keys}"
             );
-            assert!(keys.contains("Cmd+Option+C"), "letter copy leader");
-            assert!(keys.contains("Cmd+Option+V"), "letter paste leader");
-            // The two-key path leads, because it is the one worth learning.
+
+            // Shortest first: the leader path leads, because it is the one
+            // worth learning. (The old form of this asserted a numeric
+            // double-tap that the rule above forbids.)
             assert!(
-                rows[0].0.starts_with("\u{2318}C \u{2318}C"),
-                "the shortest path should be first, got {}",
+                rows[0].0.starts_with("Cmd+Option+"),
+                "the leader path should be first, got {}",
                 rows[0].0
             );
+
             assert!(!keys.contains("Ctrl+`"), "that leader is Windows-only");
         }
         // Every row explains itself; a bare chord list teaches nothing.
