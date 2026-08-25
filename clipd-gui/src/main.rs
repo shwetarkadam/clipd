@@ -6718,7 +6718,11 @@ impl eframe::App for ClipdGui {
                         sw: SHELL_ROUND,
                         se: SHELL_ROUND,
                     })
-                    .inner_margin(Margin::symmetric(16.0, 0.0)),
+                    // 8pt top and bottom against a 44pt panel and a 28pt
+                    // row: the row was allocated from the top edge with all
+                    // the slack below it, which left the text riding the
+                    // window's bottom rounding.
+                    .inner_margin(Margin::symmetric(16.0, 8.0)),
             )
             .show(ctx, |ui| {
                 paint_panel_glass_gradient(ui, self.theme);
@@ -8481,17 +8485,16 @@ impl ClipdGui {
                 // footer: it answers "is clipd watching" the moment the
                 // window opens, which is the first thing you want to know
                 // and the last thing you want to hunt for at the bottom.
+                // The light alone, no label. A word repeated in a window you
+                // opened on purpose is a word you read once and never again;
+                // the dot carries the same state and costs no line.
                 if self.active_tab != MainTab::Settings && self.active_tab != MainTab::Vault {
                     ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Capturing")
-                            .size(11.5)
-                            .color(rgb(c.subtext)),
-                    );
-                    let (dot, _) =
-                        ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                    let (dot, resp) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                     ui.painter()
-                        .circle_filled(dot.center(), 3.5, capture_dot_color(self.theme, c));
+                        .circle_filled(dot.center(), 3.6, capture_dot_color(self.theme, c));
+                    resp.on_hover_text("Capturing — clipd is watching the clipboard");
                     ui.add_space(4.0);
                 }
                 if self.active_tab != MainTab::Settings && self.active_tab != MainTab::Vault {
