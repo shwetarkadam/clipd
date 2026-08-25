@@ -28,6 +28,12 @@ const CARD_PAD_X: f32 = 10.0;
 const CARD_PAD_Y: f32 = 5.0;
 /// Gap between rows in the list (mockup: ~8–10px between cards).
 const ROW_GAP: f32 = 8.0;
+
+/// Every slot a clip can be addressed by: 1..9 numeric, 11..30 extended,
+/// 31..56 the letters A..Z. The footer counts against this rather than a
+/// round number — a denominator that does not match what the daemon binds
+/// tells the user their slots are full when they are not, or the reverse.
+const ADDRESSABLE_SLOTS: usize = 9 + 20 + 26;
 /// Pill (tag) corner radius and padding.
 const PILL_ROUND: f32 = 6.0;
 const PILL_PAD_X: f32 = 7.0;
@@ -1414,14 +1420,19 @@ fn tiny_filter_chip(
             Stroke::NONE,
         )
     } else if active && !spotlight {
-        // A tint, not a slab. These accents are built to be read *as text* on
-        // a dark ground — painted as a saturated fill behind dark text they
-        // jump ~150 luminance levels off the surface and become the loudest
-        // thing in the window, louder than the clips they are filtering.
+        // Solid, and inverted: on a dark ground the reference fills the live
+        // segment with the ink colour and sets the label in the background
+        // colour. A 20/255 white wash reads as "slightly different" rather
+        // than "this one", which is the only job this control has.
+        //
+        // The old worry — that a saturated fill would shout — applied to the
+        // themed accents, which are built to be read as *text* on dark. The
+        // ink is not: it is already the brightest thing in the window, so
+        // using it here adds no new loudness.
         (
+            rgb(c.bg_base),
             rgb(c.text),
-            Color32::from_white_alpha(20),
-            Stroke::new(1.0, Color32::from_white_alpha(16)),
+            Stroke::NONE,
         )
     } else if active {
         (
@@ -7057,11 +7068,20 @@ impl ClipdGui {
                         ))
                     });
                     if previous_group != Some(group) {
-                        // Mockup: roomy gap before "Recent", then header, then cards.
+                        // Roomy gap before "Recent", then the header, then the
+                        // rows. Set as spaced small-caps: at 12pt in sentence
+                        // case a section header reads as another row of text,
+                        // and this list is nothing but rows of text.
                         ui.add_space(if display_idx == 0 { 4.0 } else { 18.0 });
+                        let spaced: String = group
+                            .to_uppercase()
+                            .chars()
+                            .map(|ch| ch.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\u{2009}");
                         ui.label(
-                            RichText::new(group)
-                                .size(12.0)
+                            RichText::new(spaced)
+                                .size(10.5)
                                 .strong()
                                 .color(rgb(c.overlay)),
                         );
@@ -8422,9 +8442,11 @@ impl ClipdGui {
     fn render_brand_header(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
+            // The cat stays — it is the app's mark, and the reference's
+            // lettered avatar is a placeholder for exactly this.
             draw_brand_mark(ui, c);
             ui.label(
-                RichText::new("Clipd")
+                RichText::new("clipd")
                     .size(15.0)
                     .strong()
                     .color(rgb(c.text)),
@@ -8454,6 +8476,23 @@ impl ClipdGui {
                     } else {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
+                }
+                // Liveness sits in the header in the reference, not the
+                // footer: it answers "is clipd watching" the moment the
+                // window opens, which is the first thing you want to know
+                // and the last thing you want to hunt for at the bottom.
+                if self.active_tab != MainTab::Settings && self.active_tab != MainTab::Vault {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Capturing")
+                            .size(11.5)
+                            .color(rgb(c.subtext)),
+                    );
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(dot.center(), 3.5, capture_dot_color(self.theme, c));
+                    ui.add_space(4.0);
                 }
                 if self.active_tab != MainTab::Settings && self.active_tab != MainTab::Vault {
                     let vault =
@@ -8609,7 +8648,7 @@ impl ClipdGui {
                     MainTab::Settings => "Search settings...",
                     MainTab::Vault => "Search vault…",
                     MainTab::Text if asking => "Ask, then press Enter",
-                    MainTab::Text => "Search clips, links, code...",
+                    MainTab::Text => "Search clips, links, code... or start with ? to ask",
                 };
                 let slash_w = if in_settings { 0.0 } else { 28.0 };
                 // Constrain the text field so it never pushes the `/` badge
@@ -8686,34 +8725,35 @@ impl ClipdGui {
         _action: &mut Action,
         c: &clipd_core::ThemeColors,
     ) {
-        // Mockup footer: green Capturing (left) · outline clock (true centre) ·
-        // ⌘⇧V chip (right). One slim row, space-between alignment.
+        // Footer: how many slots are spoken for on the left, the chord that
+        // opens the palette on the right. The clock that used to sit in the
+        // centre said nothing the timestamps in each row do not, and
+        // "Capturing" moved to the header, where a liveness light belongs.
         let row_h = 28.0;
         let full_w = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(egui::vec2(full_w, row_h), egui::Sense::hover());
 
-        // Left — status.
+        // Left — slot occupancy. Counted from the clips actually holding a
+        // slot, so it cannot drift from what ⌘V would paste back.
+        let used = self
+            .clips
+            .iter()
+            .filter_map(|clip| clip.slot)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         let left = egui::Rect::from_min_size(
             egui::pos2(rect.left(), rect.top()),
-            egui::vec2(full_w * 0.4, row_h),
+            egui::vec2(full_w * 0.5, row_h),
         );
         ui.allocate_ui_at_rect(left, |ui| {
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let (dot, _) =
-                    ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                ui.painter()
-                    .circle_filled(dot.center(), 3.5, capture_dot_color(self.theme, c));
                 ui.label(
-                    RichText::new("Capturing")
+                    RichText::new(format!("{used} / {ADDRESSABLE_SLOTS} slots used"))
                         .size(12.0)
                         .color(rgb(c.subtext)),
                 );
             });
         });
-
-        // Centre — clock, painted at the exact midpoint.
-        draw_clock_icon_at(ui.painter(), rect.center(), rgb(c.overlay));
 
         // Right — shortcut hint.
         let right = egui::Rect::from_min_size(
