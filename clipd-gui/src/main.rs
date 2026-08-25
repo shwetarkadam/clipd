@@ -11958,24 +11958,36 @@ mod tests {
                 "Option is not a Windows modifier: {keys}"
             );
         } else {
-            // Both leaders are named, whether on one row or two.
-            assert!(keys.contains("Ctrl+Option+C"), "the copy leader");
+            // The leaders are Cmd+Option, not Ctrl+Option.
+            //
+            // This test had rotted into contradicting itself: it required the
+            // pre-move Ctrl+Option leaders, asserted Cmd+Option a few lines
+            // later, and demanded that row 0 begin with "⌘C ⌘C" while another
+            // assertion forbade that string anywhere in the list. It had been
+            // failing on main as a result. The contract below is the one the
+            // daemon actually binds (`is_cmd_opt` + C/V in daemon.rs).
+            assert!(keys.contains("Cmd+Option+C"), "the copy leader must be named");
+            assert!(keys.contains("Cmd+Option+V"), "the paste leader must be named");
+
+            // The one-chord forms need no timing at all, so help that lists
+            // only the leaders hides the easier path.
             assert!(
-                keys.contains("Ctrl+Option+V") || keys.contains("Ctrl+Option+C / V"),
-                "the paste leader must be named: {keys}"
+                keys.contains("Ctrl+Option+letter"),
+                "the one-chord paste form must be named: {keys}"
             );
-            // Copy has a double-tap form; paste deliberately does not, because
-            // ⌘V ×2 already means slot 2 and a paste cannot be taken back.
-            // Letter slots must not borrow the numeric multi-tap keys. A
+            assert!(
+                keys.contains("Ctrl+Shift+Option+letter"),
+                "the one-chord copy form must be named: {keys}"
+            );
+
+            // Letter slots must not borrow the numeric multi-tap keys: a
             // gesture built on ⌘C or ⌘V can always be mistaken for a slot
             // count, whichever way the timing is tuned.
             assert!(
                 !keys.contains("\u{2318}C \u{2318}C") && !keys.contains("\u{2318}V \u{2318}V"),
                 "letter slots must stay off the numeric keys: {keys}"
             );
-            // The gesture must not be built on a key that types something.
-            // Option+C emits ç and Option+V emits √, so a missed swallow puts
-            // a character in the user's document.
+
             // Never build a letter gesture on plain Option+letter: Option+C
             // emits ç and Option+V emits √, so a missed swallow types into the
             // user's document. Cmd in the chord suppresses that.
@@ -11983,14 +11995,16 @@ mod tests {
                 !keys.contains("Option+C  Option+C") && !keys.contains("Option+V  Option+V"),
                 "letter gestures must not use keys that emit characters: {keys}"
             );
-            assert!(keys.contains("Cmd+Option+C"), "letter copy leader");
-            assert!(keys.contains("Cmd+Option+V"), "letter paste leader");
-            // The two-key path leads, because it is the one worth learning.
+
+            // Shortest first: the leader path leads, because it is the one
+            // worth learning. (The old form of this asserted a numeric
+            // double-tap that the rule above forbids.)
             assert!(
-                rows[0].0.starts_with("\u{2318}C \u{2318}C"),
-                "the shortest path should be first, got {}",
+                rows[0].0.starts_with("Cmd+Option+"),
+                "the leader path should be first, got {}",
                 rows[0].0
             );
+
             assert!(!keys.contains("Ctrl+`"), "that leader is Windows-only");
         }
         // Every row explains itself; a bare chord list teaches nothing.
