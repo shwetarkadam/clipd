@@ -3275,23 +3275,20 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
 
     force_view_transparent(frame);
 
-    // Light does not use Liquid Glass.
+    // Both modes go through the sibling Liquid Glass view.
     //
-    // Measured on this machine: the Regular style resolves a light panel
-    // toward white whatever is painted on it, so Glass Light came out as a
-    // flat white plate over a white document. Clear was tried instead and is
-    // a lens rather than frost — browser tabs behind the window stayed
-    // legible straight through it. Classic vibrancy is the material Spotlight
-    // and the menu-bar popovers use, and it stays a translucent frost.
+    // Light was briefly routed to classic vibrancy instead, to get away from
+    // the Regular style resolving toward white. That produced a popover with
+    // no UI in it at all: `apply_vibrancy` inserts its NSVisualEffectView
+    // *into* the content view, which puts it on top of eframe's render
+    // surface and hides everything drawn there. The sibling approach below is
+    // exactly what avoids that — the material goes behind the content view,
+    // not inside it — which is why the liquid path was written this way.
     //
-    // This routing was written once, then lost when main.rs was restored from
-    // a backup during the capture work, and shipped without it.
-    let liquid = if light {
-        Err("light uses classic vibrancy".to_string())
-    } else {
-        apply_sibling_liquid_glass(frame, light)
-    };
-    match liquid {
+    // The whiteness that prompted the switch is handled where it belongs: in
+    // the tint on the glass view, and in the single frost layer painted over
+    // it, neither of which can hide the UI.
+    match apply_sibling_liquid_glass(frame, light) {
         Ok(()) => {
             *on = Some(light);
             write_glass_status("liquid-regular", light);
