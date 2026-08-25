@@ -3298,11 +3298,21 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
         }
         Err(err) => {
             log::info!("Liquid Glass unavailable ({err}); using classic vibrancy");
-            // HudWindow both ways: the Spotlight/panel material, a
-            // translucent grey frost that passes the desktop through.
-            // UnderWindowBackground is the one that resolves to a
-            // near-opaque plate in light mode.
-            let material = window_vibrancy::NSVisualEffectMaterial::HudWindow;
+            // A vibrancy material renders in the *window's* appearance, and
+            // this machine's system appearance is Dark. Left alone, a light
+            // glass theme got a dark panel with its dark ink drawn into it —
+            // the popover came out an empty black rectangle.
+            //
+            // So pin the appearance to match the theme, then pick a material
+            // that belongs to it: Popover is the light menu/panel frost,
+            // HudWindow is the dark HUD one. Choosing HudWindow for light was
+            // the mistake: it is dark by definition, whatever the appearance.
+            force_glass_appearance(frame, light);
+            let material = if light {
+                window_vibrancy::NSVisualEffectMaterial::Popover
+            } else {
+                window_vibrancy::NSVisualEffectMaterial::HudWindow
+            };
             match window_vibrancy::apply_vibrancy(
                 frame,
                 material,
@@ -3320,6 +3330,34 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
             }
         }
     }
+}
+
+/// Pin the window's appearance so a vibrancy material renders in the theme's
+/// mode rather than the system's.
+///
+/// Without this the material follows the OS: on a Mac set to Dark, the light
+/// glass theme was handed a dark frost, and dark ink on a dark frost is an
+/// empty panel.
+#[cfg(target_os = "macos")]
+fn force_glass_appearance(frame: &eframe::Frame, light: bool) {
+    use objc2_app_kit::{
+        NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua,
+        NSAppearanceNameDarkAqua,
+    };
+
+    let Some(view) = ns_metal_view(frame) else {
+        return;
+    };
+    let Some(window) = view.window() else {
+        return;
+    };
+    let name = if light {
+        unsafe { NSAppearanceNameAqua }
+    } else {
+        unsafe { NSAppearanceNameDarkAqua }
+    };
+    let appearance = unsafe { NSAppearance::appearanceNamed(name) };
+    unsafe { window.setAppearance(appearance.as_deref()) };
 }
 
 #[cfg(target_os = "macos")]
