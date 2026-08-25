@@ -3046,7 +3046,7 @@ fn paint_glass_shell(
             // At (168,175,186)@44 it washed to rgb(250,255,255), i.e. back to
             // white: light paint on this material loses very quickly, so the
             // usable range between "grey" and "white" is narrow.
-            Color32::from_rgba_unmultiplied(146, 153, 165, if native_glass { 47 } else { 136 })
+            Color32::from_rgba_unmultiplied(178, 186, 200, if native_glass { 44 } else { 130 })
         } else {
             // Neutral to match the grounds: a blue veil over neutral surfaces
             // just puts the cast back on top of the fix.
@@ -3449,7 +3449,7 @@ fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool) -> Result<(), 
         // means. Deeper and cooler: the material now has a colour of its own
         // that survives a white backdrop, and over anything darker it still
         // passes the backdrop through.
-        NSColor::colorWithRed_green_blue_alpha(0.71, 0.74, 0.79, 0.35)
+        NSColor::colorWithRed_green_blue_alpha(0.78, 0.81, 0.86, 0.30)
     } else {
         // Denser than it was. A thin tint over Regular glass still let bright
         // windows behind punch through as patches, which is what made the
