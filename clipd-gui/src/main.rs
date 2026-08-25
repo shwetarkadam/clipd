@@ -3275,18 +3275,34 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
 
     force_view_transparent(frame);
 
-    match apply_sibling_liquid_glass(frame, light) {
+    // Light does not use Liquid Glass.
+    //
+    // Measured on this machine: the Regular style resolves a light panel
+    // toward white whatever is painted on it, so Glass Light came out as a
+    // flat white plate over a white document. Clear was tried instead and is
+    // a lens rather than frost — browser tabs behind the window stayed
+    // legible straight through it. Classic vibrancy is the material Spotlight
+    // and the menu-bar popovers use, and it stays a translucent frost.
+    //
+    // This routing was written once, then lost when main.rs was restored from
+    // a backup during the capture work, and shipped without it.
+    let liquid = if light {
+        Err("light uses classic vibrancy".to_string())
+    } else {
+        apply_sibling_liquid_glass(frame, light)
+    };
+    match liquid {
         Ok(()) => {
             *on = Some(light);
             write_glass_status("liquid-regular", light);
         }
         Err(err) => {
             log::info!("Liquid Glass unavailable ({err}); using classic vibrancy");
-            let material = if light {
-                window_vibrancy::NSVisualEffectMaterial::UnderWindowBackground
-            } else {
-                window_vibrancy::NSVisualEffectMaterial::HudWindow
-            };
+            // HudWindow both ways: the Spotlight/panel material, a
+            // translucent grey frost that passes the desktop through.
+            // UnderWindowBackground is the one that resolves to a
+            // near-opaque plate in light mode.
+            let material = window_vibrancy::NSVisualEffectMaterial::HudWindow;
             match window_vibrancy::apply_vibrancy(
                 frame,
                 material,
