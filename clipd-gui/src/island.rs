@@ -88,7 +88,14 @@ const PANEL_ONE_ROW_W: f32 = 740.0;
 /// The panel's single header band: brand, tabs, actions.
 const PANEL_HEAD_H: f32 = 40.0;
 /// The "hotkeys are off" banner, when it is showing.
-const HOTKEY_BANNER_H: f32 = 62.0;
+/// Height the slab reserves for the permission banner.
+///
+/// Must track what `island_hotkey_banner` actually draws — title, two lines
+/// of prose, and a row of buttons, inside the frame's padding. It was left at
+/// 62 when the banner was reflowed to put its buttons on their own line, so
+/// the slab under-reserved by about a row: the last clip was pushed out of
+/// view and the space it should have occupied read as dead air.
+const HOTKEY_BANNER_H: f32 = 98.0;
 /// A shelved file, and how many fit before the row scrolls.
 const SHELF_TILE: egui::Vec2 = egui::vec2(74.0, 64.0);
 const SHELF_TILES: usize = 12;
@@ -1934,10 +1941,14 @@ impl ClipdGui {
                 }
 
                 let counts = self.island_counts();
+                // Lowercase, as the palette and the popover set it. Three
+                // surfaces of one app spelling its own name two ways is the
+                // kind of detail that reads as unfinished without anyone
+                // being able to say why.
                 draw_bar_brand(
                     ui,
                     &s,
-                    "Clipd",
+                    "clipd",
                     &format!("{} items", counts.recent),
                     false,
                 );
@@ -2914,6 +2925,12 @@ fn island_glyph_button(ui: &mut egui::Ui, s: &IslandSkin, glyph: IslandGlyph) ->
     let center = rect.center();
     match glyph {
         IslandGlyph::Pin(on) => {
+            // An actual pushpin — head, cross-piece, point.
+            //
+            // It was a bare circle, filled when pinned and outlined when not.
+            // Next to a gear and a magnifier that both look like what they do,
+            // an unexplained ring reads as a control someone forgot to finish,
+            // and "outlined circle" is not a thing anyone recognises as a pin.
             let color = if on {
                 s.accent
             } else if hovered {
@@ -2921,11 +2938,27 @@ fn island_glyph_button(ui: &mut egui::Ui, s: &IslandSkin, glyph: IslandGlyph) ->
             } else {
                 s.faint
             };
+            let stroke = Stroke::new(1.3, color);
+            let head = egui::pos2(center.x, center.y - 3.2);
             if on {
-                painter.circle_filled(center, 4.0, color);
+                painter.circle_filled(head, 2.8, color);
             } else {
-                painter.circle_stroke(center, 4.0, Stroke::new(1.2, color));
+                painter.circle_stroke(head, 2.8, stroke);
             }
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 4.0, center.y + 0.4),
+                    egui::pos2(center.x + 4.0, center.y + 0.4),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x, center.y + 0.4),
+                    egui::pos2(center.x, center.y + 4.6),
+                ],
+                stroke,
+            );
         }
         IslandGlyph::Gear => {
             let color = if hovered { s.ink } else { s.faint };
