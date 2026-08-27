@@ -116,6 +116,34 @@ fn is_telemetry_enabled() -> bool {
     true
 }
 
+/// Whether anonymous telemetry is on, for the settings UI to show.
+pub fn telemetry_enabled() -> bool {
+    is_telemetry_enabled()
+}
+
+/// Turn anonymous telemetry on or off, preserving the install id.
+///
+/// Opting out used to mean finding `telemetry.json` and editing it by hand,
+/// which is not an opt-out any user is going to discover — and this is a
+/// clipboard manager, where "what does it send home" is a fair question to
+/// have a switch for.
+pub fn set_telemetry_enabled(on: bool) {
+    let path = telemetry_json_path();
+    let install_id = get_or_create_install_id();
+    let json = serde_json::json!({ "install_id": install_id, "enabled": on });
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap_or_default());
+}
+
+/// Whether this build can send anything at all — false when no endpoint was
+/// compiled in, which is every local build. The settings row says so rather
+/// than offering a switch that does nothing.
+pub fn telemetry_configured() -> bool {
+    endpoint().is_some()
+}
+
 /// Returns the configured endpoint, or None if not set at compile time.
 fn endpoint() -> Option<&'static str> {
     option_env!("CLIPD_TELEMETRY_ENDPOINT").filter(|s| !s.is_empty())

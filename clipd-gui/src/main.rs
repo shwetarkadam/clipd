@@ -9242,6 +9242,41 @@ impl ClipdGui {
 
     fn render_settings_privacy(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         let mut dirty = false;
+
+        // What clipd sends home, said out loud and switchable.
+        //
+        // Telemetry defaults on and could only be turned off by finding
+        // telemetry.json and editing it, which is not an opt-out anyone
+        // discovers. On a clipboard manager especially, "what leaves this
+        // machine" deserves an answer in the settings rather than in a file.
+        settings_section(ui, c, "Anonymous usage");
+        settings_card(ui, c, |ui| {
+            if clipd_core::telemetry_configured() {
+                let mut on = clipd_core::telemetry_enabled();
+                if settings_toggle_row(
+                    ui,
+                    c,
+                    FooterIcon::Eye,
+                    &mut on,
+                    "Send anonymous usage ping",
+                    "One ping when clipd starts: version, OS, and a random id. No clip contents.",
+                ) {
+                    clipd_core::set_telemetry_enabled(on);
+                }
+            } else {
+                // A switch that cannot do anything is worse than a sentence
+                // saying so: local and self-built binaries have no endpoint
+                // compiled in and are physically unable to send a ping.
+                ui.label(
+                    RichText::new(
+                        "This build sends nothing — no telemetry endpoint was compiled in.",
+                    )
+                    .size(12.0)
+                    .color(rgb(c.subtext)),
+                );
+            }
+        });
+
         settings_section(ui, c, "Protection");
         settings_card(ui, c, |ui| {
             dirty |= settings_toggle_row(
