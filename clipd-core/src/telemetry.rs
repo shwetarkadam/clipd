@@ -4,11 +4,19 @@
 //! Users can opt out by setting `"enabled": false` in `~/.local/share/clipd/telemetry.json`
 //! (or simply deleting that file).
 //!
-//! The telemetry endpoint is set at **compile time** via the `CLIPD_TELEMETRY_ENDPOINT`
-//! environment variable:
-//!   CLIPD_TELEMETRY_ENDPOINT=https://your-worker.workers.dev cargo build --release -p clipd-daemon
+//! Two ways to receive the ping, both set at **compile time**, both optional:
 //!
-//! If the env var is absent, the telemetry feature is a no-op (zero binary cost).
+//!   CLIPD_POSTHOG_KEY=phc_...            → PostHog. Nothing to deploy or run;
+//!                                          it counts distinct install ids, so
+//!                                          active users and retention come out
+//!                                          of the box. Free to 1M events/month.
+//!   CLIPD_TELEMETRY_ENDPOINT=https://... → your own counter (the worker in
+//!                                          telemetry-worker/), if you would
+//!                                          rather the data landed on
+//!                                          infrastructure you own.
+//!
+//! PostHog wins if both are set. If neither is, this is a no-op with zero
+//! binary cost — which is every local build.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -141,12 +149,31 @@ pub fn set_telemetry_enabled(on: bool) {
 /// compiled in, which is every local build. The settings row says so rather
 /// than offering a switch that does nothing.
 pub fn telemetry_configured() -> bool {
-    endpoint().is_some()
+    endpoint().is_some() || posthog_key().is_some()
 }
 
 /// Returns the configured endpoint, or None if not set at compile time.
 fn endpoint() -> Option<&'static str> {
     option_env!("CLIPD_TELEMETRY_ENDPOINT").filter(|s| !s.is_empty())
+}
+
+/// PostHog project key, if this build was made with one.
+///
+/// The alternative to running a counter yourself. Set this instead of
+/// `CLIPD_TELEMETRY_ENDPOINT` and there is nothing to deploy or maintain:
+/// PostHog counts distinct `distinct_id`s for you, which is the "how many
+/// people actually use this" number a hand-rolled counter kept failing to
+/// answer.
+fn posthog_key() -> Option<&'static str> {
+    option_env!("CLIPD_POSTHOG_KEY").filter(|s| !s.is_empty())
+}
+
+/// Which PostHog region to talk to. Defaults to US cloud; set
+/// `CLIPD_POSTHOG_HOST=https://eu.i.posthog.com` for EU.
+fn posthog_host() -> &'static str {
+    option_env!("CLIPD_POSTHOG_HOST")
+        .filter(|s| !s.is_empty())
+        .unwrap_or("https://us.i.posthog.com")
 }
 
 // ── url encoding (no external dep) ───────────────────────────────────────────
@@ -173,11 +200,12 @@ fn urlencoding_encode(s: &str) -> String {
 /// Runs in a spawned background thread — never blocks daemon startup.
 /// On network failure or if telemetry is disabled, silently does nothing.
 pub fn ping() {
-    // If no endpoint is configured at compile time, this is a no-op.
-    let endpoint = match endpoint() {
-        Some(e) => e,
-        None => return,
-    };
+    // Nothing configured at compile time → nothing to send, no binary cost.
+    let posthog = posthog_key();
+    let endpoint = endpoint();
+    if posthog.is_none() && endpoint.is_none() {
+        return;
+    }
 
     if !is_telemetry_enabled() {
         return;
@@ -187,6 +215,17 @@ pub fn ping() {
     let version = clipd_version().to_string();
     let os = os_name().to_string();
     let arch = arch_name().to_string();
+
+    // PostHog wins when both are set: it is the one that can answer "how many
+    // people", because it counts distinct ids rather than requests.
+    if let Some(key) = posthog {
+        posthog_ping(key, &install_id, &version, &os, &arch);
+        return;
+    }
+    let endpoint = match endpoint {
+        Some(e) => e,
+        None => return,
+    };
 
     let url = format!(
         "{}/ping?v={}&os={}&arch={}&id={}",
@@ -217,6 +256,37 @@ pub fn ping() {
                 // Silently ignore — not critical functionality
                 log::debug!("📊 telemetry skipped: {}", e);
             }
+        }
+    });
+}
+
+/// One event to PostHog's capture endpoint, off the startup path.
+///
+/// A plain POST — no SDK, no extra dependency, `ureq` was already here. The
+/// install id goes in as `distinct_id`, which is the whole point: PostHog's
+/// active-user and retention views are counts of distinct ids, so they come
+/// out right without any aggregation code on our side.
+fn posthog_ping(key: &str, install_id: &str, version: &str, os: &str, arch: &str) {
+    let url = format!("{}/i/v0/e/", posthog_host().trim_end_matches('/'));
+    let body = serde_json::json!({
+        "api_key": key,
+        "event": "daemon_started",
+        "distinct_id": install_id,
+        "properties": {
+            "version": version,
+            "os": os,
+            "arch": arch,
+        },
+    });
+
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(4))
+            .timeout_read(Duration::from_secs(4))
+            .build();
+        match agent.post(&url).send_json(body) {
+            Ok(_) => log::debug!("📊 telemetry ping ok"),
+            Err(e) => log::debug!("📊 telemetry skipped: {}", e),
         }
     });
 }
