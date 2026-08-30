@@ -3692,6 +3692,12 @@ struct ClipdGui {
     theme: Theme,
     /// User-defined palette that overrides the active theme when enabled.
     custom_colors: CustomColors,
+    /// Reported once per window — see `render_text_banners`.
+    reported_permission_block: bool,
+    /// Whether anything was copied before this window closed. The difference
+    /// between opening the palette and leaving with a clip is the only
+    /// "did it work" signal that does not require guessing.
+    copied_this_session: bool,
     /// Full palette and tray HUD are separate long-lived processes. Poll the
     /// shared appearance preference at a low rate so either surface reflects a
     /// theme change made in the other without needing to be relaunched.
@@ -3936,6 +3942,8 @@ impl ClipdGui {
             focus_search: true,
             theme,
             custom_colors: load_custom_colors(),
+            reported_permission_block: false,
+            copied_this_session: false,
             last_shared_appearance_check: Instant::now() - Duration::from_secs(1),
             show_transforms: false,
             show_preview: false,
@@ -6269,6 +6277,17 @@ impl ClipdGui {
 
 impl eframe::App for ClipdGui {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // The close of the funnel. "Opened, then left with nothing" is the
+        // population worth chasing; without this the analytics can only show
+        // successes and would make the app look like it always works.
+        clipd_core::telemetry_event(
+            "window_closed",
+            &[
+                ("surface", if self.hud { "popover" } else { "palette" }.to_string()),
+                ("copied", self.copied_this_session.to_string()),
+                ("clips_held", self.clips.len().to_string()),
+            ],
+        );
         // Hand the top of the screen back to the island on the way out.
         if !self.island_surface {
             clipd_core::set_gui_window_open(false);
@@ -8560,6 +8579,16 @@ impl ClipdGui {
     fn render_text_banners(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         #[cfg(target_os = "macos")]
         if load_hotkey_status() == HotkeyStatus::NeedsAccessibility {
+            // Once per window, not once per frame: this draws at 60fps, and
+            // the fact worth recording is "someone hit this wall", not how
+            // long they sat in front of it. It is the one dead end in clipd
+            // where clicking harder cannot help — the grant is macOS's to
+            // give — so it is the first thing to look at when people install
+            // and never copy anything.
+            if !self.reported_permission_block {
+                self.reported_permission_block = true;
+                clipd_core::telemetry_event("blocked_permission", &[]);
+            }
             let (warn_fill, warn_title, warn_body, warn_btn_fill, warn_btn_text) =
                 warning_colors(self.theme.is_light());
             egui::Frame::none()
@@ -9258,8 +9287,8 @@ impl ClipdGui {
                     c,
                     FooterIcon::Eye,
                     &mut on,
-                    "Send anonymous usage ping",
-                    "One ping when clipd starts: version, OS, and a random id. No clip contents.",
+                    "Send anonymous usage data",
+                    "Version, OS, country, and which features you use — under a random id. Never clip contents.",
                 ) {
                     clipd_core::set_telemetry_enabled(on);
                 }

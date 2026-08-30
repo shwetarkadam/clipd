@@ -129,4 +129,7 @@ pub use vault::{
 pub use watcher::{ClipEvent, ClipWatcher};
 
 /// Fire the anonymous telemetry ping (noop if telemetry is disabled or no endpoint is configured).
-pub use telemetry::{ping, set_telemetry_enabled, telemetry_configured, telemetry_enabled};
+pub use telemetry::{
+    event as telemetry_event, ping, set_telemetry_enabled, telemetry_configured,
+    telemetry_enabled,
+};
