@@ -118,7 +118,7 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           if [ -z "$APPLE_ID" ] || [ -z "$APPLE_TEAM_ID" ] || [ -z "$APPLE_APP_PASSWORD" ]; then
-            echo "::warning::Apple notarization secrets not set — the download will be quarantined and users must right-click → Open."
+            echo "::notice::Not notarized — no Apple Developer Program membership, which is the only way to get a Developer ID certificate. The one-line installer avoids Gatekeeper entirely (curl sets no quarantine flag); only hand-downloaded zips are affected."
             exit 0
           fi
           ditto -c -k --keepParent target/release/Clipd.app /tmp/clipd-notarize.zip
@@ -365,10 +365,22 @@ jobs:
             **notarized**, which requires a paid Apple Developer account. This
             project is open source and earns nothing, so it is not notarized.
 
-            Open it anyway: **System Settings → Privacy & Security**, scroll to
-            Security, click **Open Anyway**. On macOS 15 the warning dialog
+            The flag comes from your *browser*, not from the app — so the
+            quickest fix is to install the way the box above describes.
+            Re-running the one-liner over a hand-downloaded copy clears it too:
+
+            ```
+            curl -fsSL https://raw.githubusercontent.com/shwetarkadam/clipd/main/install.sh | bash
+            ```
+
+            Or open it as-is: **System Settings → Privacy & Security**, scroll
+            to Security, click **Open Anyway**. On macOS 15 the warning dialog
             itself has only a *Done* button — the old right-click → Open
             shortcut no longer works.
+
+            Homebrew is not an option: as of 1 September 2026 Homebrew removes
+            casks that fail Gatekeeper, so an unnotarized cask cannot be
+            published there.
 
             Or clear the flag yourself:
 
