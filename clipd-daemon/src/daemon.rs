@@ -2272,30 +2272,94 @@ fn is_terminal_frontmost() -> bool {
 /// so rapid taps update the display instead of stacking.
 #[cfg(target_os = "macos")]
 fn show_slot_notification(action: &str, slot: u8) {
-    let lines = vec![
-        "STYLE\ttoast".to_string(),
+    show_hud(&slot_hud_payload(action, slot, None).join("\n"));
+}
+
+/// The strip of slots to draw around the one that just fired.
+///
+/// A single number answers "where did that go" but not "how far along am I",
+/// which is the question during a multi-tap — so the toast shows the run. Five
+/// chips, centred on the live slot and clamped to the 1..9 bank so the window
+/// never runs off either end.
+#[cfg(target_os = "macos")]
+fn slot_strip(slot: u8) -> Option<(u8, u8)> {
+    if !(1..=9).contains(&slot) {
+        return None;
+    }
+    let first = slot.saturating_sub(2).max(1).min(5);
+    Some((first, first + 4))
+}
+
+/// What to press to get this slot back, and how long the count stays open.
+///
+/// The window is read from TAP_WINDOW rather than written out, so the toast
+/// cannot end up quoting a timing the daemon no longer uses.
+#[cfg(target_os = "macos")]
+fn slot_foot(action: &str, slot: u8) -> String {
+    let chord = match action {
+        "Pasted" | "Paste" => retrieve_hint(slot),
+        _ => match slot {
+            1..=9 => format!("⌘C ×{slot}"),
+            11..=30 => format!("⌥C ×{}", slot - 10),
+            31..=56 => format!("⌃⌥C {}", (b'A' + (slot - 31)) as char),
+            _ => "⌘C".to_string(),
+        },
+    };
+    format!(
+        "{chord} · fires {:.2}s after the last tap",
+        TAP_WINDOW.as_secs_f32()
+    )
+}
+
+/// The slot toast: pill, slot strip, chord. Falls back to the plain toast for
+/// the letter and extended banks, where a five-chip strip would be a window
+/// onto twenty-six slots and say nothing.
+#[cfg(target_os = "macos")]
+fn slot_hud_payload(action: &str, slot: u8, content: Option<&str>) -> Vec<String> {
+    let Some((first, last)) = slot_strip(slot) else {
+        let mut lines = vec![
+            "STYLE\ttoast".to_string(),
+            format!("BADGE\t{}", slot_badge(slot)),
+            format!("TITLE\t{}", toast_title(action, slot)),
+            format!("HINT\t{}", retrieve_hint(slot)),
+        ];
+        if let Some(text) = content {
+            lines.insert(
+                3,
+                format!("PREVIEW\t{}\t{}", content_icon(text), truncate(text, 52)),
+            );
+        }
+        return lines;
+    };
+
+    let mut lines = vec![
+        "STYLE\tslot".to_string(),
         format!("BADGE\t{}", slot_badge(slot)),
         format!("TITLE\t{}", toast_title(action, slot)),
-        format!("HINT\t{}", retrieve_hint(slot)),
+        format!("SLOTS\t{slot}\t{first}\t{last}"),
+        format!("FOOT\t{}", slot_foot(action, slot)),
     ];
-    show_hud(&lines.join("\n"));
+    // The avatar shows where the clip came from; the title already carries the
+    // slot, so spending the circle on the number again says nothing new.
+    if let Some(app) = get_frontmost_app_name() {
+        if let Some(initial) = app.chars().find(|c| c.is_alphanumeric()) {
+            lines.push(format!("SOURCE\t{}", initial.to_lowercase()));
+        }
+    }
+    if let Some(text) = content {
+        lines.push(format!(
+            "PREVIEW\t{}\t{}",
+            content_icon(text),
+            truncate(text, 52)
+        ));
+    }
+    lines
 }
 
 #[cfg(target_os = "macos")]
 fn show_slot_content_notification(action: &str, slot: u8, content: &str) {
     remember_slot_for_hud(slot, content);
-    let lines = vec![
-        "STYLE\ttoast".to_string(),
-        format!("BADGE\t{}", slot_badge(slot)),
-        format!("TITLE\t{}", toast_title(action, slot)),
-        format!(
-            "PREVIEW\t{}\t{}",
-            content_icon(content),
-            truncate(content, 52)
-        ),
-        format!("HINT\t{}", retrieve_hint(slot)),
-    ];
-    show_hud(&lines.join("\n"));
+    show_hud(&slot_hud_payload(action, slot, Some(content)).join("\n"));
 }
 
 /// Toast's first line: status + the slot it acted on, e.g. "Copied to Slot 3"
@@ -5091,5 +5155,45 @@ mod slot_mapping_tests {
         assert_eq!(key_to_letter_slot(RKey::KeyM), Some((43, 12, 'M')));
         assert_eq!(key_to_letter_slot(RKey::KeyZ), Some((56, 25, 'Z')));
         assert_eq!(key_to_letter_slot(RKey::Num1), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_slot_strip_stays_inside_the_bank() {
+        // Five chips centred on the live slot, clamped so the window never
+        // runs past either end of 1..9 — a strip that starts at 0 or ends at
+        // 11 is showing slots that do not exist.
+        assert_eq!(slot_strip(7), Some((5, 9)));
+        assert_eq!(slot_strip(5), Some((3, 7)));
+        // Near the ends the window stops moving rather than hanging off.
+        assert_eq!(slot_strip(1), Some((1, 5)));
+        assert_eq!(slot_strip(2), Some((1, 5)));
+        assert_eq!(slot_strip(9), Some((5, 9)));
+        assert_eq!(slot_strip(8), Some((5, 9)));
+        // Every window is five wide and contains the slot it is drawn for.
+        for slot in 1..=9u8 {
+            let (first, last) = slot_strip(slot).expect("numeric slots have a strip");
+            assert_eq!(last - first, 4, "slot {slot} strip is not five wide");
+            assert!((first..=last).contains(&slot), "slot {slot} outside its own strip");
+            assert!(first >= 1 && last <= 9, "slot {slot} strip leaves the bank");
+        }
+        // The extended and letter banks get the plain toast: a five-chip
+        // window onto twenty-six slots would say nothing.
+        assert_eq!(slot_strip(15), None);
+        assert_eq!(slot_strip(31), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_slot_foot_quotes_the_window_the_daemon_uses() {
+        // The caption is built from TAP_WINDOW rather than written out, so it
+        // cannot end up advertising a timing that was changed here.
+        let secs = format!("{:.2}s", TAP_WINDOW.as_secs_f32());
+        let foot = slot_foot("Copied", 7);
+        assert!(foot.contains(&secs), "foot must quote TAP_WINDOW: {foot}");
+        assert!(foot.starts_with("⌘C ×7"), "copy names the copy chord: {foot}");
+        // Paste is the other direction and must not tell you to press ⌘C.
+        let paste = slot_foot("Pasted", 3);
+        assert!(paste.starts_with("⌘V ×3"), "paste names the paste chord: {paste}");
     }
 }

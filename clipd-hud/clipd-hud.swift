@@ -25,6 +25,12 @@ struct Payload {
     var previewKind = ""
     var preview = ""
     var foot = ""
+    /// Initial of the app the clip came from, drawn in the toast's avatar.
+    var source = ""
+    /// The slot strip: which slot is live, and the run it is shown within.
+    var slotActive = 0
+    var slotFirst = 0
+    var slotLast = 0
     var rows: [Row] = []
     var buttons: [Button] = []
     var timeout: Double = 0
@@ -59,6 +65,13 @@ func parse(_ text: String) -> Payload {
         case "HINT":    if f.count > 1 { p.hint = f[1] }
         case "BADGE":   if f.count > 1 { p.badge = f[1] }
         case "FOOT":    if f.count > 1 { p.foot = f[1] }
+        case "SOURCE":  if f.count > 1 { p.source = f[1] }
+        case "SLOTS":
+            if f.count > 3 {
+                p.slotActive = Int(f[1]) ?? 0
+                p.slotFirst = Int(f[2]) ?? 0
+                p.slotLast = Int(f[3]) ?? 0
+            }
         case "PREVIEW": if f.count > 2 { p.previewKind = f[1]; p.preview = f[2] }
         case "TIMEOUT": if f.count > 1 { p.timeout = Double(f[1]) ?? 0 }
         case "AVOIDTOP": if f.count > 1 { p.avoidTop = CGFloat(Double(f[1]) ?? 0) }
@@ -341,6 +354,153 @@ class HUD: NSObject {
         present(duration: 0.75)
     }
 
+    /// A panel with nothing behind the content — no frosted plate.
+    ///
+    /// The slot toast draws its own dark pill and chips as separate shapes
+    /// with gaps between them; a backing plate would put a visible rectangle
+    /// around the lot.
+    func makePlainPanel(_ rect: NSRect) {
+        let mask: NSWindow.StyleMask = [.borderless, .nonactivatingPanel]
+        panel = NSPanel(contentRect: rect, styleMask: mask, backing: .buffered, defer: false)
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.ignoresMouseEvents = true
+        panel.level = .floating
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.appearance = NSAppearance(named: .aqua)
+        let v = NSView(frame: NSRect(origin: .zero, size: rect.size))
+        v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor.clear.cgColor
+        v.autoresizingMask = [.width, .height]
+        panel.contentView = v
+        root = v
+    }
+
+    /// One rounded shape with its own shadow, for the pill and the chips.
+    func shape(_ frame: NSRect, fill: NSColor, radius: CGFloat,
+               border: NSColor? = nil, borderWidth: CGFloat = 0,
+               shadow: Bool = false) -> NSView {
+        let v = NSView(frame: frame)
+        v.wantsLayer = true
+        v.layer?.backgroundColor = fill.cgColor
+        v.layer?.cornerRadius = radius
+        if let b = border {
+            v.layer?.borderColor = b.cgColor
+            v.layer?.borderWidth = borderWidth
+        }
+        if shadow {
+            v.layer?.shadowColor = NSColor.black.cgColor
+            v.layer?.shadowOpacity = 0.22
+            v.layer?.shadowRadius = 12
+            v.layer?.shadowOffset = CGSize(width: 0, height: -3)
+            v.layer?.masksToBounds = false
+        }
+        root.addSubview(v)
+        return v
+    }
+
+    /// The slot toast: a dark pill saying what happened, the run of slots
+    /// around the one that just fired, and the chord that gets it back.
+    ///
+    /// The pill carries the copy itself; the strip below is the part worth
+    /// having, because during a multi-tap the useful question is not "which
+    /// slot did that go to" but "how far along am I" — and a single number
+    /// cannot answer that.
+    func showSlotToast(_ p: Payload) {
+        guard let screen = NSScreen.main else { return }
+        let pillW: CGFloat = 440, pillH: CGFloat = 74
+        let chip: CGFloat = 46, chipGap: CGFloat = 10
+        let chips = max(0, p.slotLast - p.slotFirst + 1)
+        let stripW = chips > 0 ? CGFloat(chips) * chip + CGFloat(chips - 1) * chipGap : 0
+        let footH: CGFloat = p.foot.isEmpty ? 0 : 16
+        let gapPillStrip: CGFloat = chips > 0 ? 14 : 0
+        let gapStripFoot: CGFloat = p.foot.isEmpty ? 0 : 12
+        let w = max(pillW, stripW) + 40
+        let h = pillH + gapPillStrip + (chips > 0 ? chip : 0) + gapStripFoot + footH + 24
+        let x = (screen.frame.width - w) / 2
+        let y = panelY(screen, height: h, fraction: 0.70, avoidTop: p.avoidTop)
+        makePlainPanel(NSRect(x: x, y: y, width: w, height: h))
+
+        let ink = NSColor(calibratedWhite: 0.07, alpha: 0.97)
+        let pillX = (w - pillW) / 2
+        let pillY = h - pillH - 12
+        _ = shape(NSRect(x: pillX, y: pillY, width: pillW, height: pillH),
+                  fill: ink, radius: pillH / 2,
+                  border: NSColor(calibratedWhite: 1.0, alpha: 0.07), borderWidth: 1,
+                  shadow: true)
+
+        // The avatar: where the clip came from, not which slot it went to —
+        // the title already says the slot, and repeating it wastes the one
+        // spot that can carry something else.
+        let av: CGFloat = 42
+        let avX = pillX + 16, avY = pillY + (pillH - av) / 2
+        _ = shape(NSRect(x: avX, y: avY, width: av, height: av),
+                  fill: NSColor(calibratedWhite: 1.0, alpha: 0.06), radius: av / 2,
+                  border: NSColor(calibratedWhite: 1.0, alpha: 0.16), borderWidth: 1)
+        let initial = p.source.isEmpty ? p.badge : p.source
+        let al = label(initial, size: 13, weight: .medium,
+                       color: NSColor(calibratedWhite: 1.0, alpha: 0.82), align: .center)
+        al.frame = NSRect(x: avX, y: avY + (av - 18) / 2 - 1, width: av, height: 18)
+        root.addSubview(al)
+
+        let tx = avX + av + 16
+        let tickW: CGFloat = 30
+        let textW = pillX + pillW - tx - tickW - 20
+        let hasPreview = !p.preview.isEmpty
+        let titleY = hasPreview ? pillY + 38 : pillY + (pillH - 20) / 2
+        let t = label(p.title, size: 15.5, weight: .semibold, color: .white)
+        t.frame = NSRect(x: tx, y: titleY, width: textW, height: 20)
+        root.addSubview(t)
+        if hasPreview {
+            let pv = label(p.preview, size: 13, weight: .regular,
+                           color: NSColor(calibratedWhite: 1.0, alpha: 0.55))
+            pv.frame = NSRect(x: tx, y: pillY + 17, width: textW, height: 18)
+            root.addSubview(pv)
+        }
+
+        // The tick reads as "done" without a word for it.
+        let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+        let iv = NSImageView(frame: NSRect(x: pillX + pillW - 46, y: pillY + (pillH - 20) / 2,
+                                           width: 20, height: 20))
+        if let base = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil) {
+            iv.image = base.withSymbolConfiguration(cfg) ?? base
+        }
+        iv.contentTintColor = NSColor(calibratedWhite: 1.0, alpha: 0.92)
+        iv.imageScaling = .scaleProportionallyDown
+        root.addSubview(iv)
+
+        // The strip: the run this slot sits in, with the live one ringed.
+        if chips > 0 {
+            let stripY = pillY - gapPillStrip - chip
+            var cx = (w - stripW) / 2
+            for n in p.slotFirst...p.slotLast {
+                let live = n == p.slotActive
+                _ = shape(NSRect(x: cx, y: stripY, width: chip, height: chip),
+                          fill: ink, radius: 13,
+                          border: live ? NSColor(calibratedRed: 0.45, green: 0.62, blue: 0.95, alpha: 0.95)
+                                       : NSColor(calibratedWhite: 1.0, alpha: 0.06),
+                          borderWidth: live ? 2 : 1)
+                let nl = label("\(n)", size: 15, weight: live ? .semibold : .regular,
+                               color: NSColor(calibratedWhite: 1.0, alpha: live ? 0.95 : 0.45),
+                               align: .center)
+                nl.frame = NSRect(x: cx, y: stripY + (chip - 19) / 2, width: chip, height: 19)
+                root.addSubview(nl)
+                cx += chip + chipGap
+            }
+        }
+
+        if !p.foot.isEmpty {
+            let f = label(p.foot, size: 11.5, weight: .regular,
+                          color: NSColor(calibratedWhite: 0.42, alpha: 1.0), align: .center)
+            f.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular)
+            f.frame = NSRect(x: 0, y: 10, width: w, height: 16)
+            root.addSubview(f)
+        }
+
+        present(duration: p.timeout > 0 ? p.timeout : 1.9)
+    }
+
     func makePanel(_ rect: NSRect, interactive: Bool = false) {
         let mask: NSWindow.StyleMask = [.borderless, .nonactivatingPanel]
         panel = interactive
@@ -388,6 +548,7 @@ class HUD: NSObject {
         NSApplication.shared.setActivationPolicy(.accessory)
         let p = parse(text)
         switch p.style {
+        case "slot": showSlotToast(p)
         case "toast": showToast(p)
         case "list": showList(p)
         case "prompt": showPrompt(p)

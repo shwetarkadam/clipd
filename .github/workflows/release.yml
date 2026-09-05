@@ -8,10 +8,21 @@ on:
 permissions:
   contents: write
 
-# Telemetry endpoint — set in GitHub repo Settings → Secrets → Actions as CLIPD_TELEMETRY_ENDPOINT.
-# Format: https://your-worker.workers.dev (no trailing slash).
-# If unset or empty, telemetry is compiled out (zero binary cost, zero network calls).
+# Telemetry — both are optional repo secrets, and either being unset or empty
+# compiles that path out entirely (zero binary cost, zero network calls).
+#
+#   CLIPD_POSTHOG_KEY       PostHog project key (phc_...). Nothing to deploy;
+#                           PostHog counts distinct install ids, so active
+#                           users, country and retention are dashboards.
+#   CLIPD_POSTHOG_HOST      only for EU projects: https://eu.i.posthog.com
+#   CLIPD_TELEMETRY_ENDPOINT  your own counter instead (telemetry-worker/),
+#                           format https://your-worker.workers.dev, no
+#                           trailing slash.
+#
+# PostHog wins if both are set.
 env:
+  CLIPD_POSTHOG_KEY: ${{ secrets.CLIPD_POSTHOG_KEY }}
+  CLIPD_POSTHOG_HOST: ${{ secrets.CLIPD_POSTHOG_HOST }}
   CLIPD_TELEMETRY_ENDPOINT: ${{ secrets.CLIPD_TELEMETRY_ENDPOINT }}
 
 jobs:

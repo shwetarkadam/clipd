@@ -28,6 +28,12 @@ const CARD_PAD_X: f32 = 10.0;
 const CARD_PAD_Y: f32 = 5.0;
 /// Gap between rows in the list (mockup: ~8–10px between cards).
 const ROW_GAP: f32 = 8.0;
+
+/// Every slot a clip can be addressed by: 1..9 numeric, 11..30 extended,
+/// 31..56 the letters A..Z. The footer counts against this rather than a
+/// round number — a denominator that does not match what the daemon binds
+/// tells the user their slots are full when they are not, or the reverse.
+const ADDRESSABLE_SLOTS: usize = 9 + 20 + 26;
 /// Pill (tag) corner radius and padding.
 const PILL_ROUND: f32 = 6.0;
 const PILL_PAD_X: f32 = 7.0;
@@ -1414,14 +1420,19 @@ fn tiny_filter_chip(
             Stroke::NONE,
         )
     } else if active && !spotlight {
-        // A tint, not a slab. These accents are built to be read *as text* on
-        // a dark ground — painted as a saturated fill behind dark text they
-        // jump ~150 luminance levels off the surface and become the loudest
-        // thing in the window, louder than the clips they are filtering.
+        // Solid, and inverted: on a dark ground the reference fills the live
+        // segment with the ink colour and sets the label in the background
+        // colour. A 20/255 white wash reads as "slightly different" rather
+        // than "this one", which is the only job this control has.
+        //
+        // The old worry — that a saturated fill would shout — applied to the
+        // themed accents, which are built to be read as *text* on dark. The
+        // ink is not: it is already the brightest thing in the window, so
+        // using it here adds no new loudness.
         (
+            rgb(c.bg_base),
             rgb(c.text),
-            Color32::from_white_alpha(20),
-            Stroke::new(1.0, Color32::from_white_alpha(16)),
+            Stroke::NONE,
         )
     } else if active {
         (
@@ -3681,6 +3692,12 @@ struct ClipdGui {
     theme: Theme,
     /// User-defined palette that overrides the active theme when enabled.
     custom_colors: CustomColors,
+    /// Reported once per window — see `render_text_banners`.
+    reported_permission_block: bool,
+    /// Whether anything was copied before this window closed. The difference
+    /// between opening the palette and leaving with a clip is the only
+    /// "did it work" signal that does not require guessing.
+    copied_this_session: bool,
     /// Full palette and tray HUD are separate long-lived processes. Poll the
     /// shared appearance preference at a low rate so either surface reflects a
     /// theme change made in the other without needing to be relaunched.
@@ -3925,6 +3942,8 @@ impl ClipdGui {
             focus_search: true,
             theme,
             custom_colors: load_custom_colors(),
+            reported_permission_block: false,
+            copied_this_session: false,
             last_shared_appearance_check: Instant::now() - Duration::from_secs(1),
             show_transforms: false,
             show_preview: false,
@@ -6258,6 +6277,17 @@ impl ClipdGui {
 
 impl eframe::App for ClipdGui {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // The close of the funnel. "Opened, then left with nothing" is the
+        // population worth chasing; without this the analytics can only show
+        // successes and would make the app look like it always works.
+        clipd_core::telemetry_event(
+            "window_closed",
+            &[
+                ("surface", if self.hud { "popover" } else { "palette" }.to_string()),
+                ("copied", self.copied_this_session.to_string()),
+                ("clips_held", self.clips.len().to_string()),
+            ],
+        );
         // Hand the top of the screen back to the island on the way out.
         if !self.island_surface {
             clipd_core::set_gui_window_open(false);
@@ -6707,7 +6737,11 @@ impl eframe::App for ClipdGui {
                         sw: SHELL_ROUND,
                         se: SHELL_ROUND,
                     })
-                    .inner_margin(Margin::symmetric(16.0, 0.0)),
+                    // 8pt top and bottom against a 44pt panel and a 28pt
+                    // row: the row was allocated from the top edge with all
+                    // the slack below it, which left the text riding the
+                    // window's bottom rounding.
+                    .inner_margin(Margin::symmetric(16.0, 8.0)),
             )
             .show(ctx, |ui| {
                 paint_panel_glass_gradient(ui, self.theme);
@@ -7057,11 +7091,20 @@ impl ClipdGui {
                         ))
                     });
                     if previous_group != Some(group) {
-                        // Mockup: roomy gap before "Recent", then header, then cards.
+                        // Roomy gap before "Recent", then the header, then the
+                        // rows. Set as spaced small-caps: at 12pt in sentence
+                        // case a section header reads as another row of text,
+                        // and this list is nothing but rows of text.
                         ui.add_space(if display_idx == 0 { 4.0 } else { 18.0 });
+                        let spaced: String = group
+                            .to_uppercase()
+                            .chars()
+                            .map(|ch| ch.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\u{2009}");
                         ui.label(
-                            RichText::new(group)
-                                .size(12.0)
+                            RichText::new(spaced)
+                                .size(10.5)
                                 .strong()
                                 .color(rgb(c.overlay)),
                         );
@@ -8422,9 +8465,11 @@ impl ClipdGui {
     fn render_brand_header(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
+            // The cat stays — it is the app's mark, and the reference's
+            // lettered avatar is a placeholder for exactly this.
             draw_brand_mark(ui, c);
             ui.label(
-                RichText::new("Clipd")
+                RichText::new("clipd")
                     .size(15.0)
                     .strong()
                     .color(rgb(c.text)),
@@ -8454,6 +8499,22 @@ impl ClipdGui {
                     } else {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
+                }
+                // Liveness sits in the header in the reference, not the
+                // footer: it answers "is clipd watching" the moment the
+                // window opens, which is the first thing you want to know
+                // and the last thing you want to hunt for at the bottom.
+                // The light alone, no label. A word repeated in a window you
+                // opened on purpose is a word you read once and never again;
+                // the dot carries the same state and costs no line.
+                if self.active_tab != MainTab::Settings && self.active_tab != MainTab::Vault {
+                    ui.add_space(6.0);
+                    let (dot, resp) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter()
+                        .circle_filled(dot.center(), 3.6, capture_dot_color(self.theme, c));
+                    resp.on_hover_text("Capturing — clipd is watching the clipboard");
+                    ui.add_space(4.0);
                 }
                 if self.active_tab != MainTab::Settings && self.active_tab != MainTab::Vault {
                     let vault =
@@ -8518,6 +8579,16 @@ impl ClipdGui {
     fn render_text_banners(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         #[cfg(target_os = "macos")]
         if load_hotkey_status() == HotkeyStatus::NeedsAccessibility {
+            // Once per window, not once per frame: this draws at 60fps, and
+            // the fact worth recording is "someone hit this wall", not how
+            // long they sat in front of it. It is the one dead end in clipd
+            // where clicking harder cannot help — the grant is macOS's to
+            // give — so it is the first thing to look at when people install
+            // and never copy anything.
+            if !self.reported_permission_block {
+                self.reported_permission_block = true;
+                clipd_core::telemetry_event("blocked_permission", &[]);
+            }
             let (warn_fill, warn_title, warn_body, warn_btn_fill, warn_btn_text) =
                 warning_colors(self.theme.is_light());
             egui::Frame::none()
@@ -8609,7 +8680,7 @@ impl ClipdGui {
                     MainTab::Settings => "Search settings...",
                     MainTab::Vault => "Search vault…",
                     MainTab::Text if asking => "Ask, then press Enter",
-                    MainTab::Text => "Search clips, links, code...",
+                    MainTab::Text => "Search clips, links, code... or start with ? to ask",
                 };
                 let slash_w = if in_settings { 0.0 } else { 28.0 };
                 // Constrain the text field so it never pushes the `/` badge
@@ -8686,34 +8757,35 @@ impl ClipdGui {
         _action: &mut Action,
         c: &clipd_core::ThemeColors,
     ) {
-        // Mockup footer: green Capturing (left) · outline clock (true centre) ·
-        // ⌘⇧V chip (right). One slim row, space-between alignment.
+        // Footer: how many slots are spoken for on the left, the chord that
+        // opens the palette on the right. The clock that used to sit in the
+        // centre said nothing the timestamps in each row do not, and
+        // "Capturing" moved to the header, where a liveness light belongs.
         let row_h = 28.0;
         let full_w = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(egui::vec2(full_w, row_h), egui::Sense::hover());
 
-        // Left — status.
+        // Left — slot occupancy. Counted from the clips actually holding a
+        // slot, so it cannot drift from what ⌘V would paste back.
+        let used = self
+            .clips
+            .iter()
+            .filter_map(|clip| clip.slot)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         let left = egui::Rect::from_min_size(
             egui::pos2(rect.left(), rect.top()),
-            egui::vec2(full_w * 0.4, row_h),
+            egui::vec2(full_w * 0.5, row_h),
         );
         ui.allocate_ui_at_rect(left, |ui| {
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let (dot, _) =
-                    ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                ui.painter()
-                    .circle_filled(dot.center(), 3.5, capture_dot_color(self.theme, c));
                 ui.label(
-                    RichText::new("Capturing")
+                    RichText::new(format!("{used} / {ADDRESSABLE_SLOTS} slots used"))
                         .size(12.0)
                         .color(rgb(c.subtext)),
                 );
             });
         });
-
-        // Centre — clock, painted at the exact midpoint.
-        draw_clock_icon_at(ui.painter(), rect.center(), rgb(c.overlay));
 
         // Right — shortcut hint.
         let right = egui::Rect::from_min_size(
@@ -9199,6 +9271,41 @@ impl ClipdGui {
 
     fn render_settings_privacy(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         let mut dirty = false;
+
+        // What clipd sends home, said out loud and switchable.
+        //
+        // Telemetry defaults on and could only be turned off by finding
+        // telemetry.json and editing it, which is not an opt-out anyone
+        // discovers. On a clipboard manager especially, "what leaves this
+        // machine" deserves an answer in the settings rather than in a file.
+        settings_section(ui, c, "Anonymous usage");
+        settings_card(ui, c, |ui| {
+            if clipd_core::telemetry_configured() {
+                let mut on = clipd_core::telemetry_enabled();
+                if settings_toggle_row(
+                    ui,
+                    c,
+                    FooterIcon::Eye,
+                    &mut on,
+                    "Send anonymous usage data",
+                    "Version, OS, country, and which features you use — under a random id. Never clip contents.",
+                ) {
+                    clipd_core::set_telemetry_enabled(on);
+                }
+            } else {
+                // A switch that cannot do anything is worse than a sentence
+                // saying so: local and self-built binaries have no endpoint
+                // compiled in and are physically unable to send a ping.
+                ui.label(
+                    RichText::new(
+                        "This build sends nothing — no telemetry endpoint was compiled in.",
+                    )
+                    .size(12.0)
+                    .color(rgb(c.subtext)),
+                );
+            }
+        });
+
         settings_section(ui, c, "Protection");
         settings_card(ui, c, |ui| {
             dirty |= settings_toggle_row(

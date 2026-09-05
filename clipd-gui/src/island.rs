@@ -88,7 +88,14 @@ const PANEL_ONE_ROW_W: f32 = 740.0;
 /// The panel's single header band: brand, tabs, actions.
 const PANEL_HEAD_H: f32 = 40.0;
 /// The "hotkeys are off" banner, when it is showing.
-const HOTKEY_BANNER_H: f32 = 62.0;
+/// Height the slab reserves for the permission banner.
+///
+/// Must track what `island_hotkey_banner` actually draws — title, two lines
+/// of prose, and a row of buttons, inside the frame's padding. It was left at
+/// 62 when the banner was reflowed to put its buttons on their own line, so
+/// the slab under-reserved by about a row: the last clip was pushed out of
+/// view and the space it should have occupied read as dead air.
+const HOTKEY_BANNER_H: f32 = 98.0;
 /// A shelved file, and how many fit before the row scrolls.
 const SHELF_TILE: egui::Vec2 = egui::vec2(74.0, 64.0);
 const SHELF_TILES: usize = 12;
@@ -1472,48 +1479,43 @@ impl ClipdGui {
             .inner_margin(Margin::symmetric(10.0, 7.0))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                // Prose across the full width, buttons on their own line.
+                // Setting them side by side reserved 200pt for the buttons on
+                // a panel barely wider than that, so the explanation wrapped
+                // into a five-line column and the banner grew taller than the
+                // list it was warning about.
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(
+                    RichText::new("Multi-slot copy is off")
+                        .size(11.5)
+                        .strong()
+                        .color(s.ink),
+                );
+                ui.label(
+                    RichText::new(
+                        "macOS drops the grant when clipd is rebuilt. Re-add it, then \
+                         restart — a new grant never reaches a running app.",
+                    )
+                    .size(9.5)
+                    .color(s.dim),
+                );
+                ui.add_space(7.0);
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    // Reserve the buttons' width up front. Laid out after the
-                    // text, the message claimed the full row and ran beneath
-                    // them.
-                    let text_w = (ui.available_width() - 200.0).max(120.0);
-                    ui.vertical(|ui| {
-                        ui.set_width(text_w);
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.label(
-                            RichText::new("Multi-slot copy is off")
-                                .size(11.5)
-                                .strong()
-                                .color(s.ink),
-                        );
-                        ui.label(
-                            RichText::new(
-                                "macOS drops the grant whenever clipd is rebuilt. Re-add it, \
-                                 then restart clipd — a new grant never reaches an \
-                                 already-running app.",
-                            )
-                            .size(9.5)
-                            .color(s.dim),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        // The second half of the fix, and the half that is
-                        // easy to miss: granting alone changes nothing until
-                        // the process that wanted the grant starts again.
-                        if island_button(ui, &s, "Restart clipd")
-                            .on_hover_text("Relaunch the tray host so it picks up the grant")
-                            .clicked()
-                        {
-                            restart_tray_host();
-                            self.island.note("Restarting clipd…");
-                        }
-                        if island_button(ui, &s, "Open Settings").clicked() {
-                            #[cfg(target_os = "macos")]
-                            clipd_core::open_keyboard_permission_settings();
-                        }
-                    });
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if island_button(ui, &s, "Open Settings").clicked() {
+                        #[cfg(target_os = "macos")]
+                        clipd_core::open_keyboard_permission_settings();
+                    }
+                    // The second half of the fix, and the half that is easy
+                    // to miss: granting alone changes nothing until the
+                    // process that wanted the grant starts again.
+                    if island_button(ui, &s, "Restart clipd")
+                        .on_hover_text("Relaunch the tray host so it picks up the grant")
+                        .clicked()
+                    {
+                        restart_tray_host();
+                        self.island.note("Restarting clipd…");
+                    }
                 });
             });
         ui.add_space(6.0);
@@ -1939,10 +1941,14 @@ impl ClipdGui {
                 }
 
                 let counts = self.island_counts();
+                // Lowercase, as the palette and the popover set it. Three
+                // surfaces of one app spelling its own name two ways is the
+                // kind of detail that reads as unfinished without anyone
+                // being able to say why.
                 draw_bar_brand(
                     ui,
                     &s,
-                    "Clipd",
+                    "clipd",
                     &format!("{} items", counts.recent),
                     false,
                 );
@@ -2318,9 +2324,15 @@ impl ClipdGui {
                         );
                     }
                     None => {
-                        ui.painter().rect_filled(
-                            egui::Rect::from_center_size(tile.center(), egui::vec2(7.0, 7.0)),
-                            Rounding::same(2.0),
+                        // A glyph for what the clip is, not a blank square.
+                        // The square was the same mark on every row, so a
+                        // list of ten rows carried ten identical icons and
+                        // the column may as well not have been there.
+                        ui.painter().text(
+                            tile.center(),
+                            egui::Align2::CENTER_CENTER,
+                            island_type_glyph(clip),
+                            egui::FontId::proportional(10.5),
                             tint,
                         );
                     }
@@ -2913,6 +2925,12 @@ fn island_glyph_button(ui: &mut egui::Ui, s: &IslandSkin, glyph: IslandGlyph) ->
     let center = rect.center();
     match glyph {
         IslandGlyph::Pin(on) => {
+            // An actual pushpin — head, cross-piece, point.
+            //
+            // It was a bare circle, filled when pinned and outlined when not.
+            // Next to a gear and a magnifier that both look like what they do,
+            // an unexplained ring reads as a control someone forgot to finish,
+            // and "outlined circle" is not a thing anyone recognises as a pin.
             let color = if on {
                 s.accent
             } else if hovered {
@@ -2920,11 +2938,27 @@ fn island_glyph_button(ui: &mut egui::Ui, s: &IslandSkin, glyph: IslandGlyph) ->
             } else {
                 s.faint
             };
+            let stroke = Stroke::new(1.3, color);
+            let head = egui::pos2(center.x, center.y - 3.2);
             if on {
-                painter.circle_filled(center, 4.0, color);
+                painter.circle_filled(head, 2.8, color);
             } else {
-                painter.circle_stroke(center, 4.0, Stroke::new(1.2, color));
+                painter.circle_stroke(head, 2.8, stroke);
             }
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 4.0, center.y + 0.4),
+                    egui::pos2(center.x + 4.0, center.y + 0.4),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x, center.y + 0.4),
+                    egui::pos2(center.x, center.y + 4.6),
+                ],
+                stroke,
+            );
         }
         IslandGlyph::Gear => {
             let color = if hovered { s.ink } else { s.faint };
@@ -3744,6 +3778,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_clip_type_gets_its_own_island_glyph() {
+        // The row icon used to be one blank square on every row, so a list of
+        // ten clips carried ten identical marks. Each type now has a glyph,
+        // and the ones that share a mark must be the ones that share a
+        // meaning — a file and a path are both "something on disk"; a link
+        // and a note are not.
+        use clipd_core::ContentType;
+        let glyph = |t: ContentType| {
+            let mut clip = clipd_core::ClipEntry::new("x".into(), None, None);
+            clip.content_type = t;
+            island_type_glyph(&clip)
+        };
+        assert_eq!(glyph(ContentType::File), glyph(ContentType::Path));
+        for (a, b) in [
+            (ContentType::Url, ContentType::Text),
+            (ContentType::Url, ContentType::Code),
+            (ContentType::Code, ContentType::Image),
+            (ContentType::Email, ContentType::Text),
+            (ContentType::Image, ContentType::File),
+        ] {
+            assert_ne!(
+                glyph(a.clone()),
+                glyph(b.clone()),
+                "{a:?} and {b:?} share a glyph"
+            );
+        }
+        for t in [
+            ContentType::Url,
+            ContentType::Text,
+            ContentType::Code,
+            ContentType::Image,
+            ContentType::File,
+            ContentType::Path,
+            ContentType::Email,
+            ContentType::Unknown,
+        ] {
+            assert!(!glyph(t.clone()).is_empty(), "{t:?} has no glyph");
+        }
+    }
+
+    #[test]
     fn a_multi_slot_copy_announces_its_slot() {
         // Repeated Cmd+C fills numbered slots. Announcing "Copied" for each of
         // them tells you the copy worked but not which number will paste it
@@ -4080,3 +4155,20 @@ mod tests {
         assert!(island_card_rows(&[], 900.0).is_empty());
     }
 }
+
+/// One character for what a clip is, sized for the island's 20pt tile.
+///
+/// The island cannot spare the room the full window gives a drawn icon, and a
+/// blank square repeated down the list tells the reader nothing — so each type
+/// gets a mark that is legible at ten and a half points.
+fn island_type_glyph(clip: &clipd_core::ClipEntry) -> &'static str {
+    match clip.content_type {
+        ContentType::Url => "↗",
+        ContentType::Email => "@",
+        ContentType::Code => "<>",
+        ContentType::Image => "▣",
+        ContentType::File | ContentType::Path => "▤",
+        _ => "¶",
+    }
+}
+
