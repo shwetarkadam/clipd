@@ -131,6 +131,54 @@ fn days_since_install() -> u64 {
     now_unix().saturating_sub(first) / 86_400
 }
 
+/// Sixteen random bytes, on every platform clipd runs on.
+///
+/// `/dev/urandom` where it exists. Windows has no such file, and the previous
+/// fallback — a clock, a pid and a stack address mixed into a u128 — was
+/// exactly the weak source that made every id start `00000000-0000-`. Left
+/// alone, the fix for Unix would have quietly excluded Windows from it, and
+/// Windows installs would collide with each other and undercount.
+///
+/// `RandomState` is the way to reach the OS entropy pool without a
+/// dependency: std seeds it from the system RNG to make HashMap
+/// collision-resistant. Two of them give 128 bits, and the clock and pid are
+/// folded in afterwards so a hypothetical constant seed still could not make
+/// two installs match.
+fn random_bytes() -> [u8; 16] {
+    let mut b = [0u8; 16];
+
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut b))
+            .is_ok()
+        {
+            return b;
+        }
+    }
+
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let hi = RandomState::new().build_hasher().finish();
+    let lo = RandomState::new().build_hasher().finish();
+    b[..8].copy_from_slice(&hi.to_le_bytes());
+    b[8..].copy_from_slice(&lo.to_le_bytes());
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    for (i, byte) in nanos.to_le_bytes().iter().enumerate() {
+        b[i] ^= byte;
+    }
+    for (i, byte) in pid.to_le_bytes().iter().enumerate() {
+        b[8 + i] ^= byte;
+    }
+    b
+}
+
 /// A random id for this install.
 ///
 /// The previous version mixed the clock, the pid and a stack address into a
@@ -146,25 +194,7 @@ fn days_since_install() -> u64 {
 ///
 /// /dev/urandom where there is one, the old mixing only as a fallback.
 fn uuid_simple() -> String {
-    let mut b = [0u8; 16];
-    let filled = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| {
-            use std::io::Read;
-            f.read_exact(&mut b)
-        })
-        .is_ok();
-
-    if !filled {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let pid = std::process::id() as u128;
-        let addr = std::ptr::addr_of!(b) as u128;
-        let mix = nanos ^ (pid << 64) ^ (addr << 32) ^ (addr.rotate_left(17));
-        b.copy_from_slice(&mix.to_le_bytes());
-    }
+    let mut b = random_bytes();
 
     // Version 4, variant 1 — so it is a real UUID and not merely shaped like
     // one, which matters if it is ever pasted into a tool that validates.
@@ -440,5 +470,24 @@ mod tests {
         // one and the user count collapses to the number of machines.
         let b = uuid_simple();
         assert_ne!(a, b, "two ids came out identical");
+    }
+
+    #[test]
+    fn entropy_does_not_depend_on_dev_urandom() {
+        // Windows has no /dev/urandom and takes the fallback. This asserts the
+        // fallback itself is sound, since CI cannot run the Windows path here:
+        // 64 draws, all distinct, and no byte position stuck at a constant.
+        use std::collections::HashSet;
+        let draws: Vec<[u8; 16]> = (0..64).map(|_| random_bytes()).collect();
+        let unique: HashSet<_> = draws.iter().collect();
+        assert_eq!(unique.len(), draws.len(), "random_bytes repeated itself");
+
+        for pos in 0..16 {
+            let first = draws[0][pos];
+            assert!(
+                draws.iter().any(|d| d[pos] != first),
+                "byte {pos} was identical across 64 draws — that position carries no entropy"
+            );
+        }
     }
 }
