@@ -4051,9 +4051,14 @@ fn start_macos_hotkey_listener(
         s.event_count += 1;
         if s.event_count == 1 {
             save_hotkey_status(HotkeyStatus::Ok);
+            // Stand the fallback down: from here the modifying tap sees every
+            // event, and a second opinion on the same keystroke is not a
+            // safety net, it is a duplicate action.
+            MAIN_TAP_LIVE.store(true, Ordering::Relaxed);
             log::info!(
                 "🎹 Hotkey listener up — multi-slot copy/paste active \
-                 (first event received; Input Monitoring OK)"
+                 (first event received; Input Monitoring OK); \
+                 listen-only fallback standing down"
             );
         }
 
@@ -4649,6 +4654,15 @@ fn start_macos_open_gui_fallback_listener(
             return;
         }
 
+        // Defer to the modifying tap once it is up. Both listeners match the
+        // same chords, and each keeps its own idea of which modifiers are
+        // down — so leaving both live means duplicate actions whenever they
+        // agree, and phantom ones whenever they do not.
+        if MAIN_TAP_LIVE.load(Ordering::Relaxed) {
+            state.pressed_mods.clear();
+            return;
+        }
+
         state.event_count += 1;
         if state.event_count == 1 {
             log::info!(
@@ -4979,6 +4993,22 @@ fn quick_letter_slots_enabled() -> bool {
 
 /// Whether a pending letter prefix may capture the next letter into a slot —
 /// true if either the Ctrl+Option chords or the quick double-tap path is on.
+/// Whether the modifying tap is alive and handling chords.
+///
+/// The listen-only fallback exists so the palette and open-clipd shortcuts
+/// still work while the main tap is retrying for its Input Monitoring grant.
+/// It was never switched off once that grant arrived — `fallback_stop` is a
+/// clone of the main stop flag, so it only ever fires at shutdown — leaving
+/// two listeners matching the same chords from two independently-tracked
+/// modifier sets.
+///
+/// One keypress then produced two actions, and the log shows it plainly: a
+/// single Ctrl+Option+G logged "paste slot 37", then "Ctrl+G → SlotMemory",
+/// then "Ctrl+G → SlotMemory (Carbon)", spawning two HUD processes. Worse
+/// than the duplication: the two sets can disagree about which modifiers are
+/// down, so one listener fires a chord the user did not type.
+static MAIN_TAP_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Which modifiers the OS says are physically held, right now.
 ///
 /// `pressed_mods` is built from key-down and key-up events alone, so it is
