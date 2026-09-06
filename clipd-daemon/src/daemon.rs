@@ -4051,14 +4051,25 @@ fn start_macos_hotkey_listener(
         s.event_count += 1;
         if s.event_count == 1 {
             save_hotkey_status(HotkeyStatus::Ok);
+            // Stand the fallback down: from here the modifying tap sees every
+            // event, and a second opinion on the same keystroke is not a
+            // safety net, it is a duplicate action.
+            MAIN_TAP_LIVE.store(true, Ordering::Relaxed);
             log::info!(
                 "🎹 Hotkey listener up — multi-slot copy/paste active \
-                 (first event received; Input Monitoring OK)"
+                 (first event received; Input Monitoring OK); \
+                 listen-only fallback standing down"
             );
         }
 
         match event.event_type.clone() {
             EventType::KeyPress(key) => {
+                // Correct the record before reading it. Everything below asks
+                // "which modifiers are down", and the answer has to come from
+                // the hardware rather than from a tally of events this process
+                // hopes it saw all of.
+                reconcile_modifiers(&mut s.pressed_mods, live_mods::held());
+
                 if is_modifier_key(key) {
                     // Two taps of Option, nothing else in between, arm a letter
                     // slot save.
@@ -4643,6 +4654,15 @@ fn start_macos_open_gui_fallback_listener(
             return;
         }
 
+        // Defer to the modifying tap once it is up. Both listeners match the
+        // same chords, and each keeps its own idea of which modifiers are
+        // down — so leaving both live means duplicate actions whenever they
+        // agree, and phantom ones whenever they do not.
+        if MAIN_TAP_LIVE.load(Ordering::Relaxed) {
+            state.pressed_mods.clear();
+            return;
+        }
+
         state.event_count += 1;
         if state.event_count == 1 {
             log::info!(
@@ -4660,6 +4680,10 @@ fn start_macos_open_gui_fallback_listener(
 
         match event.event_type {
             EventType::KeyPress(key) => {
+                // Same correction on the fallback path — it matches the same
+                // chords from the same set, so it drifts the same way.
+                reconcile_modifiers(&mut state.pressed_mods, live_mods::held());
+
                 if is_modifier_key(key) {
                     state.pressed_mods.insert(key);
                     return;
@@ -4969,6 +4993,94 @@ fn quick_letter_slots_enabled() -> bool {
 
 /// Whether a pending letter prefix may capture the next letter into a slot —
 /// true if either the Ctrl+Option chords or the quick double-tap path is on.
+/// Whether the modifying tap is alive and handling chords.
+///
+/// The listen-only fallback exists so the palette and open-clipd shortcuts
+/// still work while the main tap is retrying for its Input Monitoring grant.
+/// It was never switched off once that grant arrived — `fallback_stop` is a
+/// clone of the main stop flag, so it only ever fires at shutdown — leaving
+/// two listeners matching the same chords from two independently-tracked
+/// modifier sets.
+///
+/// One keypress then produced two actions, and the log shows it plainly: a
+/// single Ctrl+Option+G logged "paste slot 37", then "Ctrl+G → SlotMemory",
+/// then "Ctrl+G → SlotMemory (Carbon)", spawning two HUD processes. Worse
+/// than the duplication: the two sets can disagree about which modifiers are
+/// down, so one listener fires a chord the user did not type.
+static MAIN_TAP_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Which modifiers the OS says are physically held, right now.
+///
+/// `pressed_mods` is built from key-down and key-up events alone, so it is
+/// only ever as correct as the stream that fed it. Miss one key-up — the tap
+/// being disabled for slowness and re-enabled, a secure-input field taking
+/// over, Cmd+Tab eating the release, the screen locking mid-chord — and that
+/// modifier stays held forever. From then on every bare keystroke is read as
+/// a chord: `g` opens the window, `r` and `t` and `c` and `v` fire their own
+/// actions, and the user is "just typing".
+///
+/// CGEventSourceFlagsState reports the live hardware state, so it cannot
+/// drift. Declared here rather than pulling in core-graphics: one symbol from
+/// a framework already linked into this process.
+#[cfg(target_os = "macos")]
+mod live_mods {
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceFlagsState(state_id: i32) -> u64;
+    }
+
+    /// kCGEventSourceStateCombinedSessionState
+    const COMBINED_SESSION_STATE: i32 = 0;
+
+    const MASK_SHIFT: u64 = 0x0002_0000;
+    const MASK_CONTROL: u64 = 0x0004_0000;
+    const MASK_ALTERNATE: u64 = 0x0008_0000;
+    const MASK_COMMAND: u64 = 0x0010_0000;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Held {
+        pub shift: bool,
+        pub ctrl: bool,
+        pub alt: bool,
+        pub cmd: bool,
+    }
+
+    pub fn held() -> Held {
+        let flags = unsafe { CGEventSourceFlagsState(COMBINED_SESSION_STATE) };
+        Held {
+            shift: flags & MASK_SHIFT != 0,
+            ctrl: flags & MASK_CONTROL != 0,
+            alt: flags & MASK_ALTERNATE != 0,
+            cmd: flags & MASK_COMMAND != 0,
+        }
+    }
+}
+
+/// Drop modifiers the OS says are not held.
+///
+/// Only ever removes. A press this process saw is trustworthy; it is the
+/// *release* that goes missing, so correcting in that direction is enough and
+/// cannot invent a chord the user did not type.
+#[cfg(target_os = "macos")]
+fn reconcile_modifiers(pressed: &mut HashSet<RKey>, held: live_mods::Held) {
+    if !held.ctrl {
+        pressed.remove(&RKey::ControlLeft);
+        pressed.remove(&RKey::ControlRight);
+    }
+    if !held.shift {
+        pressed.remove(&RKey::ShiftLeft);
+        pressed.remove(&RKey::ShiftRight);
+    }
+    if !held.alt {
+        pressed.remove(&RKey::Alt);
+        pressed.remove(&RKey::AltGr);
+    }
+    if !held.cmd {
+        pressed.remove(&RKey::MetaLeft);
+        pressed.remove(&RKey::MetaRight);
+    }
+}
+
 fn letter_capture_active() -> bool {
     let s = load_paste_transform_settings();
     s.letter_slots_enabled && (s.direct_letter_shortcuts_enabled || s.quick_letter_slots_enabled)
@@ -5195,5 +5307,75 @@ mod slot_mapping_tests {
         // Paste is the other direction and must not tell you to press ⌘C.
         let paste = slot_foot("Pasted", 3);
         assert!(paste.starts_with("⌘V ×3"), "paste names the paste chord: {paste}");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod stale_modifier_tests {
+    use super::*;
+
+    fn held(ctrl: bool, shift: bool, alt: bool, cmd: bool) -> live_mods::Held {
+        live_mods::Held { ctrl, shift, alt, cmd }
+    }
+
+    #[test]
+    fn a_missed_control_release_cannot_turn_typing_into_chords() {
+        // The reported bug: a user types "gmail" and the window opens. It
+        // happens when a Ctrl key-up is lost — the tap being disabled and
+        // re-enabled, a secure-input field, Cmd+Tab eating the release — after
+        // which `is_ctrl_only` is true forever and every bare g/r/t/c/v is
+        // read as a chord.
+        let mut pressed = HashSet::new();
+        pressed.insert(RKey::ControlLeft);
+        assert!(is_ctrl_only(&pressed), "precondition: looks like Ctrl is down");
+
+        // The keyboard says otherwise.
+        reconcile_modifiers(&mut pressed, held(false, false, false, false));
+        assert!(
+            !is_ctrl_only(&pressed),
+            "stale Ctrl survived — bare 'g' would still open the window"
+        );
+        assert!(pressed.is_empty());
+    }
+
+    #[test]
+    fn a_modifier_that_is_really_held_is_left_alone() {
+        // The correction must not eat live chords: someone genuinely holding
+        // Ctrl still gets Ctrl+G.
+        let mut pressed = HashSet::new();
+        pressed.insert(RKey::ControlLeft);
+        reconcile_modifiers(&mut pressed, held(true, false, false, false));
+        assert!(is_ctrl_only(&pressed), "a real Ctrl hold was dropped");
+    }
+
+    #[test]
+    fn every_modifier_class_is_corrected_not_just_control() {
+        // Option going stale is just as bad: it is the palette trigger on this
+        // machine, and a stale Option turns every space into "open clipd".
+        let mut pressed = HashSet::new();
+        for k in [
+            RKey::ControlLeft,
+            RKey::ControlRight,
+            RKey::ShiftLeft,
+            RKey::ShiftRight,
+            RKey::Alt,
+            RKey::AltGr,
+            RKey::MetaLeft,
+            RKey::MetaRight,
+        ] {
+            pressed.insert(k);
+        }
+        reconcile_modifiers(&mut pressed, held(false, false, false, false));
+        assert!(pressed.is_empty(), "left behind: {pressed:?}");
+    }
+
+    #[test]
+    fn correction_only_removes_it_never_invents_a_press() {
+        // If the OS says Ctrl is down but no press was seen, do not fabricate
+        // one — that would create chords out of the user's own typing, which
+        // is the failure being fixed.
+        let mut pressed = HashSet::new();
+        reconcile_modifiers(&mut pressed, held(true, true, true, true));
+        assert!(pressed.is_empty(), "a press was invented: {pressed:?}");
     }
 }
