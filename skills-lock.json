@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "native-feel-cross-platform-desktop": {
+      "source": "yetone/native-feel-skill",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "7f8cabfd619108eb5058087ea8bb09fbbe1edc23891bf387278d95cc564bb0f9"
+    }
+  }
+}

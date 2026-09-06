@@ -116,7 +116,16 @@ const ACTIVITY_HOLD: Duration = Duration::from_millis(2200);
 // Long enough to cross a gap between the strip and the panel without the
 // island snapping shut underneath the pointer; short enough that leaving it
 // feels like it goes away rather than lingers.
-const COLLAPSE_DELAY: Duration = Duration::from_millis(90);
+/// How long the panel stays up after the pointer leaves.
+///
+/// 90ms was tuned for a surface you *act* on: get in, click, get out. As a
+/// status surface the only thing it does is get read, and reading means the
+/// pointer wanders — to the row you are checking, off the edge, back again.
+/// At 90ms the panel vanished on the way to the thing you were looking at.
+const COLLAPSE_DELAY: Duration = Duration::from_millis(650);
+
+/// Height the slot strip occupies: the 16pt chips plus the gap under them.
+const SLOT_STRIP_H: f32 = 22.0;
 /// How long the pointer has to stay in the trigger strip before the island
 /// opens. Long enough that passing through on the way somewhere else does
 /// nothing, short enough that aiming at it feels immediate.
@@ -539,6 +548,12 @@ pub(crate) struct IslandState {
     /// How many rows the Clips tab has to show, so the slab can be sized for
     /// them a frame ahead of the list being laid out.
     clips_rows: usize,
+    /// Whether the slot strip drew last frame, so the slab reserves its
+    /// height. Same publish-then-size dance as `clips_rows`: the strip only
+    /// appears when a numbered slot is loaded, which the sizing pass cannot
+    /// know on its own — and a row the panel does not reserve is a row that
+    /// pushes the last clip out of view.
+    slot_strip_shown: bool,
     /// Files parked on the island.
     pub shelf: Vec<ShelfItem>,
     /// When this island process started, used to expire the debug phase
@@ -595,6 +610,7 @@ impl Default for IslandState {
             geometry: notch_geometry(&config),
             skin: IslandSkin::default(),
             clips_rows: CLIPS_TAB_ROWS,
+            slot_strip_shown: false,
             shelf: load_shelf(),
             started_at: Instant::now(),
             pin_is_implicit: false,
@@ -749,7 +765,8 @@ impl IslandState {
             }
             IslandTab::Clips => {
                 let count = self.clips_rows.clamp(1, CLIPS_TAB_ROWS) as f32;
-                count * ISLAND_ROW_H + CARD_PAD_Y * 2.0 + 4.0
+                let strip = if self.slot_strip_shown { SLOT_STRIP_H } else { 0.0 };
+                count * ISLAND_ROW_H + CARD_PAD_Y * 2.0 + 4.0 + strip
             }
         };
         egui::vec2(width, (chrome + body + ISLAND_PAD).min(self.max_panel_height()))
@@ -1744,24 +1761,20 @@ impl ClipdGui {
             spawn_palette(&[]);
         }
 
+        // Search opens the palette instead of a field on the island.
+        //
+        // The island is a status surface: it shows what clipd is holding and
+        // never asks for the keyboard. Searching here meant becoming the key
+        // window — taking input away from whatever the user was typing into,
+        // from a strip at the top of the screen they had to keep the pointer
+        // inside to read. The palette is already the place with a search
+        // field, keyboard navigation and paste-on-pick; the island points at
+        // it rather than growing a second, worse copy of it.
         if bar_icon_button(ui, &s, BarIcon::Search, false, bar_search_size())
-            .on_hover_text("Search your clips")
+            .on_hover_text("Search your clips — opens the clipd window")
             .clicked()
         {
-            self.island.search = Some(String::new());
-            self.island.focus_search = true;
-            self.island.pinned = true;
-            self.island.pin_is_implicit = true;
-            // Take the keyboard. The island is an always-on-top overlay that
-            // never becomes key on its own, so `request_focus` on the text
-            // field had nothing to focus *into* — the widget was ready and the
-            // keystrokes were still going to whatever app was in front.
-            //
-            // Safe to do here, unlike on the tray popover: this is a click on a
-            // search button, so taking the keyboard is the thing being asked
-            // for. Escape and picking a result both release it.
-            // Handled in `update`, which holds the frame this needs.
-            self.want_key_window = true;
+            spawn_palette(&[]);
         }
     }
 
@@ -1969,14 +1982,14 @@ impl ClipdGui {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
+                    // Same as the bar: search is the palette's job. An
+                    // overlay that cannot take the keyboard cannot host a
+                    // text field worth typing into.
                     if bar_icon_button(ui, &s, BarIcon::Search, false, 32.0)
-                        .on_hover_text("Search your clips")
+                        .on_hover_text("Search your clips — opens the clipd window")
                         .clicked()
                     {
-                        self.island.search = Some(String::new());
-                        self.island.focus_search = true;
-                        self.island.pinned = true;
-            self.island.pin_is_implicit = true;
+                        spawn_palette(&[]);
                     }
                     let pinned = self.island.pinned;
                     if island_glyph_button(ui, &s, IslandGlyph::Pin(pinned))
@@ -2237,7 +2250,68 @@ impl ClipdGui {
 
     /// Clips: the full recent list, for when the card's three rows aren't
     /// enough and you don't want the whole palette.
+    /// Which numbered slots are loaded, as nine small chips.
+    ///
+    /// The one thing the island can say that no other surface does. The
+    /// palette lists clips and the popover lists clips; neither answers "is
+    /// there anything in slot 4" without hunting, and that is precisely the
+    /// question you have mid-paste with your hand already on ⌘V.
+    ///
+    /// Status, not a control: the chips are not clickable. Pasting a slot is
+    /// a keyboard action and it already has one — inviting a click here would
+    /// mean travelling to the notch to do what ⌘V ×4 does from where you are.
+    fn island_slot_strip(&mut self, ui: &mut egui::Ui) {
+        let s = self.island.skin;
+        let mut filled = [false; 9];
+        for clip in &self.clips {
+            if let Some(n) = clip.slot {
+                if (1..=9).contains(&n) {
+                    filled[(n - 1) as usize] = true;
+                }
+            }
+        }
+        let any = filled.iter().any(|f| *f);
+        self.island.slot_strip_shown = any;
+        if !any {
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(
+                egui::RichText::new("SLOTS")
+                    .size(8.5)
+                    .color(s.faint),
+            );
+            ui.add_space(2.0);
+            for (i, on) in filled.iter().enumerate() {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(
+                    rect,
+                    Rounding::same(4.0),
+                    if *on { s.ink.gamma_multiply(0.16) } else { Color32::TRANSPARENT },
+                );
+                painter.rect_stroke(
+                    rect,
+                    Rounding::same(4.0),
+                    Stroke::new(0.8, if *on { s.line } else { s.line.gamma_multiply(0.45) }),
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{}", i + 1),
+                    egui::FontId::proportional(9.5),
+                    if *on { s.ink } else { s.faint },
+                );
+            }
+        });
+        ui.add_space(6.0);
+    }
+
     fn island_clips(&mut self, ui: &mut egui::Ui) {
+        self.island_slot_strip(ui);
         let s = self.island.skin;
         let want = self
             .island
@@ -3871,7 +3945,23 @@ mod tests {
             IMPLICIT_PIN_RELEASE > COLLAPSE_DELAY,
             "it still has to outlast the ordinary collapse, or it does nothing"
         );
-        assert!(COLLAPSE_DELAY < Duration::from_millis(250));
+        // The island is a status surface: its job is to be read, and reading
+        // means the pointer wanders — to the row being checked, off an edge,
+        // back again. At the old 90ms ceiling the panel vanished on the way to
+        // the thing you were looking at.
+        //
+        // A ceiling still matters. This is an overlay across the top of the
+        // screen; one that lingers reads as stuck rather than considerate, and
+        // an implicit pin has to outlast it (asserted above) or pinning does
+        // nothing.
+        assert!(
+            COLLAPSE_DELAY >= Duration::from_millis(300),
+            "too brief to read — the panel closes while the eye is still moving"
+        );
+        assert!(
+            COLLAPSE_DELAY <= Duration::from_millis(900),
+            "lingering this long over someone's screen reads as stuck"
+        );
     }
 
     #[test]
