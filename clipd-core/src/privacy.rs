@@ -205,6 +205,35 @@ pub fn redacted_display(content: &str, config: &PrivacyConfig) -> Option<String>
         .map(|m| m.redacted_preview.clone())
 }
 
+/// Describe a clip for a log line, without reproducing any of it.
+///
+/// Logs outlive the moment that produced them. A clipboard manager that
+/// writes forty characters of every paste into a file on disk is writing
+/// passwords, API keys, addresses and one-time codes into a file on disk —
+/// and the moment anyone is asked to send that file in for support, a support
+/// channel has quietly become an exfiltration channel with a friendly name.
+///
+/// So the log records a clip's *shape* and never its content. Length and a
+/// coarse category are enough to follow what the daemon did; nothing here can
+/// be turned back into what was on the clipboard.
+///
+/// Deliberately does not try to say whether a clip was sensitive. That would
+/// invite the reader to treat the un-flagged ones as safe to log properly,
+/// and the guarantee this function exists to make is that *none* of them are.
+pub fn describe_for_log(text: &str) -> String {
+    let chars = text.chars().count();
+    let shape = if text.trim().is_empty() {
+        "blank"
+    } else if text.starts_with("http://") || text.starts_with("https://") {
+        "url"
+    } else if text.contains('\n') {
+        "multiline"
+    } else {
+        "text"
+    };
+    format!("{chars} chars, {shape}")
+}
+
 pub fn detect_sensitive(content: &str, config: &PrivacyConfig) -> Vec<SensitiveMatch> {
     if !config.enabled {
         return Vec::new();

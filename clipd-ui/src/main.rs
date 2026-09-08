@@ -414,6 +414,11 @@ fn hud_tray_label(hud_on: bool) -> String {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
+    // Before anything else: this notices whether the *last* run of the tray
+    // ever exited cleanly, which is the only way to see a hard kill or a
+    // crash below Rust's level.
+    clipd_core::crashlog::install("tray");
+    clipd_core::crashlog::spawn_watchdog();
 
     let event_loop = EventLoop::new();
     // Tray rects arrive in PHYSICAL pixels (`dpi::PhysicalPosition`), but the
@@ -992,6 +997,7 @@ Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi
                         if let Some(mut handle) = daemon.take() {
                             handle.stop();
                         }
+                        clipd_core::crashlog::mark_clean_exit();
                         *control_flow = ControlFlow::Exit;
                     }
                     MENU_ID_VAULT_CLEANUP => {
@@ -1465,7 +1471,29 @@ end tell"#,
 /// Route the in-process daemon's `log::*` output to the same file the old
 /// child-process daemon wrote to (`~/Library/Logs/clipd-ui-daemon.log`), so
 /// existing troubleshooting steps keep working.
+/// Largest the log may get before it is rolled over. One generation is kept,
+/// so the worst case on disk is twice this.
+const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Roll the log over once it gets big, keeping one previous generation.
+///
+/// It had no bound at all: 4.6MB on the machine this was written on, most of
+/// it the same permission error repeated twenty thousand times. An unbounded
+/// log is a slow leak, and a log nobody can read is a log nobody checks.
+fn rotate_log_if_large(path: &std::path::Path) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() < LOG_MAX_BYTES {
+        return;
+    }
+    let previous = path.with_extension("log.1");
+    let _ = std::fs::remove_file(&previous);
+    let _ = std::fs::rename(path, &previous);
+}
+
 fn init_logging() {
+    rotate_log_if_large(&daemon_log_path());
     if let Ok(file) = OpenOptions::new()
         .create(true)
         .append(true)

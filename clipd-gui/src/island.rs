@@ -33,7 +33,7 @@ use clipd_core::{
 use clipd_core::TransformKind;
 use clipd_core::load_transform_config;
 use crate::{
-    global_cursor_position, load_thumb_texture, main_display_size,
+    global_cursor_position, load_thumb_texture,
     relative_time_short, resolved_theme, rgb, send_surface_request_to, spawn_palette, ClipdGui,
     SurfaceMode,
 };
@@ -46,6 +46,12 @@ use clipd_core::Theme;
 /// picture when they picture this feature.
 const FALLBACK_NOTCH_W: f32 = 200.0;
 const FALLBACK_NOTCH_H: f32 = 32.0;
+
+/// How often to re-measure the display arrangement. Slow, because it is a
+/// handful of AppKit calls and nothing about a desk changes at frame rate,
+/// but fast enough that plugging in a monitor is not something you notice
+/// having to wait out.
+const SCREEN_RECHECK: Duration = Duration::from_millis(400);
 
 /// How far the resting pill extends past the notch — minimal, like iPhone.
 const RESTING_BLEED: f32 = 8.0;
@@ -116,7 +122,16 @@ const ACTIVITY_HOLD: Duration = Duration::from_millis(2200);
 // Long enough to cross a gap between the strip and the panel without the
 // island snapping shut underneath the pointer; short enough that leaving it
 // feels like it goes away rather than lingers.
-const COLLAPSE_DELAY: Duration = Duration::from_millis(90);
+/// How long the panel stays up after the pointer leaves.
+///
+/// 90ms was tuned for a surface you *act* on: get in, click, get out. As a
+/// status surface the only thing it does is get read, and reading means the
+/// pointer wanders — to the row you are checking, off the edge, back again.
+/// At 90ms the panel vanished on the way to the thing you were looking at.
+const COLLAPSE_DELAY: Duration = Duration::from_millis(650);
+
+/// Height the slot strip occupies: the 16pt chips plus the gap under them.
+const SLOT_STRIP_H: f32 = 22.0;
 /// How long the pointer has to stay in the trigger strip before the island
 /// opens. Long enough that passing through on the way somewhere else does
 /// nothing, short enough that aiming at it feels immediate.
@@ -270,12 +285,51 @@ pub(crate) struct NotchGeometry {
     pub width: f32,
     /// Height of the menu bar the island shares its row with.
     pub height: f32,
-    /// Horizontal centre of the cutout in screen points.
+    /// Horizontal centre of the cutout, in *global* screen points.
     pub center_x: f32,
     /// Whether this display actually has a notch. Drives whether the island
-    /// sits flush at y=0 or floats below the menu bar.
+    /// sits flush with the top edge or floats below the menu bar.
     pub real: bool,
+    /// The display the island lives on, in the global top-left-origin space.
+    ///
+    /// Carried rather than re-derived from a size, because every other number
+    /// here is an absolute coordinate in that space. A display's *size* alone
+    /// is only enough to place a window when that display is the primary one
+    /// sitting at the origin — which is exactly the assumption that put the
+    /// island on the wrong monitor as soon as a second one was plugged in.
+    pub screen: egui::Rect,
 }
+
+/// One display, in the global point space that `CGEvent::location` and the
+/// window server's `OuterPosition` both use: origin at the *primary*
+/// display's top-left, y increasing downward.
+///
+/// AppKit reports screen frames in the opposite convention — origin at the
+/// primary's bottom-left, y increasing upward — so a frame has to be flipped
+/// before it can be compared against a cursor position or handed to eframe.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Display {
+    pub rect: egui::Rect,
+    /// Cutout width and menu-bar height, on a display that has a notch.
+    pub notch: Option<(f32, f32)>,
+    /// Whether AppKit currently calls this the main screen — the one holding
+    /// the focused window.
+    pub main: bool,
+}
+
+/// What to assume when AppKit will not answer: one 1440x900 display at the
+/// origin. Also what the tests measure against, so their numbers do not
+/// depend on the desk the suite happens to run on.
+pub(crate) const FALLBACK_SCREEN: egui::Rect = egui::Rect {
+    min: egui::Pos2 { x: 0.0, y: 0.0 },
+    max: egui::Pos2 { x: 1440.0, y: 900.0 },
+};
+
+const FALLBACK_DISPLAY: Display = Display {
+    rect: FALLBACK_SCREEN,
+    notch: None,
+    main: true,
+};
 
 impl Default for NotchGeometry {
     fn default() -> Self {
@@ -284,6 +338,7 @@ impl Default for NotchGeometry {
             height: FALLBACK_NOTCH_H,
             center_x: 720.0,
             real: false,
+            screen: FALLBACK_SCREEN,
         }
     }
 }
@@ -294,9 +349,9 @@ impl NotchGeometry {
     /// clock or the menu titles.
     fn top(&self, hug: bool) -> f32 {
         if hug && self.real {
-            0.0
+            self.screen.top()
         } else {
-            self.height + 4.0
+            self.screen.top() + self.height + 4.0
         }
     }
 
@@ -306,17 +361,127 @@ impl NotchGeometry {
     }
 }
 
-/// Measure the notch, falling back to a plausible one.
-pub(crate) fn notch_geometry(config: &IslandConfig) -> NotchGeometry {
-    let screen = main_display_size().unwrap_or(egui::vec2(1440.0, 900.0));
+/// Flip an AppKit screen frame into the global top-left-origin space.
+///
+/// Pure, and separated out, because this single step is the whole bug: skip
+/// it and every coordinate the island computes is right for one display and
+/// wrong for every other one.
+pub(crate) fn flip_frame(origin: (f32, f32), size: (f32, f32), primary_top: f32) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(origin.0, primary_top - (origin.1 + size.1)),
+        egui::vec2(size.0, size.1),
+    )
+}
+
+/// Where to park a window so it is off *every* display.
+///
+/// Pure and separate from `displays()` so the arrangements that caused the
+/// bug — a monitor above the laptop, a monitor to its left — can be tested
+/// without a window server to plug one into.
+pub(crate) fn park_above(screen: egui::Rect, tops: &[f32], size: egui::Vec2) -> egui::Pos2 {
+    let top = tops.iter().copied().fold(screen.top(), f32::min);
+    // The 200pt is slack, not superstition: a window parked exactly on the
+    // boundary still shows a hairline on a scaled display.
+    egui::pos2(screen.left(), top - size.y - 200.0)
+}
+
+/// Every display attached right now.
+#[cfg(target_os = "macos")]
+pub(crate) fn displays() -> Vec<Display> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSScreen;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return vec![FALLBACK_DISPLAY];
+    };
+    let screens = NSScreen::screens(mtm);
+    if screens.count() == 0 {
+        return vec![FALLBACK_DISPLAY];
+    }
+    // The flip is measured against the primary display — screens[0] — because
+    // its top-left *is* the origin of the global space. Flipping each display
+    // about its own height instead would mirror every secondary monitor onto
+    // the wrong side of the desk.
+    let base = screens.objectAtIndex(0).frame();
+    let primary_top = (base.origin.y + base.size.height) as f32;
+    let main = NSScreen::mainScreen(mtm).map(|s| s.frame());
+
+    (0..screens.count())
+        .map(|i| {
+            let s = screens.objectAtIndex(i);
+            let f = s.frame();
+            Display {
+                rect: flip_frame(
+                    (f.origin.x as f32, f.origin.y as f32),
+                    (f.size.width as f32, f.size.height as f32),
+                    primary_top,
+                ),
+                notch: measure_notch(&s),
+                main: main
+                    .map(|m| {
+                        m.origin.x == f.origin.x
+                            && m.origin.y == f.origin.y
+                            && m.size.width == f.size.width
+                            && m.size.height == f.size.height
+                    })
+                    .unwrap_or(i == 0),
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn displays() -> Vec<Display> {
+    vec![FALLBACK_DISPLAY]
+}
+
+/// The arrangement as a single line, for a crash report to carry.
+///
+/// Origins and sizes, never monitor names. A window bug on someone else's desk
+/// is close to unfixable without this — the whole multi-monitor class of them
+/// looks identical from the outside ("it froze") and is entirely determined by
+/// numbers nobody thinks to include in a bug report.
+pub(crate) fn arrangement_line(screens: &[Display]) -> String {
+    screens
+        .iter()
+        .map(|d| {
+            format!(
+                "{},{},{}x{}{}",
+                d.rect.left() as i32,
+                d.rect.top() as i32,
+                d.rect.width() as i32,
+                d.rect.height() as i32,
+                if d.notch.is_some() { ",notch" } else { "" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Pick the display the island belongs on, and measure its notch.
+///
+/// `at` is the pointer, when the caller has it. On a multi-display desk the
+/// island belongs on the screen the person is actually working on, and the
+/// pointer is the only honest answer to which one that is — AppKit's "main
+/// screen" follows the focused *window*, so it swings to the other monitor
+/// the moment a browser is clicked over there, which is the jump people see.
+pub(crate) fn notch_geometry(config: &IslandConfig, at: Option<egui::Pos2>) -> NotchGeometry {
+    let screens = displays();
+    let display = at
+        .and_then(|p| screens.iter().find(|d| d.rect.contains(p)).copied())
+        .or_else(|| screens.iter().find(|d| d.main).copied())
+        .or_else(|| screens.first().copied())
+        .unwrap_or(FALLBACK_DISPLAY);
+
     let mut geo = NotchGeometry {
         width: FALLBACK_NOTCH_W,
         height: FALLBACK_NOTCH_H,
-        center_x: screen.x / 2.0,
+        center_x: display.rect.center().x,
         real: false,
+        screen: display.rect,
     };
 
-    if let Some((width, height)) = measure_notch() {
+    if let Some((width, height)) = display.notch {
         geo.width = width;
         geo.height = height;
         geo.real = true;
@@ -329,16 +494,11 @@ pub(crate) fn notch_geometry(config: &IslandConfig) -> NotchGeometry {
     geo
 }
 
-/// Ask AppKit for the notch: `safeAreaInsets.top` is non-zero only on a
-/// display with a cutout, and the two auxiliary top areas are the menu-bar
+/// Ask AppKit for one screen's notch: `safeAreaInsets.top` is non-zero only on
+/// a display with a cutout, and the two auxiliary top areas are the menu-bar
 /// strips either side of it — so what is left between them is the notch.
 #[cfg(target_os = "macos")]
-fn measure_notch() -> Option<(f32, f32)> {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::NSScreen;
-
-    let mtm = MainThreadMarker::new()?;
-    let screen = NSScreen::mainScreen(mtm)?;
+fn measure_notch(screen: &objc2_app_kit::NSScreen) -> Option<(f32, f32)> {
     let top = screen.safeAreaInsets().top as f32;
     if top <= 0.0 {
         return None;
@@ -357,11 +517,6 @@ fn measure_notch() -> Option<(f32, f32)> {
         FALLBACK_NOTCH_W
     };
     Some((width, top))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn measure_notch() -> Option<(f32, f32)> {
-    None
 }
 
 /// Make the island's view accept the *first* click.
@@ -534,11 +689,22 @@ pub(crate) struct IslandState {
     /// When the pointer arrived, so a hover can escalate from bar to panel.
     entered_at: Option<Instant>,
     geometry: NotchGeometry,
+    /// When the display arrangement was last measured. See `SCREEN_RECHECK`.
+    screen_checked: Instant,
+    /// The last arrangement seen, so a change is breadcrumbed once and not
+    /// every 400ms.
+    arrangement: Option<String>,
     /// Colours for the current theme, refreshed at the top of every frame.
     skin: IslandSkin,
     /// How many rows the Clips tab has to show, so the slab can be sized for
     /// them a frame ahead of the list being laid out.
     clips_rows: usize,
+    /// Whether the slot strip drew last frame, so the slab reserves its
+    /// height. Same publish-then-size dance as `clips_rows`: the strip only
+    /// appears when a numbered slot is loaded, which the sizing pass cannot
+    /// know on its own — and a row the panel does not reserve is a row that
+    /// pushes the last clip out of view.
+    slot_strip_shown: bool,
     /// Files parked on the island.
     pub shelf: Vec<ShelfItem>,
     /// When this island process started, used to expire the debug phase
@@ -592,9 +758,12 @@ impl Default for IslandState {
     fn default() -> Self {
         let config = load_island_config();
         Self {
-            geometry: notch_geometry(&config),
+            geometry: notch_geometry(&config, None),
+            screen_checked: Instant::now(),
+            arrangement: None,
             skin: IslandSkin::default(),
             clips_rows: CLIPS_TAB_ROWS,
+            slot_strip_shown: false,
             shelf: load_shelf(),
             started_at: Instant::now(),
             pin_is_implicit: false,
@@ -641,7 +810,7 @@ impl Default for IslandState {
 impl IslandState {
     /// Ask the background poller to refetch everything at the next tick.
     pub(crate) fn invalidate(&mut self) {
-        self.geometry = notch_geometry(&self.config);
+        self.geometry = notch_geometry(&self.config, global_cursor_position());
         self.refresh_now.store(true, Ordering::Relaxed);
     }
 
@@ -749,7 +918,8 @@ impl IslandState {
             }
             IslandTab::Clips => {
                 let count = self.clips_rows.clamp(1, CLIPS_TAB_ROWS) as f32;
-                count * ISLAND_ROW_H + CARD_PAD_Y * 2.0 + 4.0
+                let strip = if self.slot_strip_shown { SLOT_STRIP_H } else { 0.0 };
+                count * ISLAND_ROW_H + CARD_PAD_Y * 2.0 + 4.0 + strip
             }
         };
         egui::vec2(width, (chrome + body + ISLAND_PAD).min(self.max_panel_height()))
@@ -768,14 +938,14 @@ impl IslandState {
     /// Tallest the panel may get, so a full set of modules can't run off the
     /// bottom of the display.
     fn max_panel_height(&self) -> f32 {
-        let screen = main_display_size().unwrap_or(egui::vec2(1440.0, 900.0));
-        (screen.y * 0.62).min(620.0)
+        (self.geometry.screen.height() * 0.62).min(620.0)
     }
 
     /// The widest slab this display will take, leaving a margin either side.
     fn max_slab_width(&self) -> f32 {
-        let screen = main_display_size().unwrap_or(egui::vec2(1440.0, 900.0));
-        ISLAND_MAX_W.min(screen.x - 80.0).max(ISLAND_MIN_W)
+        ISLAND_MAX_W
+            .min(self.geometry.screen.width() - 80.0)
+            .max(ISLAND_MIN_W)
     }
 
     /// Room available to cards once the slab's padding is taken out.
@@ -806,11 +976,12 @@ impl IslandState {
     /// pointer — sixty times a second, which is what the freezing and the
     /// flapping width were.
     fn trigger_rect(&self) -> egui::Rect {
-        let screen = main_display_size().unwrap_or(egui::vec2(1440.0, 900.0));
+        let screen = self.geometry.screen;
         let width = self.geometry.width + RESTING_BLEED * 2.0;
-        let left = (self.geometry.center_x - width / 2.0).clamp(0.0, (screen.x - width).max(0.0));
+        let left = (self.geometry.center_x - width / 2.0)
+            .clamp(screen.left(), (screen.right() - width).max(screen.left()));
         egui::Rect::from_min_size(
-            egui::pos2(left, 0.0),
+            egui::pos2(left, screen.top()),
             // Down to where the bar's own top edge is, so the pointer never
             // crosses a dead band on its way from the notch to the bar.
             egui::vec2(width, self.header_height() + BAR_DROP + 2.0),
@@ -860,11 +1031,28 @@ impl IslandState {
     }
 
     fn window_pos(&self, size: egui::Vec2) -> egui::Pos2 {
-        let hug = self.config.anchor == IslandAnchor::Auto;
-        let _ = hug;
-        let screen = main_display_size().unwrap_or(egui::vec2(1440.0, 900.0));
-        let left = (self.geometry.center_x - size.x / 2.0).clamp(0.0, (screen.x - size.x).max(0.0));
+        let screen = self.geometry.screen;
+        let left = (self.geometry.center_x - size.x / 2.0)
+            .clamp(screen.left(), (screen.right() - size.x).max(screen.left()));
         egui::pos2(left, self.anim_top)
+    }
+
+    /// Where a hidden island goes to be out of the way.
+    ///
+    /// It used to park at `(0, -(menu_bar + 100))`: the top-left corner of the
+    /// primary display, pushed up by about 130pt. That is only off-screen when
+    /// there is exactly one display and it sits at the origin. Arrange a
+    /// monitor above or to the left of the built-in one and those coordinates
+    /// land squarely *on* it — so the island stopped vanishing. It sat at the
+    /// top-left of the other screen, over whatever was there, and ignored the
+    /// pointer, because its hot zone was still down at the notch on the
+    /// laptop. That is the "it doesn't disappear and it moved to the left"
+    /// report, and it is one bug, not two.
+    ///
+    /// So park above *everything*, not above one assumed display.
+    fn park_pos(&self, size: egui::Vec2) -> egui::Pos2 {
+        let tops: Vec<f32> = displays().iter().map(|d| d.rect.top()).collect();
+        park_above(self.geometry.screen, &tops, size)
     }
 }
 
@@ -1124,6 +1312,45 @@ impl ClipdGui {
 
         // ── Phase ──
         let cursor = global_cursor_position();
+
+        // Displays get plugged in, unplugged and rearranged while the island
+        // is running, and none of it sends us anything. The geometry used to
+        // be measured once at startup and then only when the config file
+        // changed, so plugging in a monitor left the island holding
+        // coordinates for a desk that no longer existed.
+        //
+        // Re-measure on a slow cadence, and only while the island is idle: a
+        // panel that hops to another monitor while it is being read is worse
+        // than one that finishes where it opened.
+        if self.island.screen_checked.elapsed() >= SCREEN_RECHECK
+            && !matches!(
+                self.island.phase,
+                IslandPhase::Expanded | IslandPhase::Peek
+            )
+        {
+            self.island.screen_checked = Instant::now();
+            let screens = displays();
+            let line = arrangement_line(&screens);
+            if self.island.arrangement.as_deref() != Some(line.as_str()) {
+                clipd_core::crashlog::breadcrumb("display.arrangement", &line);
+                clipd_core::crashlog::set_display_arrangement(&line);
+                self.island.arrangement = Some(line);
+            }
+            let fresh = notch_geometry(&self.island.config, cursor);
+            if fresh.screen != self.island.geometry.screen {
+                clipd_core::crashlog::breadcrumb(
+                    "island.display_changed",
+                    format!("{:?} -> {:?}", self.island.geometry.screen, fresh.screen),
+                );
+                // Cut the animation. Lerping `anim_top` from one display's
+                // coordinates to another's drags the window across the desk.
+                self.island.anim_top =
+                    fresh.top(self.island.config.anchor == IslandAnchor::Auto);
+                self.island.last_sent = None;
+            }
+            self.island.geometry = fresh;
+        }
+
         let rect = self
             .island
             .hot_rect
@@ -1277,7 +1504,7 @@ impl ClipdGui {
         let actually_hidden = self.island.phase == IslandPhase::Hidden
             && self.island.anim_opacity < 0.02;
         if actually_hidden {
-            let off = egui::pos2(0.0, -(self.island.geometry.height + 100.0));
+            let off = self.island.park_pos(size);
             if self.island.last_sent != Some((off, size)) {
                 self.island.last_sent = Some((off, size));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
@@ -1744,24 +1971,20 @@ impl ClipdGui {
             spawn_palette(&[]);
         }
 
+        // Search opens the palette instead of a field on the island.
+        //
+        // The island is a status surface: it shows what clipd is holding and
+        // never asks for the keyboard. Searching here meant becoming the key
+        // window — taking input away from whatever the user was typing into,
+        // from a strip at the top of the screen they had to keep the pointer
+        // inside to read. The palette is already the place with a search
+        // field, keyboard navigation and paste-on-pick; the island points at
+        // it rather than growing a second, worse copy of it.
         if bar_icon_button(ui, &s, BarIcon::Search, false, bar_search_size())
-            .on_hover_text("Search your clips")
+            .on_hover_text("Search your clips — opens the clipd window")
             .clicked()
         {
-            self.island.search = Some(String::new());
-            self.island.focus_search = true;
-            self.island.pinned = true;
-            self.island.pin_is_implicit = true;
-            // Take the keyboard. The island is an always-on-top overlay that
-            // never becomes key on its own, so `request_focus` on the text
-            // field had nothing to focus *into* — the widget was ready and the
-            // keystrokes were still going to whatever app was in front.
-            //
-            // Safe to do here, unlike on the tray popover: this is a click on a
-            // search button, so taking the keyboard is the thing being asked
-            // for. Escape and picking a result both release it.
-            // Handled in `update`, which holds the frame this needs.
-            self.want_key_window = true;
+            spawn_palette(&[]);
         }
     }
 
@@ -1969,14 +2192,14 @@ impl ClipdGui {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
+                    // Same as the bar: search is the palette's job. An
+                    // overlay that cannot take the keyboard cannot host a
+                    // text field worth typing into.
                     if bar_icon_button(ui, &s, BarIcon::Search, false, 32.0)
-                        .on_hover_text("Search your clips")
+                        .on_hover_text("Search your clips — opens the clipd window")
                         .clicked()
                     {
-                        self.island.search = Some(String::new());
-                        self.island.focus_search = true;
-                        self.island.pinned = true;
-            self.island.pin_is_implicit = true;
+                        spawn_palette(&[]);
                     }
                     let pinned = self.island.pinned;
                     if island_glyph_button(ui, &s, IslandGlyph::Pin(pinned))
@@ -2237,7 +2460,68 @@ impl ClipdGui {
 
     /// Clips: the full recent list, for when the card's three rows aren't
     /// enough and you don't want the whole palette.
+    /// Which numbered slots are loaded, as nine small chips.
+    ///
+    /// The one thing the island can say that no other surface does. The
+    /// palette lists clips and the popover lists clips; neither answers "is
+    /// there anything in slot 4" without hunting, and that is precisely the
+    /// question you have mid-paste with your hand already on ⌘V.
+    ///
+    /// Status, not a control: the chips are not clickable. Pasting a slot is
+    /// a keyboard action and it already has one — inviting a click here would
+    /// mean travelling to the notch to do what ⌘V ×4 does from where you are.
+    fn island_slot_strip(&mut self, ui: &mut egui::Ui) {
+        let s = self.island.skin;
+        let mut filled = [false; 9];
+        for clip in &self.clips {
+            if let Some(n) = clip.slot {
+                if (1..=9).contains(&n) {
+                    filled[(n - 1) as usize] = true;
+                }
+            }
+        }
+        let any = filled.iter().any(|f| *f);
+        self.island.slot_strip_shown = any;
+        if !any {
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(
+                egui::RichText::new("SLOTS")
+                    .size(8.5)
+                    .color(s.faint),
+            );
+            ui.add_space(2.0);
+            for (i, on) in filled.iter().enumerate() {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(
+                    rect,
+                    Rounding::same(4.0),
+                    if *on { s.ink.gamma_multiply(0.16) } else { Color32::TRANSPARENT },
+                );
+                painter.rect_stroke(
+                    rect,
+                    Rounding::same(4.0),
+                    Stroke::new(0.8, if *on { s.line } else { s.line.gamma_multiply(0.45) }),
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{}", i + 1),
+                    egui::FontId::proportional(9.5),
+                    if *on { s.ink } else { s.faint },
+                );
+            }
+        });
+        ui.add_space(6.0);
+    }
+
     fn island_clips(&mut self, ui: &mut egui::Ui) {
+        self.island_slot_strip(ui);
         let s = self.island.skin;
         let want = self
             .island
@@ -3871,7 +4155,23 @@ mod tests {
             IMPLICIT_PIN_RELEASE > COLLAPSE_DELAY,
             "it still has to outlast the ordinary collapse, or it does nothing"
         );
-        assert!(COLLAPSE_DELAY < Duration::from_millis(250));
+        // The island is a status surface: its job is to be read, and reading
+        // means the pointer wanders — to the row being checked, off an edge,
+        // back again. At the old 90ms ceiling the panel vanished on the way to
+        // the thing you were looking at.
+        //
+        // A ceiling still matters. This is an overlay across the top of the
+        // screen; one that lingers reads as stuck rather than considerate, and
+        // an implicit pin has to outlast it (asserted above) or pinning does
+        // nothing.
+        assert!(
+            COLLAPSE_DELAY >= Duration::from_millis(300),
+            "too brief to read — the panel closes while the eye is still moving"
+        );
+        assert!(
+            COLLAPSE_DELAY <= Duration::from_millis(900),
+            "lingering this long over someone's screen reads as stuck"
+        );
     }
 
     #[test]
@@ -4011,10 +4311,10 @@ mod tests {
     fn a_manual_width_overrides_the_measurement() {
         let mut config = IslandConfig::default();
         config.notch_width = 260.0;
-        assert_eq!(notch_geometry(&config).width, 260.0);
+        assert_eq!(notch_geometry(&config, None).width, 260.0);
         // Absurd values are clamped rather than trusted.
         config.notch_width = 4000.0;
-        assert!(notch_geometry(&config).width <= 520.0);
+        assert!(notch_geometry(&config, None).width <= 520.0);
     }
 
     #[test]
@@ -4041,6 +4341,117 @@ mod tests {
         } else {
             assert!(state.target_top() >= state.header_height());
         }
+    }
+
+    // A desk with the laptop and one external monitor, described the way
+    // AppKit describes it: y up, origin at the primary display's bottom-left.
+    //
+    // `external_left` is the arrangement people actually have — the monitor is
+    // the primary display and the MacBook sits below-left of it — and it is
+    // the one that broke, because every coordinate the island computed was
+    // relative to a screen it assumed started at (0, 0).
+    fn external_left() -> (egui::Rect, egui::Rect) {
+        let primary_top = 1440.0; // 27" monitor at the origin, 2560x1440
+        let monitor = flip_frame((0.0, 0.0), (2560.0, 1440.0), primary_top);
+        // Laptop parked to the left of it and lower down.
+        let laptop = flip_frame((-1470.0, -300.0), (1470.0, 956.0), primary_top);
+        (monitor, laptop)
+    }
+
+    #[test]
+    fn a_second_display_is_flipped_into_the_space_the_cursor_lives_in() {
+        let (monitor, laptop) = external_left();
+
+        // The primary display's top-left is the origin of the global space.
+        assert_eq!(monitor.min, egui::pos2(0.0, 0.0));
+        assert_eq!(monitor.max, egui::pos2(2560.0, 1440.0));
+
+        // The laptop is to the *left* — negative x — and its top edge sits
+        // below the monitor's. Both facts are lost if you only ask AppKit for
+        // a screen size, which is all the island used to do.
+        assert!(laptop.left() < 0.0, "laptop is left of the monitor");
+        assert!(laptop.top() > monitor.top(), "and lower down");
+        assert_eq!(laptop.width(), 1470.0);
+
+        // The flip has to be about the *primary* display, not each screen's
+        // own height. Flipping the laptop about its own height would put it at
+        // y=0 — level with the monitor — which is the mirror-image mistake.
+        assert_ne!(laptop.top(), 0.0);
+    }
+
+    #[test]
+    fn the_island_lands_on_the_display_it_was_measured_for() {
+        // The regression: the island opened at `screen_width / 2` treated as
+        // an absolute coordinate. On the arrangement above that is x=1280 on
+        // the monitor — which is *not* where the laptop's notch is, and if the
+        // island had been measured for the laptop it would have opened over on
+        // the monitor instead. Placement must stay inside its own display.
+        let (monitor, laptop) = external_left();
+        let mut state = IslandState::default();
+
+        for (name, screen) in [("monitor", monitor), ("laptop", laptop)] {
+            state.geometry.screen = screen;
+            state.geometry.center_x = screen.center().x;
+            state.anim_top = state.geometry.top(true);
+
+            let size = egui::vec2(560.0, 300.0);
+            let pos = state.window_pos(size);
+            let window = egui::Rect::from_min_size(pos, size);
+            assert!(
+                screen.contains_rect(window),
+                "{name}: window at {pos:?} is not on the display it belongs to ({screen:?})"
+            );
+
+            let trigger = state.trigger_rect();
+            assert!(
+                screen.contains_rect(trigger),
+                "{name}: the hover strip is off its own display — the pointer \
+                 can never be inside it, so the island can never be hovered"
+            );
+            assert_eq!(
+                trigger.top(),
+                screen.top(),
+                "{name}: the strip has to start at this display's top edge"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hidden_island_parks_off_every_display() {
+        // The old park was `(0, -(menu_bar + 100))` — about (0, -132). That is
+        // only off-screen on a single display at the origin. Put a monitor
+        // above the laptop and those coordinates are *on* it: the island stops
+        // disappearing, sits at the top-left of the other screen, and ignores
+        // the pointer, because its hot zone is still down at the notch.
+        let primary_top = 956.0;
+        let laptop = flip_frame((0.0, 0.0), (1470.0, 956.0), primary_top);
+        let above = flip_frame((0.0, 956.0), (2560.0, 1440.0), primary_top);
+        assert!(above.top() < 0.0, "a display above the laptop has negative y");
+
+        let size = egui::vec2(500.0, 320.0);
+        let old = egui::pos2(0.0, -(FALLBACK_NOTCH_H + 100.0));
+        assert!(
+            above.contains(old),
+            "this is the bug: the old park position is on the second display"
+        );
+
+        let park = park_above(laptop, &[laptop.top(), above.top()], size);
+        let parked = egui::Rect::from_min_size(park, size);
+        for screen in [laptop, above] {
+            assert!(
+                !screen.intersects(parked),
+                "a hidden island must not touch {screen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parking_still_works_with_one_display() {
+        // The single-display case is the common one and must not regress.
+        let size = egui::vec2(500.0, 320.0);
+        let park = park_above(FALLBACK_SCREEN, &[FALLBACK_SCREEN.top()], size);
+        assert!(!FALLBACK_SCREEN.intersects(egui::Rect::from_min_size(park, size)));
+        assert_eq!(park.x, FALLBACK_SCREEN.left());
     }
 
     #[test]

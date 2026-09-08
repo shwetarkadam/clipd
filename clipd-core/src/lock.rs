@@ -164,7 +164,7 @@ pub fn is_daemon_running() -> bool {
 }
 
 #[cfg(unix)]
-fn is_process_alive(pid: u32) -> bool {
+pub(crate) fn is_process_alive(pid: u32) -> bool {
     // `kill(pid, 0)` succeeds for a *zombie* — the PID entry outlives the
     // process until its parent reaps it. When clipd is killed and its launching
     // shell is already gone, the corpse can sit there indefinitely, and a lock
@@ -198,7 +198,7 @@ fn is_zombie(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn is_process_alive(pid: u32) -> bool {
+pub(crate) fn is_process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,

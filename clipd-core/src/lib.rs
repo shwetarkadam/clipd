@@ -27,6 +27,7 @@ pub mod snippets;
 pub mod store;
 pub mod sync;
 pub mod suggest;
+pub mod crashlog;
 pub mod telemetry;
 pub mod theme;
 pub mod transform;
@@ -94,7 +95,7 @@ pub use pasteboard::{
 };
 pub use privacy::{
     redacted_display,
-    detect_sensitive, is_excluded_app, load_privacy_config, looks_like_password,
+    describe_for_log, detect_sensitive, is_excluded_app, load_privacy_config, looks_like_password,
     save_privacy_config, should_skip_clip, PrivacyConfig, SensitiveKind, SensitiveMatch,
 };
 pub use secret_clipboard::{
