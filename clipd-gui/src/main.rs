@@ -2419,7 +2419,7 @@ fn main() -> eframe::Result {
         // The notch island opens at its resting size: the cutout plus a sliver
         // either side. Everything after this is driven from `drive_island`.
         let config = clipd_core::load_island_config();
-        let geometry = island::notch_geometry(&config);
+        let geometry = island::notch_geometry(&config, global_cursor_position());
         egui::ViewportBuilder::default()
             .with_inner_size([geometry.width + 28.0, geometry.height.max(24.0)])
             .with_decorations(false)
@@ -2453,13 +2453,22 @@ fn main() -> eframe::Result {
         viewport = viewport.with_position([0.0, -4000.0]);
     } else if island {
         let config = clipd_core::load_island_config();
-        let geometry = island::notch_geometry(&config);
-        let screen = main_display_size().unwrap_or(egui::vec2(1440.0, 900.0));
+        // Open on the display the pointer is on, in that display's own
+        // coordinates. Placing at `center_x - width/2` against a bare screen
+        // *size* only lands correctly on a primary display at the origin;
+        // with a second monitor attached it opened on the wrong one.
+        let geometry = island::notch_geometry(&config, global_cursor_position());
+        let screen = geometry.screen;
         let width = geometry.width + 28.0;
-        let left = (geometry.center_x - width / 2.0).clamp(0.0, (screen.x - width).max(0.0));
+        let left = (geometry.center_x - width / 2.0)
+            .clamp(screen.left(), (screen.right() - width).max(screen.left()));
         // A notched display gets the island flush with the top edge; anywhere
         // else it tucks under the menu bar so it can't cover the clock.
-        let top = if geometry.real { 0.0 } else { geometry.height + 4.0 };
+        let top = if geometry.real {
+            screen.top()
+        } else {
+            screen.top() + geometry.height + 4.0
+        };
         viewport = viewport.with_position([left, top]);
     } else if cfg!(target_os = "macos") {
         // Open where the user is working: palette appears at the mouse cursor.
