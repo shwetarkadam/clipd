@@ -435,6 +435,29 @@ pub(crate) fn displays() -> Vec<Display> {
     vec![FALLBACK_DISPLAY]
 }
 
+/// The arrangement as a single line, for a crash report to carry.
+///
+/// Origins and sizes, never monitor names. A window bug on someone else's desk
+/// is close to unfixable without this — the whole multi-monitor class of them
+/// looks identical from the outside ("it froze") and is entirely determined by
+/// numbers nobody thinks to include in a bug report.
+pub(crate) fn arrangement_line(screens: &[Display]) -> String {
+    screens
+        .iter()
+        .map(|d| {
+            format!(
+                "{},{},{}x{}{}",
+                d.rect.left() as i32,
+                d.rect.top() as i32,
+                d.rect.width() as i32,
+                d.rect.height() as i32,
+                if d.notch.is_some() { ",notch" } else { "" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// Pick the display the island belongs on, and measure its notch.
 ///
 /// `at` is the pointer, when the caller has it. On a multi-display desk the
@@ -668,6 +691,9 @@ pub(crate) struct IslandState {
     geometry: NotchGeometry,
     /// When the display arrangement was last measured. See `SCREEN_RECHECK`.
     screen_checked: Instant,
+    /// The last arrangement seen, so a change is breadcrumbed once and not
+    /// every 400ms.
+    arrangement: Option<String>,
     /// Colours for the current theme, refreshed at the top of every frame.
     skin: IslandSkin,
     /// How many rows the Clips tab has to show, so the slab can be sized for
@@ -734,6 +760,7 @@ impl Default for IslandState {
         Self {
             geometry: notch_geometry(&config, None),
             screen_checked: Instant::now(),
+            arrangement: None,
             skin: IslandSkin::default(),
             clips_rows: CLIPS_TAB_ROWS,
             slot_strip_shown: false,
@@ -1302,8 +1329,19 @@ impl ClipdGui {
             )
         {
             self.island.screen_checked = Instant::now();
+            let screens = displays();
+            let line = arrangement_line(&screens);
+            if self.island.arrangement.as_deref() != Some(line.as_str()) {
+                clipd_core::crashlog::breadcrumb("display.arrangement", &line);
+                clipd_core::crashlog::set_display_arrangement(&line);
+                self.island.arrangement = Some(line);
+            }
             let fresh = notch_geometry(&self.island.config, cursor);
             if fresh.screen != self.island.geometry.screen {
+                clipd_core::crashlog::breadcrumb(
+                    "island.display_changed",
+                    format!("{:?} -> {:?}", self.island.geometry.screen, fresh.screen),
+                );
                 // Cut the animation. Lerping `anim_top` from one display's
                 // coordinates to another's drags the window across the desk.
                 self.island.anim_top =

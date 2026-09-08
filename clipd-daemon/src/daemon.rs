@@ -1642,7 +1642,7 @@ fn save_text_to_slot(
         log::warn!("📋 Save to slot {} FAILED: {}", slot, e);
         return;
     }
-    log::info!("📋 Saved to slot {}: {}", slot, truncate(text, 40));
+    log::info!("📋 Saved to slot {} ({})", slot, clipd_core::describe_for_log(text));
     #[cfg(target_os = "macos")]
     show_slot_content_notification("Copied", slot, text);
     #[cfg(target_os = "windows")]
@@ -1759,7 +1759,11 @@ fn execute_direct_paste(
         }
         sleep_before_injected_paste();
         simulate_paste();
-        log::info!("📋 Pasted from slot {}: {}", slot, truncate(&content, 40));
+        log::info!(
+            "📋 Pasted from slot {} ({})",
+            slot,
+            clipd_core::describe_for_log(&content)
+        );
         #[cfg(target_os = "macos")]
         show_slot_content_notification("Pasted", slot, &content);
         #[cfg(target_os = "windows")]
@@ -1912,7 +1916,7 @@ fn execute_smart_paste(
     sleep_before_injected_paste();
 
     simulate_paste();
-    log::info!("📋 Smart pasted: {}", truncate(&content, 60));
+    log::info!("📋 Smart pasted ({})", clipd_core::describe_for_log(&content));
 
     std::thread::sleep(Duration::from_millis(200));
     suppress.store(false, Ordering::SeqCst);
@@ -2733,7 +2737,11 @@ fn show_hud(text: &str) {
     }
 
     let hud_bin = find_hud_binary();
-    log::info!("HUD: launching {} with text {:?}", hud_bin.display(), text);
+    log::info!(
+        "HUD: launching {} with {}",
+        hud_bin.display(),
+        clipd_core::describe_for_log(text)
+    );
 
     match std::process::Command::new(&hud_bin).arg(text).spawn() {
         Ok(child) => {
@@ -3234,7 +3242,11 @@ fn send_clipboard_to_other_mac() {
 
     match clipd_core::sync::send_clip(&clip, None) {
         Ok(device) => {
-            log::info!("📤 Sent to {}: {}", device.name, truncate(&clip.preview, 60));
+            log::info!(
+                "📤 Sent to {} ({})",
+                device.name,
+                clipd_core::describe_for_log(&clip.preview)
+            );
             #[cfg(target_os = "macos")]
             notify(
                 &format!("Sent to {}", device.name),

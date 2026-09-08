@@ -404,6 +404,61 @@ pub fn event(name: &'static str, props: &[(&'static str, String)]) {
 }
 
 /// POST a prepared body without blocking the caller.
+/// A random id for a crash report. Not the install id: a report is a thing a
+/// person hands over once, and it does not need to be linkable to the rest of
+/// their usage to be useful.
+pub(crate) fn report_id() -> String {
+    let b = random_bytes();
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+pub(crate) fn now_unix_pub() -> u64 {
+    now_unix()
+}
+
+/// Send one crash report, synchronously, and say whether it landed.
+///
+/// Synchronous because the only caller is a button: the person is looking at
+/// the dialog and deserves to be told whether it worked, rather than having
+/// the window close on a hope.
+///
+/// Not gated on `is_telemetry_enabled`. Crash reports are consented to one at
+/// a time, at the moment of sending, by someone reading the payload — see
+/// `crashlog::send`. Folding them into the analytics switch would mean either
+/// silently sending for people who only opted into being counted, or refusing
+/// to accept a report from someone actively trying to help.
+pub(crate) fn send_report(report: &crate::crashlog::Report) -> bool {
+    let Some(key) = posthog_key() else {
+        return false;
+    };
+    let mut props = serde_json::Map::new();
+    let serde_json::Value::Object(fields) = serde_json::json!(report) else {
+        return false;
+    };
+    for (k, v) in fields {
+        props.insert(k, v);
+    }
+    let body = serde_json::json!({
+        "api_key": key,
+        "event": "crash_report",
+        // The report's own id, not the install id: see `report_id`.
+        "distinct_id": report.id,
+        "properties": props,
+    });
+    let url = format!("{}/i/v0/e/", posthog_host().trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(5))
+        .build();
+    match agent.post(&url).send_json(body) {
+        Ok(_) => true,
+        Err(e) => {
+            log::debug!("crash report not sent: {e}");
+            false
+        }
+    }
+}
+
 fn send_json_async(body: serde_json::Value) {
     let url = format!("{}/i/v0/e/", posthog_host().trim_end_matches('/'));
     std::thread::spawn(move || {

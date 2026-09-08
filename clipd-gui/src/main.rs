@@ -2383,6 +2383,25 @@ fn main() -> eframe::Result {
     }
 
     let requested_mode = SurfaceMode::from_args(&args);
+    // Named per surface: "the island crashed" and "the palette crashed" are
+    // different bugs, and a report that cannot tell them apart wastes the
+    // one chance someone gave us by sending it.
+    clipd_core::crashlog::install(match requested_mode {
+        SurfaceMode::Island => "island",
+        SurfaceMode::Hud => "hud",
+        SurfaceMode::Settings => "settings",
+        _ => "palette",
+    });
+    clipd_core::crashlog::spawn_watchdog();
+    // Every surface publishes the desk it started on, not just the island.
+    // A palette that crashed on a three-monitor setup is worth knowing about
+    // for the same reason the island's is.
+    clipd_core::crashlog::set_display_arrangement(island::arrangement_line(&island::displays()));
+    clipd_core::crashlog::breadcrumb(
+        "surface.start",
+        format!("{requested_mode:?}"),
+    );
+
     // Each surface mode has its own process lease so the tray HUD popover
     // and the main palette can coexist. A later invocation of the same mode
     // posts a tiny request and exits; the existing process handles it.
@@ -2533,6 +2552,7 @@ fn main() -> eframe::Result {
     let _ = std::fs::remove_file(hud_state_path());
     let _ = std::fs::remove_file(surface_state_path_for(SurfaceMode::Island));
 
+    clipd_core::crashlog::mark_clean_exit();
     result
 }
 
@@ -3689,6 +3709,15 @@ fn paint_panel_glass_gradient(ui: &egui::Ui, theme: Theme) {
 // ── App state ──
 
 struct ClipdGui {
+    /// A crash or hang report from a previous run, waiting for a decision.
+    ///
+    /// Loaded once at startup rather than polled: a report is about something
+    /// that already happened, and a dialog that can appear mid-session while
+    /// someone is working is a dialog that gets dismissed unread.
+    pending_report: Option<clipd_core::crashlog::Report>,
+    /// What happened when they pressed Send, so the dialog can say so instead
+    /// of just vanishing.
+    report_status: Option<String>,
     store: ClipStore,
     clips: Vec<ClipEntry>,
     search_query: String,
@@ -3940,6 +3969,15 @@ impl ClipdGui {
         let session_config = SessionConfig::default();
         let sessions = compute_sessions(&clips, session_config.window_minutes);
         let mut app = Self {
+            // Only the palette asks. The island and the tray popover are
+            // glances, not places to put a consent decision, and the HUD is
+            // hidden for most of its life.
+            pending_report: if hud || island_surface || clipd_core::crashlog::never_ask() {
+                None
+            } else {
+                clipd_core::crashlog::pending().into_iter().next_back()
+            },
+            report_status: None,
             store,
             clips,
             search_query: String::new(),
@@ -6310,6 +6348,11 @@ impl eframe::App for ClipdGui {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Tell the watchdog the loop is alive. A surface whose `update` stops
+        // being called is, from the outside, a window that has stopped
+        // responding — which is the half of "it crashes or hangs" that leaves
+        // no trace at all otherwise.
+        clipd_core::crashlog::heartbeat();
         // A surface asked for the keyboard while it was drawing, where the
         // frame is not in hand. Grant it here.
         if self.want_key_window {
@@ -6856,6 +6899,11 @@ impl eframe::App for ClipdGui {
         if self.show_transforms {
             self.render_transform_window(ctx, &c);
         }
+
+        // Last, so it sits on top of whatever else is open. A report about a
+        // crash the person already lived through is not urgent enough to
+        // interrupt them, but it should not be buried either.
+        self.draw_crash_consent(ctx, &c);
 
         self.dispatch(action, ctx);
     }
@@ -9430,6 +9478,119 @@ impl ClipdGui {
 
 impl ClipdGui {
     #[allow(dead_code)]
+    /// Ask whether to send a crash report, showing the report itself.
+    ///
+    /// The scrolled block is the exact JSON that `crashlog::send` transmits —
+    /// not a summary of it, not a description of the categories. Someone
+    /// cannot consent to "diagnostic information"; they can consent to bytes
+    /// they have read. That is also why there is no "send automatically next
+    /// time": the whole value of this dialog is that it is answered each time
+    /// by someone looking at what is in front of them.
+    fn draw_crash_consent(&mut self, ctx: &egui::Context, c: &clipd_core::ThemeColors) {
+        let Some(report) = self.pending_report.clone() else {
+            return;
+        };
+        let mut dismiss = false;
+
+        egui::Window::new(report.kind.headline())
+            .id(egui::Id::new("crash_consent"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(520.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(rgb(c.bg_base))
+                    .inner_margin(Margin::same(18.0))
+                    .stroke(Stroke::new(1.0, rgb(c.border)))
+                    .rounding(Rounding::same(12.0)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Sending this report helps get it fixed. Nothing is sent unless you choose to.")
+                        .size(13.0)
+                        .color(rgb(c.text)),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("This is everything that would be sent:")
+                        .size(12.0)
+                        .color(rgb(c.subtext)),
+                );
+                ui.add_space(6.0);
+
+                egui::Frame::none()
+                    .fill(rgb(c.bg_surface))
+                    .inner_margin(Margin::same(10.0))
+                    .rounding(Rounding::same(8.0))
+                    .stroke(Stroke::new(1.0, rgb(c.border)))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(240.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(report.as_json())
+                                            .size(11.0)
+                                            .monospace()
+                                            .color(rgb(c.code)),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                    });
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "No clipboard contents, window titles or file paths are included, \
+                         and clipd's log file is never sent.",
+                    )
+                    .size(11.0)
+                    .color(rgb(c.subtext)),
+                );
+
+                if let Some(status) = &self.report_status {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(status).size(12.0).color(rgb(c.accent)));
+                }
+
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui.button("  Send report  ").clicked() {
+                        // The only call to `send` in the codebase, and it is
+                        // inside a click handler. That is the design.
+                        if clipd_core::crashlog::send(&report) {
+                            dismiss = true;
+                        } else {
+                            self.report_status =
+                                Some("Couldn't reach the server — the report was kept.".into());
+                        }
+                    }
+                    if ui.button("  Don't send  ").clicked() {
+                        // Declined means deleted, not saved for a later ask.
+                        clipd_core::crashlog::discard(&report.id);
+                        dismiss = true;
+                    }
+                    ui.add_space(8.0);
+                    if ui
+                        .button("Never ask again")
+                        .on_hover_text("Stops clipd recording crash reports at all.")
+                        .clicked()
+                    {
+                        clipd_core::crashlog::set_never_ask(true);
+                        dismiss = true;
+                    }
+                });
+            });
+
+        if dismiss {
+            self.pending_report = None;
+            self.report_status = None;
+        }
+    }
+
     fn render_sessions_window(&mut self, ctx: &egui::Context, c: &clipd_core::ThemeColors) {
         let mut open = true;
         egui::Window::new("📂 Sessions")
