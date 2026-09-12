@@ -167,29 +167,44 @@ const LIGHT: ThemeColors = ThemeColors {
     // ink). That is the Glass Light material, and having both themes chase it
     // left the light half of the app with one idea in two names — the whole
     // point of this one is that it is paper.
-    bg_base: Rgb(250, 249, 245),
-    bg_surface: Rgb(247, 246, 241),
-    // Cards lift off the paper by being the one true white in the theme.
-    bg_elevated: Rgb(255, 255, 255),
-    bg_selected: Rgb(240, 238, 230),
-    bg_hover: Rgb(245, 243, 236),
+    // The whole band used to sit in the top 15% of the luminance range, with
+    // a pure #FFFFFF card on top of it — 100% luminance, the brightest thing
+    // a display can emit, across every row of a panel that floats over
+    // whatever someone is working in. That is half the reason the light
+    // themes were tiring.
+    //
+    // The other half is that the surfaces were 2-5% apart (base to surface was
+    // 1.027:1) with a border at 1.19:1 — invisible. Structure encoded in
+    // differences that small means re-focusing to find every row edge, and
+    // squinting fatigues as much as glare does. So: same warm paper, lower
+    // ceiling, wider steps.
+    bg_base: Rgb(239, 236, 228),
+    bg_surface: Rgb(244, 242, 235),
+    // Cards still lift off the paper by being the lightest thing in the theme
+    // — they just stop doing it at maximum white.
+    bg_elevated: Rgb(252, 251, 247),
+    bg_selected: Rgb(226, 222, 210),
+    bg_hover: Rgb(233, 230, 220),
     // Warm graphite: the header glyphs, and the ink that carries the chrome.
     // A neutral grey here is what makes a warm ground look dirty rather than
     // warm — the cast has to run through everything or through nothing.
     accent: Rgb(61, 61, 58),
-    accent2: Rgb(131, 129, 124),
+    accent2: Rgb(98, 97, 93),
     text: Rgb(31, 30, 29),
-    subtext: Rgb(107, 104, 98),
-    overlay: Rgb(150, 147, 140),
+    subtext: Rgb(99, 96, 90),
+    // The section labels — "Pinned", "Recent". At 150,147,140 this was
+    // 2.91:1 on the paper and 2.64:1 on a selected row: under the 4.5:1 the
+    // HIG asks for below 17pt, and under even the 3:1 large-text floor.
+    overlay: Rgb(98, 96, 91),
     // The spot mark — the filled star on a pinned row. Warm graphite, not
     // Claude's clay: an orange pin was explicitly not wanted, and the filled
     // shape of the star already says pinned without spending a colour on it.
     green: Rgb(70, 69, 66),
-    border: Rgb(232, 230, 222),
+    border: Rgb(214, 209, 196),
     surface_alpha: 255,
     code: Rgb(61, 61, 58),
     url: Rgb(44, 44, 42),
-    email: Rgb(107, 104, 98),
+    email: Rgb(99, 96, 90),
     path: Rgb(92, 90, 85),
 };
 
@@ -260,27 +275,28 @@ const GLASS_LIGHT: ThemeColors = ThemeColors {
     bg_base: Rgb(220, 226, 236),
     bg_surface: Rgb(228, 234, 244),
     bg_elevated: Rgb(236, 242, 252),
-    bg_selected: Rgb(212, 220, 234),
+    bg_selected: Rgb(206, 215, 231),
     bg_hover: Rgb(224, 230, 242),
     accent: GLASS_LIGHT_ACCENT,
-    accent2: Rgb(100, 116, 148),
+    accent2: Rgb(79, 92, 117),
     // Darker ink — strong enough to read through frosted translucency.
     text: Rgb(18, 22, 32),
     subtext: Rgb(80, 88, 106),
     // Section labels ("Pinned", "Recent") are drawn in this. The frost is no
     // longer a plate — it follows whatever sits behind the window — so a
     // light grey here disappeared entirely against a mid-grey backdrop.
-    overlay: Rgb(88, 96, 112),
+    overlay: Rgb(84, 92, 108),
     // The spot mark: the filled star on a pinned row. At 180,190,210 it was
     // lighter than the ink around it and read as a disabled control.
-    green: Rgb(96, 104, 122),
-    // Cool blue-grey border — the edge that makes glass read as glass.
-    border: Rgb(180, 192, 214),
+    green: Rgb(84, 92, 107),
+    // Cool blue-grey border — the edge that makes glass read as glass. Was
+    // 1.41:1 against the base, which is not an edge anyone can see.
+    border: Rgb(168, 181, 205),
     // Translucent surfaces — the whole point of glass.
     surface_alpha: 140,
     code: Rgb(48, 54, 68),
     url: Rgb(28, 36, 54),
-    email: Rgb(90, 100, 120),
+    email: Rgb(80, 90, 112),
     path: Rgb(70, 82, 106),
 };
 
@@ -666,6 +682,90 @@ mod tests {
         let (x, y) = (wcag_luminance(a), wcag_luminance(b));
         let (hi, lo) = if x > y { (x, y) } else { (y, x) };
         (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// Every role that draws *text* has to clear 4.5:1 on every surface it can
+    /// land on — not just `text`, and not just on the base.
+    ///
+    /// `text` alone was covered, so `overlay` sat at 2.91:1 on Paper Light's
+    /// paper and 2.64:1 on a selected row without anything noticing. That is
+    /// the colour the section headings are drawn in: under the 4.5:1 the HIG
+    /// asks for below 17pt, and under even the 3:1 large-text floor.
+    ///
+    /// Light themes only. The dark palettes deliberately run some of these
+    /// roles quieter against near-black, where the same ratio reads very
+    /// differently; holding them to this bar is a separate decision from the
+    /// one this test records.
+    #[test]
+    fn light_themes_keep_every_text_role_readable() {
+        for theme in Theme::ALL {
+            if !theme.is_light() {
+                continue;
+            }
+            let c = theme.colors();
+            for (role, fg) in [
+                ("text", c.text),
+                ("subtext", c.subtext),
+                ("overlay", c.overlay),
+                ("accent", c.accent),
+                ("accent2", c.accent2),
+                ("green", c.green),
+                ("code", c.code),
+                ("url", c.url),
+                ("email", c.email),
+                ("path", c.path),
+            ] {
+                for (name, bg) in [
+                    ("bg_base", c.bg_base),
+                    ("bg_surface", c.bg_surface),
+                    ("bg_elevated", c.bg_elevated),
+                    ("bg_selected", c.bg_selected),
+                    ("bg_hover", c.bg_hover),
+                ] {
+                    let ratio = contrast(fg, bg);
+                    assert!(
+                        ratio >= 4.5,
+                        "{}: {role} on {name} is {ratio:.2}:1, under the 4.5:1 minimum",
+                        theme.label()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A light theme may not paint at maximum brightness.
+    ///
+    /// Paper Light's cards were `#FFFFFF` — 100% luminance, the brightest a
+    /// display can emit — under every row of a panel that floats over whatever
+    /// someone is actually working in. Contrast was fine; it was simply too
+    /// much light, which is the half of "hard on the eyes" that no contrast
+    /// ratio catches.
+    #[test]
+    fn a_light_theme_does_not_emit_at_full_brightness() {
+        // Leaves room for a bright card while keeping it off the ceiling.
+        const CEILING: f32 = 0.97;
+        for theme in Theme::ALL {
+            if !theme.is_light() {
+                continue;
+            }
+            let c = theme.colors();
+            for (name, bg) in [
+                ("bg_base", c.bg_base),
+                ("bg_surface", c.bg_surface),
+                ("bg_elevated", c.bg_elevated),
+                ("bg_selected", c.bg_selected),
+                ("bg_hover", c.bg_hover),
+            ] {
+                let lum = wcag_luminance(bg);
+                assert!(
+                    lum <= CEILING,
+                    "{}: {name} is at {:.1}% luminance — a glance surface should \
+                     not be the brightest thing on the display",
+                    theme.label(),
+                    lum * 100.0
+                );
+            }
+        }
     }
 
     /// Body text has to clear WCAG AA (4.5:1) on every surface it lands on.
