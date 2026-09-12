@@ -647,6 +647,34 @@ mod tests {
         });
     }
 
+    /// A build with no endpoint must say so, not blame the network.
+    ///
+    /// The bug: `send_report` returned a bool, so "no key was compiled into
+    /// this build" and "the POST failed" were the same value, and the UI
+    /// rendered both as "Couldn't reach the server". Someone who clicked Send
+    /// to help was told a server was unreachable when none had been contacted,
+    /// with no way to learn the button was dead on arrival.
+    ///
+    /// This test runs in exactly that build: the test binary has no
+    /// CLIPD_POSTHOG_KEY, so `option_env!` is None.
+    #[test]
+    fn a_build_with_no_endpoint_says_so_instead_of_blaming_the_network() {
+        assert!(
+            !can_send(),
+            "the test binary is built without a key; if this fails the test \
+             below is no longer checking what it claims to"
+        );
+        let report = sample("zzz", 1);
+        let outcome = crate::telemetry::send_report(&report);
+        assert_eq!(
+            outcome,
+            SendOutcome::NotConfigured,
+            "a build that cannot send must report NotConfigured, never \
+             Unreachable — nothing was contacted"
+        );
+        assert_ne!(outcome, SendOutcome::Unreachable);
+    }
+
     #[test]
     fn a_breadcrumb_cannot_smuggle_a_clip_in() {
         // The cap is the backstop for the mistake this module is designed to
