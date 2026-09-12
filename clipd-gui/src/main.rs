@@ -9512,110 +9512,121 @@ impl ClipdGui {
 
 impl ClipdGui {
     #[allow(dead_code)]
-    /// Ask whether to send a crash report, showing the report itself.
+    /// Offer to send a crash report, without behaving like one.
     ///
-    /// The scrolled block is the exact JSON that `crashlog::send` transmits —
-    /// not a summary of it, not a description of the categories. Someone
-    /// cannot consent to "diagnostic information"; they can consent to bytes
-    /// they have read. That is also why there is no "send automatically next
-    /// time": the whole value of this dialog is that it is answered each time
-    /// by someone looking at what is in front of them.
+    /// This used to be a large centred modal with the headline as its window
+    /// title, and it read as an error happening *now* — the first thing you
+    /// saw after deliberately opening clipd was a dialog covering the list you
+    /// came for. It is a footnote about something that already happened and
+    /// has already recovered, so it looks like one: a strip at the top, the
+    /// payload folded away behind a disclosure, and the list still usable
+    /// underneath.
+    ///
+    /// The payload stays one click away rather than on screen by default.
+    /// Consent still means reading it, but making it unmissable made the whole
+    /// thing feel like a fault report the user had to process.
     fn draw_crash_consent(&mut self, ctx: &egui::Context, c: &clipd_core::ThemeColors) {
         let Some(report) = self.pending_report.clone() else {
             return;
         };
         let mut dismiss = false;
 
-        egui::Window::new(report.kind.headline())
-            .id(egui::Id::new("crash_consent"))
+        egui::Window::new("crash_consent")
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(520.0)
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -38.0])
+            .default_width(ctx.screen_rect().width() - 28.0)
             .frame(
                 egui::Frame::none()
-                    .fill(rgb(c.bg_base))
-                    .inner_margin(Margin::same(18.0))
+                    .fill(rgb(c.bg_elevated))
+                    .inner_margin(Margin::symmetric(12.0, 10.0))
                     .stroke(Stroke::new(1.0, rgb(c.border)))
-                    .rounding(Rounding::same(12.0)),
+                    .rounding(Rounding::same(10.0)),
             )
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("Sending this report helps get it fixed. Nothing is sent unless you choose to.")
-                        .size(13.0)
-                        .color(rgb(c.text)),
-                );
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new("This is everything that would be sent:")
-                        .size(12.0)
-                        .color(rgb(c.subtext)),
-                );
-                ui.add_space(6.0);
-
-                egui::Frame::none()
-                    .fill(rgb(c.bg_surface))
-                    .inner_margin(Margin::same(10.0))
-                    .rounding(Rounding::same(8.0))
-                    .stroke(Stroke::new(1.0, rgb(c.border)))
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(240.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(report.as_json())
-                                            .size(11.0)
-                                            .monospace()
-                                            .color(rgb(c.code)),
-                                    )
-                                    .wrap(),
-                                );
-                            });
-                    });
-
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(report.kind.headline())
+                            .size(12.5)
+                            .color(rgb(c.text)),
+                    );
+                    ui.label(
+                        RichText::new("· send a report?")
+                            .size(12.5)
+                            .color(rgb(c.subtext)),
+                    );
+                });
                 ui.add_space(8.0);
-                ui.label(
-                    RichText::new(
-                        "No clipboard contents, window titles or file paths are included, \
-                         and clipd's log file is never sent.",
-                    )
-                    .size(11.0)
-                    .color(rgb(c.subtext)),
-                );
-
-                if let Some(status) = &self.report_status {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(status).size(12.0).color(rgb(c.accent)));
-                }
-
-                ui.add_space(14.0);
                 ui.horizontal(|ui| {
-                    if ui.button("  Send report  ").clicked() {
+                    // `clicked()` is true for a *keyboard* activation too, and
+                    // egui hands initial focus to the first widget in a fresh
+                    // window — so simply opening the palette with a report
+                    // waiting pressed Send on its own. Nothing was transmitted
+                    // here only because a local build carries no PostHog key;
+                    // a release build would have sent it.
+                    //
+                    // Consent for this is a pointer click, so ask for exactly
+                    // that. All three buttons, not just Send: a stray Return
+                    // landing on "Never" would silently switch crash reporting
+                    // off for good.
+                    let click = egui::PointerButton::Primary;
+                    if ui.button("Send").clicked_by(click) {
                         // The only call to `send` in the codebase, and it is
                         // inside a click handler. That is the design.
                         if clipd_core::crashlog::send(&report) {
                             dismiss = true;
                         } else {
                             self.report_status =
-                                Some("Couldn't reach the server — the report was kept.".into());
+                                Some("Couldn't reach the server — kept for now.".into());
                         }
                     }
-                    if ui.button("  Don't send  ").clicked() {
-                        // Declined means deleted, not saved for a later ask.
+                    if ui.button("Not now").clicked_by(click) {
                         clipd_core::crashlog::discard(&report.id);
                         dismiss = true;
                     }
-                    ui.add_space(8.0);
                     if ui
-                        .button("Never ask again")
-                        .on_hover_text("Stops clipd recording crash reports at all.")
-                        .clicked()
+                        .button("Never")
+                        .on_hover_text("Stop clipd recording crash reports at all.")
+                        .clicked_by(click)
                     {
                         clipd_core::crashlog::set_never_ask(true);
                         dismiss = true;
                     }
+                    if let Some(status) = &self.report_status {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(status).size(11.0).color(rgb(c.accent)));
+                    }
+                });
+
+                egui::CollapsingHeader::new(
+                    RichText::new("What gets sent").size(11.0).color(rgb(c.subtext)),
+                )
+                .id_salt("crash_payload")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(report.as_json())
+                                        .size(10.5)
+                                        .monospace()
+                                        .color(rgb(c.code)),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    ui.label(
+                        RichText::new(
+                            "No clipboard contents, window titles or file paths. \
+                             clipd's log file is never sent.",
+                        )
+                        .size(10.5)
+                        .color(rgb(c.subtext)),
+                    );
                 });
             });
 

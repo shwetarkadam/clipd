@@ -14,7 +14,9 @@
 //! not what gets sent. See `describe_for_log` in `privacy` for the other half.
 
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -381,6 +383,7 @@ pub fn install(surface_name: &'static str) {
         sweep_orphaned_markers();
     }
     write_marker(surface_name, &display_arrangement());
+    catch_terminating_signals(&running_marker(surface_name));
 
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -414,6 +417,59 @@ pub fn install(surface_name: &'static str) {
 pub fn mark_clean_exit() {
     let _ = std::fs::remove_file(running_marker(&surface()));
 }
+
+/// The marker path, pre-encoded so a signal handler can delete it without
+/// allocating, locking or formatting anything.
+static MARKER_CPATH: OnceLock<CString> = OnceLock::new();
+
+/// Treat a termination signal as a clean exit.
+///
+/// Without this, only one path in the whole app marked a clean exit: the
+/// tray's Quit menu item. Everything else that ends a process politely —
+/// logging out, restarting the Mac, Activity Monitor's Quit, an app update
+/// replacing the bundle, a `pkill` — arrives as SIGTERM and left the marker
+/// behind, so the next launch reported a crash that never happened.
+///
+/// Which meant every user would have been shown "clipd closed unexpectedly"
+/// after every reboot. A crash reporter that cries wolf on a reboot is worse
+/// than no crash reporter: people learn to dismiss it, and the one real crash
+/// goes with it.
+///
+/// SIGKILL is deliberately not handled — it cannot be, and a process that was
+/// hard-killed genuinely did not exit cleanly.
+#[cfg(unix)]
+extern "C" fn on_terminating_signal(sig: i32) {
+    // Async-signal-safe by construction: `OnceLock::get` is an atomic load and
+    // `unlink` is on the POSIX safe list. Nothing here takes a lock — the
+    // Mutexes this module uses elsewhere could be held by the interrupted
+    // thread, and taking one here would deadlock the shutdown.
+    if let Some(path) = MARKER_CPATH.get() {
+        unsafe { libc::unlink(path.as_ptr()) };
+    }
+    // Hand the signal back to the default disposition so the process still
+    // dies the way the sender intended.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+#[cfg(unix)]
+fn catch_terminating_signals(marker: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = CString::new(marker.as_os_str().as_bytes()) else {
+        return;
+    };
+    if MARKER_CPATH.set(c).is_err() {
+        return; // already installed
+    }
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        unsafe { libc::signal(sig, on_terminating_signal as libc::sighandler_t) };
+    }
+}
+
+#[cfg(not(unix))]
+fn catch_terminating_signals(_marker: &std::path::Path) {}
 
 // ── hang detection ────────────────────────────────────────────────────────────
 
