@@ -1212,9 +1212,14 @@ fn draw_type_tile(
         egui::Sense::hover(),
     );
     let painter = ui.painter();
-    if boxed {
-        // A frosted tile, as in the reference: the glyph's own small pane.
-        // Without it the icon floats and the row loses its left edge.
+    // On an opaque theme the glyph gets its own small pane, which gives the
+    // row a left edge to start from.
+    //
+    // On glass it does not. A launcher panel is one sheet with content on it,
+    // and a plate behind every icon is another stack of little cards over the
+    // material — the same thing the row panes were doing, at a smaller size.
+    // `surface_alpha` is the tell: a translucent theme is a glass theme.
+    if boxed && c.surface_alpha == 255 {
         painter.rect_filled(rect, Rounding::same(10.0), surf(c, c.bg_elevated));
         painter.rect_stroke(rect, Rounding::same(10.0), Stroke::new(0.8, rgb(c.border)));
     }
@@ -1344,14 +1349,31 @@ fn draw_type_tile(
 fn row_copy_button(ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
     let hovered = resp.hovered();
+    let glass = c.surface_alpha < 255;
+    // Still needed further down: the front sheet of the copy glyph is filled
+    // with it so the sheet behind does not show through.
     let face = if hovered {
         surf(c, c.bg_hover)
     } else {
         surf(c, c.bg_elevated)
     };
     let painter = ui.painter();
-    painter.rect_filled(rect, Rounding::same(8.0), face);
-    painter.rect_stroke(rect, Rounding::same(8.0), Stroke::new(0.7, rgb(c.border)));
+    // Same rule as the type tile: on glass the button is its glyph, and it
+    // only grows a face when the pointer is actually on it. A resting plate
+    // behind every action in every row is a third layer of little cards laid
+    // over the material.
+    if glass {
+        if hovered {
+            painter.rect_filled(
+                rect,
+                Rounding::same(8.0),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 64),
+            );
+        }
+    } else {
+        painter.rect_filled(rect, Rounding::same(8.0), face);
+        painter.rect_stroke(rect, Rounding::same(8.0), Stroke::new(0.7, rgb(c.border)));
+    }
     let s = Stroke::new(1.2, rgb(c.subtext));
     let back = egui::Rect::from_min_size(
         egui::pos2(rect.center().x - 6.0, rect.center().y - 7.0),
@@ -3547,59 +3569,42 @@ fn sync_glass_native(_frame: &eframe::Frame, _theme: Theme, _on: &mut Option<boo
 fn glass_row_fill(theme: Theme, selected: bool, hovered: bool) -> Option<Color32> {
     let light = theme == Theme::GlassLight;
     if light {
-        // Every row is its own frosted pane, lit by how much white it holds:
-        // resting, under the pointer, selected. Rows used to be transparent
-        // until selected, so the list was floating text on one undifferentiated
-        // sheet — and the selected row then had to be marked with black, which
-        // is a shadow on glass rather than light in it.
-        // Cool white, not plain white. Over a photo this is frost; over a
-        // white window it still separates from the plate, because it is
-        // fractionally bluer than the paper behind it.
-        // Measured, not guessed. Every value before this was subtle enough to
-        // vanish: a white pane at alpha 62 over a plate that was itself
-        // near-white differs from it by three levels, so the list read as one
-        // flat sheet no matter how correct the intent was.
-        return Some(Color32::from_rgba_unmultiplied(
-            255,
-            255,
-            255,
-            if selected {
-                72
-            } else if hovered {
-                52
-            } else {
-                34
-            },
-        ));
+        // A resting row paints nothing.
+        //
+        // Every row used to be its own frosted pane — white at alpha 34, with
+        // a cool rim at alpha 205 around it. Two problems, and they are the
+        // two words in "transparent and smooth".
+        //
+        // Transparent: the veil over the whole window is alpha 44, so a row
+        // pane on top of it took the composite from 17% coverage to 28% —
+        // the rows were carrying more paint than the window itself, and the
+        // material underneath never reached the eye.
+        //
+        // Smooth: a rim around every row is the opposite of one sheet of
+        // glass. It reads as a stack of plates, because that is what it is.
+        //
+        // A launcher panel is one pane with content floating on it. Only the
+        // row under the pointer or the selection is lit, and it is lit by
+        // light in the glass rather than by an edge drawn around it.
+        // Light *in* the glass, not a white card laid on it. At 86 the
+        // selected row composited to a near-solid pane, which is the same
+        // mistake the per-row panes made, just on one row.
+        if selected {
+            return Some(Color32::from_rgba_unmultiplied(255, 255, 255, 58));
+        }
+        if hovered {
+            return Some(Color32::from_rgba_unmultiplied(255, 255, 255, 28));
+        }
+        return None;
     }
     if selected {
-        Some(if light {
-            // Grey, by lightness alone — Spotlight's selected row, and what
-            // macOS falls back to for any list it is not actively focused on.
-            // A systemBlue wash was tried here and had to come out: over a
-            // white plate it blended toward cyan, and a coloured band across
-            // the row is the loudest thing in a window this pale.
-            //
-            // A white wash on a white plate is not a selection either, which
-            // is why this cannot simply go back to what it was.
-            // Measured, not guessed: at alpha 26 the composited row came out
-            // 14 levels under the plate, because the row's own card is drawn
-            // over part of this wash. macOS's unemphasized selection sits
-            // about 25 under its window colour, and this alpha lands there.
-            Color32::from_black_alpha(46)
-        } else {
-            // Keep keyboard focus readable even when Liquid Glass is sampling
-            // a bright window behind clipd. A white wash can turn the row into
-            // a pale slab under white text; this teal-black anchor still lets
-            // the material move while preserving contrast.
-            Color32::from_rgba_unmultiplied(16, 42, 46, 156)
-        })
+        // Keep keyboard focus readable even when Liquid Glass is sampling a
+        // bright window behind clipd. A white wash can turn the row into a
+        // pale slab under white text; this teal-black anchor still lets the
+        // material move while preserving contrast.
+        Some(Color32::from_rgba_unmultiplied(16, 42, 46, 156))
     } else if hovered {
-        Some(if light {
-            Color32::from_rgba_unmultiplied(0, 0, 0, 10)
-        } else {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 12)
-        })
+        Some(Color32::from_rgba_unmultiplied(255, 255, 255, 12))
     } else {
         None
     }
@@ -3607,31 +3612,17 @@ fn glass_row_fill(theme: Theme, selected: bool, hovered: bool) -> Option<Color32
 
 fn glass_row_stroke(theme: Theme, selected: bool) -> Stroke {
     if theme == Theme::GlassLight {
-        // The lit edge of each pane. Every row carries one: a rim is what
-        // separates two translucent surfaces stacked on each other, where a
-        // fill alone only makes a slightly brighter fog.
-        // The edge does the work. A white highlight reads as glass only when
-        // something darker sits behind it — over a white app it is invisible
-        // and the whole list flattens into one sheet. A cool grey rim is an
-        // edge on both.
-        return Stroke::new(
-            1.0,
-            if selected {
-                Color32::from_rgba_unmultiplied(144, 160, 186, 225)
-            } else {
-                Color32::from_rgba_unmultiplied(176, 188, 208, 205)
-            },
-        );
+        // No rim, on any row, ever.
+        //
+        // The rim was there to separate two translucent surfaces stacked on
+        // each other — which was only necessary because each row *was* a
+        // surface. With the panes gone there is one surface, and drawing an
+        // outline around each row on it is what made the theme read as
+        // brushed plates instead of glass.
+        return Stroke::NONE;
     }
     if selected {
-        if theme == Theme::GlassLight {
-            // A hairline the fill alone cannot provide: 9% grey on white is
-            // legible as a band but has no edge, and the rows around it are
-            // white cards with edges of their own.
-            Stroke::new(1.0, Color32::from_black_alpha(30))
-        } else {
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(160, 170, 165, 40))
-        }
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(160, 170, 165, 40))
     } else {
         Stroke::NONE
     }
@@ -8751,9 +8742,12 @@ impl ClipdGui {
         let spotlight = self.theme == Theme::GlassLight;
         let search_frame = egui::Frame::none()
             .fill(if spotlight {
-                // Frosted, not solid: at 216 alpha this was a white slab sunk
-                // into the glass. Its rim is what separates it.
-                Color32::from_white_alpha(96)
+                // No pill. A launcher's field is the panel's first line, not a
+                // control sunk into it — the caret and the magnifier say where
+                // to type, and a white slab across the top is the single
+                // largest piece of opaque paint in a window that is supposed
+                // to be glass.
+                Color32::TRANSPARENT
             } else {
                 surf(c, c.bg_elevated)
             })
@@ -8763,7 +8757,9 @@ impl ClipdGui {
                 if asking && !in_settings {
                     rgb(c.accent).gamma_multiply(0.72)
                 } else if spotlight {
-                    Color32::from_rgba_unmultiplied(188, 198, 214, 190)
+                    // Only while asking does this field need an edge; at rest
+                    // it has none.
+                    Color32::TRANSPARENT
                 } else {
                     rgb(c.border)
                 },
