@@ -4775,23 +4775,28 @@ impl ClipdGui {
                 self.popover_settings_open = !self.popover_settings_open;
             }
 
-            // Two controls used to sit here and neither earned the place.
+            // The slot-copy-feedback toggle that used to sit here is gone: one
+            // preference, weighted the same as "open the whole clipboard",
+            // controlling a HUD that is not in this popover — and already a
+            // tap away under the gear, where it has a label and a sentence
+            // explaining it instead of being an unlabelled glyph.
             //
-            // A "slot copy feedback" toggle: a single preference, given the
-            // same weight as "open the whole clipboard", affecting a HUD that
-            // is not in this popover — and already present, with a label
-            // explaining it, one tap away under the gear. A control belongs
-            // next to the thing it changes.
-            //
-            // And a power button that quit clipd and stopped the daemon, in
-            // one unconfirmed click, on a panel that opens when you merely
-            // point at the menu bar. Quitting is in the tray icon's own menu,
-            // which is where a menu-bar app's Quit lives on this platform and
-            // where nobody reaches for it by accident.
-            //
-            // What is left is what the popover is for: ask, open the full
-            // window, adjust. Three is a row you can read without hovering
-            // each glyph to find out what it does.
+            // Quit stays. It is also in the tray icon's menu, but this panel
+            // is where people actually are when they want clipd to stop, and
+            // making them go and find the other menu is not a simplification.
+            // Kept at the far end, away from the three everyday controls, so
+            // the one irreversible thing in the row is not adjacent to them.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Built exactly like its neighbours. It used to allocate 30pt
+                // against their 38 and paint no circle behind it, so it sat off
+                // the row's centre line and read as a stray mark rather than a
+                // button — which is what made the footer look crooked.
+                let resp = glass_line_button(ui, FooterIcon::Power, false, c)
+                    .on_hover_text("Quit clipd — closes every window and stops the daemon");
+                if resp.clicked() {
+                    self.quit_everything(ui.ctx());
+                }
+            });
         });
         let _ = action;
     }
