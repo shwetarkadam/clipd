@@ -7708,6 +7708,40 @@ impl ClipdGui {
                     dirty = true;
                 }
             });
+            // Every binding carries a caveat and none of them were ever shown:
+            // `warning()` existed on the enum and had no caller. Option+Space
+            // in particular can be held by the memory palette, in which case
+            // the palette matches first and the chord silently never opens
+            // clipd — which looks exactly like the setting not working.
+            let clash = self.paste_settings.palette_enabled
+                && matches!(
+                    (
+                        self.paste_settings.open_gui_hotkey,
+                        self.paste_settings.palette_trigger
+                    ),
+                    (OpenGuiHotkey::OptSpace, PaletteTrigger::OptSpace)
+                );
+            let caveat = if clash {
+                Some(
+                    "The memory palette has this chord too, and it answers first — \
+                     clipd will not open. Set the palette trigger below to Off or \
+                     Cmd+Shift+V.",
+                )
+            } else {
+                self.paste_settings.open_gui_hotkey.warning()
+            };
+            if let Some(text) = caveat {
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(30.0);
+                    ui.label(
+                        RichText::new(text)
+                            .size(11.0)
+                            .color(rgb(if clash { c.accent2 } else { c.subtext })),
+                    );
+                });
+                ui.add_space(2.0);
+            }
             settings_card_divider(ui, c);
             settings_value_row(
                 ui,

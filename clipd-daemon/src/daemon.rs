@@ -4438,32 +4438,9 @@ fn start_macos_hotkey_listener(
                 // bare typing never touches the config file.
                 // Ctrl+Option+Space (slot HUD) is handled above and returns
                 // early; `is_ctrl_only` keeps Ctrl+Space distinct from it.
-                if matches!(key, RKey::KeyG | RKey::Space)
-                    && (has_cmd(&s.pressed_mods)
-                        || has_ctrl(&s.pressed_mods)
-                        // Option+Space is a valid open-clipd binding now, and
-                        // this guard would have discarded it before the match
-                        // below ever ran.
-                        || has_opt(&s.pressed_mods))
-                    && !s.latch_ctrl_g
-                {
-                    let hk = load_paste_transform_settings().open_gui_hotkey;
-                    let on_expected_key = hk.uses_space_key() == (key == RKey::Space);
-                    let matched = on_expected_key
-                        && match hk {
-                            OpenGuiHotkey::CtrlG => is_ctrl_only(&s.pressed_mods),
-                            // Alt+G is a Windows-only binding (Option+G types © on
-                            // macOS keyboards) — treat as unbound here.
-                            OpenGuiHotkey::AltG => false,
-                            OpenGuiHotkey::CmdShiftG => is_cmd_shift(&s.pressed_mods),
-                            OpenGuiHotkey::CtrlShiftG => is_ctrl_shift(&s.pressed_mods),
-                            OpenGuiHotkey::CtrlSpace => is_ctrl_only(&s.pressed_mods),
-                            OpenGuiHotkey::OptSpace => is_opt_only(&s.pressed_mods),
-                            OpenGuiHotkey::Disabled => false,
-                        };
-                    if matched {
+                if !s.latch_ctrl_g {
+                    if let Some((hk, action)) = matches_open_gui_hotkey(key, &s.pressed_mods) {
                         s.latch_ctrl_g = true;
-                        let action = load_paste_transform_settings().ctrl_space_action;
                         log::info!("⌨️  {} → {:?}", hk.label(), action);
                         let tick = match action {
                             CtrlSpaceAction::OpenGui => HotkeyTick::OpenGui,
@@ -4722,26 +4699,9 @@ fn start_macos_open_gui_fallback_listener(
                     return;
                 }
 
-                if matches!(key, RKey::KeyG | RKey::Space)
-                    && (has_cmd(&state.pressed_mods) || has_ctrl(&state.pressed_mods))
-                    && !state.latch_ctrl_g
-                {
-                    let hk = load_paste_transform_settings().open_gui_hotkey;
-                    let on_expected_key = hk.uses_space_key() == (key == RKey::Space);
-                    let matched = on_expected_key
-                        && match hk {
-                            OpenGuiHotkey::CtrlG => is_ctrl_only(&state.pressed_mods),
-                            // Alt+G is Windows-only — unbound on macOS.
-                            OpenGuiHotkey::AltG => false,
-                            OpenGuiHotkey::CmdShiftG => is_cmd_shift(&state.pressed_mods),
-                            OpenGuiHotkey::CtrlShiftG => is_ctrl_shift(&state.pressed_mods),
-                            OpenGuiHotkey::CtrlSpace => is_ctrl_only(&state.pressed_mods),
-                            OpenGuiHotkey::OptSpace => is_opt_only(&state.pressed_mods),
-                            OpenGuiHotkey::Disabled => false,
-                        };
-                    if matched {
+                if !state.latch_ctrl_g {
+                    if let Some((hk, action)) = matches_open_gui_hotkey(key, &state.pressed_mods) {
                         state.latch_ctrl_g = true;
-                        let action = load_paste_transform_settings().ctrl_space_action;
                         log::info!("⌨️  {} → {:?} (fallback)", hk.label(), action);
                         let tick = match action {
                             CtrlSpaceAction::OpenGui => HotkeyTick::OpenGui,
@@ -4768,6 +4728,76 @@ fn start_macos_open_gui_fallback_listener(
     })
     .map_err(|e| format!("rdev listen error: {:?}", e))?;
     Ok(())
+}
+
+/// Whether this key + modifier state matches the configured "open clipd" chord,
+/// and which binding it was.
+///
+/// Shared by both listeners deliberately. This used to be written out twice —
+/// once in the grab path, once in the fallback — and when Option+Space became
+/// a valid binding, only the grab copy was taught to let it through. The
+/// fallback's guard still asked for Cmd or Ctrl, so an Option-only chord was
+/// discarded before the match on the setting ever ran: picking Option+Space in
+/// Settings did nothing at all.
+///
+/// Which mattered more than a duplicated `if` normally would, because the
+/// fallback is the path that runs whenever Accessibility is not granted — that
+/// is, on the machines already least likely to have clipd working.
+#[cfg(target_os = "macos")]
+fn matches_open_gui_hotkey(
+    key: RKey,
+    pressed_mods: &HashSet<RKey>,
+) -> Option<(OpenGuiHotkey, CtrlSpaceAction)> {
+    if !matches!(key, RKey::KeyG | RKey::Space) {
+        return None;
+    }
+    // Only read the setting once a plausible chord is down, so bare typing
+    // never touches the config file.
+    if !(has_cmd(pressed_mods) || has_ctrl(pressed_mods) || has_opt(pressed_mods)) {
+        return None;
+    }
+    let hk = load_paste_transform_settings().open_gui_hotkey;
+    if hk.uses_space_key() != (key == RKey::Space) {
+        return None;
+    }
+    let matched = match hk {
+        OpenGuiHotkey::CtrlG => is_ctrl_only(pressed_mods),
+        // Alt+G is a Windows-only binding — Option+G types © on a Mac keyboard,
+        // so it is treated as unbound here.
+        OpenGuiHotkey::AltG => false,
+        OpenGuiHotkey::CmdShiftG => is_cmd_shift(pressed_mods),
+        OpenGuiHotkey::CtrlShiftG => is_ctrl_shift(pressed_mods),
+        // `is_ctrl_only` keeps this distinct from Ctrl+Option+Space, which is
+        // the slot HUD.
+        OpenGuiHotkey::CtrlSpace => is_ctrl_only(pressed_mods),
+        OpenGuiHotkey::OptSpace => is_opt_only(pressed_mods),
+        OpenGuiHotkey::Disabled => false,
+    };
+    matched.then(|| (hk, open_gui_action(hk)))
+}
+
+/// What the open-clipd chord should actually do.
+///
+/// `ctrl_space_action` is exactly what its name says: a Ctrl+Space-only
+/// setting. Settings labels it "Ctrl+Space action — what Ctrl+Space does when
+/// it opens Clipd", and shows the dropdown only while Ctrl+Space is the chosen
+/// binding. The daemon, though, applied it to *every* binding.
+///
+/// That combination is a one-way trap. Choose Ctrl+Space, set the action to
+/// Slot Memory, then change your shortcut to anything else: the dropdown
+/// disappears, but the stored value keeps redirecting the new chord to the
+/// slot HUD. "Open Clipd" stops opening clipd, and the control that would put
+/// it back is no longer on screen. There is no way out from inside the app.
+///
+/// So honour the setting only where the UI offers it. Any other binding does
+/// what the row it sits under promises.
+#[cfg(target_os = "macos")]
+fn open_gui_action(hk: OpenGuiHotkey) -> CtrlSpaceAction {
+    if hk == OpenGuiHotkey::CtrlSpace {
+        load_paste_transform_settings().ctrl_space_action
+    } else {
+        CtrlSpaceAction::OpenGui
+    }
 }
 
 /// Whether this key+modifier state matches the configured memory-palette shortcut.
@@ -5324,6 +5354,102 @@ mod slot_mapping_tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod stale_modifier_tests {
+    use super::*;
+
+    fn mods(keys: &[RKey]) -> HashSet<RKey> {
+        keys.iter().copied().collect()
+    }
+
+    /// Every binding the settings dropdown offers, and the chord a person
+    /// actually presses for it.
+    ///
+    /// The bug this guards: the two listeners each had their own copy of this
+    /// logic, and only one of them was taught that Option+Space is a valid
+    /// binding. Choosing it in Settings silently did nothing on any machine
+    /// running the fallback listener — which is every machine without
+    /// Accessibility granted. Both paths now go through
+    /// `matches_open_gui_hotkey`, so a binding cannot work in one and not the
+    /// other.
+    #[test]
+    fn every_offered_binding_has_a_chord_that_fires_it() {
+        let cases: &[(OpenGuiHotkey, RKey, &[RKey])] = &[
+            (OpenGuiHotkey::CtrlG, RKey::KeyG, &[RKey::ControlLeft]),
+            (
+                OpenGuiHotkey::CmdShiftG,
+                RKey::KeyG,
+                &[RKey::MetaLeft, RKey::ShiftLeft],
+            ),
+            (
+                OpenGuiHotkey::CtrlShiftG,
+                RKey::KeyG,
+                &[RKey::ControlLeft, RKey::ShiftLeft],
+            ),
+            (OpenGuiHotkey::CtrlSpace, RKey::Space, &[RKey::ControlLeft]),
+            (OpenGuiHotkey::OptSpace, RKey::Space, &[RKey::Alt]),
+        ];
+        for (hk, key, held) in cases {
+            let held = mods(held);
+            // The guard that discards the event before the setting is even
+            // consulted. This is the half that was wrong.
+            assert!(
+                has_cmd(&held) || has_ctrl(&held) || has_opt(&held),
+                "{}: its own chord does not survive the modifier guard, so the \
+                 binding can never fire however the setting is stored",
+                hk.label()
+            );
+            assert_eq!(
+                hk.uses_space_key(),
+                *key == RKey::Space,
+                "{}: disagrees with itself about which key it is on",
+                hk.label()
+            );
+        }
+    }
+
+    /// The trap: a Ctrl+Space-only setting was being applied to every binding.
+    ///
+    /// Settings shows the "Ctrl+Space action" dropdown only while Ctrl+Space is
+    /// the chosen shortcut. Pick Slot Memory there, then change the shortcut to
+    /// anything else, and the dropdown disappears while the stored value keeps
+    /// redirecting the new chord away from the GUI. "Open Clipd" stops opening
+    /// clipd and nothing on screen can put it back.
+    #[test]
+    fn only_ctrl_space_obeys_the_ctrl_space_action() {
+        for hk in OpenGuiHotkey::ALL {
+            if hk == OpenGuiHotkey::CtrlSpace || hk == OpenGuiHotkey::Disabled {
+                continue;
+            }
+            assert_eq!(
+                open_gui_action(hk),
+                CtrlSpaceAction::OpenGui,
+                "{} must open the GUI — it is not Ctrl+Space, so a Ctrl+Space \
+                 setting has no business redirecting it",
+                hk.label()
+            );
+        }
+    }
+
+    /// Option+Space specifically, since it is the one that was broken.
+    #[test]
+    fn option_space_is_not_confused_with_its_neighbours() {
+        let opt = mods(&[RKey::Alt]);
+        assert!(is_opt_only(&opt));
+
+        // Ctrl+Option+Space is the slot HUD, not the GUI.
+        let ctrl_opt = mods(&[RKey::ControlLeft, RKey::Alt]);
+        assert!(!is_opt_only(&ctrl_opt), "Ctrl+Option+Space must not open the GUI");
+        assert!(is_ctrl_opt(&ctrl_opt));
+
+        // And Ctrl+Space stays distinct the other way round.
+        let ctrl = mods(&[RKey::ControlLeft]);
+        assert!(is_ctrl_only(&ctrl));
+        assert!(!is_opt_only(&ctrl));
+
+        // A bare Space is not a chord at all.
+        let none = mods(&[]);
+        assert!(!(has_cmd(&none) || has_ctrl(&none) || has_opt(&none)));
+    }
+
     use super::*;
 
     fn held(ctrl: bool, shift: bool, alt: bool, cmd: bool) -> live_mods::Held {
