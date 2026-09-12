@@ -522,12 +522,36 @@ pub fn spawn_watchdog() {
 /// over the crash they just hit, and someone who is happy to be counted has
 /// not thereby agreed to send stack locations. Consent for this is the click
 /// that reaches this function, and nothing else.
-pub fn send(report: &Report) -> bool {
-    let sent = crate::telemetry::send_report(report);
-    if sent {
+pub fn send(report: &Report) -> SendOutcome {
+    let outcome = crate::telemetry::send_report(report);
+    if outcome == SendOutcome::Sent {
         discard(&report.id);
     }
-    sent
+    outcome
+}
+
+/// What happened to a report the user asked to send.
+///
+/// Three outcomes, not a bool, because they call for three different things to
+/// be said. Collapsing "no endpoint is configured in this build" into the same
+/// failure as "the network is down" told people the server was unreachable
+/// when nothing had been attempted at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendOutcome {
+    Sent,
+    /// This build has no reporting endpoint compiled in — a local or
+    /// self-built binary. Sending is impossible, not merely failing.
+    NotConfigured,
+    Unreachable,
+}
+
+/// Whether this build can send a report at all.
+///
+/// Used to decide whether to ask. Offering someone a Send button that cannot
+/// work, and then blaming the network when they press it, is worse than not
+/// asking: it spends their goodwill on nothing.
+pub fn can_send() -> bool {
+    crate::telemetry::reporting_configured()
 }
 
 #[cfg(test)]

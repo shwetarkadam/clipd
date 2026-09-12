@@ -3972,7 +3972,15 @@ impl ClipdGui {
             // Only the palette asks. The island and the tray popover are
             // glances, not places to put a consent decision, and the HUD is
             // hidden for most of its life.
-            pending_report: if hud || island_surface || clipd_core::crashlog::never_ask() {
+            // Not asked at all when this build has no endpoint compiled in.
+            // A local or self-built binary cannot send, and offering a Send
+            // button that silently cannot work — then blaming the network when
+            // it is pressed — spends someone's goodwill on nothing.
+            pending_report: if hud
+                || island_surface
+                || clipd_core::crashlog::never_ask()
+                || !clipd_core::crashlog::can_send()
+            {
                 None
             } else {
                 clipd_core::crashlog::pending().into_iter().next_back()
@@ -9574,12 +9582,22 @@ impl ClipdGui {
                     if ui.button("Send").clicked_by(click) {
                         // The only call to `send` in the codebase, and it is
                         // inside a click handler. That is the design.
-                        if clipd_core::crashlog::send(&report) {
-                            dismiss = true;
-                        } else {
-                            self.report_status =
-                                Some("Couldn't reach the server — kept for now.".into());
-                        }
+                        use clipd_core::crashlog::SendOutcome;
+                        self.report_status = match clipd_core::crashlog::send(&report) {
+                            SendOutcome::Sent => {
+                                dismiss = true;
+                                None
+                            }
+                            SendOutcome::Unreachable => {
+                                Some("Couldn't reach the server — kept for now.".into())
+                            }
+                            // Should be unreachable: the banner is not offered
+                            // at all when the build cannot send. Say the true
+                            // thing anyway rather than blame the network.
+                            SendOutcome::NotConfigured => Some(
+                                "This build has no reporting endpoint — nothing was sent.".into(),
+                            ),
+                        };
                     }
                     if ui.button("Not now").clicked_by(click) {
                         clipd_core::crashlog::discard(&report.id);
