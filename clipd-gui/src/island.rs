@@ -84,6 +84,14 @@ const CARD_CAPTION_GAP: f32 = 4.0;
 const CARD_ROW_SPACING: f32 = 1.0;
 const CLIPS_TAB_ROWS: usize = 8;
 
+/// How many clips the Clips tab holds, as opposed to how many it shows.
+///
+/// The list used to stop at whatever fitted the panel, so the island could
+/// only ever reach the most recent handful — for anything older you had to
+/// leave and open the palette. The panel still sizes itself to
+/// `CLIPS_TAB_ROWS`; the rest are reachable by scrolling inside it.
+const CLIPS_TAB_REACH: usize = 60;
+
 /// The widest the slab may get, before the display's own width is considered.
 const ISLAND_MAX_W: f32 = 980.0;
 /// Width the card rows pack to: two of the wider cards side by side.
@@ -143,7 +151,18 @@ const FORCED_PHASE_GRACE: Duration = Duration::from_secs(180);
 // Below the threshold where a delay is perceived at all (~100ms), so opening
 // reads as instant, while still filtering the fast sweep across the strip on
 // the way to the menu bar — that crossing takes well under this.
-const OPEN_DWELL: Duration = Duration::from_millis(40);
+const OPEN_DWELL: Duration = Duration::from_millis(180);
+
+/// How far the pointer may drift between polls and still count as "stopped",
+/// in points per 12ms sample — about 165pt/s.
+///
+/// This is the difference between aiming and passing through. A pointer on its
+/// way to a browser tab or a menu is still travelling when it crosses the
+/// notch; a pointer that came for the island arrives and stops. Time alone
+/// cannot tell those apart — a 40ms dwell is less time than a normal sweep
+/// spends inside a 76pt strip, which is why reaching for a tab kept throwing
+/// the panel open over the tab bar.
+const SETTLE_SLOP: f32 = 2.0;
 
 /// Longer grace once the island has been clicked open deliberately.
 /// Air inside the bar capsule, and the drop from the menu bar to its top edge.
@@ -669,6 +688,11 @@ pub(crate) struct IslandState {
     /// The island's screen rect, shared with the cursor watcher so it knows
     /// what counts as "on the island" as the window grows and shrinks.
     hot_rect: Arc<Mutex<HotZone>>,
+    /// When the pointer stopped moving inside the hot zone, or `None` while it
+    /// is outside or still travelling. Written by the cursor watcher, which
+    /// samples on a steady 12ms tick — the UI thread's frames are too
+    /// irregular to measure motion from.
+    settled: Arc<Mutex<Option<Instant>>>,
     poller_started: bool,
     watcher_started: bool,
     /// Set by the settings UI so the poller refetches immediately instead of
@@ -694,6 +718,14 @@ pub(crate) struct IslandState {
     /// The last arrangement seen, so a change is breadcrumbed once and not
     /// every 400ms.
     arrangement: Option<String>,
+    /// Set when the panel opens, to put the clip list back at the newest clip.
+    ///
+    /// egui persists a scroll area's offset, and eframe saves that across
+    /// runs — so the island reopened wherever it had last been scrolled to.
+    /// Glancing at the notch and being shown a fortnight-old clip is not a
+    /// glance; the top of the list is the only defensible starting place for
+    /// a surface whose whole job is "what did I just copy".
+    rewind_clips: bool,
     /// Colours for the current theme, refreshed at the top of every frame.
     skin: IslandSkin,
     /// How many rows the Clips tab has to show, so the slab can be sized for
@@ -761,6 +793,7 @@ impl Default for IslandState {
             geometry: notch_geometry(&config, None),
             screen_checked: Instant::now(),
             arrangement: None,
+            rewind_clips: true,
             skin: IslandSkin::default(),
             clips_rows: CLIPS_TAB_ROWS,
             slot_strip_shown: false,
@@ -788,6 +821,7 @@ impl Default for IslandState {
             last_tab: IslandTab::Home,
             data: Arc::new(Mutex::new(IslandSnapshot::default())),
             hot_rect: Arc::new(Mutex::new(HotZone::NOTHING)),
+            settled: Arc::new(Mutex::new(None)),
             poller_started: false,
             watcher_started: false,
             refresh_now: Arc::new(AtomicBool::new(false)),
@@ -1120,13 +1154,18 @@ fn demo_snapshot() -> IslandSnapshot {
 /// dragged, the window gets no events at all, so hovering the notch with a
 /// file in hand would never open the shelf. Polling the global cursor position
 /// sidesteps both.
-fn spawn_cursor_watcher(ctx: &egui::Context, hot_rect: Arc<Mutex<HotZone>>) {
+fn spawn_cursor_watcher(
+    ctx: &egui::Context,
+    hot_rect: Arc<Mutex<HotZone>>,
+    settled: Arc<Mutex<Option<Instant>>>,
+) {
     let ctx = ctx.clone();
     std::thread::spawn(move || {
         // The pointer has to be noticed before anything else can happen, so
         // this sits at the front of every open. One CGEvent location read.
         const POLL: Duration = Duration::from_millis(12);
         let mut was_inside = false;
+        let mut last_pos: Option<egui::Pos2> = None;
         loop {
             std::thread::sleep(POLL);
             let Some(cursor) = global_cursor_position() else {
@@ -1136,6 +1175,14 @@ fn spawn_cursor_watcher(ctx: &egui::Context, hot_rect: Arc<Mutex<HotZone>>) {
                 continue;
             };
             let inside = rect.contains(cursor, rect.expand);
+
+            // Distance covered since the last sample, which at a fixed tick is
+            // a speed. Anything still moving is on its way somewhere else.
+            let drift = last_pos.map(|p| (cursor - p).length()).unwrap_or(f32::MAX);
+            last_pos = Some(cursor);
+            if let Ok(mut slot) = settled.lock() {
+                *slot = next_settle(inside, drift, *slot);
+            }
             // Repaint for as long as the pointer is in the zone, not only when
             // it crosses in.
             //
@@ -1152,6 +1199,21 @@ fn spawn_cursor_watcher(ctx: &egui::Context, hot_rect: Arc<Mutex<HotZone>>) {
             was_inside = inside;
         }
     });
+}
+
+/// Advance the "pointer has stopped here" clock by one sample.
+///
+/// Pure so the rule can be tested without a pointer: the whole fix for the
+/// island opening over browser tabs lives in these three lines, and it is a
+/// rule about motion, not about time.
+fn next_settle(inside: bool, drift: f32, current: Option<Instant>) -> Option<Instant> {
+    if !inside || drift > SETTLE_SLOP {
+        // Outside, or still travelling — the clock does not run.
+        None
+    } else {
+        // Stopped. Keep the existing start so the dwell accumulates.
+        current.or_else(|| Some(Instant::now()))
+    }
 }
 
 /// Where the pointer has to be for the island to count as hovered.
@@ -1245,7 +1307,11 @@ impl ClipdGui {
         }
         if !self.island.watcher_started {
             self.island.watcher_started = true;
-            spawn_cursor_watcher(ctx, self.island.hot_rect.clone());
+            spawn_cursor_watcher(
+                ctx,
+                self.island.hot_rect.clone(),
+                self.island.settled.clone(),
+            );
         }
         // The island keeps its own window above the menu bar. Re-applied every
         // frame is wasteful; once the window exists is enough, and the first
@@ -1601,12 +1667,28 @@ impl ClipdGui {
         }
         if hovered {
             self.island.left_at = None;
-            // Crossing the strip is not the same as aiming at it. Without a
-            // dwell, every trip to the menu bar or a browser tab threw the
-            // panel open over whatever was underneath.
-            let settled = !matches!(self.island.phase, IslandPhase::Hidden | IslandPhase::Resting);
-            let since = *self.island.entered_at.get_or_insert_with(Instant::now);
-            if settled || since.elapsed() >= OPEN_DWELL {
+            // Crossing the strip is not the same as aiming at it, and elapsed
+            // time cannot tell them apart: a normal sweep toward a browser tab
+            // spends longer inside the strip than any dwell short enough to
+            // feel responsive. So ask whether the pointer actually *stopped*.
+            //
+            // Once the panel is open the question is different — the pointer
+            // is expected to move, over rows — so an open island stays open on
+            // presence alone.
+            let already_open =
+                !matches!(self.island.phase, IslandPhase::Hidden | IslandPhase::Resting);
+            let held_still = self
+                .island
+                .settled
+                .lock()
+                .ok()
+                .and_then(|s| *s)
+                .map(|since| since.elapsed() >= OPEN_DWELL)
+                .unwrap_or(false);
+            if already_open || held_still {
+                if !already_open {
+                    self.island.rewind_clips = true;
+                }
                 return IslandPhase::Expanded;
             }
             return self.island.phase;
@@ -2523,31 +2605,56 @@ impl ClipdGui {
     fn island_clips(&mut self, ui: &mut egui::Ui) {
         self.island_slot_strip(ui);
         let s = self.island.skin;
-        let want = self
+        // Two different numbers: how tall the panel is, and how much list it
+        // holds. They used to be the same one, which is why the island could
+        // only ever see the newest few clips.
+        let shown = self
             .island
             .config
             .clip_rows
             .clamp(1, CLIPS_TAB_ROWS)
             .min(self.clips.len().max(1));
-        let clips: Vec<_> = self.clips.iter().take(want).cloned().collect();
-        // Publish the count so the slab is sized for this list next frame.
-        self.island.clips_rows = clips.len().max(1);
+        let clips: Vec<_> = self.clips.iter().take(CLIPS_TAB_REACH).cloned().collect();
+        // Publish the *visible* count, so the slab is sized for the window
+        // onto the list rather than for the whole of it.
+        self.island.clips_rows = shown;
+        let viewport = shown as f32 * ISLAND_ROW_H;
         island_card_frame(ui, &s, ui.available_size(), |ui| {
             if clips.is_empty() {
                 island_empty(ui, &s, "Nothing copied yet.");
                 return;
             }
-            for clip in clips {
-                let response = self.island_clip_row(ui, &clip, true);
-                if response.clicked() {
-                    let copied = self.island_copy(&clip);
-                    self.island.note(if copied {
-                        "Copied"
-                    } else {
-                        "Couldn't copy that clip"
-                    });
-                }
+            let rewind = std::mem::take(&mut self.island.rewind_clips);
+            let mut area = egui::ScrollArea::vertical()
+                .id_salt("island_clips")
+                .max_height(viewport);
+            if rewind {
+                // One frame only. Forcing it every frame would pin the list
+                // and there would be nothing to scroll.
+                area = area.vertical_scroll_offset(0.0);
             }
+            area
+                .auto_shrink([false, false])
+                // The island is a glance surface and a scrollbar drawn over
+                // the right-hand edge of a row reads as chrome. It appears
+                // while scrolling and fades out, the way a trackpad list does
+                // everywhere else on the system.
+                .scroll_bar_visibility(
+                    egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                )
+                .show_rows(ui, ISLAND_ROW_H, clips.len(), |ui, range| {
+                    for clip in &clips[range] {
+                        let response = self.island_clip_row(ui, clip, true);
+                        if response.clicked() {
+                            let copied = self.island_copy(clip);
+                            self.island.note(if copied {
+                                "Copied"
+                            } else {
+                                "Couldn't copy that clip"
+                            });
+                        }
+                    }
+                });
         });
     }
 
@@ -4452,6 +4559,73 @@ mod tests {
         let park = park_above(FALLBACK_SCREEN, &[FALLBACK_SCREEN.top()], size);
         assert!(!FALLBACK_SCREEN.intersects(egui::Rect::from_min_size(park, size)));
         assert_eq!(park.x, FALLBACK_SCREEN.left());
+    }
+
+    /// The island opened whenever the pointer was *near* the notch, which on a
+    /// full-screen browser is exactly where the tab bar is. Reaching for a tab
+    /// threw the panel open over the tabs.
+    ///
+    /// The rule is now about motion. A pointer travelling somewhere else never
+    /// starts the clock, however long it spends crossing the strip.
+    #[test]
+    fn a_pointer_on_its_way_somewhere_else_never_opens_the_island() {
+        // A sweep across the top of the screen: inside the zone, still moving.
+        let mut settle = None;
+        for _ in 0..200 {
+            settle = next_settle(true, SETTLE_SLOP + 0.5, settle);
+            assert!(
+                settle.is_none(),
+                "a moving pointer must not accumulate dwell — this is the \
+                 browser-tab case, and it lasts far longer than any dwell"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pointer_that_stops_does_open_it() {
+        let settle = next_settle(true, 0.0, None);
+        assert!(settle.is_some(), "a stopped pointer starts the clock");
+        // And the clock keeps its original start, so the dwell accumulates
+        // rather than restarting on every sample.
+        let held = next_settle(true, 0.1, settle);
+        assert_eq!(held, settle);
+        // Leaving the zone resets it, so re-entering needs a fresh stop.
+        assert!(next_settle(false, 0.0, held).is_none());
+    }
+
+    #[test]
+    fn the_dwell_is_long_enough_to_mean_something() {
+        // 40ms was the old value, and a normal pointer sweep spends longer
+        // than that inside a strip this size — so it gated nothing at all.
+        assert!(
+            OPEN_DWELL >= Duration::from_millis(120),
+            "a dwell shorter than a sweep is not a dwell"
+        );
+        // But it still has to feel like a hover, not a long-press.
+        assert!(OPEN_DWELL <= Duration::from_millis(400));
+    }
+
+    /// The list may hold far more than it shows, and the panel must still be
+    /// sized for the window onto it rather than for the whole list.
+    #[test]
+    fn scrolling_does_not_make_the_panel_taller() {
+        assert!(
+            CLIPS_TAB_REACH > CLIPS_TAB_ROWS,
+            "there is no point scrolling a list that ends at the fold"
+        );
+        let mut state = IslandState::default();
+        state.tab = IslandTab::Clips;
+
+        state.clips_rows = CLIPS_TAB_ROWS;
+        let full = state.target_size().y;
+        // Publishing a reach far beyond the visible rows must not grow the
+        // slab: `clips_rows` is clamped to what is actually on screen.
+        state.clips_rows = CLIPS_TAB_REACH;
+        assert_eq!(
+            state.target_size().y,
+            full,
+            "a longer list must scroll inside the panel, not stretch it"
+        );
     }
 
     #[test]
