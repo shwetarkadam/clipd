@@ -464,7 +464,23 @@ fn catch_terminating_signals(marker: &std::path::Path) {
         return; // already installed
     }
     for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-        unsafe { libc::signal(sig, on_terminating_signal as libc::sighandler_t) };
+        // Never catch a signal that was handed to us already ignored.
+        //
+        // A process inherits its signal dispositions, and a detached or
+        // launch-agent-started clipd inherits SIG_IGN for SIGHUP — that is
+        // what keeps it alive when the shell or session that started it goes
+        // away. Installing a handler silently *un*-ignores it, and the
+        // handler's job is to hand the signal back to the default
+        // disposition, which terminates. So merely adding crash reporting
+        // made background clipd processes die on a hangup they used to
+        // survive. `signal` hands back the previous disposition; if it was
+        // SIG_IGN, put it straight back.
+        unsafe {
+            let previous = libc::signal(sig, on_terminating_signal as libc::sighandler_t);
+            if previous == libc::SIG_IGN {
+                libc::signal(sig, libc::SIG_IGN);
+            }
+        }
     }
 }
 
