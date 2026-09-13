@@ -1421,7 +1421,7 @@ fn tiny_filter_chip(
     theme: Theme,
     c: &clipd_core::ThemeColors,
 ) -> bool {
-    let spotlight = theme == Theme::GlassLight;
+    let spotlight = theme.is_glass();
     // Light themes get the same treatment, darkening instead of lifting.
     let (text_col, fill, stroke) = if active && spotlight {
         // On glass the selected segment is its own frosted pane with an edge,
@@ -1536,7 +1536,7 @@ fn footer_shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeCol
 /// theme.
 fn capture_dot_color(theme: Theme, c: &clipd_core::ThemeColors) -> Color32 {
     match theme {
-        Theme::Light | Theme::GlassLight => Color32::from_rgb(52, 168, 83),
+        Theme::Light => Color32::from_rgb(52, 168, 83),
         _ => rgb(c.green),
     }
 }
@@ -2361,7 +2361,10 @@ fn theme_named(name: &str) -> Option<Theme> {
         "forest" => Some(Theme::Forest),
         "cocoa" => Some(Theme::Slate),
         "slate" => Some(Theme::Slate),
-        "glass-light" | "glasslight" => Some(Theme::GlassLight),
+        // Retired; a light translucent panel cannot hold its ink over a
+        // dark backdrop. Anyone asking for it by name gets the light theme
+        // that works.
+        "glass-light" | "glasslight" => Some(Theme::Light),
         // Retired: Glass Dark's job — a dark surface with no colour in it —
         // is what Dark already does, without a translucency layer to fight.
         "glass-dark" | "glassdark" | "glass" | "glass-minimal" | "glassminimal" => {
@@ -3037,7 +3040,7 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
 fn text_selection_style(theme: Theme, c: &clipd_core::ThemeColors) -> (Color32, Stroke) {
     if theme.is_glass() {
         // Cool slate wash — keep mint off the selection (chips/pins only).
-        let (r, g, b, a) = if theme == Theme::GlassLight {
+        let (r, g, b, a) = if false {
             // selectedTextBackgroundColor — the exact pale blue macOS puts
             // behind selected text in light mode.
             (179, 215, 255, 200)
@@ -3087,7 +3090,7 @@ fn paint_glass_shell(
     let rounding = Rounding::same(SHELL_ROUND);
 
     if theme.is_glass() {
-        let light = theme == Theme::GlassLight;
+        let light = false;
         // Frosted base — translucent enough for blur + blooms to read.
         let veil = if light {
             // A real frost plate, not bare transparency. The native clear
@@ -3320,7 +3323,7 @@ fn paint_soft_radial_glow(
 /// Older macOS releases fall back to classic vibrancy.
 #[cfg(target_os = "macos")]
 fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>) {
-    let want = theme.is_glass().then_some(theme == Theme::GlassLight);
+    let want = theme.is_glass().then_some(false);
     if want == *on {
         return;
     }
@@ -3423,7 +3426,7 @@ fn force_glass_appearance(frame: &eframe::Frame, light: bool) {
 fn write_glass_status(applied: &str, light: bool) {
     let status = format!(
         "glass_native={applied} theme={} light={light}\n",
-        if light { "GlassLight" } else { "Dark" }
+        if light { "light" } else { "Dark" }
     );
     if let Some(dir) = dirs::data_dir() {
         let _ = std::fs::write(dir.join("clipd/glass_native.status"), &status);
@@ -3567,7 +3570,7 @@ fn sync_glass_native(_frame: &eframe::Frame, _theme: Theme, _on: &mut Option<boo
 
 /// Glass selection / hover — soft neutral wash (mint stays on chips/pins).
 fn glass_row_fill(theme: Theme, selected: bool, hovered: bool) -> Option<Color32> {
-    let light = theme == Theme::GlassLight;
+    let light = false;
     if light {
         // A resting row paints nothing.
         //
@@ -3612,7 +3615,7 @@ fn glass_row_fill(theme: Theme, selected: bool, hovered: bool) -> Option<Color32
 }
 
 fn glass_row_stroke(theme: Theme, selected: bool) -> Stroke {
-    if theme == Theme::GlassLight {
+    if false {
         // No rim, on any row, ever.
         //
         // The rim was there to separate two translucent surfaces stacked on
@@ -3651,7 +3654,6 @@ fn glass_panel_frost(theme: Theme) -> Color32 {
         // Nothing. The shell's veil is the single frost layer now; painting
         // it again per panel is what made the surface uneven from region to
         // region, because the panels do not all cover the same area.
-        Theme::GlassLight => Color32::TRANSPARENT,
         _ => Color32::TRANSPARENT,
     }
 }
@@ -3662,7 +3664,7 @@ fn glass_panel_frost(theme: Theme) -> Color32 {
 fn paint_panel_glass_gradient(ui: &egui::Ui, theme: Theme) {
     // Glass Light's reflection is painted once by `paint_glass_shell`; repeating
     // it in every panel creates seams and visible colour restarts.
-    if theme == Theme::GlassLight {
+    if false {
         return;
     }
     let Some((left, right)) = theme.shell_glows() else {
@@ -3670,7 +3672,7 @@ fn paint_panel_glass_gradient(ui: &egui::Ui, theme: Theme) {
     };
     let rect = ui.max_rect();
     let screen = ui.ctx().screen_rect();
-    let alpha = if theme == Theme::GlassLight { 26 } else { 35 };
+    let alpha = if false { 26 } else { 35 };
     let sample = |pos: egui::Pos2| {
         let x = ((pos.x - screen.left()) / screen.width().max(1.0)).clamp(0.0, 1.0);
         let y = ((pos.y - screen.top()) / screen.height().max(1.0)).clamp(0.0, 1.0);
@@ -6748,7 +6750,7 @@ impl eframe::App for ClipdGui {
 
         // ── Full-GUI chrome: brand → search → tiny filters (mockup stack). ──
         egui::TopBottomPanel::top("search_header")
-            .show_separator_line(self.theme != Theme::GlassLight)
+            .show_separator_line(!self.theme.is_glass())
             .frame(
                 egui::Frame::none()
                     .fill(glass_panel_frost(self.theme))
@@ -6778,7 +6780,7 @@ impl eframe::App for ClipdGui {
 
         // ── Footer: Capturing · clock · ⌘⇧V (mockup minimal bar) ──
         egui::TopBottomPanel::bottom("footer_hints")
-            .show_separator_line(self.theme != Theme::GlassLight)
+            .show_separator_line(!self.theme.is_glass())
             .exact_height(44.0)
             .frame(
                 egui::Frame::none()

@@ -4317,7 +4317,7 @@ mod tests {
         // popover read as a green app sitting beside a neutral white island.
         // One accent per theme, and for the glass themes it stays near-neutral
         // so the material is what you notice.
-        for theme in [Theme::GlassLight] {
+        for theme in [Theme::GlassDark] {
             let c = theme.colors();
             let skin = IslandSkin::frosted(&c);
             assert_eq!(
@@ -4343,7 +4343,7 @@ mod tests {
         // had not changed. Verified here rather than by eye: forcing the
         // island open for a screenshot goes through a different path, so a
         // screenshot proves nothing about this branch.
-        for theme in [Theme::Light, Theme::GlassLight] {
+        for theme in [Theme::Light] {
             let skin = IslandSkin::frosted(&theme.colors());
             assert!(
                 !skin.dark,
@@ -4375,7 +4375,7 @@ mod tests {
         // A glass theme asks every clipd surface to let the material behind
         // read. The island held at 240 regardless, which is why it stayed a
         // solid slab while the palette went to glass.
-        for theme in [Theme::GlassLight] {
+        for theme in [Theme::GlassDark] {
             let c = theme.colors();
             let skin = IslandSkin::frosted(&c);
             assert_eq!(
