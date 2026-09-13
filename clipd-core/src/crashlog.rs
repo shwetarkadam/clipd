@@ -14,7 +14,9 @@
 //! not what gets sent. See `describe_for_log` in `privacy` for the other half.
 
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -381,6 +383,7 @@ pub fn install(surface_name: &'static str) {
         sweep_orphaned_markers();
     }
     write_marker(surface_name, &display_arrangement());
+    catch_terminating_signals(&running_marker(surface_name));
 
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -414,6 +417,75 @@ pub fn install(surface_name: &'static str) {
 pub fn mark_clean_exit() {
     let _ = std::fs::remove_file(running_marker(&surface()));
 }
+
+/// The marker path, pre-encoded so a signal handler can delete it without
+/// allocating, locking or formatting anything.
+static MARKER_CPATH: OnceLock<CString> = OnceLock::new();
+
+/// Treat a termination signal as a clean exit.
+///
+/// Without this, only one path in the whole app marked a clean exit: the
+/// tray's Quit menu item. Everything else that ends a process politely —
+/// logging out, restarting the Mac, Activity Monitor's Quit, an app update
+/// replacing the bundle, a `pkill` — arrives as SIGTERM and left the marker
+/// behind, so the next launch reported a crash that never happened.
+///
+/// Which meant every user would have been shown "clipd closed unexpectedly"
+/// after every reboot. A crash reporter that cries wolf on a reboot is worse
+/// than no crash reporter: people learn to dismiss it, and the one real crash
+/// goes with it.
+///
+/// SIGKILL is deliberately not handled — it cannot be, and a process that was
+/// hard-killed genuinely did not exit cleanly.
+#[cfg(unix)]
+extern "C" fn on_terminating_signal(sig: i32) {
+    // Async-signal-safe by construction: `OnceLock::get` is an atomic load and
+    // `unlink` is on the POSIX safe list. Nothing here takes a lock — the
+    // Mutexes this module uses elsewhere could be held by the interrupted
+    // thread, and taking one here would deadlock the shutdown.
+    if let Some(path) = MARKER_CPATH.get() {
+        unsafe { libc::unlink(path.as_ptr()) };
+    }
+    // Hand the signal back to the default disposition so the process still
+    // dies the way the sender intended.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+#[cfg(unix)]
+fn catch_terminating_signals(marker: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = CString::new(marker.as_os_str().as_bytes()) else {
+        return;
+    };
+    if MARKER_CPATH.set(c).is_err() {
+        return; // already installed
+    }
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // Never catch a signal that was handed to us already ignored.
+        //
+        // A process inherits its signal dispositions, and a detached or
+        // launch-agent-started clipd inherits SIG_IGN for SIGHUP — that is
+        // what keeps it alive when the shell or session that started it goes
+        // away. Installing a handler silently *un*-ignores it, and the
+        // handler's job is to hand the signal back to the default
+        // disposition, which terminates. So merely adding crash reporting
+        // made background clipd processes die on a hangup they used to
+        // survive. `signal` hands back the previous disposition; if it was
+        // SIG_IGN, put it straight back.
+        unsafe {
+            let previous = libc::signal(sig, on_terminating_signal as libc::sighandler_t);
+            if previous == libc::SIG_IGN {
+                libc::signal(sig, libc::SIG_IGN);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn catch_terminating_signals(_marker: &std::path::Path) {}
 
 // ── hang detection ────────────────────────────────────────────────────────────
 
@@ -466,12 +538,36 @@ pub fn spawn_watchdog() {
 /// over the crash they just hit, and someone who is happy to be counted has
 /// not thereby agreed to send stack locations. Consent for this is the click
 /// that reaches this function, and nothing else.
-pub fn send(report: &Report) -> bool {
-    let sent = crate::telemetry::send_report(report);
-    if sent {
+pub fn send(report: &Report) -> SendOutcome {
+    let outcome = crate::telemetry::send_report(report);
+    if outcome == SendOutcome::Sent {
         discard(&report.id);
     }
-    sent
+    outcome
+}
+
+/// What happened to a report the user asked to send.
+///
+/// Three outcomes, not a bool, because they call for three different things to
+/// be said. Collapsing "no endpoint is configured in this build" into the same
+/// failure as "the network is down" told people the server was unreachable
+/// when nothing had been attempted at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendOutcome {
+    Sent,
+    /// This build has no reporting endpoint compiled in — a local or
+    /// self-built binary. Sending is impossible, not merely failing.
+    NotConfigured,
+    Unreachable,
+}
+
+/// Whether this build can send a report at all.
+///
+/// Used to decide whether to ask. Offering someone a Send button that cannot
+/// work, and then blaming the network when they press it, is worse than not
+/// asking: it spends their goodwill on nothing.
+pub fn can_send() -> bool {
+    crate::telemetry::reporting_configured()
 }
 
 #[cfg(test)]
@@ -565,6 +661,34 @@ mod tests {
                 "0,0,2560x1440|-1470,300,1470x956,notch"
             );
         });
+    }
+
+    /// A build with no endpoint must say so, not blame the network.
+    ///
+    /// The bug: `send_report` returned a bool, so "no key was compiled into
+    /// this build" and "the POST failed" were the same value, and the UI
+    /// rendered both as "Couldn't reach the server". Someone who clicked Send
+    /// to help was told a server was unreachable when none had been contacted,
+    /// with no way to learn the button was dead on arrival.
+    ///
+    /// This test runs in exactly that build: the test binary has no
+    /// CLIPD_POSTHOG_KEY, so `option_env!` is None.
+    #[test]
+    fn a_build_with_no_endpoint_says_so_instead_of_blaming_the_network() {
+        assert!(
+            !can_send(),
+            "the test binary is built without a key; if this fails the test \
+             below is no longer checking what it claims to"
+        );
+        let report = sample("zzz", 1);
+        let outcome = crate::telemetry::send_report(&report);
+        assert_eq!(
+            outcome,
+            SendOutcome::NotConfigured,
+            "a build that cannot send must report NotConfigured, never \
+             Unreachable — nothing was contacted"
+        );
+        assert_ne!(outcome, SendOutcome::Unreachable);
     }
 
     #[test]

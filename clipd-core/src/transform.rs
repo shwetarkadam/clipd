@@ -292,6 +292,33 @@ impl Default for OpenGuiHotkey {
     }
 }
 
+/// Whether the tray host has claimed the open-clipd and palette chords with
+/// Carbon `RegisterEventHotKey`.
+///
+/// clipd listens for these chords three ways, and the daemon runs in-process
+/// inside the tray, so when Carbon registration succeeds the rdev listeners
+/// are looking at the *same* keypress. They were both acting on it: one
+/// press of Option+Space logged "→ SlotMemory (Carbon)" and "→ memory palette
+/// (fallback)" and did two unrelated things.
+///
+/// Carbon is the reliable path — it needs no Accessibility grant — so when it
+/// holds the chord the rdev listeners stand down for that chord only.
+static CARBON_OPEN_GUI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CARBON_PALETTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_carbon_open_gui_owned(on: bool) {
+    CARBON_OPEN_GUI.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn carbon_open_gui_owned() -> bool {
+    CARBON_OPEN_GUI.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn set_carbon_palette_owned(on: bool) {
+    CARBON_PALETTE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn carbon_palette_owned() -> bool {
+    CARBON_PALETTE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl OpenGuiHotkey {
     pub fn label(&self) -> &'static str {
         match self {
@@ -310,6 +337,41 @@ impl OpenGuiHotkey {
             Self::OptSpace => "Option+Space",
             Self::Disabled => "Disabled",
         }
+    }
+
+    /// What this chord should actually do when it fires.
+    ///
+    /// `ctrl_space_action` is a Ctrl+Space-only setting — Settings labels it
+    /// "Ctrl+Space action" and only shows the dropdown while Ctrl+Space is
+    /// the chosen binding. Applying it to every binding is a one-way trap:
+    /// pick Ctrl+Space, set Slot Memory, change your shortcut, and the
+    /// dropdown disappears while the stored value keeps redirecting the new
+    /// chord away from the GUI.
+    ///
+    /// This lives here because clipd has *three* places that answer "what
+    /// does the open-clipd chord do": the CGEventTap grab, the rdev fallback
+    /// listener, and the tray's Carbon registration. Each had its own copy,
+    /// and each had to be found separately when the answer changed. One
+    /// definition, three callers.
+    pub fn action(&self, configured: CtrlSpaceAction) -> CtrlSpaceAction {
+        if *self == Self::CtrlSpace {
+            configured
+        } else {
+            CtrlSpaceAction::OpenGui
+        }
+    }
+
+    /// Whether this binding and the palette's trigger are the same chord.
+    ///
+    /// When they collide the open-clipd setting wins. It is the one the person
+    /// chose under a row that says "Open Clipd", so it should be the one that
+    /// opens clipd — and losing silently to a different feature is
+    /// indistinguishable from the shortcut being broken.
+    pub fn collides_with_palette(&self, palette: PaletteTrigger) -> bool {
+        // Option+Space is the only chord both lists offer. Ctrl+Space and the
+        // palette's Ctrl+Option+Space are different chords, and the `G`
+        // bindings have no palette counterpart at all.
+        matches!((self, palette), (Self::OptSpace, PaletteTrigger::OptSpace))
     }
 
     /// Whether the chord's non-modifier key is Space rather than `G`.

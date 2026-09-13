@@ -7,18 +7,32 @@ pub enum Theme {
     System,
     /// Paper Light — warm ivory, graphite ink, muted sage accent.
     /// Legacy configs that stored `LightMinimal` land here.
-    #[serde(alias = "LightMinimal")]
+    /// Legacy configs that stored `LightMinimal` land here, and so do ones
+    /// that stored `GlassLight`.
+    ///
+    /// Glass Light is retired. A translucent *light* panel takes its
+    /// brightness from whatever is behind the window while its ink stays
+    /// fixed, so it was harsh over a white page and its own text fell to
+    /// 3.36:1 over a dark editor and 2.35:1 over black — under the 4.5:1
+    /// floor. Thickening it until the ink was safe everywhere required a veil
+    /// opaque enough to hide the backdrop, at which point it was this theme
+    /// with extra steps. Apple's only remedy for a translucent panel over
+    /// bright content is a *dark* dimming layer; there is no light equivalent,
+    /// which is also why Glass Dark works.
+    #[serde(alias = "LightMinimal", alias = "GlassLight")]
     Light,
     /// True dark with an off-white accent — neutral and modern.
     /// Configs holding the retired Paper Dark, Glass Dark, Command Palette
     /// or Minimal Dark land here.
-    #[serde(
-        alias = "Paper",
-        alias = "GlassDark",
-        alias = "CommandPalette",
-        alias = "MinimalDark"
-    )]
+    #[serde(alias = "Paper", alias = "CommandPalette", alias = "MinimalDark")]
     Dark,
+    /// Glass Dark — a dark translucent sheet, the way a launcher panel is
+    /// built. Restored because the light one cannot do this job: a
+    /// translucent *light* panel sitting over a light document has nowhere to
+    /// go, which is why it kept reading as "still white" however it was tuned.
+    /// Dark glass has room — the backdrop shows through as luminance instead
+    /// of having to out-brighten white.
+    GlassDark,
     /// Deep navy background with a periwinkle accent.
     Midnight,
     /// Dark green background with a sage accent.
@@ -27,8 +41,6 @@ pub enum Theme {
     /// Configs holding the retired Cocoa land here.
     #[serde(alias = "Cocoa")]
     Slate,
-    /// Frosted translucent light glass — mint accent, dark ink (mockup Glass Light).
-    GlassLight,
     /// Frosted translucent dark glass — mint accent, light ink.
     /// Legacy configs that stored `GlassMinimal` land here.
     #[serde(alias = "GlassMinimal")]
@@ -43,10 +55,10 @@ impl Theme {
         Theme::System,
         Theme::Light,
         Theme::Dark,
+        Theme::GlassDark,
         Theme::Midnight,
         Theme::Forest,
         Theme::Slate,
-        Theme::GlassLight,
         Theme::CompactCapsule,
         Theme::Catppuccin,
     ];
@@ -56,10 +68,10 @@ impl Theme {
             Theme::System => "System",
             Theme::Light => "Paper Light",
             Theme::Dark => "Dark",
+            Theme::GlassDark => "Glass Dark",
             Theme::Midnight => "Midnight",
             Theme::Forest => "Forest",
             Theme::Slate => "Slate",
-            Theme::GlassLight => "Glass Light",
             Theme::CompactCapsule => "Compact Capsule",
             Theme::Catppuccin => "Catppuccin",
         }
@@ -69,11 +81,11 @@ impl Theme {
         match self {
             Theme::System => Theme::Light,
             Theme::Light => Theme::Dark,
-            Theme::Dark => Theme::Midnight,
+            Theme::Dark => Theme::GlassDark,
+            Theme::GlassDark => Theme::Midnight,
             Theme::Midnight => Theme::Forest,
             Theme::Forest => Theme::Slate,
-            Theme::Slate => Theme::GlassLight,
-            Theme::GlassLight => Theme::CompactCapsule,
+            Theme::Slate => Theme::CompactCapsule,
             Theme::CompactCapsule => Theme::Catppuccin,
             Theme::Catppuccin => Theme::System,
         }
@@ -84,22 +96,22 @@ impl Theme {
             Theme::System => DARK,
             Theme::Light => LIGHT,
             Theme::Dark => DARK,
+            Theme::GlassDark => GLASS_DARK,
             Theme::Midnight => MIDNIGHT,
             Theme::Forest => FOREST,
             Theme::Slate => SLATE,
-            Theme::GlassLight => GLASS_LIGHT,
             Theme::CompactCapsule => COMPACT_CAPSULE,
             Theme::Catppuccin => CATPPUCCIN,
         }
     }
 
     pub fn is_light(&self) -> bool {
-        matches!(self, Theme::Light | Theme::GlassLight)
+        matches!(self, Theme::Light)
     }
 
     /// True for frosted translucent shells (Glass Light / Glass Dark).
     pub fn is_glass(&self) -> bool {
-        matches!(self, Theme::GlassLight)
+        matches!(self, Theme::GlassDark)
     }
 
     /// Soft glassmorphism blooms under the frost plate. `None` = flat opaque shell.
@@ -111,7 +123,7 @@ impl Theme {
             // surface and is mottling on a transparent one — the eye reads
             // the brightness variation as dirt on the glass rather than as
             // light in it. An even sheet is what "clean" means here.
-            Theme::GlassLight => None,
+            Theme::GlassDark => None,
             _ => None,
         }
     }
@@ -119,7 +131,7 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme::Dark
+        Theme::GlassDark
     }
 }
 
@@ -167,29 +179,44 @@ const LIGHT: ThemeColors = ThemeColors {
     // ink). That is the Glass Light material, and having both themes chase it
     // left the light half of the app with one idea in two names — the whole
     // point of this one is that it is paper.
-    bg_base: Rgb(250, 249, 245),
-    bg_surface: Rgb(247, 246, 241),
-    // Cards lift off the paper by being the one true white in the theme.
-    bg_elevated: Rgb(255, 255, 255),
-    bg_selected: Rgb(240, 238, 230),
-    bg_hover: Rgb(245, 243, 236),
+    // The whole band used to sit in the top 15% of the luminance range, with
+    // a pure #FFFFFF card on top of it — 100% luminance, the brightest thing
+    // a display can emit, across every row of a panel that floats over
+    // whatever someone is working in. That is half the reason the light
+    // themes were tiring.
+    //
+    // The other half is that the surfaces were 2-5% apart (base to surface was
+    // 1.027:1) with a border at 1.19:1 — invisible. Structure encoded in
+    // differences that small means re-focusing to find every row edge, and
+    // squinting fatigues as much as glare does. So: same warm paper, lower
+    // ceiling, wider steps.
+    bg_base: Rgb(239, 236, 228),
+    bg_surface: Rgb(244, 242, 235),
+    // Cards still lift off the paper by being the lightest thing in the theme
+    // — they just stop doing it at maximum white.
+    bg_elevated: Rgb(252, 251, 247),
+    bg_selected: Rgb(226, 222, 210),
+    bg_hover: Rgb(233, 230, 220),
     // Warm graphite: the header glyphs, and the ink that carries the chrome.
     // A neutral grey here is what makes a warm ground look dirty rather than
     // warm — the cast has to run through everything or through nothing.
     accent: Rgb(61, 61, 58),
-    accent2: Rgb(131, 129, 124),
+    accent2: Rgb(98, 97, 93),
     text: Rgb(31, 30, 29),
-    subtext: Rgb(107, 104, 98),
-    overlay: Rgb(150, 147, 140),
+    subtext: Rgb(99, 96, 90),
+    // The section labels — "Pinned", "Recent". At 150,147,140 this was
+    // 2.91:1 on the paper and 2.64:1 on a selected row: under the 4.5:1 the
+    // HIG asks for below 17pt, and under even the 3:1 large-text floor.
+    overlay: Rgb(98, 96, 91),
     // The spot mark — the filled star on a pinned row. Warm graphite, not
     // Claude's clay: an orange pin was explicitly not wanted, and the filled
     // shape of the star already says pinned without spending a colour on it.
     green: Rgb(70, 69, 66),
-    border: Rgb(232, 230, 222),
+    border: Rgb(214, 209, 196),
     surface_alpha: 255,
     code: Rgb(61, 61, 58),
     url: Rgb(44, 44, 42),
-    email: Rgb(107, 104, 98),
+    email: Rgb(99, 96, 90),
     path: Rgb(92, 90, 85),
 };
 
@@ -222,67 +249,49 @@ const DARK: ThemeColors = ThemeColors {
 // frosted glass plates — see `shell_glows` / `is_glass`.
 // ---------------------------------------------------------------------------
 
-/// Glass Light's chrome ink — graphite, the way macOS draws toolbar glyphs.
-// Was a blue-slate (72,80,92). Every grey in this theme carried the same few
-// points of extra blue, and a pale surface with a cool cast is precisely what
-// silver is — so the whole plate read as brushed metal rather than as the
-// light material AppKit paints. Neutral graphite carries a glyph just as well
-// and leaves the surface reading as white.
-const GLASS_LIGHT_ACCENT: Rgb = Rgb(64, 64, 68);
-/// The spot mark — the filled star on a pinned row — stays graphite.
+/// Glass Dark — the launcher panel.
 ///
-/// The theme has now been through both alternatives and kept neither: a
-/// systemBlue selection washed out cyan over a white plate, and the
-/// reference's orange pin was not wanted. So no colour is spent on marks at
-/// all. A pinned row reads as pinned from the filled shape of its star, and
-/// the whole surface stays neutral — which is the point of the theme.
-const GLASS_LIGHT_SPOT: Rgb = GLASS_LIGHT_ACCENT;
+/// Dark glass is the only kind that can actually look transparent over
+/// arbitrary content. A light translucent sheet over a white document has
+/// nowhere to go: white composited with white is white, which is why every
+/// attempt to make Glass Light "more see-through" arrived back at a pale flat
+/// plate. Dark has somewhere to go — whatever is behind shows up as variation
+/// in luminance, and ink stays legible because it is near-white on near-black.
+///
+/// The RGB here is deliberately close to neutral. A blue-grey dark glass
+/// tints everything behind it; this one lets the backdrop supply the colour.
+const GLASS_DARK: ThemeColors = ThemeColors {
+    bg_base: Rgb(26, 26, 28),
+    bg_surface: Rgb(32, 32, 35),
+    bg_elevated: Rgb(40, 40, 44),
+    bg_selected: Rgb(58, 58, 63),
+    bg_hover: Rgb(46, 46, 50),
+    accent: Rgb(226, 226, 230),
+    accent2: Rgb(190, 193, 201),
+    text: Rgb(238, 238, 242),
+    subtext: Rgb(191, 194, 201),
+    // Section labels. Bright enough to survive a light backdrop showing
+    // through the panel, which a 110-grey would not.
+    overlay: Rgb(190, 193, 201),
+    green: Rgb(226, 226, 230),
+    border: Rgb(70, 70, 76),
+    // Every secondary role is lighter than it looks like it needs to be,
+    // because the panel is not a fixed colour: it is the desktop, tinted and
+    // veiled. Over a white page it settles around 7% luminance, and against
+    // that the old subtext sat at 3.19:1 — under the 4.5:1 floor for the
+    // timestamp and source line on every row. These clear it on the brightest
+    // the panel ever gets, including with no native material at all.
+    // The whole point. Low enough that the material and the desktop behind it
+    // reach the eye, high enough that white text never sits on a bright patch.
+    surface_alpha: 165,
+    code: Rgb(196, 198, 204),
+    url: Rgb(206, 208, 214),
+    email: Rgb(190, 193, 199),
+    path: Rgb(190, 193, 199),
+};
+
 /// Cool silver highlight for Compact Capsule.
 const COMPACT_SPOT: Rgb = Rgb(170, 185, 198);
-
-/// Glass Light glassmorphism — warm window light falling across cool white.
-/// The blooms should be perceived as light moving in the material, never as a
-/// visible gradient of their own.
-// These were mid-greys (156,158,163 / 172,172,176) — painted across the whole
-// plate they were not blooms at all but a coat of grey paint, and they are the
-// single largest reason the theme looked silver. Two near-whites, one warm and
-// one cool, keep the plate light while still giving it a direction of light.
-const GLASS_LIGHT_GLOW_A: Rgb = Rgb(255, 253, 249);
-const GLASS_LIGHT_GLOW_B: Rgb = Rgb(236, 239, 244);
-/// Glass Dark glassmorphism — restrained teal slate + dusky plum.
-
-// Glass Light — smoked pearl frost, closer to macOS Spotlight than a white
-// sheet. Its translucency provides the brightness; the RGB values deliberately
-// stay in the mid-light range so layers do not compound into harsh white.
-const GLASS_LIGHT: ThemeColors = ThemeColors {
-    // Cool frosted glass — not white. The translucency provides brightness;
-    // the RGB stays in the cool silver range so it reads as glass, not paper.
-    bg_base: Rgb(220, 226, 236),
-    bg_surface: Rgb(228, 234, 244),
-    bg_elevated: Rgb(236, 242, 252),
-    bg_selected: Rgb(212, 220, 234),
-    bg_hover: Rgb(224, 230, 242),
-    accent: GLASS_LIGHT_ACCENT,
-    accent2: Rgb(100, 116, 148),
-    // Darker ink — strong enough to read through frosted translucency.
-    text: Rgb(18, 22, 32),
-    subtext: Rgb(80, 88, 106),
-    // Section labels ("Pinned", "Recent") are drawn in this. The frost is no
-    // longer a plate — it follows whatever sits behind the window — so a
-    // light grey here disappeared entirely against a mid-grey backdrop.
-    overlay: Rgb(88, 96, 112),
-    // The spot mark: the filled star on a pinned row. At 180,190,210 it was
-    // lighter than the ink around it and read as a disabled control.
-    green: Rgb(96, 104, 122),
-    // Cool blue-grey border — the edge that makes glass read as glass.
-    border: Rgb(180, 192, 214),
-    // Translucent surfaces — the whole point of glass.
-    surface_alpha: 140,
-    code: Rgb(48, 54, 68),
-    url: Rgb(28, 36, 54),
-    email: Rgb(90, 100, 120),
-    path: Rgb(70, 82, 106),
-};
 
 // 4 — Compact Capsule. "Ultra-compact, fits anywhere."
 //
@@ -668,6 +677,90 @@ mod tests {
         (hi + 0.05) / (lo + 0.05)
     }
 
+    /// Every role that draws *text* has to clear 4.5:1 on every surface it can
+    /// land on — not just `text`, and not just on the base.
+    ///
+    /// `text` alone was covered, so `overlay` sat at 2.91:1 on Paper Light's
+    /// paper and 2.64:1 on a selected row without anything noticing. That is
+    /// the colour the section headings are drawn in: under the 4.5:1 the HIG
+    /// asks for below 17pt, and under even the 3:1 large-text floor.
+    ///
+    /// Light themes only. The dark palettes deliberately run some of these
+    /// roles quieter against near-black, where the same ratio reads very
+    /// differently; holding them to this bar is a separate decision from the
+    /// one this test records.
+    #[test]
+    fn light_themes_keep_every_text_role_readable() {
+        for theme in Theme::ALL {
+            if !theme.is_light() {
+                continue;
+            }
+            let c = theme.colors();
+            for (role, fg) in [
+                ("text", c.text),
+                ("subtext", c.subtext),
+                ("overlay", c.overlay),
+                ("accent", c.accent),
+                ("accent2", c.accent2),
+                ("green", c.green),
+                ("code", c.code),
+                ("url", c.url),
+                ("email", c.email),
+                ("path", c.path),
+            ] {
+                for (name, bg) in [
+                    ("bg_base", c.bg_base),
+                    ("bg_surface", c.bg_surface),
+                    ("bg_elevated", c.bg_elevated),
+                    ("bg_selected", c.bg_selected),
+                    ("bg_hover", c.bg_hover),
+                ] {
+                    let ratio = contrast(fg, bg);
+                    assert!(
+                        ratio >= 4.5,
+                        "{}: {role} on {name} is {ratio:.2}:1, under the 4.5:1 minimum",
+                        theme.label()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A light theme may not paint at maximum brightness.
+    ///
+    /// Paper Light's cards were `#FFFFFF` — 100% luminance, the brightest a
+    /// display can emit — under every row of a panel that floats over whatever
+    /// someone is actually working in. Contrast was fine; it was simply too
+    /// much light, which is the half of "hard on the eyes" that no contrast
+    /// ratio catches.
+    #[test]
+    fn a_light_theme_does_not_emit_at_full_brightness() {
+        // Leaves room for a bright card while keeping it off the ceiling.
+        const CEILING: f32 = 0.97;
+        for theme in Theme::ALL {
+            if !theme.is_light() {
+                continue;
+            }
+            let c = theme.colors();
+            for (name, bg) in [
+                ("bg_base", c.bg_base),
+                ("bg_surface", c.bg_surface),
+                ("bg_elevated", c.bg_elevated),
+                ("bg_selected", c.bg_selected),
+                ("bg_hover", c.bg_hover),
+            ] {
+                let lum = wcag_luminance(bg);
+                assert!(
+                    lum <= CEILING,
+                    "{}: {name} is at {:.1}% luminance — a glance surface should \
+                     not be the brightest thing on the display",
+                    theme.label(),
+                    lum * 100.0
+                );
+            }
+        }
+    }
+
     /// Body text has to clear WCAG AA (4.5:1) on every surface it lands on.
     /// A theme that fails this isn't a style choice, it's unreadable.
     #[test]
@@ -792,7 +885,7 @@ mod tests {
         // frost moves with whatever is behind the window, so the mark is
         // pitched for contrast against that rather than against a fixed plate.
         // What still has to hold is that it carries no hue.
-        let g = Theme::GlassLight.colors().green;
+        let g = Theme::GlassDark.colors().green;
         let g_spread = g.0.max(g.1).max(g.2) - g.0.min(g.1).min(g.2);
         assert!(g_spread <= 30, "Glass Light spot should be near-neutral, spread {g_spread}");
         assert_eq!(Theme::CompactCapsule.colors().green, COMPACT_SPOT);
@@ -800,7 +893,7 @@ mod tests {
         // deep green, and the tray popover paints the accent large — eye
         // button, search glyph, filled stars — so the popover read as a green
         // app sitting next to a neutral white island.
-        let a = Theme::GlassLight.colors().accent;
+        let a = Theme::GlassDark.colors().accent;
         let spread = a.0.max(a.1).max(a.2) - a.0.min(a.1).min(a.2);
         assert!(
             spread <= 24,
@@ -811,9 +904,9 @@ mod tests {
     #[test]
     fn glass_themes_are_flat_sheets() {
         // No theme paints blooms any more — see `glass_light_paints_no_blooms`.
-        assert!(Theme::GlassLight.shell_glows().is_none());
-        assert!(Theme::GlassLight.is_glass());
-        assert!(Theme::GlassLight.is_light());
+        assert!(Theme::GlassDark.shell_glows().is_none());
+        assert!(Theme::GlassDark.is_glass());
+        assert!(!Theme::GlassDark.is_light(), "the surviving glass theme is dark");
         for theme in [
             Theme::CompactCapsule,
         ] {
@@ -827,7 +920,6 @@ mod tests {
     #[test]
     fn the_spot_colour_stands_out_on_the_selected_row() {
         for theme in [
-            Theme::GlassLight,
             Theme::CompactCapsule,
             Theme::Midnight,
             Theme::Slate,
@@ -844,16 +936,50 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_install_lands_on_dark() {
+    fn a_fresh_install_lands_on_glass_dark() {
         // What a new user sees, and what anyone falls back to when the stored
         // preference is missing or unreadable. Worth pinning: themes get added
         // and retired, and the default is the one value where a quiet change
         // would go unnoticed until someone opened the app for the first time.
-        assert_eq!(Theme::default(), Theme::Dark);
+        assert_eq!(Theme::default(), Theme::GlassDark);
         assert!(!Theme::default().is_light());
         // load_theme() falls back to the same place when nothing is stored.
         let unreadable: Result<Theme, _> = serde_json::from_str("not a theme");
-        assert_eq!(unreadable.ok().unwrap_or_default(), Theme::Dark);
+        assert_eq!(unreadable.ok().unwrap_or_default(), Theme::GlassDark);
+    }
+
+    /// The default is translucent, so it has to survive having no material.
+    ///
+    /// Windows, Linux, and macOS before 26 never get NSGlassEffectView; the
+    /// shell falls back to a thicker veil and nothing else. A default that is
+    /// only legible where the native material exists is not a default.
+    #[test]
+    fn the_default_theme_reads_without_a_native_material() {
+        let c = Theme::default().colors();
+        // The brightest the panel ever composites to: a white page behind it,
+        // veiled at the no-material alpha of 186 and nothing else.
+        let veil = Rgb(12, 12, 14);
+        let a = 186.0 / 255.0;
+        let panel = Rgb(
+            (veil.0 as f32 * a + 255.0 * (1.0 - a)) as u8,
+            (veil.1 as f32 * a + 255.0 * (1.0 - a)) as u8,
+            (veil.2 as f32 * a + 255.0 * (1.0 - a)) as u8,
+        );
+        for (role, fg) in [
+            ("text", c.text),
+            ("subtext", c.subtext),
+            ("overlay", c.overlay),
+            ("accent2", c.accent2),
+            ("code", c.code),
+            ("email", c.email),
+            ("path", c.path),
+        ] {
+            let r = contrast(fg, panel);
+            assert!(
+                r >= 4.5,
+                "{role} is {r:.2}:1 on the brightest this panel gets — under 4.5:1"
+            );
+        }
     }
 
     #[test]
@@ -865,25 +991,39 @@ mod tests {
         assert_eq!(paper, Theme::Dark);
         let cocoa: Theme = serde_json::from_str("\"Cocoa\"").expect("Cocoa still parses");
         assert_eq!(cocoa, Theme::Slate, "the nearest warm dark");
-        // Glass Dark's job — a dark surface with no colour in it — is what
-        // Dark already does, without a translucency layer to fight.
+        // Glass Dark is no longer retired, so it is no longer an alias: a
+        // config naming it gets the theme it names. It came back because a
+        // *light* translucent panel over a light document has nowhere to go —
+        // white composited with white is white — which is what kept the light
+        // glass reading as a flat pale plate however it was tuned. Dark glass
+        // is the one that can actually show a backdrop.
         let glass: Theme = serde_json::from_str("\"GlassDark\"").expect("GlassDark still parses");
-        assert_eq!(glass, Theme::Dark);
+        assert_eq!(glass, Theme::GlassDark);
         let cmd: Theme =
             serde_json::from_str("\"CommandPalette\"").expect("CommandPalette still parses");
         assert_eq!(cmd, Theme::Dark);
         let minimal: Theme =
             serde_json::from_str("\"MinimalDark\"").expect("MinimalDark still parses");
         assert_eq!(minimal, Theme::Dark);
-        // The survivors are still offered; the list is two shorter.
+        // The survivors are still offered, and Glass Dark is back among them.
         assert!(Theme::ALL.contains(&Theme::Dark));
         assert!(Theme::ALL.contains(&Theme::Slate));
+        assert!(Theme::ALL.contains(&Theme::GlassDark));
+        // And Glass Light has joined them. A translucent light panel takes
+        // its brightness from the backdrop while its ink does not, so it was
+        // harsh over a white page and fell to 2.35:1 over black — under the
+        // 4.5:1 floor. Configs naming it land on Paper Light, which is the
+        // light theme that actually holds its contrast.
+        let glass_light: Theme =
+            serde_json::from_str("\"GlassLight\"").expect("GlassLight still parses");
+        assert_eq!(glass_light, Theme::Light);
         assert_eq!(Theme::ALL.len(), 9);
-        // Nothing in the list still calls itself by a retired name.
+        // Nothing in the list still calls itself by a retired name. Glass Dark
+        // is off this list: it is a theme again, not a tombstone.
         for theme in Theme::ALL {
             assert!(!matches!(
                 theme.label(),
-                "Paper Dark" | "Cocoa" | "Glass Dark" | "Command Palette" | "Minimal Dark"
+                "Paper Dark" | "Cocoa" | "Command Palette" | "Minimal Dark" | "Glass Light"
             ));
         }
     }
@@ -910,7 +1050,7 @@ mod tests {
     #[test]
     fn light_themes_report_as_light() {
         assert!(Theme::Light.is_light());
-        assert!(Theme::GlassLight.is_light());
+        assert!(!Theme::GlassDark.is_light(), "the surviving glass theme is dark");
         assert!(!Theme::Catppuccin.is_light());
         for theme in [
             Theme::CompactCapsule,
@@ -938,12 +1078,12 @@ mod tests {
 
 
     #[test]
-    fn glass_light_paints_no_blooms() {
+    fn glass_paints_no_blooms() {
         // Was `glass_light_glows_are_sky_and_lavender`, asserting a cyan and a
         // lavender bloom. Both are gone: the theme is a transparent frost now,
         // and a bloom on a transparent surface is read as a smear on the glass
         // rather than as light within it. An even sheet is the whole point.
-        assert!(Theme::GlassLight.shell_glows().is_none());
+        assert!(Theme::GlassDark.shell_glows().is_none());
     }
 
     #[test]

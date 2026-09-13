@@ -1212,9 +1212,14 @@ fn draw_type_tile(
         egui::Sense::hover(),
     );
     let painter = ui.painter();
-    if boxed {
-        // A frosted tile, as in the reference: the glyph's own small pane.
-        // Without it the icon floats and the row loses its left edge.
+    // On an opaque theme the glyph gets its own small pane, which gives the
+    // row a left edge to start from.
+    //
+    // On glass it does not. A launcher panel is one sheet with content on it,
+    // and a plate behind every icon is another stack of little cards over the
+    // material — the same thing the row panes were doing, at a smaller size.
+    // `surface_alpha` is the tell: a translucent theme is a glass theme.
+    if boxed && c.surface_alpha == 255 {
         painter.rect_filled(rect, Rounding::same(10.0), surf(c, c.bg_elevated));
         painter.rect_stroke(rect, Rounding::same(10.0), Stroke::new(0.8, rgb(c.border)));
     }
@@ -1344,14 +1349,31 @@ fn draw_type_tile(
 fn row_copy_button(ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
     let hovered = resp.hovered();
+    let glass = c.surface_alpha < 255;
+    // Still needed further down: the front sheet of the copy glyph is filled
+    // with it so the sheet behind does not show through.
     let face = if hovered {
         surf(c, c.bg_hover)
     } else {
         surf(c, c.bg_elevated)
     };
     let painter = ui.painter();
-    painter.rect_filled(rect, Rounding::same(8.0), face);
-    painter.rect_stroke(rect, Rounding::same(8.0), Stroke::new(0.7, rgb(c.border)));
+    // Same rule as the type tile: on glass the button is its glyph, and it
+    // only grows a face when the pointer is actually on it. A resting plate
+    // behind every action in every row is a third layer of little cards laid
+    // over the material.
+    if glass {
+        if hovered {
+            painter.rect_filled(
+                rect,
+                Rounding::same(8.0),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 64),
+            );
+        }
+    } else {
+        painter.rect_filled(rect, Rounding::same(8.0), face);
+        painter.rect_stroke(rect, Rounding::same(8.0), Stroke::new(0.7, rgb(c.border)));
+    }
     let s = Stroke::new(1.2, rgb(c.subtext));
     let back = egui::Rect::from_min_size(
         egui::pos2(rect.center().x - 6.0, rect.center().y - 7.0),
@@ -1399,7 +1421,7 @@ fn tiny_filter_chip(
     theme: Theme,
     c: &clipd_core::ThemeColors,
 ) -> bool {
-    let spotlight = theme == Theme::GlassLight;
+    let spotlight = theme.is_glass();
     // Light themes get the same treatment, darkening instead of lifting.
     let (text_col, fill, stroke) = if active && spotlight {
         // On glass the selected segment is its own frosted pane with an edge,
@@ -1514,7 +1536,7 @@ fn footer_shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeCol
 /// theme.
 fn capture_dot_color(theme: Theme, c: &clipd_core::ThemeColors) -> Color32 {
     match theme {
-        Theme::Light | Theme::GlassLight => Color32::from_rgb(52, 168, 83),
+        Theme::Light => Color32::from_rgb(52, 168, 83),
         _ => rgb(c.green),
     }
 }
@@ -2339,7 +2361,10 @@ fn theme_named(name: &str) -> Option<Theme> {
         "forest" => Some(Theme::Forest),
         "cocoa" => Some(Theme::Slate),
         "slate" => Some(Theme::Slate),
-        "glass-light" | "glasslight" => Some(Theme::GlassLight),
+        // Retired; a light translucent panel cannot hold its ink over a
+        // dark backdrop. Anyone asking for it by name gets the light theme
+        // that works.
+        "glass-light" | "glasslight" => Some(Theme::Light),
         // Retired: Glass Dark's job — a dark surface with no colour in it —
         // is what Dark already does, without a translucency layer to fight.
         "glass-dark" | "glassdark" | "glass" | "glass-minimal" | "glassminimal" => {
@@ -3015,7 +3040,7 @@ fn apply_theme(ctx: &egui::Context, theme: Theme) {
 fn text_selection_style(theme: Theme, c: &clipd_core::ThemeColors) -> (Color32, Stroke) {
     if theme.is_glass() {
         // Cool slate wash — keep mint off the selection (chips/pins only).
-        let (r, g, b, a) = if theme == Theme::GlassLight {
+        let (r, g, b, a) = if false {
             // selectedTextBackgroundColor — the exact pale blue macOS puts
             // behind selected text in light mode.
             (179, 215, 255, 200)
@@ -3065,7 +3090,7 @@ fn paint_glass_shell(
     let rounding = Rounding::same(SHELL_ROUND);
 
     if theme.is_glass() {
-        let light = theme == Theme::GlassLight;
+        let light = false;
         // Frosted base — translucent enough for blur + blooms to read.
         let veil = if light {
             // A real frost plate, not bare transparency. The native clear
@@ -3298,7 +3323,7 @@ fn paint_soft_radial_glow(
 /// Older macOS releases fall back to classic vibrancy.
 #[cfg(target_os = "macos")]
 fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>) {
-    let want = theme.is_glass().then_some(theme == Theme::GlassLight);
+    let want = theme.is_glass().then_some(false);
     if want == *on {
         return;
     }
@@ -3401,7 +3426,7 @@ fn force_glass_appearance(frame: &eframe::Frame, light: bool) {
 fn write_glass_status(applied: &str, light: bool) {
     let status = format!(
         "glass_native={applied} theme={} light={light}\n",
-        if light { "GlassLight" } else { "Dark" }
+        if light { "light" } else { "Dark" }
     );
     if let Some(dir) = dirs::data_dir() {
         let _ = std::fs::write(dir.join("clipd/glass_native.status"), &status);
@@ -3545,93 +3570,63 @@ fn sync_glass_native(_frame: &eframe::Frame, _theme: Theme, _on: &mut Option<boo
 
 /// Glass selection / hover — soft neutral wash (mint stays on chips/pins).
 fn glass_row_fill(theme: Theme, selected: bool, hovered: bool) -> Option<Color32> {
-    let light = theme == Theme::GlassLight;
+    let light = false;
     if light {
-        // Every row is its own frosted pane, lit by how much white it holds:
-        // resting, under the pointer, selected. Rows used to be transparent
-        // until selected, so the list was floating text on one undifferentiated
-        // sheet — and the selected row then had to be marked with black, which
-        // is a shadow on glass rather than light in it.
-        // Cool white, not plain white. Over a photo this is frost; over a
-        // white window it still separates from the plate, because it is
-        // fractionally bluer than the paper behind it.
-        // Measured, not guessed. Every value before this was subtle enough to
-        // vanish: a white pane at alpha 62 over a plate that was itself
-        // near-white differs from it by three levels, so the list read as one
-        // flat sheet no matter how correct the intent was.
-        return Some(Color32::from_rgba_unmultiplied(
-            255,
-            255,
-            255,
-            if selected {
-                72
-            } else if hovered {
-                52
-            } else {
-                34
-            },
-        ));
+        // A resting row paints nothing.
+        //
+        // Every row used to be its own frosted pane — white at alpha 34, with
+        // a cool rim at alpha 205 around it. Two problems, and they are the
+        // two words in "transparent and smooth".
+        //
+        // Transparent: the veil over the whole window is alpha 44, so a row
+        // pane on top of it took the composite from 17% coverage to 28% —
+        // the rows were carrying more paint than the window itself, and the
+        // material underneath never reached the eye.
+        //
+        // Smooth: a rim around every row is the opposite of one sheet of
+        // glass. It reads as a stack of plates, because that is what it is.
+        //
+        // A launcher panel is one pane with content floating on it. Only the
+        // row under the pointer or the selection is lit, and it is lit by
+        // light in the glass rather than by an edge drawn around it.
+        // Light *in* the glass, not a white card laid on it. At 86 the
+        // selected row composited to a near-solid pane, which is the same
+        // mistake the per-row panes made, just on one row.
+        if selected {
+            return Some(Color32::from_rgba_unmultiplied(255, 255, 255, 58));
+        }
+        if hovered {
+            return Some(Color32::from_rgba_unmultiplied(255, 255, 255, 28));
+        }
+        return None;
     }
+    // Dark glass. The teal-black anchor that used to sit here was painting a
+    // near-opaque slab on the selected row — it was written when dark glass
+    // had no other way to hold contrast, and it is the same "card on the
+    // material" mistake as the light theme's panes. On a dark sheet a white
+    // wash is both lighter *and* higher contrast against near-white ink.
     if selected {
-        Some(if light {
-            // Grey, by lightness alone — Spotlight's selected row, and what
-            // macOS falls back to for any list it is not actively focused on.
-            // A systemBlue wash was tried here and had to come out: over a
-            // white plate it blended toward cyan, and a coloured band across
-            // the row is the loudest thing in a window this pale.
-            //
-            // A white wash on a white plate is not a selection either, which
-            // is why this cannot simply go back to what it was.
-            // Measured, not guessed: at alpha 26 the composited row came out
-            // 14 levels under the plate, because the row's own card is drawn
-            // over part of this wash. macOS's unemphasized selection sits
-            // about 25 under its window colour, and this alpha lands there.
-            Color32::from_black_alpha(46)
-        } else {
-            // Keep keyboard focus readable even when Liquid Glass is sampling
-            // a bright window behind clipd. A white wash can turn the row into
-            // a pale slab under white text; this teal-black anchor still lets
-            // the material move while preserving contrast.
-            Color32::from_rgba_unmultiplied(16, 42, 46, 156)
-        })
+        Some(Color32::from_rgba_unmultiplied(255, 255, 255, 30))
     } else if hovered {
-        Some(if light {
-            Color32::from_rgba_unmultiplied(0, 0, 0, 10)
-        } else {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 12)
-        })
+        Some(Color32::from_rgba_unmultiplied(255, 255, 255, 14))
     } else {
         None
     }
 }
 
 fn glass_row_stroke(theme: Theme, selected: bool) -> Stroke {
-    if theme == Theme::GlassLight {
-        // The lit edge of each pane. Every row carries one: a rim is what
-        // separates two translucent surfaces stacked on each other, where a
-        // fill alone only makes a slightly brighter fog.
-        // The edge does the work. A white highlight reads as glass only when
-        // something darker sits behind it — over a white app it is invisible
-        // and the whole list flattens into one sheet. A cool grey rim is an
-        // edge on both.
-        return Stroke::new(
-            1.0,
-            if selected {
-                Color32::from_rgba_unmultiplied(144, 160, 186, 225)
-            } else {
-                Color32::from_rgba_unmultiplied(176, 188, 208, 205)
-            },
-        );
+    if false {
+        // No rim, on any row, ever.
+        //
+        // The rim was there to separate two translucent surfaces stacked on
+        // each other — which was only necessary because each row *was* a
+        // surface. With the panes gone there is one surface, and drawing an
+        // outline around each row on it is what made the theme read as
+        // brushed plates instead of glass.
+        return Stroke::NONE;
     }
     if selected {
-        if theme == Theme::GlassLight {
-            // A hairline the fill alone cannot provide: 9% grey on white is
-            // legible as a band but has no edge, and the rows around it are
-            // white cards with edges of their own.
-            Stroke::new(1.0, Color32::from_black_alpha(30))
-        } else {
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(160, 170, 165, 40))
-        }
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(160, 170, 165, 40))
     } else {
         Stroke::NONE
     }
@@ -3659,7 +3654,6 @@ fn glass_panel_frost(theme: Theme) -> Color32 {
         // Nothing. The shell's veil is the single frost layer now; painting
         // it again per panel is what made the surface uneven from region to
         // region, because the panels do not all cover the same area.
-        Theme::GlassLight => Color32::TRANSPARENT,
         _ => Color32::TRANSPARENT,
     }
 }
@@ -3670,7 +3664,7 @@ fn glass_panel_frost(theme: Theme) -> Color32 {
 fn paint_panel_glass_gradient(ui: &egui::Ui, theme: Theme) {
     // Glass Light's reflection is painted once by `paint_glass_shell`; repeating
     // it in every panel creates seams and visible colour restarts.
-    if theme == Theme::GlassLight {
+    if false {
         return;
     }
     let Some((left, right)) = theme.shell_glows() else {
@@ -3678,7 +3672,7 @@ fn paint_panel_glass_gradient(ui: &egui::Ui, theme: Theme) {
     };
     let rect = ui.max_rect();
     let screen = ui.ctx().screen_rect();
-    let alpha = if theme == Theme::GlassLight { 26 } else { 35 };
+    let alpha = if false { 26 } else { 35 };
     let sample = |pos: egui::Pos2| {
         let x = ((pos.x - screen.left()) / screen.width().max(1.0)).clamp(0.0, 1.0);
         let y = ((pos.y - screen.top()) / screen.height().max(1.0)).clamp(0.0, 1.0);
@@ -3972,7 +3966,15 @@ impl ClipdGui {
             // Only the palette asks. The island and the tray popover are
             // glances, not places to put a consent decision, and the HUD is
             // hidden for most of its life.
-            pending_report: if hud || island_surface || clipd_core::crashlog::never_ask() {
+            // Not asked at all when this build has no endpoint compiled in.
+            // A local or self-built binary cannot send, and offering a Send
+            // button that silently cannot work — then blaming the network when
+            // it is pressed — spends someone's goodwill on nothing.
+            pending_report: if hud
+                || island_surface
+                || clipd_core::crashlog::never_ask()
+                || !clipd_core::crashlog::can_send()
+            {
                 None
             } else {
                 clipd_core::crashlog::pending().into_iter().next_back()
@@ -4767,19 +4769,17 @@ impl ClipdGui {
                 self.popover_settings_open = !self.popover_settings_open;
             }
 
-            let feedback_on = self.paste_settings.hud_enabled;
-            if glass_line_button(ui, FooterIcon::Eye, feedback_on, c)
-                .on_hover_text(if feedback_on {
-                    "Slot copy feedback is on"
-                } else {
-                    "Slot copy feedback is off"
-                })
-                .clicked()
-            {
-                self.paste_settings.hud_enabled = !feedback_on;
-                save_paste_transform_settings(&self.paste_settings);
-            }
-
+            // The slot-copy-feedback toggle that used to sit here is gone: one
+            // preference, weighted the same as "open the whole clipboard",
+            // controlling a HUD that is not in this popover — and already a
+            // tap away under the gear, where it has a label and a sentence
+            // explaining it instead of being an unlabelled glyph.
+            //
+            // Quit stays. It is also in the tray icon's menu, but this panel
+            // is where people actually are when they want clipd to stop, and
+            // making them go and find the other menu is not a simplification.
+            // Kept at the far end, away from the three everyday controls, so
+            // the one irreversible thing in the row is not adjacent to them.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Built exactly like its neighbours. It used to allocate 30pt
                 // against their 38 and paint no circle behind it, so it sat off
@@ -4847,9 +4847,12 @@ impl ClipdGui {
                 });
             });
 
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(4.0);
+        // Space, not a rule. The search field is already its own inset
+        // surface with a border; drawing a full-width divider directly under
+        // it separates things that were not touching, and in a 380pt panel
+        // that carries a second hairline above the footer it reads as ruled
+        // paper. Proximity does this job on its own.
+        ui.add_space(10.0);
 
         // The body swaps between three views; the footer belongs to all of
         // them. Returning early here left settings and ask mode with no
@@ -6747,7 +6750,7 @@ impl eframe::App for ClipdGui {
 
         // ── Full-GUI chrome: brand → search → tiny filters (mockup stack). ──
         egui::TopBottomPanel::top("search_header")
-            .show_separator_line(self.theme != Theme::GlassLight)
+            .show_separator_line(!self.theme.is_glass())
             .frame(
                 egui::Frame::none()
                     .fill(glass_panel_frost(self.theme))
@@ -6777,7 +6780,7 @@ impl eframe::App for ClipdGui {
 
         // ── Footer: Capturing · clock · ⌘⇧V (mockup minimal bar) ──
         egui::TopBottomPanel::bottom("footer_hints")
-            .show_separator_line(self.theme != Theme::GlassLight)
+            .show_separator_line(!self.theme.is_glass())
             .exact_height(44.0)
             .frame(
                 egui::Frame::none()
@@ -7708,6 +7711,40 @@ impl ClipdGui {
                     dirty = true;
                 }
             });
+            // Every binding carries a caveat and none of them were ever shown:
+            // `warning()` existed on the enum and had no caller. Option+Space
+            // in particular can be held by the memory palette, in which case
+            // the palette matches first and the chord silently never opens
+            // clipd — which looks exactly like the setting not working.
+            let clash = self.paste_settings.palette_enabled
+                && matches!(
+                    (
+                        self.paste_settings.open_gui_hotkey,
+                        self.paste_settings.palette_trigger
+                    ),
+                    (OpenGuiHotkey::OptSpace, PaletteTrigger::OptSpace)
+                );
+            let caveat = if clash {
+                Some(
+                    "The memory palette has this chord too, and it answers first — \
+                     clipd will not open. Set the palette trigger below to Off or \
+                     Cmd+Shift+V.",
+                )
+            } else {
+                self.paste_settings.open_gui_hotkey.warning()
+            };
+            if let Some(text) = caveat {
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(30.0);
+                    ui.label(
+                        RichText::new(text)
+                            .size(11.0)
+                            .color(rgb(if clash { c.accent2 } else { c.subtext })),
+                    );
+                });
+                ui.add_space(2.0);
+            }
             settings_card_divider(ui, c);
             settings_value_row(
                 ui,
@@ -8705,12 +8742,15 @@ impl ClipdGui {
         let search_w = ui.available_width();
         let asking = self.in_ask_mode();
         let in_settings = self.active_tab == MainTab::Settings;
-        let spotlight = self.theme == Theme::GlassLight;
+        let spotlight = self.theme.is_glass();
         let search_frame = egui::Frame::none()
             .fill(if spotlight {
-                // Frosted, not solid: at 216 alpha this was a white slab sunk
-                // into the glass. Its rim is what separates it.
-                Color32::from_white_alpha(96)
+                // No pill. A launcher's field is the panel's first line, not a
+                // control sunk into it — the caret and the magnifier say where
+                // to type, and a white slab across the top is the single
+                // largest piece of opaque paint in a window that is supposed
+                // to be glass.
+                Color32::TRANSPARENT
             } else {
                 surf(c, c.bg_elevated)
             })
@@ -8720,7 +8760,9 @@ impl ClipdGui {
                 if asking && !in_settings {
                     rgb(c.accent).gamma_multiply(0.72)
                 } else if spotlight {
-                    Color32::from_rgba_unmultiplied(188, 198, 214, 190)
+                    // Only while asking does this field need an edge; at rest
+                    // it has none.
+                    Color32::TRANSPARENT
                 } else {
                     rgb(c.border)
                 },
@@ -9478,110 +9520,131 @@ impl ClipdGui {
 
 impl ClipdGui {
     #[allow(dead_code)]
-    /// Ask whether to send a crash report, showing the report itself.
+    /// Offer to send a crash report, without behaving like one.
     ///
-    /// The scrolled block is the exact JSON that `crashlog::send` transmits —
-    /// not a summary of it, not a description of the categories. Someone
-    /// cannot consent to "diagnostic information"; they can consent to bytes
-    /// they have read. That is also why there is no "send automatically next
-    /// time": the whole value of this dialog is that it is answered each time
-    /// by someone looking at what is in front of them.
+    /// This used to be a large centred modal with the headline as its window
+    /// title, and it read as an error happening *now* — the first thing you
+    /// saw after deliberately opening clipd was a dialog covering the list you
+    /// came for. It is a footnote about something that already happened and
+    /// has already recovered, so it looks like one: a strip at the top, the
+    /// payload folded away behind a disclosure, and the list still usable
+    /// underneath.
+    ///
+    /// The payload stays one click away rather than on screen by default.
+    /// Consent still means reading it, but making it unmissable made the whole
+    /// thing feel like a fault report the user had to process.
     fn draw_crash_consent(&mut self, ctx: &egui::Context, c: &clipd_core::ThemeColors) {
         let Some(report) = self.pending_report.clone() else {
             return;
         };
         let mut dismiss = false;
 
-        egui::Window::new(report.kind.headline())
-            .id(egui::Id::new("crash_consent"))
+        egui::Window::new("crash_consent")
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .default_width(520.0)
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -38.0])
+            .default_width(ctx.screen_rect().width() - 28.0)
             .frame(
                 egui::Frame::none()
-                    .fill(rgb(c.bg_base))
-                    .inner_margin(Margin::same(18.0))
+                    .fill(rgb(c.bg_elevated))
+                    .inner_margin(Margin::symmetric(12.0, 10.0))
                     .stroke(Stroke::new(1.0, rgb(c.border)))
-                    .rounding(Rounding::same(12.0)),
+                    .rounding(Rounding::same(10.0)),
             )
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("Sending this report helps get it fixed. Nothing is sent unless you choose to.")
-                        .size(13.0)
-                        .color(rgb(c.text)),
-                );
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new("This is everything that would be sent:")
-                        .size(12.0)
-                        .color(rgb(c.subtext)),
-                );
-                ui.add_space(6.0);
-
-                egui::Frame::none()
-                    .fill(rgb(c.bg_surface))
-                    .inner_margin(Margin::same(10.0))
-                    .rounding(Rounding::same(8.0))
-                    .stroke(Stroke::new(1.0, rgb(c.border)))
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(240.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(report.as_json())
-                                            .size(11.0)
-                                            .monospace()
-                                            .color(rgb(c.code)),
-                                    )
-                                    .wrap(),
-                                );
-                            });
-                    });
-
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(report.kind.headline())
+                            .size(12.5)
+                            .color(rgb(c.text)),
+                    );
+                    ui.label(
+                        RichText::new("· send a report?")
+                            .size(12.5)
+                            .color(rgb(c.subtext)),
+                    );
+                });
                 ui.add_space(8.0);
-                ui.label(
-                    RichText::new(
-                        "No clipboard contents, window titles or file paths are included, \
-                         and clipd's log file is never sent.",
-                    )
-                    .size(11.0)
-                    .color(rgb(c.subtext)),
-                );
-
-                if let Some(status) = &self.report_status {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(status).size(12.0).color(rgb(c.accent)));
-                }
-
-                ui.add_space(14.0);
                 ui.horizontal(|ui| {
-                    if ui.button("  Send report  ").clicked() {
+                    // `clicked()` is true for a *keyboard* activation too, and
+                    // egui hands initial focus to the first widget in a fresh
+                    // window — so simply opening the palette with a report
+                    // waiting pressed Send on its own. Nothing was transmitted
+                    // here only because a local build carries no PostHog key;
+                    // a release build would have sent it.
+                    //
+                    // Consent for this is a pointer click, so ask for exactly
+                    // that. All three buttons, not just Send: a stray Return
+                    // landing on "Never" would silently switch crash reporting
+                    // off for good.
+                    let click = egui::PointerButton::Primary;
+                    if ui.button("Send").clicked_by(click) {
                         // The only call to `send` in the codebase, and it is
                         // inside a click handler. That is the design.
-                        if clipd_core::crashlog::send(&report) {
-                            dismiss = true;
-                        } else {
-                            self.report_status =
-                                Some("Couldn't reach the server — the report was kept.".into());
-                        }
+                        use clipd_core::crashlog::SendOutcome;
+                        self.report_status = match clipd_core::crashlog::send(&report) {
+                            SendOutcome::Sent => {
+                                dismiss = true;
+                                None
+                            }
+                            SendOutcome::Unreachable => {
+                                Some("Couldn't reach the server — kept for now.".into())
+                            }
+                            // Should be unreachable: the banner is not offered
+                            // at all when the build cannot send. Say the true
+                            // thing anyway rather than blame the network.
+                            SendOutcome::NotConfigured => Some(
+                                "This build has no reporting endpoint — nothing was sent.".into(),
+                            ),
+                        };
                     }
-                    if ui.button("  Don't send  ").clicked() {
-                        // Declined means deleted, not saved for a later ask.
+                    if ui.button("Not now").clicked_by(click) {
                         clipd_core::crashlog::discard(&report.id);
                         dismiss = true;
                     }
-                    ui.add_space(8.0);
                     if ui
-                        .button("Never ask again")
-                        .on_hover_text("Stops clipd recording crash reports at all.")
-                        .clicked()
+                        .button("Never")
+                        .on_hover_text("Stop clipd recording crash reports at all.")
+                        .clicked_by(click)
                     {
                         clipd_core::crashlog::set_never_ask(true);
                         dismiss = true;
                     }
+                    if let Some(status) = &self.report_status {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(status).size(11.0).color(rgb(c.accent)));
+                    }
+                });
+
+                egui::CollapsingHeader::new(
+                    RichText::new("What gets sent").size(11.0).color(rgb(c.subtext)),
+                )
+                .id_salt("crash_payload")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(report.as_json())
+                                        .size(10.5)
+                                        .monospace()
+                                        .color(rgb(c.code)),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    ui.label(
+                        RichText::new(
+                            "No clipboard contents, window titles or file paths. \
+                             clipd's log file is never sent.",
+                        )
+                        .size(10.5)
+                        .color(rgb(c.subtext)),
+                    );
                 });
             });
 

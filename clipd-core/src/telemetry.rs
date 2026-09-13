@@ -427,13 +427,22 @@ pub(crate) fn now_unix_pub() -> u64 {
 /// `crashlog::send`. Folding them into the analytics switch would mean either
 /// silently sending for people who only opted into being counted, or refusing
 /// to accept a report from someone actively trying to help.
-pub(crate) fn send_report(report: &crate::crashlog::Report) -> bool {
+pub(crate) fn reporting_configured() -> bool {
+    posthog_key().is_some()
+}
+
+pub(crate) fn send_report(report: &crate::crashlog::Report) -> crate::crashlog::SendOutcome {
+    use crate::crashlog::SendOutcome;
     let Some(key) = posthog_key() else {
-        return false;
+        // No endpoint was compiled into this build — a local or self-built
+        // binary. Nothing was attempted, so saying the server was unreachable
+        // would be a lie, and the person who just clicked Send deserves to
+        // know their click could never have worked.
+        return SendOutcome::NotConfigured;
     };
     let mut props = serde_json::Map::new();
     let serde_json::Value::Object(fields) = serde_json::json!(report) else {
-        return false;
+        return SendOutcome::Unreachable;
     };
     for (k, v) in fields {
         props.insert(k, v);
@@ -451,10 +460,10 @@ pub(crate) fn send_report(report: &crate::crashlog::Report) -> bool {
         .timeout_read(Duration::from_secs(5))
         .build();
     match agent.post(&url).send_json(body) {
-        Ok(_) => true,
+        Ok(_) => SendOutcome::Sent,
         Err(e) => {
             log::debug!("crash report not sent: {e}");
-            false
+            SendOutcome::Unreachable
         }
     }
 }
