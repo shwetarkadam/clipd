@@ -1082,9 +1082,11 @@ impl SettingsHotkeys {
         }
 
         if let Some(hk) = self.open_gui.take() {
+            clipd_core::set_carbon_open_gui_owned(false);
             let _ = manager.unregister(hk);
         }
         if let Some(hk) = self.palette.take() {
+            clipd_core::set_carbon_palette_owned(false);
             let _ = manager.unregister(hk);
         }
 
@@ -1094,6 +1096,9 @@ impl SettingsHotkeys {
                 Ok(()) => {
                     log::info!("Registered Settings open-GUI hotkey: {}", s.open_gui_hotkey.label());
                     self.open_gui = Some(hk);
+                    // Tell the in-process rdev listeners to leave this chord
+                    // alone, or one press gets handled twice.
+                    clipd_core::set_carbon_open_gui_owned(true);
                 }
                 Err(e) => log::warn!(
                     "Failed to register {}: {e}",
@@ -1112,6 +1117,7 @@ impl SettingsHotkeys {
                             s.palette_trigger.label()
                         );
                         self.palette = Some(hk);
+                        clipd_core::set_carbon_palette_owned(true);
                     }
                     Err(e) => log::warn!(
                         "Failed to register {}: {e}",
@@ -1132,7 +1138,10 @@ impl SettingsHotkeys {
             }
             let s = load_paste_transform_settings();
             if self.open_gui.is_some_and(|hk| hk.id() == event.id) {
-                match s.ctrl_space_action {
+                // `ctrl_space_action` belongs to Ctrl+Space alone. This path
+                // applied it to every binding, which is why Option+Space was
+                // logging "→ SlotMemory" instead of opening the GUI.
+                match s.open_gui_hotkey.action(s.ctrl_space_action) {
                     CtrlSpaceAction::OpenGui => {
                         log::info!("⌨️  {} → OpenGui (Carbon)", s.open_gui_hotkey.label());
                         if !clipd_daemon::request_shortcut(clipd_daemon::ShortcutRequest::OpenGui)

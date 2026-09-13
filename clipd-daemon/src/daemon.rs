@@ -4748,6 +4748,11 @@ fn matches_open_gui_hotkey(
     key: RKey,
     pressed_mods: &HashSet<RKey>,
 ) -> Option<(OpenGuiHotkey, CtrlSpaceAction)> {
+    // The tray registered this chord with Carbon and will act on it there.
+    // Both listeners are in this process looking at the same keypress.
+    if clipd_core::carbon_open_gui_owned() {
+        return None;
+    }
     if !matches!(key, RKey::KeyG | RKey::Space) {
         return None;
     }
@@ -4793,20 +4798,27 @@ fn matches_open_gui_hotkey(
 /// what the row it sits under promises.
 #[cfg(target_os = "macos")]
 fn open_gui_action(hk: OpenGuiHotkey) -> CtrlSpaceAction {
-    if hk == OpenGuiHotkey::CtrlSpace {
-        load_paste_transform_settings().ctrl_space_action
-    } else {
-        CtrlSpaceAction::OpenGui
-    }
+    hk.action(load_paste_transform_settings().ctrl_space_action)
 }
 
 /// Whether this key+modifier state matches the configured memory-palette shortcut.
 #[cfg(target_os = "macos")]
 fn matches_palette_trigger(key: RKey, pressed_mods: &HashSet<RKey>) -> bool {
+    if clipd_core::carbon_palette_owned() {
+        return false;
+    }
     let settings = load_paste_transform_settings();
     // `palette_enabled` is honoured for configs written before "Off" existed
     // in the trigger list; new ones express it as the trigger itself.
     if !settings.palette_enabled {
+        return false;
+    }
+    // When both settings name the same chord, the one under "Open Clipd"
+    // wins. The palette matcher runs first in both listeners, so without this
+    // the explicitly chosen open-clipd shortcut lost silently to a different
+    // feature — which from the outside is indistinguishable from the setting
+    // not working at all.
+    if settings.open_gui_hotkey.collides_with_palette(settings.palette_trigger) {
         return false;
     }
     match settings.palette_trigger {
@@ -5404,6 +5416,38 @@ mod stale_modifier_tests {
                 hk.label()
             );
         }
+    }
+
+    /// Option+Space, configured as "Open Clipd", must open clipd.
+    ///
+    /// It was detected by three listeners and opened the GUI in none of them.
+    /// The Carbon registration in the tray applied `ctrl_space_action` to
+    /// every binding, so it fired Slot Memory; the rdev fallback matched the
+    /// palette first, because the palette's trigger defaults to the same
+    /// chord. One press, two wrong actions, and the setting looked dead.
+    #[test]
+    fn the_open_clipd_chord_wins_over_the_palette_and_keeps_its_action() {
+        use clipd_core::{CtrlSpaceAction, OpenGuiHotkey, PaletteTrigger};
+
+        // The action a binding takes is its own, unless it is Ctrl+Space.
+        assert_eq!(
+            OpenGuiHotkey::OptSpace.action(CtrlSpaceAction::SlotMemory),
+            CtrlSpaceAction::OpenGui,
+            "a Ctrl+Space setting must not redirect Option+Space"
+        );
+        assert_eq!(
+            OpenGuiHotkey::CtrlSpace.action(CtrlSpaceAction::SlotMemory),
+            CtrlSpaceAction::SlotMemory,
+            "Ctrl+Space still obeys its own dropdown"
+        );
+
+        // And when both features name the same chord, "Open Clipd" takes it.
+        assert!(OpenGuiHotkey::OptSpace.collides_with_palette(PaletteTrigger::OptSpace));
+        assert!(!OpenGuiHotkey::OptSpace.collides_with_palette(PaletteTrigger::CmdShiftV));
+        assert!(
+            !OpenGuiHotkey::CtrlSpace.collides_with_palette(PaletteTrigger::CtrlOptSpace),
+            "Ctrl+Space and Ctrl+Option+Space are different chords"
+        );
     }
 
     /// The trap: a Ctrl+Space-only setting was being applied to every binding.
