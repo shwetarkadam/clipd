@@ -131,7 +131,7 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme::Dark
+        Theme::GlassDark
     }
 }
 
@@ -267,21 +267,27 @@ const GLASS_DARK: ThemeColors = ThemeColors {
     bg_selected: Rgb(58, 58, 63),
     bg_hover: Rgb(46, 46, 50),
     accent: Rgb(226, 226, 230),
-    accent2: Rgb(150, 152, 158),
+    accent2: Rgb(190, 193, 201),
     text: Rgb(238, 238, 242),
-    subtext: Rgb(158, 160, 166),
+    subtext: Rgb(191, 194, 201),
     // Section labels. Bright enough to survive a light backdrop showing
     // through the panel, which a 110-grey would not.
-    overlay: Rgb(150, 152, 158),
+    overlay: Rgb(190, 193, 201),
     green: Rgb(226, 226, 230),
     border: Rgb(70, 70, 76),
+    // Every secondary role is lighter than it looks like it needs to be,
+    // because the panel is not a fixed colour: it is the desktop, tinted and
+    // veiled. Over a white page it settles around 7% luminance, and against
+    // that the old subtext sat at 3.19:1 — under the 4.5:1 floor for the
+    // timestamp and source line on every row. These clear it on the brightest
+    // the panel ever gets, including with no native material at all.
     // The whole point. Low enough that the material and the desktop behind it
     // reach the eye, high enough that white text never sits on a bright patch.
     surface_alpha: 165,
     code: Rgb(196, 198, 204),
     url: Rgb(206, 208, 214),
-    email: Rgb(170, 172, 178),
-    path: Rgb(178, 180, 186),
+    email: Rgb(190, 193, 199),
+    path: Rgb(190, 193, 199),
 };
 
 /// Cool silver highlight for Compact Capsule.
@@ -930,16 +936,50 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_install_lands_on_dark() {
+    fn a_fresh_install_lands_on_glass_dark() {
         // What a new user sees, and what anyone falls back to when the stored
         // preference is missing or unreadable. Worth pinning: themes get added
         // and retired, and the default is the one value where a quiet change
         // would go unnoticed until someone opened the app for the first time.
-        assert_eq!(Theme::default(), Theme::Dark);
+        assert_eq!(Theme::default(), Theme::GlassDark);
         assert!(!Theme::default().is_light());
         // load_theme() falls back to the same place when nothing is stored.
         let unreadable: Result<Theme, _> = serde_json::from_str("not a theme");
-        assert_eq!(unreadable.ok().unwrap_or_default(), Theme::Dark);
+        assert_eq!(unreadable.ok().unwrap_or_default(), Theme::GlassDark);
+    }
+
+    /// The default is translucent, so it has to survive having no material.
+    ///
+    /// Windows, Linux, and macOS before 26 never get NSGlassEffectView; the
+    /// shell falls back to a thicker veil and nothing else. A default that is
+    /// only legible where the native material exists is not a default.
+    #[test]
+    fn the_default_theme_reads_without_a_native_material() {
+        let c = Theme::default().colors();
+        // The brightest the panel ever composites to: a white page behind it,
+        // veiled at the no-material alpha of 186 and nothing else.
+        let veil = Rgb(12, 12, 14);
+        let a = 186.0 / 255.0;
+        let panel = Rgb(
+            (veil.0 as f32 * a + 255.0 * (1.0 - a)) as u8,
+            (veil.1 as f32 * a + 255.0 * (1.0 - a)) as u8,
+            (veil.2 as f32 * a + 255.0 * (1.0 - a)) as u8,
+        );
+        for (role, fg) in [
+            ("text", c.text),
+            ("subtext", c.subtext),
+            ("overlay", c.overlay),
+            ("accent2", c.accent2),
+            ("code", c.code),
+            ("email", c.email),
+            ("path", c.path),
+        ] {
+            let r = contrast(fg, panel);
+            assert!(
+                r >= 4.5,
+                "{role} is {r:.2}:1 on the brightest this panel gets — under 4.5:1"
+            );
+        }
     }
 
     #[test]
