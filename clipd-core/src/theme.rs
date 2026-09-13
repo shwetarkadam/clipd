@@ -12,13 +12,15 @@ pub enum Theme {
     /// True dark with an off-white accent — neutral and modern.
     /// Configs holding the retired Paper Dark, Glass Dark, Command Palette
     /// or Minimal Dark land here.
-    #[serde(
-        alias = "Paper",
-        alias = "GlassDark",
-        alias = "CommandPalette",
-        alias = "MinimalDark"
-    )]
+    #[serde(alias = "Paper", alias = "CommandPalette", alias = "MinimalDark")]
     Dark,
+    /// Glass Dark — a dark translucent sheet, the way a launcher panel is
+    /// built. Restored because the light one cannot do this job: a
+    /// translucent *light* panel sitting over a light document has nowhere to
+    /// go, which is why it kept reading as "still white" however it was tuned.
+    /// Dark glass has room — the backdrop shows through as luminance instead
+    /// of having to out-brighten white.
+    GlassDark,
     /// Deep navy background with a periwinkle accent.
     Midnight,
     /// Dark green background with a sage accent.
@@ -39,10 +41,11 @@ pub enum Theme {
 }
 
 impl Theme {
-    pub const ALL: [Theme; 9] = [
+    pub const ALL: [Theme; 10] = [
         Theme::System,
         Theme::Light,
         Theme::Dark,
+        Theme::GlassDark,
         Theme::Midnight,
         Theme::Forest,
         Theme::Slate,
@@ -56,6 +59,7 @@ impl Theme {
             Theme::System => "System",
             Theme::Light => "Paper Light",
             Theme::Dark => "Dark",
+            Theme::GlassDark => "Glass Dark",
             Theme::Midnight => "Midnight",
             Theme::Forest => "Forest",
             Theme::Slate => "Slate",
@@ -69,7 +73,8 @@ impl Theme {
         match self {
             Theme::System => Theme::Light,
             Theme::Light => Theme::Dark,
-            Theme::Dark => Theme::Midnight,
+            Theme::Dark => Theme::GlassDark,
+            Theme::GlassDark => Theme::Midnight,
             Theme::Midnight => Theme::Forest,
             Theme::Forest => Theme::Slate,
             Theme::Slate => Theme::GlassLight,
@@ -84,6 +89,7 @@ impl Theme {
             Theme::System => DARK,
             Theme::Light => LIGHT,
             Theme::Dark => DARK,
+            Theme::GlassDark => GLASS_DARK,
             Theme::Midnight => MIDNIGHT,
             Theme::Forest => FOREST,
             Theme::Slate => SLATE,
@@ -99,7 +105,7 @@ impl Theme {
 
     /// True for frosted translucent shells (Glass Light / Glass Dark).
     pub fn is_glass(&self) -> bool {
-        matches!(self, Theme::GlassLight)
+        matches!(self, Theme::GlassLight | Theme::GlassDark)
     }
 
     /// Soft glassmorphism blooms under the frost plate. `None` = flat opaque shell.
@@ -111,7 +117,7 @@ impl Theme {
             // surface and is mottling on a transparent one — the eye reads
             // the brightness variation as dirt on the glass rather than as
             // light in it. An even sheet is what "clean" means here.
-            Theme::GlassLight => None,
+            Theme::GlassLight | Theme::GlassDark => None,
             _ => None,
         }
     }
@@ -236,6 +242,41 @@ const DARK: ThemeColors = ThemeColors {
 // palette instead of forcing one lime everywhere. Glass Dark paints dual
 // frosted glass plates — see `shell_glows` / `is_glass`.
 // ---------------------------------------------------------------------------
+
+/// Glass Dark — the launcher panel.
+///
+/// Dark glass is the only kind that can actually look transparent over
+/// arbitrary content. A light translucent sheet over a white document has
+/// nowhere to go: white composited with white is white, which is why every
+/// attempt to make Glass Light "more see-through" arrived back at a pale flat
+/// plate. Dark has somewhere to go — whatever is behind shows up as variation
+/// in luminance, and ink stays legible because it is near-white on near-black.
+///
+/// The RGB here is deliberately close to neutral. A blue-grey dark glass
+/// tints everything behind it; this one lets the backdrop supply the colour.
+const GLASS_DARK: ThemeColors = ThemeColors {
+    bg_base: Rgb(26, 26, 28),
+    bg_surface: Rgb(32, 32, 35),
+    bg_elevated: Rgb(40, 40, 44),
+    bg_selected: Rgb(58, 58, 63),
+    bg_hover: Rgb(46, 46, 50),
+    accent: Rgb(226, 226, 230),
+    accent2: Rgb(150, 152, 158),
+    text: Rgb(238, 238, 242),
+    subtext: Rgb(158, 160, 166),
+    // Section labels. Bright enough to survive a light backdrop showing
+    // through the panel, which a 110-grey would not.
+    overlay: Rgb(150, 152, 158),
+    green: Rgb(226, 226, 230),
+    border: Rgb(70, 70, 76),
+    // The whole point. Low enough that the material and the desktop behind it
+    // reach the eye, high enough that white text never sits on a bright patch.
+    surface_alpha: 165,
+    code: Rgb(196, 198, 204),
+    url: Rgb(206, 208, 214),
+    email: Rgb(170, 172, 178),
+    path: Rgb(178, 180, 186),
+};
 
 /// Glass Light's chrome ink — graphite, the way macOS draws toolbar glyphs.
 // Was a blue-slate (72,80,92). Every grey in this theme carried the same few
@@ -965,25 +1006,31 @@ mod tests {
         assert_eq!(paper, Theme::Dark);
         let cocoa: Theme = serde_json::from_str("\"Cocoa\"").expect("Cocoa still parses");
         assert_eq!(cocoa, Theme::Slate, "the nearest warm dark");
-        // Glass Dark's job — a dark surface with no colour in it — is what
-        // Dark already does, without a translucency layer to fight.
+        // Glass Dark is no longer retired, so it is no longer an alias: a
+        // config naming it gets the theme it names. It came back because a
+        // *light* translucent panel over a light document has nowhere to go —
+        // white composited with white is white — which is what kept the light
+        // glass reading as a flat pale plate however it was tuned. Dark glass
+        // is the one that can actually show a backdrop.
         let glass: Theme = serde_json::from_str("\"GlassDark\"").expect("GlassDark still parses");
-        assert_eq!(glass, Theme::Dark);
+        assert_eq!(glass, Theme::GlassDark);
         let cmd: Theme =
             serde_json::from_str("\"CommandPalette\"").expect("CommandPalette still parses");
         assert_eq!(cmd, Theme::Dark);
         let minimal: Theme =
             serde_json::from_str("\"MinimalDark\"").expect("MinimalDark still parses");
         assert_eq!(minimal, Theme::Dark);
-        // The survivors are still offered; the list is two shorter.
+        // The survivors are still offered, and Glass Dark is back among them.
         assert!(Theme::ALL.contains(&Theme::Dark));
         assert!(Theme::ALL.contains(&Theme::Slate));
-        assert_eq!(Theme::ALL.len(), 9);
-        // Nothing in the list still calls itself by a retired name.
+        assert!(Theme::ALL.contains(&Theme::GlassDark));
+        assert_eq!(Theme::ALL.len(), 10);
+        // Nothing in the list still calls itself by a retired name. Glass Dark
+        // is off this list: it is a theme again, not a tombstone.
         for theme in Theme::ALL {
             assert!(!matches!(
                 theme.label(),
-                "Paper Dark" | "Cocoa" | "Glass Dark" | "Command Palette" | "Minimal Dark"
+                "Paper Dark" | "Cocoa" | "Command Palette" | "Minimal Dark"
             ));
         }
     }

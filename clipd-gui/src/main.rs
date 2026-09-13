@@ -3597,14 +3597,15 @@ fn glass_row_fill(theme: Theme, selected: bool, hovered: bool) -> Option<Color32
         }
         return None;
     }
+    // Dark glass. The teal-black anchor that used to sit here was painting a
+    // near-opaque slab on the selected row — it was written when dark glass
+    // had no other way to hold contrast, and it is the same "card on the
+    // material" mistake as the light theme's panes. On a dark sheet a white
+    // wash is both lighter *and* higher contrast against near-white ink.
     if selected {
-        // Keep keyboard focus readable even when Liquid Glass is sampling a
-        // bright window behind clipd. A white wash can turn the row into a
-        // pale slab under white text; this teal-black anchor still lets the
-        // material move while preserving contrast.
-        Some(Color32::from_rgba_unmultiplied(16, 42, 46, 156))
+        Some(Color32::from_rgba_unmultiplied(255, 255, 255, 30))
     } else if hovered {
-        Some(Color32::from_rgba_unmultiplied(255, 255, 255, 12))
+        Some(Color32::from_rgba_unmultiplied(255, 255, 255, 14))
     } else {
         None
     }
@@ -8739,7 +8740,7 @@ impl ClipdGui {
         let search_w = ui.available_width();
         let asking = self.in_ask_mode();
         let in_settings = self.active_tab == MainTab::Settings;
-        let spotlight = self.theme == Theme::GlassLight;
+        let spotlight = self.theme.is_glass();
         let search_frame = egui::Frame::none()
             .fill(if spotlight {
                 // No pill. A launcher's field is the panel's first line, not a
