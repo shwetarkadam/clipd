@@ -1367,7 +1367,7 @@ fn row_copy_button(ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> egui::Resp
             painter.rect_filled(
                 rect,
                 Rounding::same(8.0),
-                Color32::from_rgba_unmultiplied(255, 255, 255, 64),
+                Color32::from_rgba_unmultiplied(14, 14, 16, 110),
             );
         }
     } else {
@@ -1423,16 +1423,12 @@ fn tiny_filter_chip(
 ) -> bool {
     let spotlight = theme.is_glass();
     // Light themes get the same treatment, darkening instead of lifting.
-    let (text_col, fill, stroke) = if active && spotlight {
-        // On glass the selected segment is its own frosted pane with an edge,
-        // matching the rows. A smudge of black is a shadow, and there are no
-        // shadows inside glass.
-        (
-            rgb(c.text),
-            Color32::from_rgba_unmultiplied(252, 253, 255, 200),
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(188, 198, 214, 180)),
-        )
-    } else if active && theme.is_light() {
+    // The frosted white pane that used to lead this chain was drawn for Glass
+    // Light, with dark ink on it. When Glass Light was retired the flag that
+    // selected it widened to every glass theme, so on Glass Dark the active
+    // chip became a white pill with near-white text on it: "All" vanished.
+    // Dark glass takes the same inverted treatment as the dark themes.
+    let (text_col, fill, stroke) = if active && theme.is_light() {
         // Filled, unoutlined — the reference's selected segment. The hairline
         // that used to ring it made every pill look like a control; only the
         // active one is meant to.
@@ -1441,7 +1437,7 @@ fn tiny_filter_chip(
             Color32::from_black_alpha(20),
             Stroke::NONE,
         )
-    } else if active && !spotlight {
+    } else if active {
         // Solid, and inverted: on a dark ground the reference fills the live
         // segment with the ink colour and sets the label in the background
         // colour. A 20/255 white wash reads as "slightly different" rather
@@ -1454,12 +1450,6 @@ fn tiny_filter_chip(
         (
             rgb(c.bg_base),
             rgb(c.text),
-            Stroke::NONE,
-        )
-    } else if active {
-        (
-            if spotlight { Color32::WHITE } else { rgb(c.bg_base) },
-            rgb(c.green),
             Stroke::NONE,
         )
     } else if spotlight {
@@ -3569,62 +3559,34 @@ fn clear_sibling_glass(frame: &eframe::Frame) {
 fn sync_glass_native(_frame: &eframe::Frame, _theme: Theme, _on: &mut Option<bool>) {}
 
 /// Glass selection / hover — soft neutral wash (mint stays on chips/pins).
-fn glass_row_fill(theme: Theme, selected: bool, hovered: bool) -> Option<Color32> {
-    let light = false;
-    if light {
-        // A resting row paints nothing.
-        //
-        // Every row used to be its own frosted pane — white at alpha 34, with
-        // a cool rim at alpha 205 around it. Two problems, and they are the
-        // two words in "transparent and smooth".
-        //
-        // Transparent: the veil over the whole window is alpha 44, so a row
-        // pane on top of it took the composite from 17% coverage to 28% —
-        // the rows were carrying more paint than the window itself, and the
-        // material underneath never reached the eye.
-        //
-        // Smooth: a rim around every row is the opposite of one sheet of
-        // glass. It reads as a stack of plates, because that is what it is.
-        //
-        // A launcher panel is one pane with content floating on it. Only the
-        // row under the pointer or the selection is lit, and it is lit by
-        // light in the glass rather than by an edge drawn around it.
-        // Light *in* the glass, not a white card laid on it. At 86 the
-        // selected row composited to a near-solid pane, which is the same
-        // mistake the per-row panes made, just on one row.
-        if selected {
-            return Some(Color32::from_rgba_unmultiplied(255, 255, 255, 58));
-        }
-        if hovered {
-            return Some(Color32::from_rgba_unmultiplied(255, 255, 255, 28));
-        }
-        return None;
-    }
-    // Dark glass. The teal-black anchor that used to sit here was painting a
-    // near-opaque slab on the selected row — it was written when dark glass
-    // had no other way to hold contrast, and it is the same "card on the
-    // material" mistake as the light theme's panes. On a dark sheet a white
-    // wash is both lighter *and* higher contrast against near-white ink.
+fn glass_row_fill(_theme: Theme, selected: bool, hovered: bool) -> Option<Color32> {
+    // A dark band, never a light wash.
+    //
+    // Liquid Glass adapts to what is painted on it. Draw light paint on a row
+    // and the material under that row resolves lighter too, so a white wash at
+    // alpha 30 did not stay a faint lift: it became a pale slab, and the
+    // near-white text on it went to 2.19:1 (title) and 1.42:1 (meta). This
+    // function held a dark anchor for exactly that reason, with a comment
+    // saying so, and it was removed as "a card on the material". It was not
+    // decoration; it was the thing keeping the selected row readable.
+    //
+    // Neutral rather than the old teal: Glass Dark keeps its RGB close to
+    // neutral so the backdrop supplies the colour. Measured on the panel
+    // brightness seen over a white window: selected 8.56:1 title, 5.55:1 meta;
+    // hover 7.11:1 and 4.62:1.
     if selected {
-        Some(Color32::from_rgba_unmultiplied(255, 255, 255, 30))
+        Some(Color32::from_rgba_unmultiplied(14, 14, 16, 156))
     } else if hovered {
-        Some(Color32::from_rgba_unmultiplied(255, 255, 255, 14))
+        Some(Color32::from_rgba_unmultiplied(14, 14, 16, 134))
     } else {
         None
     }
 }
 
-fn glass_row_stroke(theme: Theme, selected: bool) -> Stroke {
-    if false {
-        // No rim, on any row, ever.
-        //
-        // The rim was there to separate two translucent surfaces stacked on
-        // each other — which was only necessary because each row *was* a
-        // surface. With the panes gone there is one surface, and drawing an
-        // outline around each row on it is what made the theme read as
-        // brushed plates instead of glass.
-        return Stroke::NONE;
-    }
+fn glass_row_stroke(_theme: Theme, selected: bool) -> Stroke {
+    // A faint light rim on the selected band only, so the selection has an
+    // edge as well as a tone. An edge is a line, not a fill, so it does not
+    // pull the material pale the way a wash does.
     if selected {
         Stroke::new(1.0, Color32::from_rgba_unmultiplied(160, 170, 165, 40))
     } else {
@@ -12461,5 +12423,55 @@ mod tests {
         let out = one_line_preview(&"x".repeat(100), 10);
         assert_eq!(out.chars().count(), 10);
         assert!(out.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod glass_selection_tests {
+    use super::*;
+
+    fn lum(c: [u8; 3]) -> f32 {
+        let ch = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * ch(c[0]) + 0.7152 * ch(c[1]) + 0.0722 * ch(c[2])
+    }
+    fn ratio(a: [u8; 3], b: [u8; 3]) -> f32 {
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+    fn over(fill: Color32, panel: [u8; 3]) -> [u8; 3] {
+        let [r, g, b, a] = fill.to_srgba_unmultiplied();
+        let a = a as f32 / 255.0;
+        let mix = |f: u8, p: u8| (f as f32 * a + p as f32 * (1.0 - a)).round() as u8;
+        [mix(r, panel[0]), mix(g, panel[1]), mix(b, panel[2])]
+    }
+
+    /// The selected and hovered rows on dark glass must stay readable on the
+    /// panel brightness the material actually produces over a white window.
+    ///
+    /// A white wash here made the material under the row resolve pale and
+    /// took the title to 2.19:1 and the meta line to 1.42:1.
+    #[test]
+    fn a_lit_row_on_dark_glass_keeps_its_text_readable() {
+        let c = Theme::GlassDark.colors();
+        let panel_over_white_window = [150, 150, 152];
+        for (state, fill) in [
+            ("selected", glass_row_fill(Theme::GlassDark, true, false)),
+            ("hovered", glass_row_fill(Theme::GlassDark, false, true)),
+        ] {
+            let fill = fill.expect("a lit row paints a band");
+            let [r, g, b, _] = fill.to_srgba_unmultiplied();
+            assert!(
+                r < 60 && g < 60 && b < 60,
+                "{state}: a light wash makes Liquid Glass resolve pale under the row"
+            );
+            let band = over(fill, panel_over_white_window);
+            let text = ratio([c.text.0, c.text.1, c.text.2], band);
+            let meta = ratio([c.subtext.0, c.subtext.1, c.subtext.2], band);
+            assert!(text >= 4.5, "{state}: title is {text:.2}:1");
+            assert!(meta >= 4.5, "{state}: meta line is {meta:.2}:1");
+        }
     }
 }
