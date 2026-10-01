@@ -8826,9 +8826,18 @@ impl ClipdGui {
                 Some("success") => Some(OnboardStep::Success),
                 _ => None,
             };
-            if forced.is_some() {
-                self.onboard = forced;
-                self.onboard_forced = true;
+            if let Some(step) = forced {
+                self.onboard = Some(step);
+                // A previewed Permission step would move on according to the
+                // *launching* process's grants, not clipd's, so it is held
+                // still. A previewed Try is the real thing: it watches slot 2
+                // like the live one, so the hand-off to "That's slot 2" can be
+                // checked without being a new user and clicking through.
+                if step == OnboardStep::Try {
+                    self.begin_try();
+                } else {
+                    self.onboard_forced = true;
+                }
                 return self.render_slot_onboarding(ui, c);
             }
             let used = self.slots_in_use();
@@ -9038,12 +9047,24 @@ impl ClipdGui {
                         }
                     }
                     OnboardStep::Success => {
+                        // Only claim slot 1 still holds something when it does.
+                        // ⌘C twice saves to slot 2 alone, so for someone whose
+                        // very first move is this one, slot 1 is empty and
+                        // "your earlier copy is still in slot 1" would be false.
+                        let slot1_held = self.clips.iter().any(|clip| clip.slot == Some(1));
+                        let lead = if slot1_held {
+                            "Your earlier copy is still in slot 1."
+                        } else {
+                            "A plain ⌘C still goes to slot 1."
+                        };
                         title(ui, "That's slot 2");
                         body(
                             ui,
-                            "Your earlier copy is still in slot 1. Press ⌘V twice to \
-                             paste slot 2 — and ⌘C three times saves to slot 3, up to 9. \
-                             The row of numbers at the bottom shows what's in each.",
+                            &format!(
+                                "{lead} Press ⌘V twice to paste slot 2 — and ⌘C three \
+                                 times saves to slot 3, up to 9. The row of numbers at \
+                                 the bottom shows what's in each."
+                            ),
                         );
                         if primary(ui, "Got it") {
                             self.finish_onboarding("done");
