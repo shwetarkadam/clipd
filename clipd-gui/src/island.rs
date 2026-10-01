@@ -4143,7 +4143,7 @@ pub(crate) fn truncate(text: &str, max: usize) -> String {
 /// revisits them, so granting the permission while clipd is running does
 /// nothing until it is restarted. That is the step people miss — they grant
 /// it, nothing changes, and it looks like the grant didn't work.
-fn restart_tray_host() {
+pub(crate) fn restart_tray_host() {
     #[cfg(unix)]
     if let Some(pid) = clipd_core::daemon_lock_pid() {
         if pid != std::process::id() {

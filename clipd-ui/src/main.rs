@@ -648,9 +648,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // does not make macOS grant the permission any faster.
     #[cfg(target_os = "macos")]
     let keyboard_granted_before_prompt = clipd_core::keyboard_permissions_granted();
+    //
+    // Except for someone the slot introduction is still for. Until now a new
+    // user's first sight of clipd was System Settings flying open by itself
+    // plus a caution-icon dialog listing two privacy toggles — before they had
+    // copied anything or knew what the permission was for. privacy.md: avoid
+    // asking at launch; ask when the person can see why. The introduction's
+    // second step asks, with the reason on screen, so the cold prompt stands
+    // down while it is pending.
     #[cfg(target_os = "macos")]
-    let should_offer_keyboard_setup =
-        !keyboard_granted_before_prompt && claim_keyboard_permission_offer();
+    let introduction = slot_introduction_state();
+    #[cfg(target_os = "macos")]
+    let should_offer_keyboard_setup = !introduction.asks_for_permission
+        && !keyboard_granted_before_prompt
+        && claim_keyboard_permission_offer();
     #[cfg(target_os = "macos")]
     let keyboard_granted = if should_offer_keyboard_setup {
         clipd_core::request_keyboard_permissions()
@@ -719,6 +730,17 @@ Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi
                 clipd_core::missing_keyboard_permission_label()
             );
         }
+    }
+
+    // Open clipd once for a new user, so the introduction is actually seen.
+    // A menu-bar app with no window otherwise shows nothing on first launch
+    // but an icon, and the people who most need the introduction are the
+    // ones who would never open the palette to find it. Exactly once: the
+    // palette records that it has been presented.
+    #[cfg(target_os = "macos")]
+    if introduction.open_palette_once {
+        log::info!("First launch: opening clipd once to introduce slots");
+        open_gui_search();
     }
 
     // Tray-only startup. The clipboard surface only appears when the user
@@ -1698,6 +1720,34 @@ fn daemon_log_path() -> PathBuf {
     };
     let _ = std::fs::create_dir_all(&logs_dir);
     logs_dir.join("clipd-ui-daemon.log")
+}
+
+/// Where the slot introduction stands, as far as launch needs to know.
+#[cfg(target_os = "macos")]
+struct SlotIntroduction {
+    /// The introduction is pending and will ask for keyboard access itself.
+    asks_for_permission: bool,
+    /// It has never been shown: open the palette once at launch.
+    open_palette_once: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn slot_introduction_state() -> SlotIntroduction {
+    let settings = load_paste_transform_settings();
+    // Someone already filling slots 2-9 found the feature on their own;
+    // they get neither the window nor the change in how access is asked for.
+    let used: Vec<u8> = clipd_core::SlotManager::persistent_default()
+        .map(|slots| {
+            (2..=9u8)
+                .filter(|n| matches!(slots.get_slot(*n), Ok(Some(_))))
+                .collect()
+        })
+        .unwrap_or_default();
+    let pending = clipd_core::slot_onboarding_due(&settings, &used);
+    SlotIntroduction {
+        asks_for_permission: pending,
+        open_palette_once: pending && !settings.slots_onboarding_presented,
+    }
 }
 
 /// Claim the one automatic keyboard-permission offer for this Clipd version.

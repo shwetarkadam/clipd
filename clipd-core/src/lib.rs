@@ -116,6 +116,7 @@ pub use theme::{
     ThemeColors,
 };
 pub use transform::{
+    has_used_multi_slot, slot_onboarding_due, slot_tip_due,
     carbon_open_gui_owned, carbon_palette_owned, set_carbon_open_gui_owned,
     set_carbon_palette_owned,
     all_transforms, apply_transform, load_last_active_app, load_paste_transform_settings,

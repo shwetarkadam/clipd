@@ -468,6 +468,25 @@ pub struct PasteTransformSettings {
     #[serde(default = "default_false")]
     pub onboarding_seen: bool,
 
+    /// The slot introduction has been finished or skipped. Either way it is
+    /// not offered again — onboarding.md: someone who skipped a tutorial
+    /// should not be shown it on every launch.
+    #[serde(default = "default_false")]
+    pub slots_onboarding_done: bool,
+    /// The palette has been opened once to show the introduction. Separate
+    /// from `slots_onboarding_done` so the tray opens clipd for a new user
+    /// exactly once, while the card itself stays until it is dealt with.
+    #[serde(default = "default_false")]
+    pub slots_onboarding_presented: bool,
+    /// How many times the "you could have used a slot" tip has been shown,
+    /// when it last was (unix seconds), and whether it was waved away.
+    #[serde(default)]
+    pub slot_tip_count: u8,
+    #[serde(default)]
+    pub slot_tip_last: i64,
+    #[serde(default = "default_false")]
+    pub slot_tip_dismissed: bool,
+
     #[serde(default = "default_true_val")]
     pub hud_enabled: bool,
 
@@ -582,6 +601,11 @@ impl Default for PasteTransformSettings {
             active_transforms: vec![TransformKind::TrimWhitespace, TransformKind::PrettyJson],
             default_ai_prompt: String::new(),
             onboarding_seen: false,
+            slots_onboarding_done: false,
+            slots_onboarding_presented: false,
+            slot_tip_count: 0,
+            slot_tip_last: 0,
+            slot_tip_dismissed: false,
             hud_enabled: true,
             hover_opens_hud: true,
             show_clip_count: true,
@@ -612,6 +636,71 @@ fn paste_settings_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("clipd")
         .join("paste_transform.json")
+}
+
+/// Slots 2-9 are the ones only the multi-slot gesture fills. Slot 1 is
+/// filled by every plain ⌘C, so it says nothing about whether someone has
+/// discovered the feature.
+pub fn has_used_multi_slot(slots_in_use: &[u8]) -> bool {
+    slots_in_use.iter().any(|s| (2..=9).contains(s))
+}
+
+/// Whether to show the slot introduction.
+///
+/// Not once it has been finished or skipped, and not for someone who is
+/// already using slots — they found it on their own, and walking them through
+/// it would be teaching them what they know.
+pub fn slot_onboarding_due(settings: &PasteTransformSettings, slots_in_use: &[u8]) -> bool {
+    !settings.slots_onboarding_done && !has_used_multi_slot(slots_in_use)
+}
+
+/// How many separate copies inside `SLOT_TIP_BURST` count as juggling.
+pub const SLOT_TIP_MIN_COPIES: usize = 3;
+/// The burst window. Long enough to cover copying from three places in a
+/// document, short enough that it means "one task", not "one afternoon".
+pub const SLOT_TIP_BURST_SECS: i64 = 45;
+/// Lifetime cap on the tip, and the minimum gap between showings.
+pub const SLOT_TIP_MAX_SHOWINGS: u8 = 4;
+pub const SLOT_TIP_GAP_SECS: i64 = 24 * 60 * 60;
+/// Only a recent burst is worth mentioning — one from last week is not a
+/// moment the person will recognise.
+pub const SLOT_TIP_RECENT_SECS: i64 = 6 * 60 * 60;
+
+/// Whether to show the "a slot would have helped here" tip.
+///
+/// The tip is earned by behaviour, not scheduled: it only appears after the
+/// person has done exactly what slots are for — copied several different
+/// things in quick succession, each one replacing the last. That is the
+/// moment the idea makes sense, which is onboarding.md's case for
+/// context-specific tips over a single up-front flow.
+///
+/// And it is rationed so it stays a tip rather than a nag: never for someone
+/// already using slots, never after it has been dismissed, at most once a day
+/// and four times ever.
+///
+/// `copy_times` are unix seconds of recent distinct copies, any order.
+pub fn slot_tip_due(
+    settings: &PasteTransformSettings,
+    slots_in_use: &[u8],
+    copy_times: &[i64],
+    now: i64,
+) -> bool {
+    if settings.slot_tip_dismissed
+        || settings.slot_tip_count >= SLOT_TIP_MAX_SHOWINGS
+        || has_used_multi_slot(slots_in_use)
+        || now - settings.slot_tip_last < SLOT_TIP_GAP_SECS
+    {
+        return false;
+    }
+    let mut recent: Vec<i64> = copy_times
+        .iter()
+        .copied()
+        .filter(|t| now - t <= SLOT_TIP_RECENT_SECS && *t <= now)
+        .collect();
+    recent.sort_unstable();
+    recent
+        .windows(SLOT_TIP_MIN_COPIES)
+        .any(|w| w[SLOT_TIP_MIN_COPIES - 1] - w[0] <= SLOT_TIP_BURST_SECS)
 }
 
 pub fn load_paste_transform_settings() -> PasteTransformSettings {
@@ -1596,5 +1685,85 @@ mod tests {
         assert!(numbered.contains("1│ fn main()"));
         let restored = remove_line_numbers(&numbered);
         assert_eq!(restored, input);
+    }
+}
+
+#[cfg(test)]
+mod slot_onboarding_tests {
+    use super::*;
+
+    fn fresh() -> PasteTransformSettings {
+        PasteTransformSettings::default()
+    }
+    const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn slot_1_alone_does_not_count_as_using_multi_slot() {
+        // Every plain ⌘C fills slot 1, so a person who has never heard of
+        // the feature still has it. Treating that as "already using slots"
+        // would skip the introduction for exactly the people it is for.
+        assert!(!has_used_multi_slot(&[1]));
+        assert!(!has_used_multi_slot(&[1, 31]), "letter slots are a separate gesture");
+        assert!(has_used_multi_slot(&[1, 2]));
+        assert!(has_used_multi_slot(&[9]));
+    }
+
+    #[test]
+    fn the_introduction_shows_once_and_skips_people_who_found_slots() {
+        let mut s = fresh();
+        assert!(slot_onboarding_due(&s, &[1]), "a new user sees it");
+        assert!(!slot_onboarding_due(&s, &[1, 3]), "someone already using slots does not");
+        s.slots_onboarding_done = true;
+        assert!(!slot_onboarding_due(&s, &[1]), "finished or skipped means never again");
+    }
+
+    #[test]
+    fn the_tip_needs_a_real_burst_of_copying() {
+        let s = fresh();
+        // Three copies inside 45 seconds: juggling.
+        assert!(slot_tip_due(&s, &[1], &[NOW - 40, NOW - 20, NOW - 5], NOW));
+        // Three copies spread over ten minutes: ordinary use, not a moment
+        // where a slot would have helped.
+        assert!(!slot_tip_due(&s, &[1], &[NOW - 600, NOW - 300, NOW - 5], NOW));
+        // Two is not a pattern.
+        assert!(!slot_tip_due(&s, &[1], &[NOW - 10, NOW - 5], NOW));
+        // A burst from yesterday is not one anyone will recognise.
+        let old = NOW - SLOT_TIP_RECENT_SECS - 100;
+        assert!(!slot_tip_due(&s, &[1], &[old, old + 5, old + 10], NOW));
+    }
+
+    #[test]
+    fn the_tip_is_a_tip_not_a_nag() {
+        let burst = [NOW - 30, NOW - 20, NOW - 10];
+        let mut s = fresh();
+
+        // Never for someone already using slots — that is the goal reached.
+        assert!(!slot_tip_due(&s, &[1, 2], &burst, NOW));
+
+        // At most once a day.
+        s.slot_tip_last = NOW - 60;
+        assert!(!slot_tip_due(&s, &[1], &burst, NOW));
+        s.slot_tip_last = NOW - SLOT_TIP_GAP_SECS - 1;
+        assert!(slot_tip_due(&s, &[1], &burst, NOW));
+
+        // Four times ever.
+        s.slot_tip_count = SLOT_TIP_MAX_SHOWINGS;
+        assert!(!slot_tip_due(&s, &[1], &burst, NOW));
+
+        // And not at all once waved away.
+        let mut s = fresh();
+        s.slot_tip_dismissed = true;
+        assert!(!slot_tip_due(&s, &[1], &burst, NOW));
+    }
+
+    #[test]
+    fn old_settings_files_load_with_the_introduction_pending() {
+        // Everyone upgrading has a settings file without these fields. They
+        // must deserialize, and land with the introduction still due —
+        // existing users who never found slots are the people this is for.
+        let s: PasteTransformSettings = serde_json::from_str("{}").expect("empty settings parse");
+        assert!(!s.slots_onboarding_done);
+        assert!(!s.slots_onboarding_presented);
+        assert_eq!(s.slot_tip_count, 0);
     }
 }
