@@ -1686,6 +1686,7 @@ fn execute_undo_paste(
 
         std::thread::sleep(Duration::from_millis(50));
         simulate_paste();
+        clipd_core::record_slot_paste(slot);
         log::info!(
             "📋 Pasted from slot {} after {} undo(s): {}",
             slot,
@@ -1759,6 +1760,7 @@ fn execute_direct_paste(
         }
         sleep_before_injected_paste();
         simulate_paste();
+        clipd_core::record_slot_paste(slot);
         log::info!(
             "📋 Pasted from slot {} ({})",
             slot,

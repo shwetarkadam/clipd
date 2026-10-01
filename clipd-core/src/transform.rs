@@ -703,6 +703,68 @@ pub fn slot_tip_due(
         .any(|w| w[SLOT_TIP_MIN_COPIES - 1] - w[0] <= SLOT_TIP_BURST_SECS)
 }
 
+/// The three lines the introduction has people copy into slots 1-3.
+///
+/// A name, an email and a phone number, because that is the real job slots
+/// do: filling in a form without going back and forth between two windows.
+/// All three are placeholders — example.com is reserved for documentation, and
+/// 020 7946 0xxx is a London range set aside for fiction.
+pub const PRACTICE_LINES: [&str; 3] = ["Ada Lovelace", "ada@example.com", "+44 20 7946 0958"];
+
+/// Which practice lines are already sitting in their slot.
+///
+/// Read from what the slots actually hold, never from which keys were pressed.
+/// clipd has more than one way into a slot — two quick single copies start
+/// collect mode, which stacks later copies into 2, 3, … on its own — and the
+/// exercise should tick for any of them. What matters is that the right thing
+/// ended up in the right place.
+pub fn practice_marks(slots: &[(u8, String)]) -> [bool; 3] {
+    let mut marks = [false; 3];
+    for (i, line) in PRACTICE_LINES.iter().enumerate() {
+        let want = (i + 1) as u8;
+        marks[i] = slots
+            .iter()
+            .any(|(slot, content)| *slot == want && content.trim() == *line);
+    }
+    marks
+}
+
+fn last_slot_paste_path() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("clipd")
+        .join("last_slot_paste")
+}
+
+/// Record that the daemon just pasted `slot` back into some app.
+///
+/// The paste half of the introduction needs to know a paste happened, and it
+/// happens in whatever app the person is in — so it cannot be seen from the
+/// window. A double ⌘V also works by pasting once and then undoing it, so even
+/// in clipd's own text field the field's contents are not a reliable signal.
+/// The daemon knows, so it says so. One line, overwritten each time.
+pub fn record_slot_paste(slot: u8) {
+    let path = last_slot_paste_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let ms = chrono::Utc::now().timestamp_millis();
+    let _ = std::fs::write(path, format!("{slot} {ms}"));
+}
+
+/// The most recent slot paste, as (slot, unix milliseconds).
+pub fn last_slot_paste() -> Option<(u8, i64)> {
+    let text = std::fs::read_to_string(last_slot_paste_path()).ok()?;
+    parse_slot_paste(&text)
+}
+
+fn parse_slot_paste(text: &str) -> Option<(u8, i64)> {
+    let mut parts = text.split_whitespace();
+    let slot = parts.next()?.parse().ok()?;
+    let at = parts.next()?.parse().ok()?;
+    Some((slot, at))
+}
+
 pub fn load_paste_transform_settings() -> PasteTransformSettings {
     std::fs::read_to_string(paste_settings_path())
         .ok()
@@ -1691,6 +1753,36 @@ mod tests {
 #[cfg(test)]
 mod slot_onboarding_tests {
     use super::*;
+
+    #[test]
+    fn practice_ticks_on_what_is_in_the_slot_not_how_it_got_there() {
+        let line = |n: usize| PRACTICE_LINES[n].to_string();
+        assert_eq!(practice_marks(&[]), [false; 3]);
+        // Each line counts only in its own slot.
+        assert_eq!(practice_marks(&[(2, line(1))]), [false, true, false]);
+        assert_eq!(practice_marks(&[(3, line(1))]), [false; 3], "right line, wrong slot");
+        // All three, in any order, however they arrived.
+        let all = [(3, line(2)), (1, line(0)), (2, line(1))];
+        assert_eq!(practice_marks(&all), [true; 3]);
+        // Copied with a trailing newline from a text field still counts.
+        assert_eq!(practice_marks(&[(1, format!("{}\n", line(0)))]), [true, false, false]);
+    }
+
+    #[test]
+    fn a_slot_paste_record_round_trips_and_rejects_junk() {
+        assert_eq!(parse_slot_paste("2 1800000000123"), Some((2, 1_800_000_000_123)));
+        assert_eq!(parse_slot_paste(""), None);
+        assert_eq!(parse_slot_paste("two 123"), None);
+        assert_eq!(parse_slot_paste("2"), None);
+    }
+
+    #[test]
+    fn the_practice_lines_are_placeholders() {
+        // These end up in someone's real clipboard history. They must not be a
+        // working address or a dialable number.
+        assert!(PRACTICE_LINES[1].ends_with("@example.com"));
+        assert!(PRACTICE_LINES[2].replace(' ', "").starts_with("+442079460"));
+    }
 
     fn fresh() -> PasteTransformSettings {
         PasteTransformSettings::default()

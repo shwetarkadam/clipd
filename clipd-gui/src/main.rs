@@ -2038,7 +2038,10 @@ enum OnboardStep {
     Idea,
     /// Only reached on macOS, and only when keyboard access is missing.
     Permission,
+    /// Fill three slots with the practice lines.
     Try,
+    /// Paste one of them back, in any app.
+    Paste,
     Success,
 }
 
@@ -2049,6 +2052,7 @@ impl OnboardStep {
             OnboardStep::Permission => 2,
             OnboardStep::Try => 4,
             OnboardStep::Success => 8,
+            OnboardStep::Paste => 16,
         }
     }
     fn name(self) -> &'static str {
@@ -2056,6 +2060,7 @@ impl OnboardStep {
             OnboardStep::Idea => "idea",
             OnboardStep::Permission => "permission",
             OnboardStep::Try => "try",
+            OnboardStep::Paste => "paste",
             OnboardStep::Success => "success",
         }
     }
@@ -3736,10 +3741,13 @@ struct ClipdGui {
     /// Opened at a fixed step by CLIPD_ONBOARD_STEP: a still preview, so the
     /// live checks that would move it along are off.
     onboard_forced: bool,
-    /// Slot 2's clip when "try it" began. Success means *this* attempt
-    /// filled it — not that something happened to be there already.
-    onboard_slot2_baseline: Option<i64>,
     onboard_try_since: Option<Instant>,
+    /// The practice line the person has clicked, which ⌘C will copy.
+    onboard_pick: Option<usize>,
+    /// When the paste step began, in unix ms: only a paste after this counts.
+    onboard_paste_since_ms: i64,
+    /// A paste landed, but from the wrong slot — say which.
+    onboard_paste_hint: Option<u8>,
     onboard_last_poll: Instant,
     /// Steps already reported to telemetry this window, as a bitmask.
     onboard_reported: u8,
@@ -4015,8 +4023,10 @@ impl ClipdGui {
             onboard: None,
             onboard_decided: false,
             onboard_forced: false,
-            onboard_slot2_baseline: None,
             onboard_try_since: None,
+            onboard_pick: None,
+            onboard_paste_since_ms: 0,
+            onboard_paste_hint: None,
             onboard_last_poll: Instant::now(),
             onboard_reported: 0,
             slot_tip_visible: false,
@@ -4403,10 +4413,22 @@ impl ClipdGui {
             return;
         }
 
+        // Mid-exercise counts as busy, the same as a half-typed search. The
+        // popover hides when the pointer leaves it, and the exercise is exactly
+        // when the pointer leaves: click a line, press ⌘C on the keyboard, go
+        // to another app to paste. Folding the card away then would make the
+        // tray's introduction impossible to finish, and nobody would see it
+        // tick. Bounded, though: an exercise nobody has touched for 90 seconds
+        // has been abandoned, and must not pin a window over the menu bar.
+        let exercising = matches!(self.onboard, Some(OnboardStep::Try | OnboardStep::Paste))
+            && self
+                .onboard_try_since
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(90));
         let busy = self.ask.running
             || self.transform_job.running
             || !self.search_query.trim().is_empty()
-            || self.ask.answer.is_some();
+            || self.ask.answer.is_some()
+            || exercising;
         if busy {
             self.hud_left_at = None;
             self.animate_hud(ctx);
@@ -4468,6 +4490,18 @@ impl ClipdGui {
     /// instant appearance to avoid macOS window resize glitching.
     fn show_hud_onscreen(&mut self, ctx: &egui::Context) {
         self.hud_expanded = true;
+        // This process lives across hovers, so what it decided last time can
+        // be stale: the introduction may have been finished or skipped in the
+        // palette since. Keep an exercise that is under way; otherwise decide
+        // again from what is on disk.
+        self.paste_settings = load_paste_transform_settings();
+        if self.paste_settings.slots_onboarding_done {
+            self.onboard = None;
+        }
+        if self.onboard.is_none() {
+            self.onboard_decided = false;
+        }
+        self.slot_tip_decided = false;
         // Catch up on everything copied while this window was parked.
         self.refresh();
         clipd_core::set_gui_window_open(true);
@@ -4896,6 +4930,13 @@ impl ClipdGui {
             self.render_hud_settings(ui, c);
             self.render_hud_footer_row(ui, action, c);
             return;
+        }
+
+        // The introduction and the slot tip, in the same place the palette
+        // shows them. Most people meet clipd here first.
+        let introducing = self.render_slot_onboarding(ui, c);
+        if !introducing {
+            self.render_slot_tip(ui, c);
         }
 
         // Compact clip list.
@@ -8796,12 +8837,23 @@ impl ClipdGui {
 
     fn begin_try(&mut self) {
         self.onboard = Some(OnboardStep::Try);
-        self.onboard_slot2_baseline = self
-            .clips
-            .iter()
-            .find(|clip| clip.slot == Some(2))
-            .map(|clip| clip.id);
+        self.onboard_pick = None;
         self.onboard_try_since = Some(Instant::now());
+    }
+
+    fn begin_paste(&mut self) {
+        self.onboard = Some(OnboardStep::Paste);
+        self.onboard_paste_since_ms = chrono::Utc::now().timestamp_millis();
+        self.onboard_paste_hint = None;
+        self.onboard_try_since = Some(Instant::now());
+    }
+
+    /// What each numbered slot holds right now, from the loaded clips.
+    fn slot_contents(&self) -> Vec<(u8, String)> {
+        self.clips
+            .iter()
+            .filter_map(|clip| clip.slot.map(|n| (n, clip.content.clone())))
+            .collect()
     }
 
     /// The slot introduction. Returns whether it drew anything.
@@ -8811,7 +8863,10 @@ impl ClipdGui {
     /// asked for in context rather than cold at launch (privacy.md), and then
     /// doing it: press ⌘C twice and watch it land. The × skips it for good.
     fn render_slot_onboarding(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> bool {
-        if self.hud || self.island_surface {
+        // The tray popover is where most people meet clipd first — they hover
+        // the icon before they ever open the palette — so it teaches too. The
+        // island is a glance surface with no room for an exercise.
+        if self.island_surface {
             return false;
         }
         if !self.onboard_decided {
@@ -8823,6 +8878,7 @@ impl ClipdGui {
                 Some("idea") => Some(OnboardStep::Idea),
                 Some("permission") => Some(OnboardStep::Permission),
                 Some("try") => Some(OnboardStep::Try),
+                Some("paste") => Some(OnboardStep::Paste),
                 Some("success") => Some(OnboardStep::Success),
                 _ => None,
             };
@@ -8835,6 +8891,8 @@ impl ClipdGui {
                 // checked without being a new user and clicking through.
                 if step == OnboardStep::Try {
                     self.begin_try();
+                } else if step == OnboardStep::Paste {
+                    self.begin_paste();
                 } else {
                     self.onboard_forced = true;
                 }
@@ -8864,7 +8922,10 @@ impl ClipdGui {
         // Live checks, once a second, only while a step is waiting on
         // something outside this window.
         if !self.onboard_forced
-            && matches!(step, OnboardStep::Permission | OnboardStep::Try)
+            && matches!(
+                step,
+                OnboardStep::Permission | OnboardStep::Try | OnboardStep::Paste
+            )
             && self.onboard_last_poll.elapsed() >= Duration::from_secs(1)
         {
             self.onboard_last_poll = Instant::now();
@@ -8877,20 +8938,44 @@ impl ClipdGui {
                 }
                 OnboardStep::Try => {
                     self.refresh();
-                    let now_in_2 = self
-                        .clips
-                        .iter()
-                        .find(|clip| clip.slot == Some(2))
-                        .map(|clip| clip.id);
-                    if now_in_2.is_some() && now_in_2 != self.onboard_slot2_baseline {
-                        self.onboard = Some(OnboardStep::Success);
+                    if clipd_core::practice_marks(&self.slot_contents()) == [true; 3] {
+                        self.begin_paste();
+                    }
+                }
+                OnboardStep::Paste => {
+                    if let Some((slot, at)) = clipd_core::last_slot_paste() {
+                        if at >= self.onboard_paste_since_ms {
+                            if slot == 2 {
+                                self.onboard = Some(OnboardStep::Success);
+                            } else {
+                                self.onboard_paste_hint = Some(slot);
+                            }
+                        }
                     }
                 }
                 _ => {}
             }
         }
-        if matches!(step, OnboardStep::Permission | OnboardStep::Try) {
+        if matches!(
+            step,
+            OnboardStep::Permission | OnboardStep::Try | OnboardStep::Paste
+        ) {
             ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
+
+        // ⌘C on a picked practice line copies that line. egui reports the
+        // chord as a Copy event whatever has focus; with nothing selected in a
+        // text field nothing else claims it, and this is drawn after the
+        // search box, so it is the last word on what the clipboard holds. The
+        // daemon counts the taps from the keyboard and reads the clipboard
+        // when the count settles — so one, two or three presses here land in
+        // slot 1, 2 or 3.
+        if step == OnboardStep::Try {
+            if let Some(i) = self.onboard_pick {
+                if ui.input(|inp| inp.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
+                    ui.ctx().copy_text(clipd_core::PRACTICE_LINES[i].to_string());
+                }
+            }
         }
 
         let step = self.onboard.unwrap_or(step);
@@ -8898,7 +8983,8 @@ impl ClipdGui {
         let index = match step {
             OnboardStep::Idea => 0,
             OnboardStep::Permission => 1,
-            OnboardStep::Try | OnboardStep::Success => 2,
+            OnboardStep::Try => 2,
+            OnboardStep::Paste | OnboardStep::Success => 3,
         };
 
         egui::Frame::none()
@@ -8909,7 +8995,7 @@ impl ClipdGui {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    for i in 0..3 {
+                    for i in 0..4 {
                         let (dot, _) =
                             ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
                         ui.painter().circle_filled(
@@ -9014,30 +9100,99 @@ impl ClipdGui {
                         );
                     }
                     OnboardStep::Try => {
-                        title(ui, "Try it");
+                        title(ui, "Fill three slots");
                         body(
                             ui,
-                            "Select a word anywhere — any app — and press ⌘C twice, \
-                             quickly. A small confirmation shows where it went.",
+                            "Click a line, then press the keys beside it. Each one \
+                             lands in its own slot.",
                         );
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("Watching for slot 2…")
-                                .size(11.0)
-                                .color(rgb(c.overlay)),
-                        );
-                        // Granted but not landing usually means the tray was
-                        // already running when access was turned on.
-                        let stuck = self
-                            .onboard_try_since
-                            .is_some_and(|t| t.elapsed() >= Duration::from_secs(15));
+                        ui.add_space(8.0);
+                        let marks = clipd_core::practice_marks(&self.slot_contents());
+                        for (i, line) in clipd_core::PRACTICE_LINES.iter().enumerate() {
+                            let n = (i + 1) as u8;
+                            let picked = self.onboard_pick == Some(i);
+                            ui.horizontal(|ui| {
+                                let chip = egui::Frame::none()
+                                    .fill(if picked { rgb(c.bg_hover) } else { surf(c, c.bg_surface) })
+                                    .stroke(Stroke::new(
+                                        if picked { 1.5 } else { 1.0 },
+                                        if picked { rgb(c.text) } else { rgb(c.border) },
+                                    ))
+                                    .rounding(Rounding::same(6.0))
+                                    .inner_margin(Margin::symmetric(8.0, 4.0))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(150.0);
+                                        ui.label(
+                                            RichText::new(*line).size(12.0).monospace().color(rgb(c.text)),
+                                        );
+                                    })
+                                    .response
+                                    .interact(egui::Sense::click())
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if chip.clicked() {
+                                    self.onboard_pick = Some(i);
+                                    // ⌘C has to reach this window. The popover
+                                    // does not take the keyboard on hover — it
+                                    // would steal it from whatever you were
+                                    // typing in — but a click on a line here is
+                                    // the person asking for it.
+                                    self.want_key_window = true;
+                                }
+                                let keys = vec!["⌘C"; n as usize].join(" ");
+                                ui.label(RichText::new(keys).size(12.0).color(rgb(c.subtext)));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if marks[i] {
+                                        // Drawn, not typed. The interface font
+                                        // has no ✓ glyph, so the character
+                                        // rendered as an empty box — a tick
+                                        // that read as a checkbox still to fill.
+                                        ui.label(
+                                            RichText::new(format!("slot {n}"))
+                                                .size(12.0)
+                                                .strong()
+                                                .color(rgb(c.text)),
+                                        );
+                                        let (mark, _) = ui.allocate_exact_size(
+                                            egui::vec2(14.0, 14.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        let (m, w) = (mark.center(), mark.width());
+                                        let ink = Stroke::new(1.8, rgb(c.text));
+                                        ui.painter().line_segment(
+                                            [
+                                                egui::pos2(m.x - w * 0.3, m.y),
+                                                egui::pos2(m.x - w * 0.06, m.y + w * 0.24),
+                                            ],
+                                            ink,
+                                        );
+                                        ui.painter().line_segment(
+                                            [
+                                                egui::pos2(m.x - w * 0.06, m.y + w * 0.24),
+                                                egui::pos2(m.x + w * 0.32, m.y - w * 0.26),
+                                            ],
+                                            ink,
+                                        );
+                                    } else {
+                                        ui.label(RichText::new("—").size(12.0).color(rgb(c.overlay)));
+                                    }
+                                });
+                            });
+                            ui.add_space(4.0);
+                        }
+                        let stuck = !marks.iter().any(|m| *m)
+                            && self
+                                .onboard_try_since
+                                .is_some_and(|t| t.elapsed() >= Duration::from_secs(20));
                         if stuck {
-                            ui.add_space(6.0);
+                            ui.add_space(4.0);
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
-                                    RichText::new("Nothing yet? Make sure a word is selected first. If it still doesn't land, clipd may need a restart to pick up the permission.")
-                                        .size(11.0)
-                                        .color(rgb(c.subtext)),
+                                    RichText::new(
+                                        "Nothing landing? Click a line first so ⌘C copies it. If it \
+                                         still doesn't, clipd may need a restart to pick up the permission.",
+                                    )
+                                    .size(11.0)
+                                    .color(rgb(c.subtext)),
                                 );
                                 if ui.small_button("Restart clipd").clicked() {
                                     island::restart_tray_host();
@@ -9046,27 +9201,49 @@ impl ClipdGui {
                             });
                         }
                     }
-                    OnboardStep::Success => {
-                        // Only claim slot 1 still holds something when it does.
-                        // ⌘C twice saves to slot 2 alone, so for someone whose
-                        // very first move is this one, slot 1 is empty and
-                        // "your earlier copy is still in slot 1" would be false.
-                        let slot1_held = self.clips.iter().any(|clip| clip.slot == Some(1));
-                        let lead = if slot1_held {
-                            "Your earlier copy is still in slot 1."
-                        } else {
-                            "A plain ⌘C still goes to slot 1."
+                    OnboardStep::Paste => {
+                        title(ui, "Now get one back");
+                        body(
+                            ui,
+                            "Click into any text field — your notes, a message, \
+                             anywhere — and press ⌘V twice, quickly. The email from \
+                             slot 2 lands there.",
+                        );
+                        ui.add_space(4.0);
+                        let waited = self
+                            .onboard_try_since
+                            .is_some_and(|t| t.elapsed() >= Duration::from_secs(20));
+                        let (line, col) = match self.onboard_paste_hint {
+                            Some(slot) => (
+                                format!("That pasted slot {slot}. Tap ⌘V exactly twice for slot 2."),
+                                rgb(c.text),
+                            ),
+                            None if waited => (
+                                "One ⌘V just pastes as usual — it's the second, quick ⌘V that \
+                                 reaches into a slot."
+                                    .to_string(),
+                                rgb(c.subtext),
+                            ),
+                            None => ("Waiting for ⌘V ⌘V…".to_string(), rgb(c.overlay)),
                         };
-                        title(ui, "That's slot 2");
+                        ui.label(RichText::new(line).size(11.0).color(col));
+                    }
+                    OnboardStep::Success => {
+                        title(ui, "You've got it");
+                        let strip = if self.hud {
+                            ""
+                        } else {
+                            " The row of numbers at the bottom shows what's in each."
+                        };
                         body(
                             ui,
                             &format!(
-                                "{lead} Press ⌘V twice to paste slot 2 — and ⌘C three \
-                                 times saves to slot 3, up to 9. The row of numbers at \
-                                 the bottom shows what's in each."
+                                "Taps on ⌘C choose where a copy goes; taps on ⌘V choose \
+                                 what comes back. Slots 2–9 keep what you put in them \
+                                 until you replace it.{strip}"
                             ),
                         );
-                        if primary(ui, "Got it") {
+                        if primary(ui, "Done") {
                             self.finish_onboarding("done");
                         }
                     }
@@ -9080,7 +9257,7 @@ impl ClipdGui {
     /// copying — the moment a slot would have saved a trip back — and rationed
     /// by `slot_tip_due`. Clicking it opens the "try it" step.
     fn render_slot_tip(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
-        if self.hud || self.island_surface {
+        if self.island_surface {
             return;
         }
         if !self.slot_tip_decided {
