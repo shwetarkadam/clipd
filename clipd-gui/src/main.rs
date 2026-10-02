@@ -5060,52 +5060,41 @@ impl ClipdGui {
         let _ = action;
     }
 
-    /// Clipboard | Slots, under the search field. The clipboard view keeps
-    /// its own order (pins, then newest); Slots lists what is in slots 1-9.
-    fn render_hud_view_switch(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+    /// The Slots toggle at the right end of the popover's search bar. Off,
+    /// the list is the clipboard (pins, then newest); on, it is what is in
+    /// slots 1-9, in slot order.
+    fn render_hud_slots_toggle(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         let filled: usize = self.slots_by_content.values().map(Vec::len).sum();
-        let mut pick = None;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.add_space(4.0);
-            let tabs = [
-                (false, "Clipboard".to_string()),
-                (
-                    true,
-                    if filled > 0 { format!("Slots  {filled}") } else { "Slots".to_string() },
-                ),
-            ];
-            for (slots, label) in tabs {
-                let on = self.hud_slots_view == slots;
-                let resp = ui.add(
-                    egui::Button::new(
-                        RichText::new(label)
-                            .size(12.0)
-                            .color(if on { rgb(c.text) } else { rgb(c.subtext) }),
-                    )
-                    .fill(if on { surf(c, c.bg_selected) } else { Color32::TRANSPARENT })
-                    .stroke(Stroke::NONE)
-                    .rounding(Rounding::same(7.0))
-                    .min_size(egui::vec2(0.0, 24.0)),
-                );
-                if resp.clicked() && !on {
-                    pick = Some(slots);
-                }
-            }
+        let on = self.hud_slots_view;
+        let label = if filled > 0 { format!("Slots {filled}") } else { "Slots".to_string() };
+        let resp = ui
+            .add(
+                egui::Button::new(
+                    RichText::new(label)
+                        .size(11.5)
+                        .color(if on { rgb(c.accent) } else { rgb(c.subtext) }),
+                )
+                .fill(if on {
+                    rgb(c.accent).gamma_multiply(0.16)
+                } else {
+                    surf(c, c.bg_selected)
+                })
+                .stroke(if on {
+                    Stroke::new(0.8, rgb(c.accent).gamma_multiply(0.6))
+                } else {
+                    Stroke::NONE
+                })
+                .rounding(Rounding::same(7.0))
+                .min_size(egui::vec2(0.0, 22.0)),
+            )
+            .on_hover_text(if on {
+                "Back to the clipboard"
+            } else {
+                "What's in slots 1-9 · ⌘V ×N pastes slot N from any app"
+            });
+        if resp.clicked() {
+            self.hud_slots_view = !on;
             if self.hud_slots_view {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("⌘V ×N pastes slot N")
-                            .size(10.5)
-                            .color(rgb(c.overlay)),
-                    );
-                });
-            }
-        });
-        if let Some(slots) = pick {
-            self.hud_slots_view = slots;
-            if slots {
                 clipd_core::telemetry_event("slot_view", &[("surface", "popover".into())]);
             }
             self.apply_filter();
@@ -5139,6 +5128,8 @@ impl ClipdGui {
                             .id(egui::Id::new("hud_search"))
                             .hint_text(if asking {
                                 "Ask, then press Enter"
+                            } else if self.hud_slots_view {
+                                "Search slots…"
                             } else {
                                 "Search clipboard…"
                             })
@@ -5161,6 +5152,14 @@ impl ClipdGui {
                     {
                         *action = Action::Ask;
                     }
+                    // The Slots toggle lives in the search bar's spare right
+                    // end. As a row of its own it cost a clip row, and the
+                    // popover is for reaching clips in as few moves as possible.
+                    if !asking && !self.popover_settings_open {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.render_hud_slots_toggle(ui, c);
+                        });
+                    }
                 });
             });
 
@@ -5170,11 +5169,6 @@ impl ClipdGui {
         // that carries a second hairline above the footer it reads as ruled
         // paper. Proximity does this job on its own.
         ui.add_space(10.0);
-
-        if !self.in_ask_mode() && !self.popover_settings_open {
-            self.render_hud_view_switch(ui, c);
-            ui.add_space(6.0);
-        }
 
         // The body swaps between three views; the footer belongs to all of
         // them. Returning early here left settings and ask mode with no
