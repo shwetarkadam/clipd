@@ -41,10 +41,7 @@ const SETTINGS_GUTTER_X: f32 = 16.0;
 const SETTINGS_GUTTER_Y: f32 = 14.0;
 // Compact palette by default (mockup proportions — tall, readable, not wide).
 // Double-clicking a row expands to EXPANDED_W with the preview on the right.
-/// The clip list (600) plus the Slots column beside it.
-const COMPACT_W: f32 = 600.0 + SLOT_COLUMN_W;
-/// The main window's Slots column. The preview inspector takes its place.
-const SLOT_COLUMN_W: f32 = 260.0;
+const COMPACT_W: f32 = 600.0;
 const EXPANDED_W: f32 = 980.0;
 const WIN_H: f32 = 740.0;
 const SHELL_ROUND: f32 = 18.0;
@@ -1327,15 +1324,17 @@ fn slots_first(
     (ordered, slot_rows)
 }
 
-/// "⌘V ×2 pastes it", or "⌘V ×2 or ×3 pastes it" for a text in two slots.
+/// "Slot 2 · ⌘V ×2 pastes it", or "Slots 2, 3 · ⌘V ×2 or ×3 pastes it" for
+/// a text in two slots.
 pub(crate) fn slot_paste_keys(slots: &[u8]) -> String {
     let mut keys = slots.iter().map(|n| slot_chord('V', *n));
     let first = keys.next().unwrap_or_default();
     let rest: Vec<String> = slots[1..].iter().map(|n| if *n == 1 { "⌘V".into() } else { format!("×{n}") }).collect();
+    let names: Vec<String> = slots.iter().map(|n| n.to_string()).collect();
     if rest.is_empty() {
-        format!("{first} pastes it")
+        format!("Slot {}  ·  {first} pastes it", names.join(""))
     } else {
-        format!("{first} or {} pastes it", rest.join(" or "))
+        format!("Slots {}  ·  {first} or {} pastes it", names.join(", "), rest.join(" or "))
     }
 }
 
@@ -7318,28 +7317,6 @@ impl eframe::App for ClipdGui {
             self.set_preview_open(ctx, true);
         }
 
-        // ── Slots column, beside the list ──
-        //
-        // What is in each slot, all the time, next to the clips — not behind a
-        // tab, and not cut to a dozen characters in a row of cards. Slot-major:
-        // nine rows, empty ones saying how to fill them, so the column is also
-        // where the gesture is learned. The preview inspector takes its place.
-        if self.active_tab == MainTab::Text && !self.show_preview {
-            egui::SidePanel::right("slot_column")
-                .resizable(false)
-                .exact_width(SLOT_COLUMN_W)
-                .frame(
-                    egui::Frame::none()
-                        .fill(glass_panel_frost(self.theme))
-                        .inner_margin(Margin { left: 12.0, right: 14.0, top: 12.0, bottom: 10.0 })
-                        .rounding(Rounding::same(0.0)),
-                )
-                .show(ctx, |ui| {
-                    paint_panel_glass_gradient(ui, self.theme);
-                    self.render_slot_column(ui, &mut action, &c);
-                });
-        }
-
         // ── Right inspector: on-demand preview (Text tab, toggled with Space) ──
         if self.active_tab == MainTab::Text && self.show_preview {
             egui::SidePanel::right("clip_inspector")
@@ -9345,110 +9322,6 @@ impl ClipdGui {
             self.render_quick_settings(ui, c);
         }
         let _ = c;
-    }
-
-    /// The Slots column: slots 1-9, what each holds and the keys that paste
-    /// it; empty ones say the keys that fill them. Click a filled slot to
-    /// paste it.
-    fn render_slot_column(
-        &mut self,
-        ui: &mut egui::Ui,
-        action: &mut Action,
-        c: &clipd_core::ThemeColors,
-    ) {
-        let rows = self.slot_strip_rows();
-        let spaced: String = "SLOTS"
-            .chars()
-            .map(|ch| ch.to_string())
-            .collect::<Vec<_>>()
-            .join("\u{2009}");
-        ui.label(RichText::new(spaced).size(10.5).strong().color(rgb(c.overlay)));
-        ui.label(
-            RichText::new("⌘C ×N saves · ⌘V ×N pastes, in any app")
-                .size(10.5)
-                .color(rgb(c.overlay).gamma_multiply(0.85)),
-        );
-        ui.add_space(8.0);
-        let mut take: Option<String> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("slot_column")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                for (n, held) in &rows {
-                    let id = egui::Id::new(("slot_column_row", *n));
-                    let hovered = held.is_some()
-                        && ui.ctx().read_response(id).is_some_and(|r| r.hovered());
-                    let frame = egui::Frame::none()
-                        .fill(if hovered { surf(c, c.bg_hover) } else { Color32::TRANSPARENT })
-                        .rounding(Rounding::same(8.0))
-                        .inner_margin(Margin::symmetric(6.0, 5.0))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 10.0;
-                                match held {
-                                    Some(_) => draw_slot_tile(ui, &[*n], false, c),
-                                    None => draw_number_box(ui, &[*n], c),
-                                }
-                                ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 1.0;
-                                    match held {
-                                        Some((_, preview)) => {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(preview)
-                                                        .size(13.0)
-                                                        .color(rgb(c.text)),
-                                                )
-                                                .truncate(),
-                                            );
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{} pastes it",
-                                                    slot_chord('V', *n)
-                                                ))
-                                                .size(10.5)
-                                                .color(rgb(c.subtext)),
-                                            );
-                                        }
-                                        None => {
-                                            ui.label(
-                                                RichText::new("Empty")
-                                                    .size(12.5)
-                                                    .color(rgb(c.overlay)),
-                                            );
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{} saves here",
-                                                    slot_chord('C', *n)
-                                                ))
-                                                .size(10.5)
-                                                .color(rgb(c.overlay).gamma_multiply(0.8)),
-                                            );
-                                        }
-                                    }
-                                });
-                            });
-                        });
-                    let sense = if held.is_some() { egui::Sense::click() } else { egui::Sense::hover() };
-                    let resp = ui.interact(frame.response.rect, id, sense);
-                    if let Some((content, preview)) = held {
-                        let resp = resp.on_hover_text(slot_chip_hint(*n, Some(preview), "paste"));
-                        if resp.clicked() {
-                            take = Some(content.clone());
-                        }
-                    }
-                }
-            });
-        if let Some(content) = take {
-            if let Some(clip_id) = self.clips.iter().find(|clip| clip.content == content).map(|clip| clip.id) {
-                if self.jump_to_clip(clip_id) {
-                    clipd_core::telemetry_event("slot_column", &[("action", "paste".into())]);
-                    *action = Action::Paste;
-                }
-            }
-        }
     }
 
     /// Cached by refresh(); falls back to a scan for a clip not seen yet.
@@ -13881,9 +13754,9 @@ mod slot_strip_tests {
 
     #[test]
     fn a_slotted_row_says_the_keys_that_paste_it() {
-        assert_eq!(slot_paste_keys(&[1]), "⌘V pastes it");
-        assert_eq!(slot_paste_keys(&[4]), "⌘V ×4 pastes it");
-        assert_eq!(slot_paste_keys(&[2, 3]), "⌘V ×2 or ×3 pastes it");
+        assert_eq!(slot_paste_keys(&[1]), "Slot 1  ·  ⌘V pastes it");
+        assert_eq!(slot_paste_keys(&[4]), "Slot 4  ·  ⌘V ×4 pastes it");
+        assert_eq!(slot_paste_keys(&[2, 3]), "Slots 2, 3  ·  ⌘V ×2 or ×3 pastes it");
     }
 
     #[test]
