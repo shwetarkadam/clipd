@@ -1241,6 +1241,59 @@ fn draw_source_tile(ui: &mut egui::Ui, source: &str, c: &clipd_core::ThemeColors
 /// filled rounded tile. The letter repeated what the meta line already says,
 /// and the tile made a plain list look like a grid of buttons. The reference
 /// draws the glyph alone, with nothing behind it.
+/// How recent a copy has to be to sit above the pins, and how many may.
+const FRESH_WINDOW_SECS: i64 = 10 * 60;
+const FRESH_MAX: usize = 3;
+
+/// Clips you touched in the last ten minutes — copied, or starred — moved to
+/// the front, newest touch first, up to three; everything else keeps its
+/// order. Returns the order and how many rows lead.
+///
+/// Starring counts as a touch so a clip you just starred comes to the top,
+/// where you are looking, rather than dropping into the middle of the pins.
+fn fresh_first(
+    indices: &[usize],
+    clips: &[ClipEntry],
+    starred_at: &HashMap<i64, chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<usize>, usize) {
+    let touched = |i: usize| {
+        let clip = &clips[i];
+        match starred_at.get(&clip.id) {
+            Some(at) if *at > clip.timestamp => *at,
+            _ => clip.timestamp,
+        }
+    };
+    let mut fresh: Vec<usize> = indices
+        .iter()
+        .copied()
+        .filter(|&i| (now - touched(i)).num_seconds() <= FRESH_WINDOW_SECS)
+        .collect();
+    fresh.sort_by(|&a, &b| touched(b).cmp(&touched(a)));
+    fresh.truncate(FRESH_MAX);
+    let count = fresh.len();
+    let mut ordered = fresh.clone();
+    ordered.extend(indices.iter().copied().filter(|i| !fresh.contains(i)));
+    (ordered, count)
+}
+
+/// The section a row of the main list belongs to.
+fn row_group(
+    pos: usize,
+    clip: &ClipEntry,
+    starred: bool,
+    in_slots_tab: bool,
+    fresh_rows: usize,
+) -> &'static str {
+    if in_slots_tab {
+        "In slots"
+    } else if pos < fresh_rows {
+        "Just now"
+    } else {
+        clip_group_label(clip, starred)
+    }
+}
+
 /// Rows in slots first, in slot order, then everything else as it was. A text
 /// in two slots is one row; a clip whose text a slotted row already shows is
 /// left out of the rest. Returns the order and how many rows are slots.
@@ -1271,103 +1324,18 @@ fn slots_first(
     (ordered, slot_rows)
 }
 
-/// "⌘V ×2 pastes it", or "⌘V ×2 or ×3 pastes it" for a text in two slots.
+/// "Slot 2 · ⌘V ×2 pastes it", or "Slots 2, 3 · ⌘V ×2 or ×3 pastes it" for
+/// a text in two slots.
 pub(crate) fn slot_paste_keys(slots: &[u8]) -> String {
     let mut keys = slots.iter().map(|n| slot_chord('V', *n));
     let first = keys.next().unwrap_or_default();
     let rest: Vec<String> = slots[1..].iter().map(|n| if *n == 1 { "⌘V".into() } else { format!("×{n}") }).collect();
+    let names: Vec<String> = slots.iter().map(|n| n.to_string()).collect();
     if rest.is_empty() {
-        format!("{first} pastes it")
+        format!("Slot {}  ·  {first} pastes it", names.join(""))
     } else {
-        format!("{first} or {} pastes it", rest.join(" or "))
+        format!("Slots {}  ·  {first} or {} pastes it", names.join(", "), rest.join(" or "))
     }
-}
-
-/// The palette's slot shelf: a header, then one line of cards, each a slot
-/// number and the start of what it holds. Returns the clip id clicked.
-fn draw_slot_shelf(
-    ui: &mut egui::Ui,
-    cards: &[(Vec<u8>, i64, String)],
-    c: &clipd_core::ThemeColors,
-) -> Option<i64> {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        let spaced: String = "IN SLOTS"
-            .chars()
-            .map(|ch| ch.to_string())
-            .collect::<Vec<_>>()
-            .join("\u{2009}");
-        ui.label(RichText::new(spaced).size(10.5).strong().color(rgb(c.overlay)));
-        ui.label(
-            RichText::new("⌘V ×N pastes slot N from any app")
-                .size(10.5)
-                .color(rgb(c.overlay).gamma_multiply(0.8)),
-        );
-    });
-    ui.add_space(6.0);
-    let mut clicked = None;
-    // Up to four cards share the width exactly; more scroll sideways (trackpad
-    // or wheel) with the last one cut at the edge to say so. A scrollbar
-    // under one line of cards is a second line that holds nothing.
-    const GAP: f32 = 8.0;
-    let across = cards.len().clamp(1, 4) as f32;
-    // Less a point for the frames' hairlines, so the fourth card is not cut.
-    let card_w = ((ui.available_width() - GAP * (across - 1.0)) / across).floor() - 1.0;
-    egui::ScrollArea::horizontal()
-        .id_salt("slot_shelf")
-        .auto_shrink([false, true])
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-        .show(ui, |ui| {
-            // Top-aligned: a centred row re-centres as it grows, and each card
-            // landed a few points lower than the one before.
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = GAP;
-                for (slots, clip_id, preview) in cards {
-                    // The tile widens for "2·3"; the text takes what is left.
-                    let tile_w = if slots.len() > 1 { 34.0 } else { 26.0 };
-                    let text_w = (card_w - 16.0 - 8.0 - tile_w).max(40.0);
-                    let resp = egui::Frame::none()
-                        .fill(surf(c, c.bg_elevated))
-                        .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(0.7, rgb(c.border)))
-                        .inner_margin(Margin { left: 6.0, right: 10.0, top: 5.0, bottom: 5.0 })
-                        .show(ui, |ui| {
-                            // Width first, on the frame's own ui; then the row.
-                            ui.set_width(card_w - 16.0);
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                draw_slot_tile(ui, slots, false, c);
-                                ui.allocate_ui(egui::vec2(text_w, 22.0), |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(preview).size(12.5).color(rgb(c.text)),
-                                        )
-                                        .truncate(),
-                                    );
-                                });
-                            });
-                        })
-                        .response;
-                    let resp = ui
-                        .interact(resp.rect, egui::Id::new(("slot_shelf_card", *clip_id)), egui::Sense::click())
-                        .on_hover_text(format!(
-                            "{preview}\nClick to paste · from any app: {}",
-                            slots.iter().map(|n| slot_chord('V', *n)).collect::<Vec<_>>().join(" or ")
-                        ));
-                    if resp.hovered() {
-                        ui.painter().rect_stroke(
-                            resp.rect,
-                            Rounding::same(10.0),
-                            Stroke::new(1.0, rgb(c.accent).gamma_multiply(0.7)),
-                        );
-                    }
-                    if resp.clicked() {
-                        clicked = Some(*clip_id);
-                    }
-                }
-            });
-        });
-    clicked
 }
 
 /// A row's ⋮ menu — Copy, Pin/Unpin, Delete — as (copy, star, delete).
@@ -2698,7 +2666,7 @@ fn save_surface_state(mode: SurfaceMode) {
 
 impl ContentFilter {
     /// Full-GUI filter row — includes Images so screenshots aren't buried.
-    const MAIN: [(ContentFilter, &'static str); 8] = [
+    const MAIN: [(ContentFilter, &'static str); 7] = [
         (ContentFilter::All, "All"),
         (ContentFilter::Links, "Links"),
         (ContentFilter::Text, "Text"),
@@ -2706,7 +2674,6 @@ impl ContentFilter {
         (ContentFilter::Images, "Images"),
         (ContentFilter::ApiKeys, "API keys"),
         (ContentFilter::Favorites, "Pinned"),
-        (ContentFilter::Slots, "Slots"),
     ];
 
     /// Extended set kept for keyboard / settings access (Slots, Files).
@@ -2722,6 +2689,7 @@ impl ContentFilter {
         (ContentFilter::Files, "Files"),
     ];
 }
+
 
 // ── Entry point ──
 
@@ -4173,6 +4141,9 @@ struct ClipdGui {
     collections: Vec<clipd_core::Collection>,
     starred_collection_id: Option<i64>,
     starred_clip_ids: HashSet<i64>,
+    /// When each starred clip was starred — pins list newest-starred first,
+    /// and a clip starred moments ago leads the list (see `fresh_first`).
+    starred_at: HashMap<i64, chrono::DateTime<chrono::Utc>>,
     /// GPU textures for image-clip thumbnails, keyed by clip id. `None` means we
     /// tried to load and failed (missing/corrupt file) — don't retry every frame.
     thumb_textures: std::collections::HashMap<i64, Option<egui::TextureHandle>>,
@@ -4215,10 +4186,21 @@ struct ClipdGui {
     slots_by_content: HashMap<String, Vec<u8>>,
     /// The popover is showing its Slots view instead of the clipboard.
     hud_slots_view: bool,
+    /// How many rows at the top of the list are just-copied clips, set ahead
+    /// of the pins (see `fresh_first`).
+    fresh_rows: usize,
     /// Set when something asked for the keyboard mid-frame.
     want_key_window: bool,
     /// Secret-scan results by clip id, so a reload only scans what is new.
     secret_scan_cache: HashMap<i64, Option<String>>,
+    /// Keyboard-permission state, read at most every couple of seconds. The
+    /// banner and the onboarding card asked on every frame, and each answer
+    /// is a round trip to macOS's privacy daemon (tccd) plus a file read —
+    /// at 60 frames a second, and the window stalled whenever tccd was slow,
+    /// which is exactly when an app's grant has just changed.
+    perm_checked: Option<Instant>,
+    hotkey_status_seen: HotkeyStatus,
+    missing_permission_seen: &'static str,
     /// Whether each clip trips the secret detector, by id. Rows wear the key
     /// glyph from this; scanning ~40 rows' full text on every frame was the
     /// largest cost in drawing the popover.
@@ -4440,6 +4422,7 @@ impl ClipdGui {
             collections: Vec::new(),
             starred_collection_id: None,
             starred_clip_ids: HashSet::new(),
+            starred_at: HashMap::new(),
             thumb_textures: std::collections::HashMap::new(),
             new_collection_name: String::new(),
             new_collection_app: String::new(),
@@ -4456,9 +4439,13 @@ impl ClipdGui {
             masked_clip_ids,
             slots_by_content,
             hud_slots_view: false,
+            fresh_rows: 0,
             want_key_window: false,
             secret_scan_cache,
             sensitive_cache,
+            perm_checked: None,
+            hotkey_status_seen: HotkeyStatus::Ok,
+            missing_permission_seen: "keyboard access",
             last_claim_refresh: Instant::now() - Duration::from_secs(60),
             island: island::IslandState::default(),
             quitting: false,
@@ -4502,13 +4489,9 @@ impl ClipdGui {
             })
             .map(|collection| collection.id);
         if let Some(collection_id) = self.starred_collection_id {
-            self.starred_clip_ids = self
-                .store
-                .collection_items(collection_id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|item| item.clip_id)
-                .collect();
+            let items = self.store.collection_items(collection_id).unwrap_or_default();
+            self.starred_clip_ids = items.iter().map(|item| item.clip_id).collect();
+            self.starred_at = items.iter().map(|item| (item.clip_id, item.added_at)).collect();
         }
     }
 
@@ -4541,9 +4524,11 @@ impl ClipdGui {
                 let _ = self.store.remove_collection_item(collection_id, clip_id);
             }
             self.starred_clip_ids.remove(&clip_id);
+            self.starred_at.remove(&clip_id);
         } else if let Some(collection_id) = self.ensure_starred_collection() {
             let _ = self.store.add_clip_to_collection(collection_id, clip_id);
             self.starred_clip_ids.insert(clip_id);
+            self.starred_at.insert(clip_id, chrono::Utc::now());
         }
         self.refresh_collections();
         self.apply_filter();
@@ -4559,13 +4544,20 @@ impl ClipdGui {
             .and_then(|&i| self.clips.get(i))
             .map(|c| c.id);
 
+        let before: Vec<i64> = self.clips.iter().map(|clip| clip.id).collect();
         self.clips = self.store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
         self.slots_by_content = sync_active_slot_labels(&self.store, &mut self.clips);
         self.masked_clip_ids =
             mask_secret_previews(&mut self.clips, &mut self.secret_scan_cache);
         warm_sensitive_cache(&self.clips, &self.privacy_config, &mut self.sensitive_cache);
         self.sessions = compute_sessions(&self.clips, self.session_config.window_minutes);
-        self.cached_tfidf = None; // invalidate — will be rebuilt lazily on next search
+        // Rebuild the search index only when the clips changed. This runs every
+        // 3s while the window is open, and throwing the index away each time
+        // made the next keystroke — or the refresh itself, mid-search — rebuild
+        // TF-IDF over every loaded clip: a visible hitch every three seconds.
+        if self.clips.iter().map(|clip| clip.id).ne(before.iter().copied()) {
+            self.cached_tfidf = None;
+        }
         self.refresh_snippets();
         self.apply_filter();
 
@@ -5966,8 +5958,40 @@ impl ClipdGui {
 
         // Pinned clips form the first visual section, matching the reference.
         // sort_by_key is stable, so recency is preserved within both groups.
-        self.filtered
-            .sort_by_key(|&i| !self.starred_clip_ids.contains(&self.clips[i].id));
+        // Newest-starred first within the pins; everything else keeps its order
+        // (sort_by is stable). Ordered by copy time instead, a pin you had
+        // just made could land anywhere in the section.
+        {
+            let starred_at = &self.starred_at;
+            let clips = &self.clips;
+            self.filtered.sort_by(|&a, &b| {
+                match (starred_at.get(&clips[a].id), starred_at.get(&clips[b].id)) {
+                    (Some(ta), Some(tb)) => tb.cmp(ta),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
+        }
+        // What you just copied leads, ahead even of pins. With pins first, a
+        // handful of starred clips filled the popover's seven rows and a copy
+        // made seconds ago landed at row six — present, and invisible. Pins
+        // keep their section right below.
+        self.fresh_rows = 0;
+        if content_q.is_empty()
+            && content_filter == ContentFilter::All
+            && !self.show_active_slots_only
+            && !(self.hud && self.hud_slots_view)
+        {
+            let (ordered, fresh) = fresh_first(
+                &self.filtered,
+                &self.clips,
+                &self.starred_at,
+                chrono::Utc::now(),
+            );
+            self.filtered = ordered;
+            self.fresh_rows = fresh;
+        }
         // The popover's Slots view: only what is in slots 1-9, in slot order.
         // A view of its own rather than a section on top, so the clipboard
         // keeps its order — pins first, then newest. Slots hold what you set
@@ -7561,27 +7585,6 @@ impl ClipdGui {
         // Breath between filter row and first section header (mockup rhythm).
         ui.add_space(10.0);
 
-        // What is in each slot, on the first screen, above the list and fixed
-        // there. Behind a tab nobody opens it; as a section of full rows it
-        // would push pins and recents a screen down. One line of cards — the
-        // number and what it holds — costs one row and answers "what's in 2?"
-        // at a glance. All tab only: the others are a search for something.
-        if self.content_filter == ContentFilter::All
-            && self.search_query.trim().is_empty()
-            && !self.in_ask_mode()
-        {
-            let cards = self.slot_shelf_cards();
-            if !cards.is_empty() {
-                if let Some(clip_id) = draw_slot_shelf(ui, &cards, c) {
-                    if self.jump_to_clip(clip_id) {
-                        clipd_core::telemetry_event("slot_shelf", &[("action", "paste".into())]);
-                        *action = Action::Paste;
-                    }
-                }
-                ui.add_space(6.0);
-            }
-        }
-
         let visible_indices = self.filtered.clone();
         let snippets = self.matched_snippets.clone();
 
@@ -7670,21 +7673,18 @@ impl ClipdGui {
                     // The Slots tab is in slot order, so pinned/recent would
                     // split it at random; it is one section.
                     let in_slots_tab = self.content_filter == ContentFilter::Slots;
-                    let group = if in_slots_tab {
-                        "In slots"
-                    } else {
-                        clip_group_label(clip, is_starred)
-                    };
+                    let fresh_rows = self.fresh_rows;
+                    let group =
+                        row_group(display_idx, clip, is_starred, in_slots_tab, fresh_rows);
                     let previous_group = display_idx.checked_sub(1).and_then(|previous| {
                         let previous_clip = self.clips.get(visible_indices[previous])?;
-                        Some(if in_slots_tab {
-                            "In slots"
-                        } else {
-                            clip_group_label(
-                                previous_clip,
-                                self.starred_clip_ids.contains(&previous_clip.id),
-                            )
-                        })
+                        Some(row_group(
+                            previous,
+                            previous_clip,
+                            self.starred_clip_ids.contains(&previous_clip.id),
+                            in_slots_tab,
+                            fresh_rows,
+                        ))
                     });
                     let row_slots: Vec<u8> =
                         self.slots_by_content.get(&clip.content).cloned().unwrap_or_default();
@@ -7718,9 +7718,12 @@ impl ClipdGui {
                     // the rest butt together into a single edge.
                     let next_group = visible_indices.get(display_idx + 1).and_then(|&next| {
                         let next_clip = self.clips.get(next)?;
-                        Some(clip_group_label(
+                        Some(row_group(
+                            display_idx + 1,
                             next_clip,
                             self.starred_clip_ids.contains(&next_clip.id),
+                            in_slots_tab,
+                            fresh_rows,
                         ))
                     });
                     let first_in_group = previous_group != Some(group);
@@ -8460,7 +8463,7 @@ impl ClipdGui {
         settings_section(ui, c, "Advanced");
         settings_card(ui, c, |ui| {
             #[cfg(target_os = "macos")]
-            if load_hotkey_status() == HotkeyStatus::NeedsAccessibility {
+            if self.hotkey_status() == HotkeyStatus::NeedsAccessibility {
                 settings_card_body(ui, |ui| {
                     ui.label(
                         RichText::new("Global shortcuts need keyboard access in System Settings.")
@@ -9281,7 +9284,7 @@ impl ClipdGui {
             self.render_slot_tip(ui, c);
         }
         #[cfg(target_os = "macos")]
-        if !introducing && load_hotkey_status() == HotkeyStatus::NeedsAccessibility {
+        if !introducing && self.hotkey_status() == HotkeyStatus::NeedsAccessibility {
             // Once per window, not once per frame: this draws at 60fps, and
             // the fact worth recording is "someone hit this wall", not how
             // long they sat in front of it. It is the one dead end in clipd
@@ -9310,7 +9313,7 @@ impl ClipdGui {
                         RichText::new(format!(
                             "Enable Clipd under {} in System Settings, in Privacy & Security. \
                              The daemon retries automatically once toggled on.",
-                            clipd_core::missing_keyboard_permission_label()
+                            self.missing_permission()
                         ))
                         .size(10.5)
                         .color(warn_body),
@@ -9340,26 +9343,30 @@ impl ClipdGui {
         let _ = c;
     }
 
-    /// One card per text in slots 1-9, in slot order: (slots, clip id, preview).
-    /// The preview is the clip's own, so a secret is already masked.
-    fn slot_shelf_cards(&self) -> Vec<(Vec<u8>, i64, String)> {
-        let mut cards: Vec<(Vec<u8>, i64, String)> = self
-            .slots_by_content
-            .iter()
-            .filter_map(|(content, slots)| {
-                let clip = self.clips.iter().find(|clip| &clip.content == content)?;
-                let mut preview = one_line_preview(&clip.preview, 80);
-                if preview.is_empty() {
-                    preview = match clip.content_type {
-                        ContentType::Image => "Image".to_string(),
-                        _ => one_line_preview(&clip.content, 80),
-                    };
-                }
-                Some((slots.clone(), clip.id, preview))
-            })
-            .collect();
-        cards.sort_by_key(|(slots, _, _)| slots.first().copied().unwrap_or(u8::MAX));
-        cards
+    /// Re-read the keyboard-permission state if it is more than 2s old.
+    fn refresh_permission_state(&mut self) {
+        const EVERY: Duration = Duration::from_secs(2);
+        if self.perm_checked.is_some_and(|at| at.elapsed() < EVERY) {
+            return;
+        }
+        self.perm_checked = Some(Instant::now());
+        self.hotkey_status_seen = load_hotkey_status();
+        #[cfg(target_os = "macos")]
+        {
+            self.missing_permission_seen = clipd_core::missing_keyboard_permission_label();
+        }
+    }
+
+    /// The daemon's hotkey status, at most 2s old.
+    fn hotkey_status(&mut self) -> HotkeyStatus {
+        self.refresh_permission_state();
+        self.hotkey_status_seen
+    }
+
+    /// Which keyboard permission is missing, at most 2s old.
+    fn missing_permission(&mut self) -> &'static str {
+        self.refresh_permission_state();
+        self.missing_permission_seen
     }
 
     /// Cached by refresh(); falls back to a scan for a clip not seen yet.
@@ -9649,7 +9656,7 @@ impl ClipdGui {
                         // comes back when nothing is missing — a frame before
                         // this step moves on — so name both sections instead.
                         #[cfg(target_os = "macos")]
-                        let missing = match clipd_core::missing_keyboard_permission_label() {
+                        let missing = match self.missing_permission() {
                             "keyboard access" => "Accessibility and Input Monitoring",
                             label => label,
                         };
@@ -12605,10 +12612,11 @@ fn sync_active_slot_labels(
             extras.push(clip);
         }
     }
+    // At the end, not the front: these are older clips kept loaded so their
+    // slot can be shown, and at the front they sat in "Recent" above copies
+    // made minutes ago.
     extras.sort_by_key(|c| c.slot.unwrap_or(u8::MAX));
-    for (i, clip) in extras.into_iter().enumerate() {
-        clips.insert(i, clip);
-    }
+    clips.extend(extras);
     all_slots
 }
 
@@ -13791,9 +13799,9 @@ mod slot_strip_tests {
 
     #[test]
     fn a_slotted_row_says_the_keys_that_paste_it() {
-        assert_eq!(slot_paste_keys(&[1]), "⌘V pastes it");
-        assert_eq!(slot_paste_keys(&[4]), "⌘V ×4 pastes it");
-        assert_eq!(slot_paste_keys(&[2, 3]), "⌘V ×2 or ×3 pastes it");
+        assert_eq!(slot_paste_keys(&[1]), "Slot 1  ·  ⌘V pastes it");
+        assert_eq!(slot_paste_keys(&[4]), "Slot 4  ·  ⌘V ×4 pastes it");
+        assert_eq!(slot_paste_keys(&[2, 3]), "Slots 2, 3  ·  ⌘V ×2 or ×3 pastes it");
     }
 
     #[test]
@@ -13815,6 +13823,54 @@ mod slot_strip_tests {
         // Mirrored to one screen: just the icon's own x, never halved.
         let p = popover_origin_in((1990.0, 12.0), &[egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0))], w).unwrap();
         assert_eq!(p.x, 1990.0 - w / 2.0);
+    }
+
+    #[test]
+    fn a_copy_made_minutes_ago_sits_above_the_pins() {
+        let now = chrono::Utc::now();
+        let mut clips = vec![
+            clip(1, "pinned a", ContentType::Text, 1),
+            clip(2, "pinned b", ContentType::Text, 1),
+            clip(3, "just now", ContentType::Text, 1),
+            clip(4, "a minute ago", ContentType::Text, 1),
+            clip(5, "last week", ContentType::Text, 1),
+        ];
+        clips[0].timestamp = now - chrono::Duration::days(20);
+        clips[1].timestamp = now - chrono::Duration::days(30);
+        clips[2].timestamp = now - chrono::Duration::seconds(5);
+        clips[3].timestamp = now - chrono::Duration::seconds(70);
+        clips[4].timestamp = now - chrono::Duration::days(7);
+        let mut starred: HashMap<i64, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        starred.insert(1, now - chrono::Duration::days(3));
+        starred.insert(2, now - chrono::Duration::days(4));
+        // As apply_filter leaves it: pins first, then newest.
+        let (order, fresh) = fresh_first(&[0, 1, 2, 3, 4], &clips, &starred, now);
+        assert_eq!(fresh, 2);
+        let ids: Vec<i64> = order.iter().map(|&i| clips[i].id).collect();
+        assert_eq!(ids, vec![3, 4, 1, 2, 5]);
+        // Nothing recent: pins stay first.
+        let later = now + chrono::Duration::hours(1);
+        let (order, fresh) = fresh_first(&[0, 1, 2, 3, 4], &clips, &starred, later);
+        assert_eq!(fresh, 0);
+        assert_eq!(order, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_clip_starred_just_now_goes_to_the_top() {
+        let now = chrono::Utc::now();
+        let mut clips = vec![
+            clip(1, "copied a minute ago", ContentType::Text, 1),
+            clip(2, "last week, starred now", ContentType::Text, 1),
+        ];
+        clips[0].timestamp = now - chrono::Duration::seconds(60);
+        clips[1].timestamp = now - chrono::Duration::days(7);
+        let mut starred: HashMap<i64, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        starred.insert(2, now - chrono::Duration::seconds(2));
+        // Pins first (as apply_filter sorts), then the recent copy.
+        let (order, fresh) = fresh_first(&[1, 0], &clips, &starred, now);
+        assert_eq!(fresh, 2);
+        let ids: Vec<i64> = order.iter().map(|&i| clips[i].id).collect();
+        assert_eq!(ids, vec![2, 1], "the star is the newest touch");
     }
 
     #[test]

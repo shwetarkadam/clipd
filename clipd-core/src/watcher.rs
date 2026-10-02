@@ -47,14 +47,17 @@ pub enum ClipEvent {
 
 /// True when the frontmost app is one of clipd's own windows, so the watcher
 /// can ignore its own UI (search text, re-copied clips).
+///
+/// Only the windows with something to copy out of — the palette and the tray
+/// popover, both `clipd-gui`. The tray host (`clipd-ui`) has no text, and it
+/// is frontmost after every launch and whenever its menu opens; matching it
+/// silently dropped every copy made until you clicked another app — including
+/// any made by a script, a background app or a keyboard tool that leaves the
+/// focus where it was.
 fn is_own_ui(app: Option<&str>) -> bool {
     let Some(app) = app else { return false };
     let a = app.to_lowercase();
-    a == "clipd"
-        || a == "clipd-gui"
-        || a == "clipd-ui"
-        || a.starts_with("clipd-")
-        || a == "clipd.app"
+    a == "clipd-gui" || a == "clipd" || a == "clipd.app"
 }
 
 /// Watches the OS clipboard for changes by polling.
@@ -467,6 +470,18 @@ impl Default for ClipWatcher {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_clipds_own_windows_count_as_its_ui() {
+        assert!(super::is_own_ui(Some("clipd-gui")));
+        assert!(super::is_own_ui(Some("Clipd")));
+        // The tray host and the prompt have no text to copy out of.
+        assert!(!super::is_own_ui(Some("clipd-ui")));
+        assert!(!super::is_own_ui(Some("clipd-hud")));
+        assert!(!super::is_own_ui(Some("Brave Browser")));
+        assert!(!super::is_own_ui(None));
+    }
+
     use super::*;
 
     #[test]
