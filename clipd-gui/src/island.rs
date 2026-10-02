@@ -2321,8 +2321,23 @@ impl ClipdGui {
             // Only Enter and Esc are bound, and only while the search field
             // has focus. Everything else here is the pointer.
             let searching = self.island.search.is_some();
+            // A click's answer ("Copied slot 2 — ⌘V to paste") takes the
+            // footer for a few seconds. Without it, a slot click on this view
+            // changed something and said nothing.
+            let note = self
+                .island
+                .status
+                .as_ref()
+                .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
+                .map(|(m, _)| m.clone());
+            if note.is_some() {
+                ui.ctx().request_repaint_after(Duration::from_millis(250));
+            }
+            let note_hint = [("", note.as_deref().unwrap_or(""))];
             let footer: &[(&str, &str)] = if searching {
                 &[("Enter", "Copy first match"), ("Esc", "Close")]
+            } else if note.is_some() {
+                &note_hint
             } else {
                 match self.island.tab {
                     IslandTab::Home => &[("", "Click a clip to copy · drop files to shelve")],
@@ -2552,53 +2567,91 @@ impl ClipdGui {
     /// Status, not a control: the chips are not clickable. Pasting a slot is
     /// a keyboard action and it already has one — inviting a click here would
     /// mean travelling to the notch to do what ⌘V ×4 does from where you are.
+    /// Slots 1-9, as something you can use rather than only read.
+    ///
+    /// This was status only — "status, not a control" — and it hid itself
+    /// until a slot was filled, so the one person it could have helped, a new
+    /// user who has never filled one, never saw it. It now shows from the
+    /// start, and every chip answers: a filled one copies its contents (the
+    /// island's click-to-copy, same as its rows), an empty one takes your
+    /// latest copy, and hovering names the keys that do the same from any app.
     fn island_slot_strip(&mut self, ui: &mut egui::Ui) {
         let s = self.island.skin;
-        let mut filled = [false; 9];
-        for clip in &self.clips {
-            if let Some(n) = clip.slot {
-                if (1..=9).contains(&n) {
-                    filled[(n - 1) as usize] = true;
-                }
-            }
-        }
-        let any = filled.iter().any(|f| *f);
-        self.island.slot_strip_shown = any;
-        if !any {
-            return;
-        }
-
+        // From the slot store, like the palette's strip — clip labels can't
+        // carry two slots that hold the same text.
+        let held = self.slot_strip_rows();
+        self.island.slot_strip_shown = true;
+        let mut take: Option<(u8, String)> = None;
+        let mut fill: Option<u8> = None;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            ui.label(
-                egui::RichText::new("SLOTS")
-                    .size(8.5)
-                    .color(s.faint),
-            );
+            ui.label(egui::RichText::new("SLOTS").size(8.5).color(s.faint));
             ui.add_space(2.0);
-            for (i, on) in filled.iter().enumerate() {
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            for (n, slot) in &held {
+                let on = slot.is_some();
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+                let hot = resp.hovered();
                 let painter = ui.painter();
                 painter.rect_filled(
                     rect,
                     Rounding::same(4.0),
-                    if *on { s.ink.gamma_multiply(0.16) } else { Color32::TRANSPARENT },
+                    match (on, hot) {
+                        (true, true) => s.ink.gamma_multiply(0.32),
+                        (true, false) => s.ink.gamma_multiply(0.16),
+                        (false, true) => s.ink.gamma_multiply(0.08),
+                        (false, false) => Color32::TRANSPARENT,
+                    },
                 );
                 painter.rect_stroke(
                     rect,
                     Rounding::same(4.0),
-                    Stroke::new(0.8, if *on { s.line } else { s.line.gamma_multiply(0.45) }),
+                    Stroke::new(0.8, if on || hot { s.line } else { s.line.gamma_multiply(0.45) }),
                 );
                 painter.text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    format!("{}", i + 1),
+                    format!("{n}"),
                     egui::FontId::proportional(9.5),
-                    if *on { s.ink } else { s.faint },
+                    if on { s.ink } else { s.faint },
                 );
+                let preview = slot.as_ref().map(|(_, preview)| preview.as_str());
+                let resp = resp
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(super::slot_chip_hint(*n, preview, "copy"));
+                if resp.clicked() {
+                    match slot {
+                        Some((content, _)) => take = Some((*n, content.clone())),
+                        None => fill = Some(*n),
+                    }
+                }
             }
         });
+        if let Some((n, content)) = take {
+            // A loaded clip with this content knows if it is an image or a file;
+            // otherwise it is text, and goes on the clipboard as is.
+            let copied = match self.clips.iter().find(|clip| clip.content == content).cloned() {
+                Some(clip) => self.island_copy(&clip),
+                None => self.set_clipboard(&content),
+            };
+            clipd_core::telemetry_event("slot_strip", &[("action", "copy".into())]);
+            self.island.note(if copied {
+                format!("Copied slot {n} — ⌘V to paste")
+            } else {
+                "Couldn't copy that slot".to_string()
+            });
+        }
+        if let Some(n) = fill {
+            match super::latest_text_copy(&self.clips).map(|c| c.content.clone()) {
+                Some(text) if super::save_to_slot(n, &text) => {
+                    clipd_core::telemetry_event("slot_strip", &[("action", "fill".into())]);
+                    self.refresh();
+                    self.island.note(format!("Saved to slot {n} · next time, {} does it", super::slot_chord('C', n)));
+                }
+                Some(_) => self.island.note("Couldn't save to that slot"),
+                None => self.island.note("Copy something first, then click a slot"),
+            }
+        }
         ui.add_space(6.0);
     }
 
@@ -4143,7 +4196,7 @@ pub(crate) fn truncate(text: &str, max: usize) -> String {
 /// revisits them, so granting the permission while clipd is running does
 /// nothing until it is restarted. That is the step people miss — they grant
 /// it, nothing changes, and it looks like the grant didn't work.
-fn restart_tray_host() {
+pub(crate) fn restart_tray_host() {
     #[cfg(unix)]
     if let Some(pid) = clipd_core::daemon_lock_pid() {
         if pid != std::process::id() {

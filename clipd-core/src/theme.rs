@@ -48,10 +48,14 @@ pub enum Theme {
     CompactCapsule,
     /// Catppuccin Mocha — the island's own palette, for the rest of clipd.
     Catppuccin,
+    /// Mono — near-black, grey hairlines, white ink, no colour at all. The
+    /// main window also lays itself out flat under it: one-line rows on the
+    /// base, ruled apart, actions only under the pointer.
+    Mono,
 }
 
 impl Theme {
-    pub const ALL: [Theme; 9] = [
+    pub const ALL: [Theme; 10] = [
         Theme::System,
         Theme::Light,
         Theme::Dark,
@@ -61,6 +65,7 @@ impl Theme {
         Theme::Slate,
         Theme::CompactCapsule,
         Theme::Catppuccin,
+        Theme::Mono,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -74,6 +79,7 @@ impl Theme {
             Theme::Slate => "Slate",
             Theme::CompactCapsule => "Compact Capsule",
             Theme::Catppuccin => "Catppuccin",
+            Theme::Mono => "Mono",
         }
     }
 
@@ -87,7 +93,8 @@ impl Theme {
             Theme::Forest => Theme::Slate,
             Theme::Slate => Theme::CompactCapsule,
             Theme::CompactCapsule => Theme::Catppuccin,
-            Theme::Catppuccin => Theme::System,
+            Theme::Catppuccin => Theme::Mono,
+            Theme::Mono => Theme::System,
         }
     }
 
@@ -102,11 +109,17 @@ impl Theme {
             Theme::Slate => SLATE,
             Theme::CompactCapsule => COMPACT_CAPSULE,
             Theme::Catppuccin => CATPPUCCIN,
+            Theme::Mono => MONO,
         }
     }
 
     pub fn is_light(&self) -> bool {
         matches!(self, Theme::Light)
+    }
+
+    /// The flat, ruled main-window layout that goes with Mono.
+    pub fn is_flat(&self) -> bool {
+        matches!(self, Theme::Mono)
     }
 
     /// True for frosted translucent shells (Glass Light / Glass Dark).
@@ -240,6 +253,29 @@ const DARK: ThemeColors = ThemeColors {
     url: Rgb(160, 160, 160),
     email: Rgb(160, 160, 160),
     path: Rgb(160, 160, 160),
+};
+
+/// Mono — the near-black of a terminal-style dark UI: one step between base,
+/// row and selection, grey hairlines doing the separating, and ink that is
+/// white or grey, never tinted. Selection is a fill, not a colour.
+const MONO: ThemeColors = ThemeColors {
+    bg_base: Rgb(10, 10, 10),
+    bg_surface: Rgb(14, 14, 14),
+    bg_elevated: Rgb(18, 18, 18),
+    bg_selected: Rgb(28, 28, 29),
+    bg_hover: Rgb(21, 21, 22),
+    accent: Rgb(237, 237, 237),
+    accent2: Rgb(161, 161, 161),
+    text: Rgb(250, 250, 250),
+    subtext: Rgb(161, 161, 161),
+    overlay: Rgb(115, 115, 115),
+    green: Rgb(237, 237, 237),
+    border: Rgb(38, 38, 38),
+    surface_alpha: 255,
+    code: Rgb(161, 161, 161),
+    url: Rgb(161, 161, 161),
+    email: Rgb(161, 161, 161),
+    path: Rgb(161, 161, 161),
 };
 
 // ---------------------------------------------------------------------------
@@ -1017,7 +1053,7 @@ mod tests {
         let glass_light: Theme =
             serde_json::from_str("\"GlassLight\"").expect("GlassLight still parses");
         assert_eq!(glass_light, Theme::Light);
-        assert_eq!(Theme::ALL.len(), 9);
+        assert_eq!(Theme::ALL.len(), 10);
         // Nothing in the list still calls itself by a retired name. Glass Dark
         // is off this list: it is a theme again, not a tombstone.
         for theme in Theme::ALL {

@@ -16,26 +16,43 @@ fn anchor_path() -> PathBuf {
         .join("tray_anchor")
 }
 
-/// Record the horizontal centre of the tray icon, in screen points.
-pub fn save_tray_anchor(center_x: f64) {
+/// Record the tray icon's centre, in global screen points with the origin at
+/// the top-left of the primary display (egui's space).
+///
+/// `y` says which display the icon is on. With only `x`, a popover could tell
+/// where along a menu bar to sit but not *which* menu bar — and on a monitor
+/// stacked above or below the laptop the two share the same x range.
+pub fn save_tray_anchor(center_x: f64, y: Option<f64>) {
     let path = anchor_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, format!("{:.1}", center_x));
+    let line = match y {
+        Some(y) => format!("{:.1} {:.1}", center_x, y),
+        None => format!("{:.1}", center_x),
+    };
+    let _ = std::fs::write(path, line);
 }
 
-/// The last known tray-icon centre, if one was ever recorded.
+/// The last known tray-icon centre x, if one was ever recorded.
 ///
 /// `None` on a fresh install (the icon has not been hovered or clicked yet) —
 /// callers should fall back to centring on screen rather than guessing.
 pub fn load_tray_anchor() -> Option<f64> {
-    std::fs::read_to_string(anchor_path())
-        .ok()?
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|x| x.is_finite() && *x >= 0.0)
+    load_tray_point().map(|(x, _)| x)
+}
+
+/// The last known tray-icon point: x, and y when it was recorded (older files
+/// hold only x).
+pub fn load_tray_point() -> Option<(f64, Option<f64>)> {
+    parse_tray_point(&std::fs::read_to_string(anchor_path()).ok()?)
+}
+
+fn parse_tray_point(text: &str) -> Option<(f64, Option<f64>)> {
+    let mut parts = text.split_whitespace();
+    let x = parts.next()?.parse::<f64>().ok().filter(|x| x.is_finite())?;
+    let y = parts.next().and_then(|y| y.parse::<f64>().ok()).filter(|y| y.is_finite());
+    Some((x, y))
 }
 
 #[cfg(test)]
@@ -49,6 +66,15 @@ mod tests {
             "".trim().parse::<f64>().ok().filter(|x: &f64| *x >= 0.0),
             None
         );
+    }
+
+    #[test]
+    fn a_point_round_trips_and_old_files_still_read() {
+        assert_eq!(super::parse_tray_point("1512.0 12.0"), Some((1512.0, Some(12.0))));
+        assert_eq!(super::parse_tray_point("1280.5"), Some((1280.5, None)));
+        // A display to the left of the primary has negative x.
+        assert_eq!(super::parse_tray_point("-900.0 -1080.0"), Some((-900.0, Some(-1080.0))));
+        assert_eq!(super::parse_tray_point("junk"), None);
     }
 
     #[test]

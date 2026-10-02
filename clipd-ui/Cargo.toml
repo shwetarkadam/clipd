@@ -30,5 +30,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSRunningApplication",
     # Reading the notch, so the status item can be pushed clear of it.
     "NSScreen",
+    # Where the pointer is, in points — to anchor the popover under the icon.
+    "NSEvent",
 ] }
 objc2-foundation = { version = "0.3", features = ["NSString"] }

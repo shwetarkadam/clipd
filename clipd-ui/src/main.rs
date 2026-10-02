@@ -648,9 +648,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // does not make macOS grant the permission any faster.
     #[cfg(target_os = "macos")]
     let keyboard_granted_before_prompt = clipd_core::keyboard_permissions_granted();
+    //
+    // Except for someone the slot introduction is still for. Until now a new
+    // user's first sight of clipd was System Settings flying open by itself
+    // plus a caution-icon dialog listing two privacy toggles — before they had
+    // copied anything or knew what the permission was for. privacy.md: avoid
+    // asking at launch; ask when the person can see why. The introduction's
+    // second step asks, with the reason on screen, so the cold prompt stands
+    // down while it is pending.
     #[cfg(target_os = "macos")]
-    let should_offer_keyboard_setup =
-        !keyboard_granted_before_prompt && claim_keyboard_permission_offer();
+    let introduction = slot_introduction_state();
+    #[cfg(target_os = "macos")]
+    let should_offer_keyboard_setup = !introduction.asks_for_permission
+        && !keyboard_granted_before_prompt
+        && claim_keyboard_permission_offer();
     #[cfg(target_os = "macos")]
     let keyboard_granted = if should_offer_keyboard_setup {
         clipd_core::request_keyboard_permissions()
@@ -719,6 +730,17 @@ Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi
                 clipd_core::missing_keyboard_permission_label()
             );
         }
+    }
+
+    // Open clipd once for a new user, so the introduction is actually seen.
+    // A menu-bar app with no window otherwise shows nothing on first launch
+    // but an icon, and the people who most need the introduction are the
+    // ones who would never open the palette to find it. Exactly once: the
+    // palette records that it has been presented.
+    #[cfg(target_os = "macos")]
+    if introduction.open_palette_once {
+        log::info!("First launch: opening clipd once to introduce slots");
+        open_gui_search();
     }
 
     // Tray-only startup. The clipboard surface only appears when the user
@@ -839,9 +861,7 @@ Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi
                 }
                 match tray_ev {
                     TrayIconEvent::Enter { rect, position, .. } => {
-                        clipd_core::save_tray_anchor(logical_tray_anchor(
-                            &rect, position.x, tray_scale,
-                        ));
+                        save_anchor_from_tray_event(&rect, position.x, tray_scale);
                         // Pointer entered the tray icon — show the HUD
                         // immediately (no delay — the user is clearly here).
                         hover_entered_at = None;
@@ -861,9 +881,7 @@ Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi
                         // Refresh anchor while moving over the icon. Don't
                         // re-send "show" — that would reset the HUD each time
                         // and cause flicker.
-                        clipd_core::save_tray_anchor(logical_tray_anchor(
-                            &rect, position.x, tray_scale,
-                        ));
+                        save_anchor_from_tray_event(&rect, position.x, tray_scale);
                     }
                     TrayIconEvent::Click {
                         button,
@@ -872,9 +890,7 @@ Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi
                         position,
                         ..
                     } if matches!(button_state, MouseButtonState::Down | MouseButtonState::Up) => {
-                        clipd_core::save_tray_anchor(logical_tray_anchor(
-                            &rect, position.x, tray_scale,
-                        ));
+                        save_anchor_from_tray_event(&rect, position.x, tray_scale);
                         // The two buttons do opposite things, so they must not
                         // share a code path:
                         //   left  — open the full clipboard palette (not a
@@ -1302,6 +1318,56 @@ fn hud_currently_visible() -> bool {
 /// tray-icon reports a physical rect. A real status item is ~22pt wide; if
 /// the rect is much larger (a full-bar window, a zero-size one) the centre
 /// is meaningless and we use the cursor, which is on the icon.
+/// Record where the icon is, for the popover to sit under.
+///
+/// On macOS this reads the pointer — which is on the icon, since a tray event
+/// is what called this — in points, in the global space, on whatever display
+/// it is. The tray rect comes in *physical* pixels, and converting it needs
+/// the scale of the display the icon is on *now*: a factor read once at launch
+/// went stale the moment a Retina MacBook (2x) switched to mirroring a 1x
+/// monitor, halving every x and parking the popover mid-screen.
+fn save_anchor_from_tray_event(rect: &tray_icon::Rect, cursor_x: f64, launch_scale: f64) {
+    #[cfg(target_os = "macos")]
+    if let Some((x, y)) = pointer_anchor(rect) {
+        clipd_core::save_tray_anchor(x, Some(y));
+        return;
+    }
+    clipd_core::save_tray_anchor(logical_tray_anchor(rect, cursor_x, launch_scale), None);
+}
+
+/// The icon's centre as (x, y) in egui's global points (top-left origin at the
+/// primary display's top). x snaps to the rect's centre when the rect, scaled
+/// by the pointer's own display, agrees with the pointer; otherwise the
+/// pointer itself.
+#[cfg(target_os = "macos")]
+fn pointer_anchor(rect: &tray_icon::Rect) -> Option<(f64, f64)> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSEvent, NSScreen};
+    let mtm = MainThreadMarker::new()?;
+    let mouse = NSEvent::mouseLocation();
+    let screens = NSScreen::screens(mtm);
+    if screens.count() == 0 {
+        return None;
+    }
+    let primary = screens.objectAtIndex(0).frame();
+    let primary_top = primary.origin.y + primary.size.height;
+    let scale = (0..screens.count())
+        .map(|i| screens.objectAtIndex(i))
+        .find(|s| {
+            let f = s.frame();
+            mouse.x >= f.origin.x
+                && mouse.x < f.origin.x + f.size.width
+                && mouse.y >= f.origin.y
+                && mouse.y <= f.origin.y + f.size.height
+        })
+        .map(|s| s.backingScaleFactor())
+        .filter(|s| *s > 0.0)
+        .unwrap_or(1.0);
+    let centre = (rect.position.x + f64::from(rect.size.width) / 2.0) / scale;
+    let x = if (centre - mouse.x).abs() <= 24.0 { centre } else { mouse.x };
+    Some((x, primary_top - mouse.y))
+}
+
 fn logical_tray_anchor(rect: &tray_icon::Rect, cursor_x: f64, scale: f64) -> f64 {
     let scale = if scale > 0.0 { scale } else { 1.0 };
     let width = f64::from(rect.size.width) / scale;
@@ -1698,6 +1764,34 @@ fn daemon_log_path() -> PathBuf {
     };
     let _ = std::fs::create_dir_all(&logs_dir);
     logs_dir.join("clipd-ui-daemon.log")
+}
+
+/// Where the slot introduction stands, as far as launch needs to know.
+#[cfg(target_os = "macos")]
+struct SlotIntroduction {
+    /// The introduction is pending and will ask for keyboard access itself.
+    asks_for_permission: bool,
+    /// It has never been shown: open the palette once at launch.
+    open_palette_once: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn slot_introduction_state() -> SlotIntroduction {
+    let settings = load_paste_transform_settings();
+    // Someone already filling slots 2-9 found the feature on their own;
+    // they get neither the window nor the change in how access is asked for.
+    let used: Vec<u8> = clipd_core::SlotManager::persistent_default()
+        .map(|slots| {
+            (2..=9u8)
+                .filter(|n| matches!(slots.get_slot(*n), Ok(Some(_))))
+                .collect()
+        })
+        .unwrap_or_default();
+    let pending = clipd_core::slot_onboarding_due(&settings, &used);
+    SlotIntroduction {
+        asks_for_permission: pending,
+        open_palette_once: pending && !settings.slots_onboarding_presented,
+    }
 }
 
 /// Claim the one automatic keyboard-permission offer for this Clipd version.
