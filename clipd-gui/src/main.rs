@@ -4061,9 +4061,8 @@ struct ClipdGui {
     /// Every slot each text is in. `ClipEntry.slot` holds one; the same text
     /// in slots 2 and 3 is one clip, and its row should say both.
     slots_by_content: HashMap<String, Vec<u8>>,
-    /// How many rows at the top of the popover's list are slots (0 when the
-    /// list is a search or a filter, which keep their own order).
-    hud_slot_rows: usize,
+    /// The popover is showing its Slots view instead of the clipboard.
+    hud_slots_view: bool,
     /// Set when something asked for the keyboard mid-frame.
     want_key_window: bool,
     /// Secret-scan results by clip id, so a reload only scans what is new.
@@ -4295,7 +4294,7 @@ impl ClipdGui {
             hud_watcher_started: false,
             masked_clip_ids,
             slots_by_content,
-            hud_slot_rows: 0,
+            hud_slots_view: false,
             want_key_window: false,
             secret_scan_cache,
             last_claim_refresh: Instant::now() - Duration::from_secs(60),
@@ -4688,6 +4687,11 @@ impl ClipdGui {
     /// instant appearance to avoid macOS window resize glitching.
     fn show_hud_onscreen(&mut self, ctx: &egui::Context) {
         self.hud_expanded = true;
+        // Every opening starts on the clipboard; Slots is a place you go.
+        if self.hud_slots_view {
+            self.hud_slots_view = false;
+            self.apply_filter();
+        }
         // This process lives across hovers, so what it decided last time can
         // be stale: the introduction may have been finished or skipped in the
         // palette since. Keep an exercise that is under way; otherwise decide
@@ -5056,6 +5060,58 @@ impl ClipdGui {
         let _ = action;
     }
 
+    /// Clipboard | Slots, under the search field. The clipboard view keeps
+    /// its own order (pins, then newest); Slots lists what is in slots 1-9.
+    fn render_hud_view_switch(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        let filled: usize = self.slots_by_content.values().map(Vec::len).sum();
+        let mut pick = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.add_space(4.0);
+            let tabs = [
+                (false, "Clipboard".to_string()),
+                (
+                    true,
+                    if filled > 0 { format!("Slots  {filled}") } else { "Slots".to_string() },
+                ),
+            ];
+            for (slots, label) in tabs {
+                let on = self.hud_slots_view == slots;
+                let resp = ui.add(
+                    egui::Button::new(
+                        RichText::new(label)
+                            .size(12.0)
+                            .color(if on { rgb(c.text) } else { rgb(c.subtext) }),
+                    )
+                    .fill(if on { surf(c, c.bg_selected) } else { Color32::TRANSPARENT })
+                    .stroke(Stroke::NONE)
+                    .rounding(Rounding::same(7.0))
+                    .min_size(egui::vec2(0.0, 24.0)),
+                );
+                if resp.clicked() && !on {
+                    pick = Some(slots);
+                }
+            }
+            if self.hud_slots_view {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("⌘V ×N pastes slot N")
+                            .size(10.5)
+                            .color(rgb(c.overlay)),
+                    );
+                });
+            }
+        });
+        if let Some(slots) = pick {
+            self.hud_slots_view = slots;
+            if slots {
+                clipd_core::telemetry_event("slot_view", &[("surface", "popover".into())]);
+            }
+            self.apply_filter();
+        }
+    }
+
     fn render_hud_expanded(
         &mut self,
         ui: &mut egui::Ui,
@@ -5115,6 +5171,11 @@ impl ClipdGui {
         // paper. Proximity does this job on its own.
         ui.add_space(10.0);
 
+        if !self.in_ask_mode() && !self.popover_settings_open {
+            self.render_hud_view_switch(ui, c);
+            ui.add_space(6.0);
+        }
+
         // The body swaps between three views; the footer belongs to all of
         // them. Returning early here left settings and ask mode with no
         // visible way back — the gear that toggles them lives in the footer.
@@ -5150,11 +5211,29 @@ impl ClipdGui {
                 if self.filtered.is_empty() {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(
-                            RichText::new("Nothing here yet — copy something.")
+                        if self.hud_slots_view && self.search_query.is_empty() {
+                            ui.label(
+                                RichText::new("No slots yet")
+                                    .size(12.5)
+                                    .color(rgb(c.text)),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("Press ⌘C twice to copy into slot 2,\nthree times for slot 3.")
+                                    .size(11.5)
+                                    .color(rgb(c.subtext)),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(if self.hud_slots_view {
+                                    "No slot matches that."
+                                } else {
+                                    "Nothing here yet — copy something."
+                                })
                                 .size(12.0)
                                 .color(rgb(c.subtext)),
-                        );
+                            );
+                        }
                     });
                     return;
                 }
@@ -5206,30 +5285,9 @@ impl ClipdGui {
                 // Ruled rows that share edges, so the list reads as one sheet.
                 let row_count = rows.len();
                 ui.spacing_mut().item_spacing.y = 0.0;
-                let slot_rows = self.hud_slot_rows.min(row_count);
                 for (pos, (_idx, clip_id, preview, _app, time, slots, kind, sensitive)) in
                     rows.into_iter().enumerate()
                 {
-                    // Two quiet captions, only when there are slots to set apart.
-                    if slot_rows > 0 && (pos == 0 || pos == slot_rows) {
-                        ui.add_space(if pos == 0 { 2.0 } else { 10.0 });
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            ui.label(
-                                RichText::new(if pos == 0 { "IN SLOTS" } else { "RECENT" })
-                                    .size(10.0)
-                                    .color(rgb(c.overlay)),
-                            );
-                            if pos == 0 {
-                                ui.label(
-                                    RichText::new("· ⌘V ×N pastes slot N")
-                                        .size(10.0)
-                                        .color(rgb(c.overlay).gamma_multiply(0.75)),
-                                );
-                            }
-                        });
-                        ui.add_space(4.0);
-                    }
                     let selected = self.selected == pos;
                     let starred = self.starred_clip_ids.contains(&clip_id);
                     let mut star_clicked = false;
@@ -5761,20 +5819,15 @@ impl ClipdGui {
         // sort_by_key is stable, so recency is preserved within both groups.
         self.filtered
             .sort_by_key(|&i| !self.starred_clip_ids.contains(&self.clips[i].id));
-        // The popover leads with what is in the slots, ahead even of pins.
-        // Slots hold what you set aside on purpose, so they are usually not
-        // your latest copies: in date order they sat a hundred rows down, past
-        // the end of the list, and nothing on screen said which slot held what.
-        self.hud_slot_rows = 0;
-        if self.hud
-            && content_q.is_empty()
-            && content_filter == ContentFilter::All
-            && !self.show_active_slots_only
-        {
-            let (ordered, slot_rows) =
+        // The popover's Slots view: only what is in slots 1-9, in slot order.
+        // A view of its own rather than a section on top, so the clipboard
+        // keeps its order — pins first, then newest. Slots hold what you set
+        // aside on purpose, which in date order sat a hundred rows down.
+        if self.hud && self.hud_slots_view {
+            let (mut ordered, slot_rows) =
                 slots_first(&self.filtered, &self.clips, &self.slots_by_content);
+            ordered.truncate(slot_rows);
             self.filtered = ordered;
-            self.hud_slot_rows = slot_rows;
         }
         // Top result is selected so Enter pastes the best match immediately.
         self.selected = 0;
