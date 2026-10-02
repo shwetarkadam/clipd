@@ -4021,6 +4021,10 @@ struct ClipdGui {
     want_key_window: bool,
     /// Secret-scan results by clip id, so a reload only scans what is new.
     secret_scan_cache: HashMap<i64, Option<String>>,
+    /// Whether each clip trips the secret detector, by id. Rows wear the key
+    /// glyph from this; scanning ~40 rows' full text on every frame was the
+    /// largest cost in drawing the popover.
+    sensitive_cache: HashMap<i64, bool>,
     /// Last time this window renewed its on-screen claim.
     last_claim_refresh: Instant,
     /// Island configuration, live readings and shelf. Present in every process
@@ -4136,6 +4140,11 @@ impl ClipdGui {
         let slots_by_content = sync_active_slot_labels(&store, &mut clips);
         let mut secret_scan_cache: HashMap<i64, Option<String>> = HashMap::new();
         let masked_clip_ids = mask_secret_previews(&mut clips, &mut secret_scan_cache);
+        // Warm now, not on the first refresh: a parked popover skips refresh
+        // but still lays out its rows, and every miss is a full-text scan.
+        let privacy_config = load_privacy_config();
+        let mut sensitive_cache = HashMap::new();
+        warm_sensitive_cache(&clips, &privacy_config, &mut sensitive_cache);
         let count = clips.len();
         let session_config = SessionConfig::default();
         let sessions = compute_sessions(&clips, session_config.window_minutes);
@@ -4216,7 +4225,7 @@ impl ClipdGui {
             transforms: paste_transforms(),
             paste_settings: load_paste_transform_settings(),
             cached_tfidf: None,
-            privacy_config: load_privacy_config(),
+            privacy_config,
             sessions,
             session_config,
             active_tab: if open_settings {
@@ -4251,6 +4260,7 @@ impl ClipdGui {
             hud_slots_view: false,
             want_key_window: false,
             secret_scan_cache,
+            sensitive_cache,
             last_claim_refresh: Instant::now() - Duration::from_secs(60),
             island: island::IslandState::default(),
             quitting: false,
@@ -4355,6 +4365,7 @@ impl ClipdGui {
         self.slots_by_content = sync_active_slot_labels(&self.store, &mut self.clips);
         self.masked_clip_ids =
             mask_secret_previews(&mut self.clips, &mut self.secret_scan_cache);
+        warm_sensitive_cache(&self.clips, &self.privacy_config, &mut self.sensitive_cache);
         self.sessions = compute_sessions(&self.clips, self.session_config.window_minutes);
         self.cached_tfidf = None; // invalidate — will be rebuilt lazily on next search
         self.refresh_snippets();
@@ -5225,7 +5236,7 @@ impl ClipdGui {
                             relative_time_short(&clip.timestamp),
                             self.slots_by_content.get(&clip.content).cloned().unwrap_or_default(),
                             clip.content_type.clone(),
-                            !detect_sensitive(&clip.content, &self.privacy_config).is_empty(),
+                            self.is_sensitive(clip),
                         )
                     })
                     .collect();
@@ -7604,7 +7615,7 @@ impl ClipdGui {
                         .filter(|source| !source.trim().is_empty())
                         .unwrap_or(content_type_label(&clip.content_type));
                     let is_sensitive =
-                        !detect_sensitive(&clip.content, &self.privacy_config).is_empty();
+                        self.is_sensitive(clip);
                     let thumb_tex = if is_image {
                         self.thumb_textures.get(&clip_id_value).cloned().flatten()
                     } else {
@@ -9066,8 +9077,28 @@ impl ClipdGui {
         let _ = c;
     }
 
+    /// Cached by refresh(); falls back to a scan for a clip not seen yet.
+    fn is_sensitive(&self, clip: &ClipEntry) -> bool {
+        self.sensitive_cache
+            .get(&clip.id)
+            .copied()
+            .unwrap_or_else(|| !detect_sensitive(&clip.content, &self.privacy_config).is_empty())
+    }
+
+    /// Slots 1-9 as (slot, text), from the map refresh() keeps. These are
+    /// drawn every frame, so they must not query the database each time.
+    fn active_slots_cached(&self) -> Vec<(u8, String)> {
+        let mut active: Vec<(u8, String)> = self
+            .slots_by_content
+            .iter()
+            .flat_map(|(content, slots)| slots.iter().map(move |n| (*n, content.clone())))
+            .collect();
+        active.sort_by_key(|(n, _)| *n);
+        active
+    }
+
     fn slot_strip_rows(&self) -> Vec<(u8, Option<(String, String)>)> {
-        let active = self.store.list_active_slots().unwrap_or_default();
+        let active = self.active_slots_cached();
         let privacy = &self.privacy_config;
         strip_rows_from_store(&active, &self.clips, |text| {
             clipd_core::redacted_display(text, privacy)
@@ -9119,7 +9150,7 @@ impl ClipdGui {
     /// same reason the strip reads it: clip labels cannot represent two slots
     /// holding the same text.
     fn slot_contents(&self) -> Vec<(u8, String)> {
-        self.store.list_active_slots().unwrap_or_default()
+        self.active_slots_cached()
     }
 
     /// The slot introduction. Returns whether it drew anything.
@@ -12191,6 +12222,23 @@ impl ClipdGui {
 ///
 /// A clip's content never changes once stored, so a result keyed by id stays
 /// correct for the life of the process.
+/// Record, by id, whether each clip trips the secret detector. A clip's text
+/// never changes once stored, so an entry stays right for the process's life.
+fn warm_sensitive_cache(
+    clips: &[ClipEntry],
+    privacy: &clipd_core::PrivacyConfig,
+    cache: &mut HashMap<i64, bool>,
+) {
+    if cache.len() > MAX_LOADED_CLIPS * 4 {
+        cache.clear();
+    }
+    for clip in clips {
+        cache
+            .entry(clip.id)
+            .or_insert_with(|| !detect_sensitive(&clip.content, privacy).is_empty());
+    }
+}
+
 fn mask_secret_previews(
     clips: &mut [ClipEntry],
     cache: &mut HashMap<i64, Option<String>>,
