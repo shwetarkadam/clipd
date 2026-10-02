@@ -157,6 +157,12 @@ pub fn looks_like_password(content: &str) -> bool {
     if is_all_hex(t) || is_uuid(t) {
         return false;
     }
+    // Addresses are mixed by construction — letters, digits and `/ . @ :` —
+    // so "three character classes" called nearly every link and email a
+    // password, and each copy popped a "Save this password?" prompt.
+    if looks_like_address(t) {
+        return false;
+    }
     let has_lower = t.chars().any(|c| c.is_ascii_lowercase());
     let has_upper = t.chars().any(|c| c.is_ascii_uppercase());
     let has_digit = t.chars().any(|c| c.is_ascii_digit());
@@ -168,6 +174,41 @@ pub fn looks_like_password(content: &str) -> bool {
     // ≥3 of {lower, upper, digit, symbol} → mixed enough to be a generated
     // password, while plain words, numbers, and slugs stay out.
     classes >= 3
+}
+
+/// A link, an email address, a domain or a file path: text with a shape of
+/// its own that a generated password does not have.
+fn looks_like_address(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    if lower.contains("://") || lower.starts_with("www.") || lower.starts_with("mailto:") {
+        return true;
+    }
+    // Paths: absolute, home-relative, or several segments deep.
+    if s.starts_with('/') || s.starts_with("~/") || s.starts_with("./") || s.matches('/').count() >= 2 {
+        return true;
+    }
+    // name@host.tld
+    if let Some((local, host)) = s.split_once('@') {
+        if !local.is_empty() && !host.contains('@') && looks_like_domain(host) {
+            return true;
+        }
+    }
+    // example.com, example.com/path
+    let host = s.split('/').next().unwrap_or(s);
+    looks_like_domain(host)
+}
+
+/// labels of letters, digits and hyphens joined by dots, ending in an
+/// all-letter TLD of two or more: `linkedin.com`, `mail.example.co.uk`.
+fn looks_like_domain(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    labels.len() >= 2
+        && labels
+            .iter()
+            .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        && labels
+            .last()
+            .is_some_and(|tld| tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()))
 }
 
 fn is_all_hex(s: &str) -> bool {
@@ -531,6 +572,17 @@ mod tests {
         assert!(!looks_like_password("550e8400-e29b-41d4-a716-446655440000"));
         // Too long (likely a token/blob, caught by prefix detectors if a key)
         assert!(!looks_like_password(&"Aa1!".repeat(20)));
+        // Links, emails and paths are mixed by nature — not passwords.
+        assert!(!looks_like_password("https://www.linkedin.com/in/someone98/"));
+        assert!(!looks_like_password("https://example.com/jobs/view/4471341355/"));
+        assert!(!looks_like_password("someone02482@gmail.com"));
+        assert!(!looks_like_password("www.example.com/a1"));
+        assert!(!looks_like_password("example.com/Page2"));
+        assert!(!looks_like_password("~/Downloads/Report2026.pdf"));
+        assert!(!looks_like_password("src/main_v2.rs/x"));
+        // …while the real thing still is.
+        assert!(looks_like_password("Tr0ub4dour&3xyz"));
+        assert!(looks_like_password("p@ssW0rd2026"));
     }
 
     #[test]

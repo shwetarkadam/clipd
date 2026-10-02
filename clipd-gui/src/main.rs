@@ -1241,6 +1241,53 @@ fn draw_source_tile(ui: &mut egui::Ui, source: &str, c: &clipd_core::ThemeColors
 /// filled rounded tile. The letter repeated what the meta line already says,
 /// and the tile made a plain list look like a grid of buttons. The reference
 /// draws the glyph alone, with nothing behind it.
+/// How recent a copy has to be to sit above the pins, and how many may.
+const FRESH_WINDOW_SECS: i64 = 10 * 60;
+const FRESH_MAX: usize = 3;
+
+/// Unpinned clips copied in the last ten minutes (up to three, newest first)
+/// moved to the front; everything else keeps its order. Returns the order and
+/// how many rows lead.
+fn fresh_first(
+    indices: &[usize],
+    clips: &[ClipEntry],
+    starred: &HashSet<i64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<usize>, usize) {
+    let mut fresh: Vec<usize> = indices
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let clip = &clips[i];
+            !starred.contains(&clip.id)
+                && (now - clip.timestamp).num_seconds() <= FRESH_WINDOW_SECS
+        })
+        .collect();
+    fresh.sort_by(|&a, &b| clips[b].timestamp.cmp(&clips[a].timestamp));
+    fresh.truncate(FRESH_MAX);
+    let count = fresh.len();
+    let mut ordered = fresh.clone();
+    ordered.extend(indices.iter().copied().filter(|i| !fresh.contains(i)));
+    (ordered, count)
+}
+
+/// The section a row of the main list belongs to.
+fn row_group(
+    pos: usize,
+    clip: &ClipEntry,
+    starred: bool,
+    in_slots_tab: bool,
+    fresh_rows: usize,
+) -> &'static str {
+    if in_slots_tab {
+        "In slots"
+    } else if pos < fresh_rows {
+        "Just copied"
+    } else {
+        clip_group_label(clip, starred)
+    }
+}
+
 /// Rows in slots first, in slot order, then everything else as it was. A text
 /// in two slots is one row; a clip whose text a slotted row already shows is
 /// left out of the rest. Returns the order and how many rows are slots.
@@ -4215,6 +4262,9 @@ struct ClipdGui {
     slots_by_content: HashMap<String, Vec<u8>>,
     /// The popover is showing its Slots view instead of the clipboard.
     hud_slots_view: bool,
+    /// How many rows at the top of the list are just-copied clips, set ahead
+    /// of the pins (see `fresh_first`).
+    fresh_rows: usize,
     /// Set when something asked for the keyboard mid-frame.
     want_key_window: bool,
     /// Secret-scan results by clip id, so a reload only scans what is new.
@@ -4456,6 +4506,7 @@ impl ClipdGui {
             masked_clip_ids,
             slots_by_content,
             hud_slots_view: false,
+            fresh_rows: 0,
             want_key_window: false,
             secret_scan_cache,
             sensitive_cache,
@@ -5968,6 +6019,25 @@ impl ClipdGui {
         // sort_by_key is stable, so recency is preserved within both groups.
         self.filtered
             .sort_by_key(|&i| !self.starred_clip_ids.contains(&self.clips[i].id));
+        // What you just copied leads, ahead even of pins. With pins first, a
+        // handful of starred clips filled the popover's seven rows and a copy
+        // made seconds ago landed at row six — present, and invisible. Pins
+        // keep their section right below.
+        self.fresh_rows = 0;
+        if content_q.is_empty()
+            && content_filter == ContentFilter::All
+            && !self.show_active_slots_only
+            && !(self.hud && self.hud_slots_view)
+        {
+            let (ordered, fresh) = fresh_first(
+                &self.filtered,
+                &self.clips,
+                &self.starred_clip_ids,
+                chrono::Utc::now(),
+            );
+            self.filtered = ordered;
+            self.fresh_rows = fresh;
+        }
         // The popover's Slots view: only what is in slots 1-9, in slot order.
         // A view of its own rather than a section on top, so the clipboard
         // keeps its order — pins first, then newest. Slots hold what you set
@@ -7670,21 +7740,18 @@ impl ClipdGui {
                     // The Slots tab is in slot order, so pinned/recent would
                     // split it at random; it is one section.
                     let in_slots_tab = self.content_filter == ContentFilter::Slots;
-                    let group = if in_slots_tab {
-                        "In slots"
-                    } else {
-                        clip_group_label(clip, is_starred)
-                    };
+                    let fresh_rows = self.fresh_rows;
+                    let group =
+                        row_group(display_idx, clip, is_starred, in_slots_tab, fresh_rows);
                     let previous_group = display_idx.checked_sub(1).and_then(|previous| {
                         let previous_clip = self.clips.get(visible_indices[previous])?;
-                        Some(if in_slots_tab {
-                            "In slots"
-                        } else {
-                            clip_group_label(
-                                previous_clip,
-                                self.starred_clip_ids.contains(&previous_clip.id),
-                            )
-                        })
+                        Some(row_group(
+                            previous,
+                            previous_clip,
+                            self.starred_clip_ids.contains(&previous_clip.id),
+                            in_slots_tab,
+                            fresh_rows,
+                        ))
                     });
                     let row_slots: Vec<u8> =
                         self.slots_by_content.get(&clip.content).cloned().unwrap_or_default();
@@ -7718,9 +7785,12 @@ impl ClipdGui {
                     // the rest butt together into a single edge.
                     let next_group = visible_indices.get(display_idx + 1).and_then(|&next| {
                         let next_clip = self.clips.get(next)?;
-                        Some(clip_group_label(
+                        Some(row_group(
+                            display_idx + 1,
                             next_clip,
                             self.starred_clip_ids.contains(&next_clip.id),
+                            in_slots_tab,
+                            fresh_rows,
                         ))
                     });
                     let first_in_group = previous_group != Some(group);
@@ -12605,10 +12675,11 @@ fn sync_active_slot_labels(
             extras.push(clip);
         }
     }
+    // At the end, not the front: these are older clips kept loaded so their
+    // slot can be shown, and at the front they sat in "Recent" above copies
+    // made minutes ago.
     extras.sort_by_key(|c| c.slot.unwrap_or(u8::MAX));
-    for (i, clip) in extras.into_iter().enumerate() {
-        clips.insert(i, clip);
-    }
+    clips.extend(extras);
     all_slots
 }
 
@@ -13815,6 +13886,34 @@ mod slot_strip_tests {
         // Mirrored to one screen: just the icon's own x, never halved.
         let p = popover_origin_in((1990.0, 12.0), &[egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0))], w).unwrap();
         assert_eq!(p.x, 1990.0 - w / 2.0);
+    }
+
+    #[test]
+    fn a_copy_made_minutes_ago_sits_above_the_pins() {
+        let now = chrono::Utc::now();
+        let mut clips = vec![
+            clip(1, "pinned a", ContentType::Text, 1),
+            clip(2, "pinned b", ContentType::Text, 1),
+            clip(3, "just now", ContentType::Text, 1),
+            clip(4, "a minute ago", ContentType::Text, 1),
+            clip(5, "last week", ContentType::Text, 1),
+        ];
+        clips[0].timestamp = now - chrono::Duration::days(20);
+        clips[1].timestamp = now - chrono::Duration::days(30);
+        clips[2].timestamp = now - chrono::Duration::seconds(5);
+        clips[3].timestamp = now - chrono::Duration::seconds(70);
+        clips[4].timestamp = now - chrono::Duration::days(7);
+        let starred: HashSet<i64> = [1, 2].into_iter().collect();
+        // As apply_filter leaves it: pins first, then newest.
+        let (order, fresh) = fresh_first(&[0, 1, 2, 3, 4], &clips, &starred, now);
+        assert_eq!(fresh, 2);
+        let ids: Vec<i64> = order.iter().map(|&i| clips[i].id).collect();
+        assert_eq!(ids, vec![3, 4, 1, 2, 5]);
+        // Nothing recent: pins stay first.
+        let later = now + chrono::Duration::hours(1);
+        let (order, fresh) = fresh_first(&[0, 1, 2, 3, 4], &clips, &starred, later);
+        assert_eq!(fresh, 0);
+        assert_eq!(order, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
