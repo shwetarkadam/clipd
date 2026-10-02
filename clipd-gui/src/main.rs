@@ -2690,6 +2690,7 @@ impl ContentFilter {
     ];
 }
 
+
 // ── Entry point ──
 
 fn theme_named(name: &str) -> Option<Theme> {
@@ -4192,6 +4193,14 @@ struct ClipdGui {
     want_key_window: bool,
     /// Secret-scan results by clip id, so a reload only scans what is new.
     secret_scan_cache: HashMap<i64, Option<String>>,
+    /// Keyboard-permission state, read at most every couple of seconds. The
+    /// banner and the onboarding card asked on every frame, and each answer
+    /// is a round trip to macOS's privacy daemon (tccd) plus a file read —
+    /// at 60 frames a second, and the window stalled whenever tccd was slow,
+    /// which is exactly when an app's grant has just changed.
+    perm_checked: Option<Instant>,
+    hotkey_status_seen: HotkeyStatus,
+    missing_permission_seen: &'static str,
     /// Whether each clip trips the secret detector, by id. Rows wear the key
     /// glyph from this; scanning ~40 rows' full text on every frame was the
     /// largest cost in drawing the popover.
@@ -4434,6 +4443,9 @@ impl ClipdGui {
             want_key_window: false,
             secret_scan_cache,
             sensitive_cache,
+            perm_checked: None,
+            hotkey_status_seen: HotkeyStatus::Ok,
+            missing_permission_seen: "keyboard access",
             last_claim_refresh: Instant::now() - Duration::from_secs(60),
             island: island::IslandState::default(),
             quitting: false,
@@ -4532,13 +4544,20 @@ impl ClipdGui {
             .and_then(|&i| self.clips.get(i))
             .map(|c| c.id);
 
+        let before: Vec<i64> = self.clips.iter().map(|clip| clip.id).collect();
         self.clips = self.store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
         self.slots_by_content = sync_active_slot_labels(&self.store, &mut self.clips);
         self.masked_clip_ids =
             mask_secret_previews(&mut self.clips, &mut self.secret_scan_cache);
         warm_sensitive_cache(&self.clips, &self.privacy_config, &mut self.sensitive_cache);
         self.sessions = compute_sessions(&self.clips, self.session_config.window_minutes);
-        self.cached_tfidf = None; // invalidate — will be rebuilt lazily on next search
+        // Rebuild the search index only when the clips changed. This runs every
+        // 3s while the window is open, and throwing the index away each time
+        // made the next keystroke — or the refresh itself, mid-search — rebuild
+        // TF-IDF over every loaded clip: a visible hitch every three seconds.
+        if self.clips.iter().map(|clip| clip.id).ne(before.iter().copied()) {
+            self.cached_tfidf = None;
+        }
         self.refresh_snippets();
         self.apply_filter();
 
@@ -8444,7 +8463,7 @@ impl ClipdGui {
         settings_section(ui, c, "Advanced");
         settings_card(ui, c, |ui| {
             #[cfg(target_os = "macos")]
-            if load_hotkey_status() == HotkeyStatus::NeedsAccessibility {
+            if self.hotkey_status() == HotkeyStatus::NeedsAccessibility {
                 settings_card_body(ui, |ui| {
                     ui.label(
                         RichText::new("Global shortcuts need keyboard access in System Settings.")
@@ -9265,7 +9284,7 @@ impl ClipdGui {
             self.render_slot_tip(ui, c);
         }
         #[cfg(target_os = "macos")]
-        if !introducing && load_hotkey_status() == HotkeyStatus::NeedsAccessibility {
+        if !introducing && self.hotkey_status() == HotkeyStatus::NeedsAccessibility {
             // Once per window, not once per frame: this draws at 60fps, and
             // the fact worth recording is "someone hit this wall", not how
             // long they sat in front of it. It is the one dead end in clipd
@@ -9294,7 +9313,7 @@ impl ClipdGui {
                         RichText::new(format!(
                             "Enable Clipd under {} in System Settings, in Privacy & Security. \
                              The daemon retries automatically once toggled on.",
-                            clipd_core::missing_keyboard_permission_label()
+                            self.missing_permission()
                         ))
                         .size(10.5)
                         .color(warn_body),
@@ -9322,6 +9341,32 @@ impl ClipdGui {
             self.render_quick_settings(ui, c);
         }
         let _ = c;
+    }
+
+    /// Re-read the keyboard-permission state if it is more than 2s old.
+    fn refresh_permission_state(&mut self) {
+        const EVERY: Duration = Duration::from_secs(2);
+        if self.perm_checked.is_some_and(|at| at.elapsed() < EVERY) {
+            return;
+        }
+        self.perm_checked = Some(Instant::now());
+        self.hotkey_status_seen = load_hotkey_status();
+        #[cfg(target_os = "macos")]
+        {
+            self.missing_permission_seen = clipd_core::missing_keyboard_permission_label();
+        }
+    }
+
+    /// The daemon's hotkey status, at most 2s old.
+    fn hotkey_status(&mut self) -> HotkeyStatus {
+        self.refresh_permission_state();
+        self.hotkey_status_seen
+    }
+
+    /// Which keyboard permission is missing, at most 2s old.
+    fn missing_permission(&mut self) -> &'static str {
+        self.refresh_permission_state();
+        self.missing_permission_seen
     }
 
     /// Cached by refresh(); falls back to a scan for a clip not seen yet.
@@ -9611,7 +9656,7 @@ impl ClipdGui {
                         // comes back when nothing is missing — a frame before
                         // this step moves on — so name both sections instead.
                         #[cfg(target_os = "macos")]
-                        let missing = match clipd_core::missing_keyboard_permission_label() {
+                        let missing = match self.missing_permission() {
                             "keyboard access" => "Accessibility and Input Monitoring",
                             label => label,
                         };
