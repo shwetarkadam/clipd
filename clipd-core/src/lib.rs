@@ -126,7 +126,7 @@ pub use transform::{
     PasteTransformSettings, SlotInputMode, TransformConfig, TransformKind,
     GuiLayout,
 };
-pub use tray::{load_tray_anchor, save_tray_anchor};
+pub use tray::{load_tray_anchor, load_tray_point, save_tray_anchor};
 pub use vault::{
     available_targets, forget_secret, list_secrets, rename_secret, reveal_secret, save_secret,
     SecretEntry, SecretRef, VaultTarget,

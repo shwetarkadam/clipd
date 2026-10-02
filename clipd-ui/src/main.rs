@@ -861,9 +861,7 @@ Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi
                 }
                 match tray_ev {
                     TrayIconEvent::Enter { rect, position, .. } => {
-                        clipd_core::save_tray_anchor(logical_tray_anchor(
-                            &rect, position.x, tray_scale,
-                        ));
+                        save_anchor_from_tray_event(&rect, position.x, tray_scale);
                         // Pointer entered the tray icon — show the HUD
                         // immediately (no delay — the user is clearly here).
                         hover_entered_at = None;
@@ -883,9 +881,7 @@ Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi
                         // Refresh anchor while moving over the icon. Don't
                         // re-send "show" — that would reset the HUD each time
                         // and cause flicker.
-                        clipd_core::save_tray_anchor(logical_tray_anchor(
-                            &rect, position.x, tray_scale,
-                        ));
+                        save_anchor_from_tray_event(&rect, position.x, tray_scale);
                     }
                     TrayIconEvent::Click {
                         button,
@@ -894,9 +890,7 @@ Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi
                         position,
                         ..
                     } if matches!(button_state, MouseButtonState::Down | MouseButtonState::Up) => {
-                        clipd_core::save_tray_anchor(logical_tray_anchor(
-                            &rect, position.x, tray_scale,
-                        ));
+                        save_anchor_from_tray_event(&rect, position.x, tray_scale);
                         // The two buttons do opposite things, so they must not
                         // share a code path:
                         //   left  — open the full clipboard palette (not a
@@ -1324,6 +1318,56 @@ fn hud_currently_visible() -> bool {
 /// tray-icon reports a physical rect. A real status item is ~22pt wide; if
 /// the rect is much larger (a full-bar window, a zero-size one) the centre
 /// is meaningless and we use the cursor, which is on the icon.
+/// Record where the icon is, for the popover to sit under.
+///
+/// On macOS this reads the pointer — which is on the icon, since a tray event
+/// is what called this — in points, in the global space, on whatever display
+/// it is. The tray rect comes in *physical* pixels, and converting it needs
+/// the scale of the display the icon is on *now*: a factor read once at launch
+/// went stale the moment a Retina MacBook (2x) switched to mirroring a 1x
+/// monitor, halving every x and parking the popover mid-screen.
+fn save_anchor_from_tray_event(rect: &tray_icon::Rect, cursor_x: f64, launch_scale: f64) {
+    #[cfg(target_os = "macos")]
+    if let Some((x, y)) = pointer_anchor(rect) {
+        clipd_core::save_tray_anchor(x, Some(y));
+        return;
+    }
+    clipd_core::save_tray_anchor(logical_tray_anchor(rect, cursor_x, launch_scale), None);
+}
+
+/// The icon's centre as (x, y) in egui's global points (top-left origin at the
+/// primary display's top). x snaps to the rect's centre when the rect, scaled
+/// by the pointer's own display, agrees with the pointer; otherwise the
+/// pointer itself.
+#[cfg(target_os = "macos")]
+fn pointer_anchor(rect: &tray_icon::Rect) -> Option<(f64, f64)> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSEvent, NSScreen};
+    let mtm = MainThreadMarker::new()?;
+    let mouse = NSEvent::mouseLocation();
+    let screens = NSScreen::screens(mtm);
+    if screens.count() == 0 {
+        return None;
+    }
+    let primary = screens.objectAtIndex(0).frame();
+    let primary_top = primary.origin.y + primary.size.height;
+    let scale = (0..screens.count())
+        .map(|i| screens.objectAtIndex(i))
+        .find(|s| {
+            let f = s.frame();
+            mouse.x >= f.origin.x
+                && mouse.x < f.origin.x + f.size.width
+                && mouse.y >= f.origin.y
+                && mouse.y <= f.origin.y + f.size.height
+        })
+        .map(|s| s.backingScaleFactor())
+        .filter(|s| *s > 0.0)
+        .unwrap_or(1.0);
+    let centre = (rect.position.x + f64::from(rect.size.width) / 2.0) / scale;
+    let x = if (centre - mouse.x).abs() <= 24.0 { centre } else { mouse.x };
+    Some((x, primary_top - mouse.y))
+}
+
 fn logical_tray_anchor(rect: &tray_icon::Rect, cursor_x: f64, scale: f64) -> f64 {
     let scale = if scale > 0.0 { scale } else { 1.0 };
     let width = f64::from(rect.size.width) / scale;

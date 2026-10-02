@@ -141,6 +141,56 @@ fn color_row(ui: &mut egui::Ui, c: &clipd_core::ThemeColors, label: &str, val: &
 /// The card is centred on the cat icon so the tail points at it. It is only
 /// nudged inward when that would run off a screen edge — never parked against
 /// the right of the display just because the extra is not in a guessed zone.
+/// Where the popover's top-left goes: under the icon, on the display the icon
+/// is on, kept inside that display's edges. `None` when no point has been
+/// recorded with its display, so callers fall back to the single-screen rule.
+fn popover_origin(width: f32) -> Option<egui::Pos2> {
+    let (x, y) = clipd_core::load_tray_point()?;
+    let rects: Vec<egui::Rect> = island::displays().iter().map(|d| d.rect).collect();
+    popover_origin_in((x as f32, y? as f32), &rects, width)
+}
+
+/// Pure half of `popover_origin`, so arrangements can be tested without a
+/// window server.
+fn popover_origin_in(point: (f32, f32), displays: &[egui::Rect], width: f32) -> Option<egui::Pos2> {
+    let (x, y) = point;
+    // The display holding the point; failing that (a pointer a hair off the
+    // top edge), the nearest one along x.
+    let screen = displays
+        .iter()
+        .find(|r| r.contains(egui::pos2(x, y)))
+        .or_else(|| {
+            displays.iter().min_by(|a, b| {
+                let da = (a.center().x - x).abs() + (a.top() - y).abs();
+                let db = (b.center().x - x).abs() + (b.top() - y).abs();
+                da.total_cmp(&db)
+            })
+        })?;
+    let min_left = screen.left() + POPOVER_EDGE_PAD;
+    let max_left = (screen.right() - width - POPOVER_EDGE_PAD).max(min_left);
+    Some(egui::pos2(
+        (x - width * 0.5).clamp(min_left, max_left),
+        screen.top() + HUD_TOP_MARGIN,
+    ))
+}
+
+/// The region that counts as "still on the popover": the panel plus a margin,
+/// stretched up through the gap to its display's menu bar so the trip from the
+/// icon down to the panel never reads as leaving. Up to that display's top —
+/// not to y = 0, which is the primary display's top: on a monitor above the
+/// laptop that cut the zone off below the panel, and it hid under the pointer.
+fn hot_zone(panel: egui::Rect) -> egui::Rect {
+    let mut hot = panel.expand(10.0);
+    hot.min.y = panel.min.y - HUD_TOP_MARGIN;
+    hot
+}
+
+/// The popover's top-left: `popover_origin`, or the single-screen fallback.
+fn popover_pos(width: f32, screen: egui::Vec2) -> egui::Pos2 {
+    popover_origin(width)
+        .unwrap_or_else(|| egui::pos2(popover_left(width, screen, true), HUD_TOP_MARGIN))
+}
+
 fn popover_left(width: f32, screen: egui::Vec2, anchored: bool) -> f32 {
     let max_left = (screen.x - width - POPOVER_EDGE_PAD).max(POPOVER_EDGE_PAD);
     let anchor = if anchored {
@@ -4570,8 +4620,7 @@ impl ClipdGui {
                 .input(|i| i.viewport().monitor_size)
                 .or_else(main_display_size)
             {
-                let left = popover_left(size.x, screen, true);
-                let pos = egui::pos2(left, HUD_TOP_MARGIN);
+                let pos = popover_pos(size.x, screen);
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 self.last_sent_pos = Some(pos);
             }
@@ -4616,10 +4665,7 @@ impl ClipdGui {
         let size = self.panel_expanded_size();
         // Use the actual window position if available; otherwise fall back to
         // the tray-anchored position the HUD opens at.
-        let pos = self.last_sent_pos.unwrap_or_else(|| {
-            let left = popover_left(size.x, screen, true);
-            egui::pos2(left, HUD_TOP_MARGIN)
-        });
+        let pos = self.last_sent_pos.unwrap_or_else(|| popover_pos(size.x, screen));
         Some(egui::Rect::from_min_size(pos, size))
     }
 
@@ -4662,9 +4708,7 @@ impl ClipdGui {
                 let cursor = global_cursor_position();
                 let still_inside = match (cursor, self.surface_screen_rect()) {
                     (Some(cur), Some(rect)) => {
-                        let mut hot = rect.expand(10.0);
-                        hot.min.y = 0.0;
-                        hot.contains(cur)
+                        hot_zone(rect).contains(cur)
                     }
                     _ => false,
                 };
@@ -4708,9 +4752,7 @@ impl ClipdGui {
         let cursor = global_cursor_position();
         let pointer_inside = match (cursor, self.surface_screen_rect()) {
             (Some(cur), Some(rect)) => {
-                let mut hot = rect.expand(10.0);
-                hot.min.y = 0.0;
-                let global_hit = hot.contains(cur);
+                let global_hit = hot_zone(rect).contains(cur);
                 let egui_hit = ctx.input(|i| i.pointer.hover_pos()).is_some();
                 global_hit || egui_hit
             }
@@ -4825,8 +4867,7 @@ impl ClipdGui {
             .or_else(main_display_size)
         {
             let size = egui::vec2(HUD_W, HUD_H);
-            let left = popover_left(HUD_W, screen, true);
-            let pos = egui::pos2(left, HUD_TOP_MARGIN);
+            let pos = popover_pos(HUD_W, screen);
             self.last_sent_size = Some(size);
             self.last_sent_pos = Some(pos);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -4897,7 +4938,7 @@ impl ClipdGui {
         // — and a tail aimed at nothing is worse than no tail.
         let cx = match (clipd_core::load_tray_anchor(), main_display_size()) {
             (Some(anchor), Some(screen)) if self.hud => {
-                let card_left = popover_left(self.panel_expanded_size().x, screen, true);
+                let card_left = popover_pos(self.panel_expanded_size().x, screen).x;
                 // Keep the tail on the card, with room for its own base.
                 (anchor as f32 - card_left + rect.left())
                     .clamp(rect.left() + 16.0, rect.right() - 16.0)
@@ -13753,6 +13794,27 @@ mod slot_strip_tests {
         assert_eq!(slot_paste_keys(&[1]), "⌘V pastes it");
         assert_eq!(slot_paste_keys(&[4]), "⌘V ×4 pastes it");
         assert_eq!(slot_paste_keys(&[2, 3]), "⌘V ×2 or ×3 pastes it");
+    }
+
+    #[test]
+    fn the_popover_sits_under_the_icon_on_the_display_the_icon_is_on() {
+        let laptop = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1512.0, 982.0));
+        // A monitor to the right, and one stacked above the laptop.
+        let right = egui::Rect::from_min_size(egui::pos2(1512.0, -300.0), egui::vec2(2560.0, 1440.0));
+        let above = egui::Rect::from_min_size(egui::pos2(0.0, -1080.0), egui::vec2(1920.0, 1080.0));
+        let all = [laptop, right, above];
+        let w = 300.0;
+        // Icon on the right monitor's menu bar: under it, on that display.
+        let p = popover_origin_in((3900.0, -290.0), &all, w).unwrap();
+        assert!(p.x > 1512.0 && p.x + w <= right.right(), "{p:?}");
+        assert_eq!(p.y, right.top() + HUD_TOP_MARGIN);
+        // Icon on the monitor above: same x range as the laptop, its own top.
+        let p = popover_origin_in((1800.0, -1070.0), &all, w).unwrap();
+        assert_eq!(p.y, above.top() + HUD_TOP_MARGIN);
+        assert!(p.x + w <= above.right());
+        // Mirrored to one screen: just the icon's own x, never halved.
+        let p = popover_origin_in((1990.0, 12.0), &[egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0))], w).unwrap();
+        assert_eq!(p.x, 1990.0 - w / 2.0);
     }
 
     #[test]
