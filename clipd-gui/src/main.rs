@@ -1196,6 +1196,58 @@ fn draw_source_tile(ui: &mut egui::Ui, source: &str, c: &clipd_core::ThemeColors
 /// filled rounded tile. The letter repeated what the meta line already says,
 /// and the tile made a plain list look like a grid of buttons. The reference
 /// draws the glyph alone, with nothing behind it.
+/// Rows in slots first, in slot order, then everything else as it was. A text
+/// in two slots is one row; a clip whose text a slotted row already shows is
+/// left out of the rest. Returns the order and how many rows are slots.
+fn slots_first(
+    indices: &[usize],
+    clips: &[ClipEntry],
+    slots_by_content: &HashMap<String, Vec<u8>>,
+) -> (Vec<usize>, usize) {
+    let mut slotted: Vec<(u8, usize)> = Vec::new();
+    let mut shown: HashSet<&str> = HashSet::new();
+    for &i in indices {
+        let content = clips[i].content.as_str();
+        if let Some(first) = slots_by_content.get(content).and_then(|s| s.first()) {
+            if shown.insert(content) {
+                slotted.push((*first, i));
+            }
+        }
+    }
+    slotted.sort_by_key(|(slot, _)| *slot);
+    let slot_rows = slotted.len();
+    let mut ordered: Vec<usize> = slotted.into_iter().map(|(_, i)| i).collect();
+    ordered.extend(
+        indices
+            .iter()
+            .copied()
+            .filter(|&i| !shown.contains(clips[i].content.as_str())),
+    );
+    (ordered, slot_rows)
+}
+
+/// A row's slot number(s), drawn where the type glyph would be.
+fn draw_slot_tile(ui: &mut egui::Ui, slots: &[u8], c: &clipd_core::ThemeColors) {
+    let label = slots
+        .iter()
+        .map(|n| clipd_core::slot_badge(*n))
+        .collect::<Vec<_>>()
+        .join("·");
+    let font = FontId::proportional(if slots.len() > 1 { 10.5 } else { 12.5 });
+    let galley = ui.painter().layout_no_wrap(label, font, rgb(c.accent));
+    // The type glyph's width, so titles line up down the list; only a text in
+    // three or more slots widens it.
+    let (cell, _) = ui.allocate_exact_size(
+        egui::vec2((galley.size().x + 8.0).max(26.0), 30.0),
+        egui::Sense::hover(),
+    );
+    let chip = egui::Rect::from_center_size(cell.center(), egui::vec2(cell.width(), 22.0));
+    let painter = ui.painter();
+    painter.rect_filled(chip, Rounding::same(6.0), rgb(c.accent).gamma_multiply(0.16));
+    painter.rect_stroke(chip, Rounding::same(6.0), Stroke::new(0.8, rgb(c.accent).gamma_multiply(0.6)));
+    painter.galley(chip.center() - galley.size() / 2.0, galley, rgb(c.accent));
+}
+
 fn draw_type_tile(
     ui: &mut egui::Ui,
     kind: &ContentType,
@@ -4006,6 +4058,12 @@ struct ClipdGui {
     hud_watcher_started: bool,
     /// Clips whose preview is a redaction, so their tooltip stays hidden.
     masked_clip_ids: HashSet<i64>,
+    /// Every slot each text is in. `ClipEntry.slot` holds one; the same text
+    /// in slots 2 and 3 is one clip, and its row should say both.
+    slots_by_content: HashMap<String, Vec<u8>>,
+    /// How many rows at the top of the popover's list are slots (0 when the
+    /// list is a search or a filter, which keep their own order).
+    hud_slot_rows: usize,
     /// Set when something asked for the keyboard mid-frame.
     want_key_window: bool,
     /// Secret-scan results by clip id, so a reload only scans what is new.
@@ -4122,7 +4180,7 @@ impl ClipdGui {
         let db_path = ClipStore::default_path();
         let store = ClipStore::new(&db_path).expect("Failed to open clip database");
         let mut clips = store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
-        sync_active_slot_labels(&store, &mut clips);
+        let slots_by_content = sync_active_slot_labels(&store, &mut clips);
         let mut secret_scan_cache: HashMap<i64, Option<String>> = HashMap::new();
         let masked_clip_ids = mask_secret_previews(&mut clips, &mut secret_scan_cache);
         let count = clips.len();
@@ -4236,6 +4294,8 @@ impl ClipdGui {
             island_surface,
             hud_watcher_started: false,
             masked_clip_ids,
+            slots_by_content,
+            hud_slot_rows: 0,
             want_key_window: false,
             secret_scan_cache,
             last_claim_refresh: Instant::now() - Duration::from_secs(60),
@@ -4339,7 +4399,7 @@ impl ClipdGui {
             .map(|c| c.id);
 
         self.clips = self.store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
-        sync_active_slot_labels(&self.store, &mut self.clips);
+        self.slots_by_content = sync_active_slot_labels(&self.store, &mut self.clips);
         self.masked_clip_ids =
             mask_secret_previews(&mut self.clips, &mut self.secret_scan_cache);
         self.sessions = compute_sessions(&self.clips, self.session_config.window_minutes);
@@ -5055,25 +5115,6 @@ impl ClipdGui {
         // paper. Proximity does this job on its own.
         ui.add_space(10.0);
 
-        // The slots, in the place people actually go to grab a clip. The
-        // popover used to be a plain list, so the one surface most people use
-        // every day said nothing about slots at all. Filled ones paste on
-        // click, empty ones take your latest copy, and every hover names the
-        // keys that do the same from any app — so the feature works without
-        // the gesture, and using it teaches the gesture.
-        if !self.in_ask_mode() && !self.popover_settings_open {
-            let slots = self.slot_strip_rows();
-            match draw_slot_strip(ui, c, &slots, "paste") {
-                Some(SlotStripClick::Take(text)) => {
-                    clipd_core::telemetry_event("slot_strip", &[("action", "paste".into())]);
-                    *action = Action::PasteText(text);
-                }
-                Some(SlotStripClick::Fill(n)) => self.fill_slot_from_latest(n),
-                None => {}
-            }
-            ui.add_space(8.0);
-        }
-
         // The body swaps between three views; the footer belongs to all of
         // them. Returning early here left settings and ask mode with no
         // visible way back — the gear that toggles them lives in the footer.
@@ -5127,7 +5168,7 @@ impl ClipdGui {
                     String,
                     String,
                     String,
-                    Option<u8>,
+                    Vec<u8>,
                     ContentType,
                     bool,
                 )> = self
@@ -5155,7 +5196,7 @@ impl ClipdGui {
                             text,
                             clip.source_app.clone().unwrap_or_default(),
                             relative_time_short(&clip.timestamp),
-                            clip.slot,
+                            self.slots_by_content.get(&clip.content).cloned().unwrap_or_default(),
                             clip.content_type.clone(),
                             !detect_sensitive(&clip.content, &self.privacy_config).is_empty(),
                         )
@@ -5165,9 +5206,30 @@ impl ClipdGui {
                 // Ruled rows that share edges, so the list reads as one sheet.
                 let row_count = rows.len();
                 ui.spacing_mut().item_spacing.y = 0.0;
-                for (pos, (_idx, clip_id, preview, _app, time, slot, kind, sensitive)) in
+                let slot_rows = self.hud_slot_rows.min(row_count);
+                for (pos, (_idx, clip_id, preview, _app, time, slots, kind, sensitive)) in
                     rows.into_iter().enumerate()
                 {
+                    // Two quiet captions, only when there are slots to set apart.
+                    if slot_rows > 0 && (pos == 0 || pos == slot_rows) {
+                        ui.add_space(if pos == 0 { 2.0 } else { 10.0 });
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new(if pos == 0 { "IN SLOTS" } else { "RECENT" })
+                                    .size(10.0)
+                                    .color(rgb(c.overlay)),
+                            );
+                            if pos == 0 {
+                                ui.label(
+                                    RichText::new("· ⌘V ×N pastes slot N")
+                                        .size(10.0)
+                                        .color(rgb(c.overlay).gamma_multiply(0.75)),
+                                );
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
                     let selected = self.selected == pos;
                     let starred = self.starred_clip_ids.contains(&clip_id);
                     let mut star_clicked = false;
@@ -5211,7 +5273,17 @@ impl ClipdGui {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                draw_type_tile(ui, &kind, sensitive, false, c);
+                                // A slotted row leads with its slot number, in
+                                // the glyph's place: the first thing you read
+                                // is where it lives and so which keys bring it
+                                // back. The number used to sit at the far end,
+                                // swapped in for the time, and vanished
+                                // whenever the row was hovered.
+                                if slots.is_empty() {
+                                    draw_type_tile(ui, &kind, sensitive, false, c);
+                                } else {
+                                    draw_slot_tile(ui, &slots, c);
+                                }
                                 ui.add_space(10.0);
                                 // One line, not two. The source app and the
                                 // time used to sit under the title; the
@@ -5284,18 +5356,6 @@ impl ClipdGui {
                                             {
                                                 copy_clicked = true;
                                             }
-                                        } else if let Some(n) = slot {
-                                            // A slotted row keeps its number:
-                                            // that is the key you press to
-                                            // paste it back.
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "⌘{}",
-                                                    clipd_core::slot_badge(n)
-                                                ))
-                                                .size(11.0)
-                                                .color(rgb(c.accent)),
-                                            );
                                         } else {
                                             ui.label(
                                                 RichText::new(&time)
@@ -5701,6 +5761,21 @@ impl ClipdGui {
         // sort_by_key is stable, so recency is preserved within both groups.
         self.filtered
             .sort_by_key(|&i| !self.starred_clip_ids.contains(&self.clips[i].id));
+        // The popover leads with what is in the slots, ahead even of pins.
+        // Slots hold what you set aside on purpose, so they are usually not
+        // your latest copies: in date order they sat a hundred rows down, past
+        // the end of the list, and nothing on screen said which slot held what.
+        self.hud_slot_rows = 0;
+        if self.hud
+            && content_q.is_empty()
+            && content_filter == ContentFilter::All
+            && !self.show_active_slots_only
+        {
+            let (ordered, slot_rows) =
+                slots_first(&self.filtered, &self.clips, &self.slots_by_content);
+            self.filtered = ordered;
+            self.hud_slot_rows = slot_rows;
+        }
         // Top result is selected so Enter pastes the best match immediately.
         self.selected = 0;
         if self.selected >= self.filtered.len() {
@@ -12163,8 +12238,21 @@ fn mask_secret_previews(
     masked
 }
 
-fn sync_active_slot_labels(store: &ClipStore, clips: &mut Vec<ClipEntry>) {
+/// Label clips with their slot, and return every slot each text is in.
+fn sync_active_slot_labels(
+    store: &ClipStore,
+    clips: &mut Vec<ClipEntry>,
+) -> HashMap<String, Vec<u8>> {
     let active = store.list_active_slots().unwrap_or_default();
+    let mut all_slots: HashMap<String, Vec<u8>> = HashMap::new();
+    // 1-9 only: those are the slots ⌘V ×N reaches, and the only ones a row's
+    // badge can tell you how to paste.
+    for (slot, content) in active.iter().filter(|(slot, _)| (1..=9).contains(slot)) {
+        all_slots.entry(content.clone()).or_default().push(*slot);
+    }
+    for slots in all_slots.values_mut() {
+        slots.sort_unstable();
+    }
     let active_by_content: std::collections::HashMap<String, u8> = active
         .iter()
         .filter(|(slot, _)| *slot > 0)
@@ -12193,6 +12281,7 @@ fn sync_active_slot_labels(store: &ClipStore, clips: &mut Vec<ClipEntry>) {
     for (i, clip) in extras.into_iter().enumerate() {
         clips.insert(i, clip);
     }
+    all_slots
 }
 
 const PIN_GROUP_COUNT: usize = 6;
@@ -13349,6 +13438,26 @@ mod slot_strip_tests {
         let (content, preview) = rows[1].1.clone().unwrap();
         assert_eq!(content, key, "the click still pastes the real thing");
         assert_eq!(preview, "sk-••••", "but the hover never shows it");
+    }
+
+    #[test]
+    fn the_popover_leads_with_slots_in_slot_order_without_repeating_a_row() {
+        // Newest first, as history loads.
+        let clips = vec![
+            clip(1, "latest", ContentType::Text, 1),
+            clip(2, "in four", ContentType::Text, 2),
+            clip(3, "older", ContentType::Text, 3),
+            clip(4, "in two and three", ContentType::Text, 4),
+            clip(5, "in one", ContentType::Text, 5),
+        ];
+        let mut map = HashMap::new();
+        map.insert("in one".to_string(), vec![1]);
+        map.insert("in two and three".to_string(), vec![2, 3]);
+        map.insert("in four".to_string(), vec![4]);
+        let (order, slot_rows) = slots_first(&[0, 1, 2, 3, 4], &clips, &map);
+        assert_eq!(slot_rows, 3);
+        let ids: Vec<i64> = order.iter().map(|&i| clips[i].id).collect();
+        assert_eq!(ids, vec![5, 4, 2, 1, 3]);
     }
 
     #[test]
