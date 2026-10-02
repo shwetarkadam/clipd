@@ -41,7 +41,10 @@ const SETTINGS_GUTTER_X: f32 = 16.0;
 const SETTINGS_GUTTER_Y: f32 = 14.0;
 // Compact palette by default (mockup proportions — tall, readable, not wide).
 // Double-clicking a row expands to EXPANDED_W with the preview on the right.
-const COMPACT_W: f32 = 600.0;
+/// The clip list (600) plus the Slots column beside it.
+const COMPACT_W: f32 = 600.0 + SLOT_COLUMN_W;
+/// The main window's Slots column. The preview inspector takes its place.
+const SLOT_COLUMN_W: f32 = 260.0;
 const EXPANDED_W: f32 = 980.0;
 const WIN_H: f32 = 740.0;
 const SHELL_ROUND: f32 = 18.0;
@@ -1334,93 +1337,6 @@ pub(crate) fn slot_paste_keys(slots: &[u8]) -> String {
     } else {
         format!("{first} or {} pastes it", rest.join(" or "))
     }
-}
-
-/// The palette's slot shelf: a header, then one line of cards, each a slot
-/// number and the start of what it holds. Returns the clip id clicked.
-fn draw_slot_shelf(
-    ui: &mut egui::Ui,
-    cards: &[(Vec<u8>, i64, String)],
-    c: &clipd_core::ThemeColors,
-) -> Option<i64> {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        let spaced: String = "IN SLOTS"
-            .chars()
-            .map(|ch| ch.to_string())
-            .collect::<Vec<_>>()
-            .join("\u{2009}");
-        ui.label(RichText::new(spaced).size(10.5).strong().color(rgb(c.overlay)));
-        ui.label(
-            RichText::new("⌘V ×N pastes slot N from any app")
-                .size(10.5)
-                .color(rgb(c.overlay).gamma_multiply(0.8)),
-        );
-    });
-    ui.add_space(6.0);
-    let mut clicked = None;
-    // Up to four cards share the width exactly; more scroll sideways (trackpad
-    // or wheel) with the last one cut at the edge to say so. A scrollbar
-    // under one line of cards is a second line that holds nothing.
-    const GAP: f32 = 8.0;
-    let across = cards.len().clamp(1, 4) as f32;
-    // Less a point for the frames' hairlines, so the fourth card is not cut.
-    let card_w = ((ui.available_width() - GAP * (across - 1.0)) / across).floor() - 1.0;
-    egui::ScrollArea::horizontal()
-        .id_salt("slot_shelf")
-        .auto_shrink([false, true])
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-        .show(ui, |ui| {
-            // Top-aligned: a centred row re-centres as it grows, and each card
-            // landed a few points lower than the one before.
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = GAP;
-                for (slots, clip_id, preview) in cards {
-                    // The tile widens for "2·3"; the text takes what is left.
-                    let tile_w = if slots.len() > 1 { 34.0 } else { 26.0 };
-                    let text_w = (card_w - 16.0 - 8.0 - tile_w).max(40.0);
-                    let resp = egui::Frame::none()
-                        .fill(surf(c, c.bg_elevated))
-                        .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(0.7, rgb(c.border)))
-                        .inner_margin(Margin { left: 6.0, right: 10.0, top: 5.0, bottom: 5.0 })
-                        .show(ui, |ui| {
-                            // Width first, on the frame's own ui; then the row.
-                            ui.set_width(card_w - 16.0);
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                draw_slot_tile(ui, slots, false, c);
-                                ui.allocate_ui(egui::vec2(text_w, 22.0), |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(preview).size(12.5).color(rgb(c.text)),
-                                        )
-                                        .truncate(),
-                                    );
-                                });
-                            });
-                        })
-                        .response;
-                    let resp = ui
-                        .interact(resp.rect, egui::Id::new(("slot_shelf_card", *clip_id)), egui::Sense::click())
-                        .on_hover_text(format!(
-                            "{preview}\nClick to paste · from any app: {}",
-                            slots.iter().map(|n| slot_chord('V', *n)).collect::<Vec<_>>().join(" or ")
-                        ));
-                    if resp.hovered() {
-                        ui.painter().rect_stroke(
-                            resp.rect,
-                            Rounding::same(10.0),
-                            Stroke::new(1.0, rgb(c.accent).gamma_multiply(0.7)),
-                        );
-                    }
-                    if resp.clicked() {
-                        clicked = Some(*clip_id);
-                    }
-                }
-            });
-        });
-    clicked
 }
 
 /// A row's ⋮ menu — Copy, Pin/Unpin, Delete — as (copy, star, delete).
@@ -2751,7 +2667,7 @@ fn save_surface_state(mode: SurfaceMode) {
 
 impl ContentFilter {
     /// Full-GUI filter row — includes Images so screenshots aren't buried.
-    const MAIN: [(ContentFilter, &'static str); 8] = [
+    const MAIN: [(ContentFilter, &'static str); 7] = [
         (ContentFilter::All, "All"),
         (ContentFilter::Links, "Links"),
         (ContentFilter::Text, "Text"),
@@ -2759,7 +2675,6 @@ impl ContentFilter {
         (ContentFilter::Images, "Images"),
         (ContentFilter::ApiKeys, "API keys"),
         (ContentFilter::Favorites, "Pinned"),
-        (ContentFilter::Slots, "Slots"),
     ];
 
     /// Extended set kept for keyboard / settings access (Slots, Files).
@@ -7403,6 +7318,28 @@ impl eframe::App for ClipdGui {
             self.set_preview_open(ctx, true);
         }
 
+        // ── Slots column, beside the list ──
+        //
+        // What is in each slot, all the time, next to the clips — not behind a
+        // tab, and not cut to a dozen characters in a row of cards. Slot-major:
+        // nine rows, empty ones saying how to fill them, so the column is also
+        // where the gesture is learned. The preview inspector takes its place.
+        if self.active_tab == MainTab::Text && !self.show_preview {
+            egui::SidePanel::right("slot_column")
+                .resizable(false)
+                .exact_width(SLOT_COLUMN_W)
+                .frame(
+                    egui::Frame::none()
+                        .fill(glass_panel_frost(self.theme))
+                        .inner_margin(Margin { left: 12.0, right: 14.0, top: 12.0, bottom: 10.0 })
+                        .rounding(Rounding::same(0.0)),
+                )
+                .show(ctx, |ui| {
+                    paint_panel_glass_gradient(ui, self.theme);
+                    self.render_slot_column(ui, &mut action, &c);
+                });
+        }
+
         // ── Right inspector: on-demand preview (Text tab, toggled with Space) ──
         if self.active_tab == MainTab::Text && self.show_preview {
             egui::SidePanel::right("clip_inspector")
@@ -7651,27 +7588,6 @@ impl ClipdGui {
     ) {
         // Breath between filter row and first section header (mockup rhythm).
         ui.add_space(10.0);
-
-        // What is in each slot, on the first screen, above the list and fixed
-        // there. Behind a tab nobody opens it; as a section of full rows it
-        // would push pins and recents a screen down. One line of cards — the
-        // number and what it holds — costs one row and answers "what's in 2?"
-        // at a glance. All tab only: the others are a search for something.
-        if self.content_filter == ContentFilter::All
-            && self.search_query.trim().is_empty()
-            && !self.in_ask_mode()
-        {
-            let cards = self.slot_shelf_cards();
-            if !cards.is_empty() {
-                if let Some(clip_id) = draw_slot_shelf(ui, &cards, c) {
-                    if self.jump_to_clip(clip_id) {
-                        clipd_core::telemetry_event("slot_shelf", &[("action", "paste".into())]);
-                        *action = Action::Paste;
-                    }
-                }
-                ui.add_space(6.0);
-            }
-        }
 
         let visible_indices = self.filtered.clone();
         let snippets = self.matched_snippets.clone();
@@ -9431,26 +9347,108 @@ impl ClipdGui {
         let _ = c;
     }
 
-    /// One card per text in slots 1-9, in slot order: (slots, clip id, preview).
-    /// The preview is the clip's own, so a secret is already masked.
-    fn slot_shelf_cards(&self) -> Vec<(Vec<u8>, i64, String)> {
-        let mut cards: Vec<(Vec<u8>, i64, String)> = self
-            .slots_by_content
-            .iter()
-            .filter_map(|(content, slots)| {
-                let clip = self.clips.iter().find(|clip| &clip.content == content)?;
-                let mut preview = one_line_preview(&clip.preview, 80);
-                if preview.is_empty() {
-                    preview = match clip.content_type {
-                        ContentType::Image => "Image".to_string(),
-                        _ => one_line_preview(&clip.content, 80),
-                    };
+    /// The Slots column: slots 1-9, what each holds and the keys that paste
+    /// it; empty ones say the keys that fill them. Click a filled slot to
+    /// paste it.
+    fn render_slot_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        action: &mut Action,
+        c: &clipd_core::ThemeColors,
+    ) {
+        let rows = self.slot_strip_rows();
+        let spaced: String = "SLOTS"
+            .chars()
+            .map(|ch| ch.to_string())
+            .collect::<Vec<_>>()
+            .join("\u{2009}");
+        ui.label(RichText::new(spaced).size(10.5).strong().color(rgb(c.overlay)));
+        ui.label(
+            RichText::new("⌘C ×N saves · ⌘V ×N pastes, in any app")
+                .size(10.5)
+                .color(rgb(c.overlay).gamma_multiply(0.85)),
+        );
+        ui.add_space(8.0);
+        let mut take: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("slot_column")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for (n, held) in &rows {
+                    let id = egui::Id::new(("slot_column_row", *n));
+                    let hovered = held.is_some()
+                        && ui.ctx().read_response(id).is_some_and(|r| r.hovered());
+                    let frame = egui::Frame::none()
+                        .fill(if hovered { surf(c, c.bg_hover) } else { Color32::TRANSPARENT })
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(Margin::symmetric(6.0, 5.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                match held {
+                                    Some(_) => draw_slot_tile(ui, &[*n], false, c),
+                                    None => draw_number_box(ui, &[*n], c),
+                                }
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    match held {
+                                        Some((_, preview)) => {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(preview)
+                                                        .size(13.0)
+                                                        .color(rgb(c.text)),
+                                                )
+                                                .truncate(),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} pastes it",
+                                                    slot_chord('V', *n)
+                                                ))
+                                                .size(10.5)
+                                                .color(rgb(c.subtext)),
+                                            );
+                                        }
+                                        None => {
+                                            ui.label(
+                                                RichText::new("Empty")
+                                                    .size(12.5)
+                                                    .color(rgb(c.overlay)),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} saves here",
+                                                    slot_chord('C', *n)
+                                                ))
+                                                .size(10.5)
+                                                .color(rgb(c.overlay).gamma_multiply(0.8)),
+                                            );
+                                        }
+                                    }
+                                });
+                            });
+                        });
+                    let sense = if held.is_some() { egui::Sense::click() } else { egui::Sense::hover() };
+                    let resp = ui.interact(frame.response.rect, id, sense);
+                    if let Some((content, preview)) = held {
+                        let resp = resp.on_hover_text(slot_chip_hint(*n, Some(preview), "paste"));
+                        if resp.clicked() {
+                            take = Some(content.clone());
+                        }
+                    }
                 }
-                Some((slots.clone(), clip.id, preview))
-            })
-            .collect();
-        cards.sort_by_key(|(slots, _, _)| slots.first().copied().unwrap_or(u8::MAX));
-        cards
+            });
+        if let Some(content) = take {
+            if let Some(clip_id) = self.clips.iter().find(|clip| clip.content == content).map(|clip| clip.id) {
+                if self.jump_to_clip(clip_id) {
+                    clipd_core::telemetry_event("slot_column", &[("action", "paste".into())]);
+                    *action = Action::Paste;
+                }
+            }
+        }
     }
 
     /// Cached by refresh(); falls back to a scan for a clip not seen yet.
