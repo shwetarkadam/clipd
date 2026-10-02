@@ -1245,25 +1245,31 @@ fn draw_source_tile(ui: &mut egui::Ui, source: &str, c: &clipd_core::ThemeColors
 const FRESH_WINDOW_SECS: i64 = 10 * 60;
 const FRESH_MAX: usize = 3;
 
-/// Unpinned clips copied in the last ten minutes (up to three, newest first)
-/// moved to the front; everything else keeps its order. Returns the order and
-/// how many rows lead.
+/// Clips you touched in the last ten minutes — copied, or starred — moved to
+/// the front, newest touch first, up to three; everything else keeps its
+/// order. Returns the order and how many rows lead.
+///
+/// Starring counts as a touch so a clip you just starred comes to the top,
+/// where you are looking, rather than dropping into the middle of the pins.
 fn fresh_first(
     indices: &[usize],
     clips: &[ClipEntry],
-    starred: &HashSet<i64>,
+    starred_at: &HashMap<i64, chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> (Vec<usize>, usize) {
+    let touched = |i: usize| {
+        let clip = &clips[i];
+        match starred_at.get(&clip.id) {
+            Some(at) if *at > clip.timestamp => *at,
+            _ => clip.timestamp,
+        }
+    };
     let mut fresh: Vec<usize> = indices
         .iter()
         .copied()
-        .filter(|&i| {
-            let clip = &clips[i];
-            !starred.contains(&clip.id)
-                && (now - clip.timestamp).num_seconds() <= FRESH_WINDOW_SECS
-        })
+        .filter(|&i| (now - touched(i)).num_seconds() <= FRESH_WINDOW_SECS)
         .collect();
-    fresh.sort_by(|&a, &b| clips[b].timestamp.cmp(&clips[a].timestamp));
+    fresh.sort_by(|&a, &b| touched(b).cmp(&touched(a)));
     fresh.truncate(FRESH_MAX);
     let count = fresh.len();
     let mut ordered = fresh.clone();
@@ -1282,7 +1288,7 @@ fn row_group(
     if in_slots_tab {
         "In slots"
     } else if pos < fresh_rows {
-        "Just copied"
+        "Just now"
     } else {
         clip_group_label(clip, starred)
     }
@@ -4220,6 +4226,9 @@ struct ClipdGui {
     collections: Vec<clipd_core::Collection>,
     starred_collection_id: Option<i64>,
     starred_clip_ids: HashSet<i64>,
+    /// When each starred clip was starred — pins list newest-starred first,
+    /// and a clip starred moments ago leads the list (see `fresh_first`).
+    starred_at: HashMap<i64, chrono::DateTime<chrono::Utc>>,
     /// GPU textures for image-clip thumbnails, keyed by clip id. `None` means we
     /// tried to load and failed (missing/corrupt file) — don't retry every frame.
     thumb_textures: std::collections::HashMap<i64, Option<egui::TextureHandle>>,
@@ -4490,6 +4499,7 @@ impl ClipdGui {
             collections: Vec::new(),
             starred_collection_id: None,
             starred_clip_ids: HashSet::new(),
+            starred_at: HashMap::new(),
             thumb_textures: std::collections::HashMap::new(),
             new_collection_name: String::new(),
             new_collection_app: String::new(),
@@ -4553,13 +4563,9 @@ impl ClipdGui {
             })
             .map(|collection| collection.id);
         if let Some(collection_id) = self.starred_collection_id {
-            self.starred_clip_ids = self
-                .store
-                .collection_items(collection_id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|item| item.clip_id)
-                .collect();
+            let items = self.store.collection_items(collection_id).unwrap_or_default();
+            self.starred_clip_ids = items.iter().map(|item| item.clip_id).collect();
+            self.starred_at = items.iter().map(|item| (item.clip_id, item.added_at)).collect();
         }
     }
 
@@ -4592,9 +4598,11 @@ impl ClipdGui {
                 let _ = self.store.remove_collection_item(collection_id, clip_id);
             }
             self.starred_clip_ids.remove(&clip_id);
+            self.starred_at.remove(&clip_id);
         } else if let Some(collection_id) = self.ensure_starred_collection() {
             let _ = self.store.add_clip_to_collection(collection_id, clip_id);
             self.starred_clip_ids.insert(clip_id);
+            self.starred_at.insert(clip_id, chrono::Utc::now());
         }
         self.refresh_collections();
         self.apply_filter();
@@ -6017,8 +6025,21 @@ impl ClipdGui {
 
         // Pinned clips form the first visual section, matching the reference.
         // sort_by_key is stable, so recency is preserved within both groups.
-        self.filtered
-            .sort_by_key(|&i| !self.starred_clip_ids.contains(&self.clips[i].id));
+        // Newest-starred first within the pins; everything else keeps its order
+        // (sort_by is stable). Ordered by copy time instead, a pin you had
+        // just made could land anywhere in the section.
+        {
+            let starred_at = &self.starred_at;
+            let clips = &self.clips;
+            self.filtered.sort_by(|&a, &b| {
+                match (starred_at.get(&clips[a].id), starred_at.get(&clips[b].id)) {
+                    (Some(ta), Some(tb)) => tb.cmp(ta),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
+        }
         // What you just copied leads, ahead even of pins. With pins first, a
         // handful of starred clips filled the popover's seven rows and a copy
         // made seconds ago landed at row six — present, and invisible. Pins
@@ -6032,7 +6053,7 @@ impl ClipdGui {
             let (ordered, fresh) = fresh_first(
                 &self.filtered,
                 &self.clips,
-                &self.starred_clip_ids,
+                &self.starred_at,
                 chrono::Utc::now(),
             );
             self.filtered = ordered;
@@ -13903,7 +13924,9 @@ mod slot_strip_tests {
         clips[2].timestamp = now - chrono::Duration::seconds(5);
         clips[3].timestamp = now - chrono::Duration::seconds(70);
         clips[4].timestamp = now - chrono::Duration::days(7);
-        let starred: HashSet<i64> = [1, 2].into_iter().collect();
+        let mut starred: HashMap<i64, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        starred.insert(1, now - chrono::Duration::days(3));
+        starred.insert(2, now - chrono::Duration::days(4));
         // As apply_filter leaves it: pins first, then newest.
         let (order, fresh) = fresh_first(&[0, 1, 2, 3, 4], &clips, &starred, now);
         assert_eq!(fresh, 2);
@@ -13914,6 +13937,24 @@ mod slot_strip_tests {
         let (order, fresh) = fresh_first(&[0, 1, 2, 3, 4], &clips, &starred, later);
         assert_eq!(fresh, 0);
         assert_eq!(order, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_clip_starred_just_now_goes_to_the_top() {
+        let now = chrono::Utc::now();
+        let mut clips = vec![
+            clip(1, "copied a minute ago", ContentType::Text, 1),
+            clip(2, "last week, starred now", ContentType::Text, 1),
+        ];
+        clips[0].timestamp = now - chrono::Duration::seconds(60);
+        clips[1].timestamp = now - chrono::Duration::days(7);
+        let mut starred: HashMap<i64, chrono::DateTime<chrono::Utc>> = HashMap::new();
+        starred.insert(2, now - chrono::Duration::seconds(2));
+        // Pins first (as apply_filter sorts), then the recent copy.
+        let (order, fresh) = fresh_first(&[1, 0], &clips, &starred, now);
+        assert_eq!(fresh, 2);
+        let ids: Vec<i64> = order.iter().map(|&i| clips[i].id).collect();
+        assert_eq!(ids, vec![2, 1], "the star is the newest touch");
     }
 
     #[test]
