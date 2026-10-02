@@ -1320,6 +1320,66 @@ fn draw_slot_shelf(
     clicked
 }
 
+/// A row's ⋮ menu — Copy, Pin/Unpin, Delete — as (copy, star, delete).
+/// A blank button with the dots painted on: the ⋮ character is not in the
+/// bundled font and came out as an empty box.
+fn row_more_menu(
+    ui: &mut egui::Ui,
+    is_starred: bool,
+    c: &clipd_core::ThemeColors,
+) -> (bool, bool, bool) {
+    let (mut copy, mut star, mut delete) = (false, false, false);
+    let more = egui::menu::menu_custom_button(
+        ui,
+        egui::Button::new("")
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::NONE)
+            .min_size(egui::vec2(22.0, 28.0)),
+        |ui| {
+            if ui.button("Copy").clicked() {
+                copy = true;
+                ui.close_menu();
+            }
+            if ui.button(if is_starred { "Unpin" } else { "Pin" }).clicked() {
+                star = true;
+                ui.close_menu();
+            }
+            if ui.button("Delete").clicked() {
+                delete = true;
+                ui.close_menu();
+            }
+        },
+    );
+    let r = more.response.rect;
+    for dy in [-4.6_f32, 0.0, 4.6] {
+        ui.painter()
+            .circle_filled(egui::pos2(r.center().x, r.center().y + dy), 1.5, rgb(c.overlay));
+    }
+    (copy, star, delete)
+}
+
+/// Mono's slot marker: a hairline box with the number in grey, as quiet as
+/// the rest of the row. ("2·3" for a text in two slots.)
+fn draw_number_box(ui: &mut egui::Ui, slots: &[u8], c: &clipd_core::ThemeColors) {
+    let label = slots
+        .iter()
+        .map(|n| clipd_core::slot_badge(*n))
+        .collect::<Vec<_>>()
+        .join("·");
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label, FontId::proportional(12.0), rgb(c.subtext));
+    let (cell, _) = ui.allocate_exact_size(
+        egui::vec2((galley.size().x + 12.0).max(26.0), 30.0),
+        egui::Sense::hover(),
+    );
+    let chip = egui::Rect::from_center_size(cell.center(), egui::vec2(cell.width(), 24.0));
+    ui.painter()
+        .rect_stroke(chip, Rounding::same(5.0), Stroke::new(1.0, rgb(c.overlay).gamma_multiply(0.6)));
+    ui.painter()
+        .galley(chip.center() - galley.size() / 2.0, galley, rgb(c.subtext));
+}
+
 /// A row's slot number(s), drawn where the type glyph would be.
 fn draw_slot_tile(ui: &mut egui::Ui, slots: &[u8], boxed: bool, c: &clipd_core::ThemeColors) {
     let label = slots
@@ -2639,6 +2699,7 @@ fn theme_named(name: &str) -> Option<Theme> {
         // calls don't break. The old colorful themes are gone, but users land in
         // a readable palette instead of an error.
         "catppuccin" | "mocha" => Some(Theme::Catppuccin),
+        "mono" | "noir" => Some(Theme::Mono),
         "monokai" | "nord" | "dracula" => Some(Theme::Dark),
         _ => None,
     }
@@ -2649,7 +2710,7 @@ fn requested_theme(args: &[String]) -> Option<Result<Theme, String>> {
     let name = args.get(position + 1).map(String::as_str).unwrap_or("");
     Some(theme_named(name).ok_or_else(|| {
         format!(
-            "Unknown theme '{name}'. Use system, light, dark, midnight, forest, slate, catppuccin, glass-light, or glass-dark."
+            "Unknown theme '{name}'. Use system, light, dark, midnight, forest, slate, catppuccin, mono, glass-light, or glass-dark."
         )
     }))
 }
@@ -7627,7 +7688,9 @@ impl ClipdGui {
                     // rim, so they keep all four corners and stand apart.
                     // Opaque themes rule them together into one card.
                     let glass_rows = self.theme.is_glass();
-                    let row_rounding = if glass_rows {
+                    let row_rounding = if self.theme.is_flat() {
+                        Rounding::same(6.0)
+                    } else if glass_rows {
                         Rounding::same(10.0)
                     } else {
                         Rounding {
@@ -7696,6 +7759,22 @@ impl ClipdGui {
                             Stroke::new(0.5, rgb(c.border).gamma_multiply(0.55)),
                         )
                     };
+                    // Flat (Mono): rows sit on the base with no card under
+                    // them; a fill marks where you are and hairlines do the
+                    // separating. The slot is said by the number box, not a ring.
+                    let flat = self.theme.is_flat();
+                    let (bg, border) = if flat {
+                        let fill = if is_selected {
+                            surf(c, c.bg_selected)
+                        } else if row_hovered {
+                            surf(c, c.bg_hover)
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        (fill, Stroke::NONE)
+                    } else {
+                        (bg, border)
+                    };
 
                     let is_image = clip.content_type == ContentType::Image;
                     let preview = if is_image {
@@ -7745,11 +7824,66 @@ impl ClipdGui {
                         .fill(bg)
                         .rounding(row_rounding)
                         .stroke(border)
-                        .inner_margin(Margin::symmetric(12.0, 10.0))
+                        .inner_margin(if flat {
+                            Margin::symmetric(10.0, 6.0)
+                        } else {
+                            Margin::symmetric(12.0, 10.0)
+                        })
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 10.0;
+                                if flat {
+                                    // One line: number box (slots only) or a
+                                    // quiet type glyph, the text, and the time —
+                                    // which gives way to the actions under the
+                                    // pointer or the selection.
+                                    ui.spacing_mut().item_spacing.x = 12.0;
+                                    if row_slots.is_empty() {
+                                        let quiet = clipd_core::ThemeColors { text: c.overlay, ..*c };
+                                        draw_type_tile(ui, &clip.content_type, is_sensitive, false, &quiet);
+                                    } else {
+                                        draw_number_box(ui, &row_slots, c);
+                                    }
+                                    let lit = is_selected || row_hovered;
+                                    let right_w = if lit { 96.0 } else { 52.0 };
+                                    let content_w = (ui.available_width() - right_w).max(60.0);
+                                    ui.allocate_ui(egui::vec2(content_w, 26.0), |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(format!("{}{}", truncated, suffix))
+                                                    .size(14.0)
+                                                    .color(rgb(c.text)),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if lit {
+                                                let (copy, star, delete) =
+                                                    row_more_menu(ui, is_starred, c);
+                                                copy_clicked |= copy;
+                                                star_clicked |= star;
+                                                delete_clicked |= delete;
+                                                if row_star_quiet(ui, is_starred, c).clicked() {
+                                                    star_clicked = true;
+                                                }
+                                                if row_copy_button(ui, c).clicked() {
+                                                    copy_clicked = true;
+                                                }
+                                            } else {
+                                                ui.label(
+                                                    RichText::new(&time)
+                                                        .size(12.5)
+                                                        .color(rgb(c.overlay)),
+                                                );
+                                            }
+                                        },
+                                    );
+                                    return;
+                                }
 
                                 // No selection rail. The reference marks the
                                 // selected row by filling it, and inside a
@@ -7813,40 +7947,10 @@ impl ClipdGui {
                                         // painted on: the ⋮ character is not
                                         // in the bundled font and came out as
                                         // an empty box.
-                                        let more = egui::menu::menu_custom_button(
-                                            ui,
-                                            egui::Button::new("")
-                                                .fill(Color32::TRANSPARENT)
-                                                .stroke(Stroke::NONE)
-                                                .min_size(egui::vec2(22.0, 28.0)),
-                                            |ui| {
-                                                if ui.button("Copy").clicked() {
-                                                    copy_clicked = true;
-                                                    ui.close_menu();
-                                                }
-                                                if ui
-                                                    .button(if is_starred { "Unpin" } else { "Pin" })
-                                                    .clicked()
-                                                {
-                                                    star_clicked = true;
-                                                    ui.close_menu();
-                                                }
-                                                if ui.button("Delete").clicked() {
-                                                    delete_clicked = true;
-                                                    ui.close_menu();
-                                                }
-                                            },
-                                        );
-                                        {
-                                            let r = more.response.rect;
-                                            for dy in [-4.6_f32, 0.0, 4.6] {
-                                                ui.painter().circle_filled(
-                                                    egui::pos2(r.center().x, r.center().y + dy),
-                                                    1.5,
-                                                    rgb(c.overlay),
-                                                );
-                                            }
-                                        }
+                                        let (copy, star, delete) = row_more_menu(ui, is_starred, c);
+                                        copy_clicked |= copy;
+                                        star_clicked |= star;
+                                        delete_clicked |= delete;
                                         // The pin holds its place whether or
                                         // not it is filled: a control that
                                         // appears on hover moves the two
@@ -7907,6 +8011,16 @@ impl ClipdGui {
                             });
                         });
 
+                    // Flat rows are ruled apart, inset so the rule does not
+                    // run into the selection's rounded corners.
+                    if flat && !last_in_group {
+                        let r = frame_resp.response.rect;
+                        ui.painter().hline(
+                            (r.left() + 10.0)..=(r.right() - 10.0),
+                            r.bottom(),
+                            Stroke::new(1.0, rgb(c.border)),
+                        );
+                    }
                     if star_clicked {
                         self.selected = display_idx;
                         *action = Action::ToggleStar(clip_id_value);
@@ -9874,6 +9988,21 @@ impl ClipdGui {
         let row_h = 28.0;
         let full_w = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(egui::vec2(full_w, row_h), egui::Sense::hover());
+
+        // Left, Mono only — the one thing to know about the list.
+        if self.theme.is_flat() {
+            let left = egui::Rect::from_min_size(rect.min, egui::vec2(full_w * 0.6, row_h));
+            ui.allocate_ui_at_rect(left, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Click to copy · Enter to paste")
+                            .size(12.0)
+                            .color(rgb(c.overlay)),
+                    );
+                });
+            });
+        }
 
         // Right — shortcut hint.
         let right = egui::Rect::from_min_size(
@@ -13328,6 +13457,7 @@ mod tests {
         // the real thing rather than a stand-in.
         assert_eq!(theme_named("catppuccin"), Some(Theme::Catppuccin));
         assert_eq!(theme_named("mocha"), Some(Theme::Catppuccin));
+        assert_eq!(theme_named("mono"), Some(Theme::Mono));
         // The other retired names still land somewhere readable.
         assert_eq!(theme_named("nord"), Some(Theme::Dark));
         assert_eq!(theme_named("dracula"), Some(Theme::Dark));
