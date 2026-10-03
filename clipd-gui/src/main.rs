@@ -2381,6 +2381,16 @@ pub(crate) fn strip_rows_from_store(
         .collect()
 }
 
+/// The review sheet for a skill about to be saved.
+struct SkillReview {
+    candidate: clipd_core::SkillCandidate,
+    name: String,
+    md: String,
+    to_agents: bool,
+    to_snippets: bool,
+    error: Option<String>,
+}
+
 enum Action {
     None,
     /// Copy to the clipboard only — clipd stays in front (single-click select).
@@ -4193,6 +4203,14 @@ struct ClipdGui {
     want_key_window: bool,
     /// Secret-scan results by clip id, so a reload only scans what is new.
     secret_scan_cache: HashMap<i64, Option<String>>,
+    /// Skills from the clipboard (see clipd_core::skills): the background scan,
+    /// the workflow being offered, and the review sheet when it is open. None
+    /// of it leaves the Mac, and none of it is reported to telemetry.
+    skill_scan_rx: Option<std::sync::mpsc::Receiver<Vec<clipd_core::SkillCandidate>>>,
+    skill_scanned_at: Option<Instant>,
+    skill_offer: Option<clipd_core::SkillCandidate>,
+    skill_review: Option<SkillReview>,
+    skill_note: Option<(String, Instant)>,
     /// Keyboard-permission state, read at most every couple of seconds. The
     /// banner and the onboarding card asked on every frame, and each answer
     /// is a round trip to macOS's privacy daemon (tccd) plus a file read —
@@ -4443,6 +4461,11 @@ impl ClipdGui {
             want_key_window: false,
             secret_scan_cache,
             sensitive_cache,
+            skill_scan_rx: None,
+            skill_scanned_at: None,
+            skill_offer: None,
+            skill_review: None,
+            skill_note: None,
             perm_checked: None,
             hotkey_status_seen: HotkeyStatus::Ok,
             missing_permission_seen: "keyboard access",
@@ -7431,6 +7454,12 @@ impl eframe::App for ClipdGui {
             self.render_transform_window(ctx, &c);
         }
 
+        self.poll_skill_scan(ctx);
+        if self.skill_scan_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+        self.draw_skill_review(ctx, &c);
+
         // Last, so it sits on top of whatever else is open. A report about a
         // crash the person already lived through is not urgent enough to
         // interrupt them, but it should not be buried either.
@@ -9282,6 +9311,7 @@ impl ClipdGui {
         let introducing = self.render_slot_onboarding(ui, c);
         if !introducing {
             self.render_slot_tip(ui, c);
+            self.render_skill_offer(ui, c);
         }
         #[cfg(target_os = "macos")]
         if !introducing && self.hotkey_status() == HotkeyStatus::NeedsAccessibility {
@@ -9367,6 +9397,277 @@ impl ClipdGui {
     fn missing_permission(&mut self) -> &'static str {
         self.refresh_permission_state();
         self.missing_permission_seen
+    }
+
+    /// Look for repeated workflows in the background — on open, then every 15
+    /// minutes — and offer the first one not answered yet. The main window
+    /// only: the popover and the island are glances, not places to review a
+    /// file.
+    fn poll_skill_scan(&mut self, ctx: &egui::Context) {
+        if self.hud || self.island_surface {
+            return;
+        }
+        if let Some(rx) = &self.skill_scan_rx {
+            if let Ok(found) = rx.try_recv() {
+                self.skill_scan_rx = None;
+                let state = clipd_core::load_skill_state();
+                if self.skill_offer.is_none() && self.skill_review.is_none() {
+                    self.skill_offer = found.into_iter().find(|c| !state.answered(&c.signature));
+                }
+                ctx.request_repaint();
+            }
+            return;
+        }
+        let due = self
+            .skill_scanned_at
+            .map_or(true, |at| at.elapsed() >= Duration::from_secs(15 * 60));
+        if !due {
+            return;
+        }
+        self.skill_scanned_at = Some(Instant::now());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.skill_scan_rx = Some(rx);
+        let minutes = self.session_config.window_minutes;
+        std::thread::spawn(move || {
+            let found = ClipStore::new(&ClipStore::default_path())
+                .ok()
+                .and_then(|store| store.copy_timeline(5000).ok())
+                .map(|timeline| {
+                    clipd_core::find_skill_candidates(
+                        &timeline,
+                        &clipd_core::load_privacy_config(),
+                        minutes,
+                    )
+                })
+                .unwrap_or_default();
+            let _ = tx.send(found);
+        });
+    }
+
+    /// "You repeat this workflow — make it a skill?" Quiet, one line of steps,
+    /// three answers: look at it, not now, never for this one.
+    fn render_skill_offer(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        if let Some((note, at)) = &self.skill_note {
+            if at.elapsed() < Duration::from_secs(8) {
+                ui.label(RichText::new(note).size(11.5).color(rgb(c.subtext)));
+                ui.add_space(6.0);
+            }
+        }
+        let Some(offer) = self.skill_offer.clone() else { return };
+        if self.skill_review.is_some() {
+            return;
+        }
+        let mut answer: Option<&'static str> = None;
+        egui::Frame::none()
+            .fill(surf(c, c.bg_elevated))
+            .stroke(Stroke::new(0.8, rgb(c.border)))
+            .rounding(Rounding::same(10.0))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("You repeat this workflow. Make it a skill?")
+                        .size(12.5)
+                        .strong()
+                        .color(rgb(c.text)),
+                );
+                let flow: Vec<String> = offer
+                    .steps
+                    .iter()
+                    .take(4)
+                    .map(|step| clipd_core::step_summary(step, 26))
+                    .collect();
+                // "·", not "→": the bundled UI font has no arrow and drew a box.
+                let more = if offer.steps.len() > 4 { "  ·  …" } else { "" };
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{}{more}", flow.join("  ·  ")))
+                            .size(11.5)
+                            .color(rgb(c.subtext)),
+                    )
+                    .truncate(),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Seen in {} separate work sessions. Made on this Mac; nothing is sent anywhere.",
+                        offer.sessions
+                    ))
+                    .size(10.5)
+                    .color(rgb(c.overlay)),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Review").size(12.0)).clicked() {
+                        answer = Some("review");
+                    }
+                    if ui.button(RichText::new("Not now").size(12.0)).clicked() {
+                        answer = Some("later");
+                    }
+                    if ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new("Don't suggest this").size(11.5).color(rgb(c.overlay)),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        answer = Some("never");
+                    }
+                });
+            });
+        ui.add_space(6.0);
+        match answer {
+            Some("review") => {
+                let name = offer.name.clone();
+                let md = clipd_core::render_skill_md(&offer, &name);
+                self.skill_review = Some(SkillReview {
+                    candidate: offer,
+                    name,
+                    md,
+                    to_agents: true,
+                    to_snippets: true,
+                    error: None,
+                });
+            }
+            Some("later") => self.skill_offer = None,
+            Some("never") => {
+                let mut state = clipd_core::load_skill_state();
+                state.dismissed.push(offer.signature.clone());
+                clipd_core::save_skill_state(&state);
+                self.skill_offer = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// The review sheet: the name, the SKILL.md exactly as it will be written,
+    /// where it goes, and Save. Nothing is written before Save.
+    fn draw_skill_review(&mut self, ctx: &egui::Context, c: &clipd_core::ThemeColors) {
+        let Some(mut review) = self.skill_review.take() else { return };
+        let mut close = false;
+        let mut save = false;
+        let width = (ctx.screen_rect().width() - 40.0).min(560.0);
+        egui::Window::new("skill_review")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([width, 0.0])
+            .frame(
+                egui::Frame::none()
+                    .fill(rgb(c.bg_elevated))
+                    .inner_margin(Margin::symmetric(16.0, 14.0))
+                    .stroke(Stroke::new(1.0, rgb(c.border)))
+                    .rounding(Rounding::same(12.0)),
+            )
+            .show(ctx, |ui| {
+                ui.label(RichText::new("New skill from your clipboard").size(15.0).strong().color(rgb(c.text)));
+                ui.label(
+                    RichText::new("Made on this Mac from your clipboard history. Nothing is sent anywhere.")
+                        .size(11.0)
+                        .color(rgb(c.subtext)),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Name").size(12.0).color(rgb(c.subtext)));
+                    let edit = ui.add(egui::TextEdit::singleline(&mut review.name).desired_width(240.0));
+                    if edit.changed() {
+                        let name = clipd_core::clean_skill_name(&review.name);
+                        review.md = clipd_core::render_skill_md(&review.candidate, &name);
+                        review.error = None;
+                    }
+                });
+                ui.add_space(8.0);
+                egui::Frame::none()
+                    .fill(rgb(c.bg_base))
+                    .stroke(Stroke::new(0.8, rgb(c.border)))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(Margin::same(8.0))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("skill_review_md")
+                            .min_scrolled_height(260.0)
+                            .max_height(300.0)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut review.md.as_str())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .frame(false),
+                                );
+                            });
+                    });
+                ui.add_space(8.0);
+                let name = clipd_core::clean_skill_name(&review.name);
+                ui.checkbox(
+                    &mut review.to_agents,
+                    RichText::new(format!("Save for AI agents  ·  ~/.claude/skills/{name}/SKILL.md")).size(12.0),
+                );
+                ui.checkbox(
+                    &mut review.to_snippets,
+                    RichText::new(format!(
+                        "Add each step as a clipd snippet  ·  {name}-1 … {name}-{}",
+                        review.candidate.steps.len()
+                    ))
+                    .size(12.0),
+                );
+                if let Some(error) = &review.error {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(error).size(11.5).color(Color32::from_rgb(230, 120, 110)));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let can_save = review.to_agents || review.to_snippets;
+                    if ui
+                        .add_enabled(can_save, egui::Button::new(RichText::new("Save skill").size(12.5).strong()))
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui.button(RichText::new("Cancel").size(12.5)).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if save {
+            let name = clipd_core::clean_skill_name(&review.name);
+            let md = clipd_core::render_skill_md(&review.candidate, &name);
+            let mut saved: Vec<String> = Vec::new();
+            if review.to_agents {
+                match clipd_core::agent_skills_dir()
+                    .ok_or_else(|| "Couldn't find your home folder.".to_string())
+                    .and_then(|dir| clipd_core::save_skill(&dir, &name, &md))
+                {
+                    Ok(_) => saved.push(format!("~/.claude/skills/{name}")),
+                    Err(error) => {
+                        review.error = Some(error);
+                        self.skill_review = Some(review);
+                        return;
+                    }
+                }
+            }
+            if review.to_snippets {
+                for (i, step) in review.candidate.steps.iter().enumerate() {
+                    let _ = self.store.upsert_snippet(
+                        &format!("{name}-{}", i + 1),
+                        &format!("{} · step {}", review.candidate.title, i + 1),
+                        &step.text,
+                    );
+                }
+                self.refresh_snippets();
+                saved.push(format!("{} snippets", review.candidate.steps.len()));
+            }
+            let mut state = clipd_core::load_skill_state();
+            state.created.push(review.candidate.signature.clone());
+            clipd_core::save_skill_state(&state);
+            self.skill_offer = None;
+            self.skill_note = Some((format!("Saved \"{name}\": {}.", saved.join(" and ")), Instant::now()));
+            return;
+        }
+        if !close {
+            self.skill_review = Some(review);
+        }
     }
 
     /// Cached by refresh(); falls back to a scan for a clip not seen yet.

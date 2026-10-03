@@ -23,6 +23,7 @@ pub mod secret_clipboard;
 pub mod semantic;
 pub mod session;
 pub mod slots;
+pub mod skills;
 pub mod snippets;
 pub mod store;
 pub mod sync;
@@ -105,6 +106,10 @@ pub use semantic::{SemanticResult, TfIdfIndex};
 pub use session::{compute_sessions, Session, SessionConfig};
 pub use slots::{SlotManager, MAX_CLIP_SLOT};
 pub use snippets::Snippet;
+pub use skills::{
+    agent_skills_dir, clean_skill_name, find_skill_candidates, load_skill_state, render_skill_md,
+    save_skill, save_skill_state, step_summary, SkillCandidate, SkillState, SkillStep, StepKind,
+};
 pub use store::ClipStore;
 pub use sync::{
     clip_from_envelope, deliver, encode as encode_envelope, envelope_from_clip, pending,
