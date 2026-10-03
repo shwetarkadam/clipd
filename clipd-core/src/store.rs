@@ -145,6 +145,17 @@ impl ClipStore {
 
             CREATE INDEX IF NOT EXISTS idx_coll_items ON collection_items(collection_id, position);
 
+            -- When each clip was copied: one row per copy, an id and a time,
+            -- never content. `clips` keeps one row per distinct text and moves
+            -- its timestamp on a re-copy, so on its own it cannot say that the
+            -- same command was copied on Monday and again on Thursday — which
+            -- is what finding a repeated workflow needs (see skills.rs).
+            CREATE TABLE IF NOT EXISTS copy_events (
+                clip_id INTEGER NOT NULL,
+                at      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_copy_events_at ON copy_events(at);
+
             CREATE TABLE IF NOT EXISTS snippets (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 trigger     TEXT NOT NULL UNIQUE,
@@ -288,6 +299,7 @@ impl ClipStore {
                     existing_id
                 ],
             )?;
+            self.record_copy_event(existing_id, &entry.timestamp);
             return Ok(existing_id);
         }
 
@@ -320,7 +332,55 @@ impl ClipStore {
             ],
         )?;
 
-        Ok(self.conn.last_insert_rowid())
+        let id = self.conn.last_insert_rowid();
+        self.record_copy_event(id, &entry.timestamp);
+        Ok(id)
+    }
+
+    /// Note that `clip_id` was copied at `at`. Best-effort: the copy is
+    /// already saved, and a missing event only costs a workflow suggestion.
+    fn record_copy_event(&self, clip_id: i64, at: &DateTime<Utc>) {
+        let _ = self.conn.execute(
+            "INSERT INTO copy_events (clip_id, at) VALUES (?1, ?2)",
+            params![clip_id, at.to_rfc3339()],
+        );
+    }
+
+    /// Copies as a timeline, newest first: one entry per copy, each carrying
+    /// the clip with `timestamp` set to when that copy happened. Clips copied
+    /// before events were recorded appear once, at their latest copy.
+    pub fn copy_timeline(&self, limit: usize) -> SqlResult<Vec<ClipEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT clip_id, at FROM copy_events ORDER BY at DESC LIMIT ?1")?;
+        let events: Vec<(i64, String)> = stmt
+            .query_map(params![limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(Result::ok)
+            .collect();
+        let mut seen: std::collections::HashSet<(i64, String)> = std::collections::HashSet::new();
+        let mut cache: std::collections::HashMap<i64, Option<ClipEntry>> =
+            std::collections::HashMap::new();
+        let mut timeline: Vec<ClipEntry> = Vec::new();
+        for (clip_id, at) in events {
+            let Ok(when) = DateTime::parse_from_rfc3339(&at) else { continue };
+            let clip = cache
+                .entry(clip_id)
+                .or_insert_with(|| self.get_by_id(clip_id).ok())
+                .clone();
+            if let Some(mut clip) = clip {
+                clip.timestamp = when.with_timezone(&Utc);
+                seen.insert((clip_id, clip.timestamp.to_rfc3339()));
+                timeline.push(clip);
+            }
+        }
+        for clip in self.get_recent(limit)? {
+            if !seen.contains(&(clip.id, clip.timestamp.to_rfc3339())) {
+                timeline.push(clip);
+            }
+        }
+        timeline.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        timeline.truncate(limit);
+        Ok(timeline)
     }
 
     /// Get recent clips, newest first.
@@ -466,6 +526,9 @@ impl ClipStore {
         let count = self
             .conn
             .execute("DELETE FROM clips WHERE id = ?1", params![id])?;
+        let _ = self
+            .conn
+            .execute("DELETE FROM copy_events WHERE clip_id = ?1", params![id]);
         Ok(count > 0)
     }
 
@@ -499,12 +562,17 @@ impl ClipStore {
             "DELETE FROM clips WHERE timestamp < ?1",
             params![before.to_rfc3339()],
         )?;
+        let _ = self.conn.execute(
+            "DELETE FROM copy_events WHERE at < ?1 OR clip_id NOT IN (SELECT id FROM clips)",
+            params![before.to_rfc3339()],
+        );
         Ok(count)
     }
 
     /// Delete all clips.
     pub fn clear_all(&self) -> SqlResult<usize> {
         let count = self.conn.execute("DELETE FROM clips", [])?;
+        let _ = self.conn.execute("DELETE FROM copy_events", []);
         Ok(count)
     }
 
@@ -599,6 +667,12 @@ impl ClipStore {
     /// Delete clips beyond `max_clips` (keeps most recent). Removes their embeddings too.
     /// Call this periodically to prevent unbounded DB growth.
     pub fn prune_old_clips(&self, max_clips: usize) -> SqlResult<usize> {
+        // Copy events live 90 days, and never outlive their clip.
+        let horizon = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+        let _ = self.conn.execute(
+            "DELETE FROM copy_events WHERE at < ?1 OR clip_id NOT IN (SELECT id FROM clips)",
+            params![horizon],
+        );
         let count: usize = self
             .conn
             .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))?;
@@ -1001,6 +1075,23 @@ mod tests {
             blob_path: blob.map(|b| b.to_string()),
             size: 1234,
         }
+    }
+
+    #[test]
+    fn a_clip_copied_twice_is_two_copies_in_the_timeline() {
+        let store = ClipStore::in_memory().unwrap();
+        let mut first = make_entry("cargo build --release");
+        first.timestamp = Utc::now() - chrono::Duration::days(3);
+        let id = store.insert(&first).unwrap();
+        let mut again = make_entry("cargo build --release");
+        again.timestamp = Utc::now();
+        assert_eq!(store.insert(&again).unwrap(), id, "still one clip");
+        let timeline = store.copy_timeline(100).unwrap();
+        assert_eq!(timeline.len(), 2, "but two copies");
+        assert!(timeline[0].timestamp > timeline[1].timestamp, "newest first");
+        // Deleting the clip takes its copies with it.
+        store.delete(id).ok();
+        assert!(store.copy_timeline(100).unwrap().is_empty());
     }
 
     #[test]
