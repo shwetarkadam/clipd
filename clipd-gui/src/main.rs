@@ -10956,7 +10956,7 @@ impl ClipdGui {
                     // clipd's cat where the magnifier was: the one bit of
                     // brand the window keeps, small and a little faded so it
                     // reads as the field's glyph rather than a logo.
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
                     if let Some(tex) = clipd_cat_texture(ui.ctx()) {
                         let size = tex.size_vec2();
                         let scale = (rect.width() / size.x).min(rect.height() / size.y);
