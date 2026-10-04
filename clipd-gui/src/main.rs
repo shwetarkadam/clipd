@@ -1384,28 +1384,6 @@ fn row_more_menu(
     (copy, star, delete)
 }
 
-/// Mono's slot marker: a hairline box with the number in grey, as quiet as
-/// the rest of the row. ("2·3" for a text in two slots.)
-fn draw_number_box(ui: &mut egui::Ui, slots: &[u8], c: &clipd_core::ThemeColors) {
-    let label = slots
-        .iter()
-        .map(|n| clipd_core::slot_badge(*n))
-        .collect::<Vec<_>>()
-        .join("·");
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label, FontId::proportional(12.0), rgb(c.subtext));
-    let (cell, _) = ui.allocate_exact_size(
-        egui::vec2((galley.size().x + 12.0).max(26.0), 30.0),
-        egui::Sense::hover(),
-    );
-    let chip = egui::Rect::from_center_size(cell.center(), egui::vec2(cell.width(), 24.0));
-    ui.painter()
-        .rect_stroke(chip, Rounding::same(5.0), Stroke::new(1.0, rgb(c.overlay).gamma_multiply(0.6)));
-    ui.painter()
-        .galley(chip.center() - galley.size() / 2.0, galley, rgb(c.subtext));
-}
-
 /// "Slot 2", or "Slots 2·3" for a text in two slots.
 fn slot_pill_label(slots: &[u8]) -> String {
     let numbers: Vec<String> = slots.iter().map(|n| clipd_core::slot_badge(*n)).collect();
@@ -8311,24 +8289,38 @@ impl ClipdGui {
                                     // which gives way to the actions under the
                                     // pointer or the selection.
                                     ui.spacing_mut().item_spacing.x = 12.0;
-                                    if row_slots.is_empty() {
-                                        let quiet = clipd_core::ThemeColors { text: c.overlay, ..*c };
-                                        draw_type_tile(ui, &clip.content_type, is_sensitive, false, &quiet);
-                                    } else {
-                                        draw_number_box(ui, &row_slots, c);
-                                    }
+                                    let quiet = clipd_core::ThemeColors { text: c.overlay, ..*c };
+                                    draw_type_tile(ui, &clip.content_type, is_sensitive, false, &quiet);
                                     let lit = is_selected || row_hovered;
                                     let right_w = if lit { 96.0 } else { 52.0 };
                                     let content_w = (ui.available_width() - right_w).max(60.0);
                                     ui.allocate_ui(egui::vec2(content_w, 26.0), |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(format!("{}{}", truncated, suffix))
-                                                    .size(15.0)
-                                                    .color(rgb(c.text)),
-                                            )
-                                            .truncate(),
-                                        );
+                                        // The slot as a pill right after the
+                                        // title, as on every other theme.
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 8.0;
+                                            let pill = (!row_slots.is_empty())
+                                                .then(|| slot_pill_label(&row_slots));
+                                            let pill_w = pill
+                                                .as_ref()
+                                                .map_or(0.0, |label| label.chars().count() as f32 * 7.2 + 26.0);
+                                            ui.allocate_ui(
+                                                egui::vec2((ui.available_width() - pill_w).max(40.0), 22.0),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(format!("{}{}", truncated, suffix))
+                                                                .size(15.0)
+                                                                .color(rgb(c.text)),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                },
+                                            );
+                                            if let Some(label) = &pill {
+                                                draw_slot_pill(ui, label, c);
+                                            }
+                                        });
                                     });
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
