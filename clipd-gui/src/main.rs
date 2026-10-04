@@ -1764,6 +1764,24 @@ fn draw_clock_icon_at(painter: &egui::Painter, center: egui::Pos2, col: Color32)
 }
 
 /// Footer shortcut chip — quiet outline box like the mockup's ⌘⇧V.
+/// "Option+Space" → "⌥ Space", the way macOS writes shortcuts.
+fn shortcut_symbols(label: &str) -> String {
+    if !cfg!(target_os = "macos") {
+        return label.to_string();
+    }
+    label
+        .split('+')
+        .map(|part| match part {
+            "Cmd" => "⌘",
+            "Shift" => "⇧",
+            "Option" | "Alt" => "⌥",
+            "Ctrl" => "⌃",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn footer_shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeColors) {
     egui::Frame::none()
         .fill(Color32::TRANSPARENT)
@@ -1771,13 +1789,63 @@ fn footer_shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeCol
         .stroke(Stroke::new(0.85, rgb(c.border)))
         .inner_margin(Margin::symmetric(7.0, 3.0))
         .show(ui, |ui| {
-            ui.label(
-                RichText::new(text)
-                    .size(11.0)
-                    .family(egui::FontFamily::Monospace)
-                    .color(rgb(c.subtext)),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                key_caps(ui, text, rgb(c.subtext), 11.0);
+            });
         });
+}
+
+/// Draw a shortcut like "⌥ Space" or "↑↓": the symbols the bundled font
+/// lacks (⌥ ⇧ ⌃ ↑↓ ↵) are painted; everything else is text. Typed, they came
+/// out as empty boxes.
+fn key_caps(ui: &mut egui::Ui, text: &str, color: Color32, size: f32) {
+    let mut tokens: Vec<&str> = text.split(' ').filter(|t| !t.is_empty()).collect();
+    // A row laid out right to left places the first token rightmost: "Space ⌥".
+    if ui.layout().prefer_right_to_left() {
+        tokens.reverse();
+    }
+    for token in tokens {
+        if matches!(token, "⌥" | "⇧" | "⌃" | "↑↓" | "↵") {
+            let w = if token == "↑↓" { size * 1.5 } else { size * 0.95 };
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, size + 2.0), egui::Sense::hover());
+            paint_key_symbol(ui.painter(), rect.shrink2(egui::vec2(0.5, 2.5)), token, color);
+        } else {
+            ui.label(RichText::new(token).size(size).color(color));
+        }
+    }
+}
+
+fn paint_key_symbol(painter: &egui::Painter, r: egui::Rect, symbol: &str, color: Color32) {
+    let stroke = Stroke::new(1.2, color);
+    let p = |x: f32, y: f32| egui::pos2(r.left() + r.width() * x, r.top() + r.height() * y);
+    let path = |points: Vec<egui::Pos2>| egui::Shape::line(points, stroke);
+    match symbol {
+        "⌥" => {
+            painter.add(path(vec![p(0.0, 0.2), p(0.35, 0.2), p(0.68, 0.85), p(1.0, 0.85)]));
+            painter.add(path(vec![p(0.6, 0.2), p(1.0, 0.2)]));
+        }
+        "⇧" => {
+            painter.add(egui::Shape::closed_line(
+                vec![p(0.5, 0.0), p(1.0, 0.5), p(0.72, 0.5), p(0.72, 1.0), p(0.28, 1.0), p(0.28, 0.5), p(0.0, 0.5)],
+                stroke,
+            ));
+        }
+        "⌃" => {
+            painter.add(path(vec![p(0.12, 0.65), p(0.5, 0.2), p(0.88, 0.65)]));
+        }
+        "↑↓" => {
+            painter.add(path(vec![p(0.25, 1.0), p(0.25, 0.0)]));
+            painter.add(path(vec![p(0.08, 0.25), p(0.25, 0.0), p(0.42, 0.25)]));
+            painter.add(path(vec![p(0.75, 0.0), p(0.75, 1.0)]));
+            painter.add(path(vec![p(0.58, 0.75), p(0.75, 1.0), p(0.92, 0.75)]));
+        }
+        "↵" => {
+            painter.add(path(vec![p(0.9, 0.05), p(0.9, 0.7), p(0.08, 0.7)]));
+            painter.add(path(vec![p(0.3, 0.42), p(0.08, 0.7), p(0.3, 0.98)]));
+        }
+        _ => {}
+    }
 }
 
 /// Quiet row star: solid green when pinned, outline otherwise.
@@ -1940,6 +2008,32 @@ fn cursor_in_points(ctx: &egui::Context) -> Option<egui::Pos2> {
 
 /// Where to place the window so it feels like it popped up at the cursor:
 /// search bar centered under the pointer, just below it.
+/// Where Spotlight puts itself: centred on the display the pointer is on, a
+/// sixth of the way down — the same place every time, so the eye knows where
+/// to look before the window is there.
+fn spotlight_pos(cursor: egui::Pos2, win_size: egui::Vec2) -> egui::Pos2 {
+    let displays = island::displays();
+    let screen = displays
+        .iter()
+        .map(|d| d.rect)
+        .find(|r| r.contains(cursor))
+        .or_else(|| displays.first().map(|d| d.rect));
+    match screen {
+        Some(r) => {
+            let min_top = if clipd_core::island_layout_active() {
+                clipd_core::ISLAND_RESERVED_TOP
+            } else {
+                32.0
+            };
+            let x = (r.center().x - win_size.x * 0.5).clamp(r.left() + 8.0, (r.right() - win_size.x - 8.0).max(r.left() + 8.0));
+            let y = (r.top() + (r.height() * 0.16).max(min_top))
+                .min((r.bottom() - win_size.y - 8.0).max(r.top() + min_top));
+            egui::pos2(x, y)
+        }
+        None => window_pos_at_cursor(cursor, win_size, None),
+    }
+}
+
 fn window_pos_at_cursor(
     cursor: egui::Pos2,
     win_size: egui::Vec2,
@@ -4153,6 +4247,11 @@ struct ClipdGui {
     /// When the window was last shown; focus churn right after a show (the
     /// tray or popover handing over) is not "clicking away".
     main_shown_at: Option<Instant>,
+    /// Keep putting the caret in the search field until this moment. One
+    /// request on the frame the window appears can land before macOS has made
+    /// it the key window and be dropped — the window came up focused with no
+    /// caret, and the first keystrokes went nowhere.
+    focus_search_until: Option<Instant>,
     /// Tracks window focus so summoning clipd lands the cursor in search.
     was_focused: bool,
     /// Vault (1Password / Bitwarden / Keychain) "save clipboard as a password" form.
@@ -4471,6 +4570,7 @@ impl ClipdGui {
             main_show_asked: None,
             main_had_focus: false,
             main_shown_at: None,
+            focus_search_until: None,
             was_focused: true,
             vault_targets: available_targets(),
             vault_selected: available_targets().first().copied(),
@@ -4741,11 +4841,7 @@ impl ClipdGui {
             ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             if let Some(cursor) = global_cursor_position() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(window_pos_at_cursor(
-                    cursor,
-                    size,
-                    main_display_size(),
-                )));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(spotlight_pos(cursor, size)));
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.focus_search = mode == SurfaceMode::Main;
@@ -4808,6 +4904,7 @@ impl ClipdGui {
         self.was_focused = false;
         self.main_had_focus = false;
         self.main_shown_at = Some(Instant::now());
+        self.focus_search_until = Some(Instant::now() + Duration::from_millis(700));
         clipd_core::set_gui_window_open(true);
         // Accept the keyboard the requester handed over (see clipd_core::focus).
         clipd_core::take_focus();
@@ -7330,6 +7427,7 @@ impl eframe::App for ClipdGui {
         }
         if focused && !self.was_focused {
             self.focus_search = true;
+            self.focus_search_until = Some(Instant::now() + Duration::from_millis(700));
             self.search_query.clear();
             self.apply_filter();
             // Summoned (Ctrl+G): jump to the mouse cursor — but NEVER while a
@@ -7350,11 +7448,8 @@ impl eframe::App for ClipdGui {
                         .map_or(true, |r| !r.contains(cursor));
                     if outside {
                         let size = ctx.input(|i| i.screen_rect().size());
-                        let monitor = ctx
-                            .input(|i| i.viewport().monitor_size)
-                            .or_else(main_display_size);
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                            window_pos_at_cursor(cursor, size, monitor),
+                            spotlight_pos(cursor, size),
                         ));
                     }
                 }
@@ -7562,13 +7657,28 @@ impl eframe::App for ClipdGui {
                         sw: 0.0,
                         se: 0.0,
                     })
-                    .inner_margin(Margin::symmetric(16.0, 14.0)),
+                    // The list below keeps ~12pt on its right for the scroll
+                    // bar; the header matches it so the search field, the
+                    // cards and the footer badge end on one line.
+                    .inner_margin(Margin {
+                        left: 16.0,
+                        right: if self.active_tab == MainTab::Text { 28.0 } else { 16.0 },
+                        top: 14.0,
+                        bottom: 14.0,
+                    }),
             )
             .show(ctx, |ui| {
                 paint_panel_glass_gradient(ui, self.theme);
-                self.render_brand_header(ui, &c);
-                ui.add_space(12.0);
-                self.render_search_bar(ui, &mut action, &c);
+                if self.active_tab == MainTab::Text {
+                    // Spotlight's shape: the search field is the top of the
+                    // window. No title, no row of icons — one menu for the
+                    // rest, and Esc or a click elsewhere to close.
+                    self.render_search_bar(ui, &mut action, &c);
+                } else {
+                    self.render_brand_header(ui, &c);
+                    ui.add_space(12.0);
+                    self.render_search_bar(ui, &mut action, &c);
+                }
                 if self.active_tab == MainTab::Text {
                     ui.add_space(12.0);
                     self.render_filter_pills(ui, &c);
@@ -9581,6 +9691,60 @@ impl ClipdGui {
         });
     }
 
+    /// The ⚙ menu beside the search field: Settings, the vault, keep on top,
+    /// and whether clipd is capturing.
+    fn render_window_menu(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        let mut open_settings = false;
+        let mut open_vault = false;
+        let mut toggle_pin = false;
+        let pinned = self.window_pinned;
+        let theme = self.theme;
+        egui::menu::menu_custom_button(
+            ui,
+            egui::Button::new(RichText::new("⚙").size(14.0).color(rgb(c.overlay)))
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::NONE)
+                .min_size(egui::vec2(24.0, 24.0)),
+            |ui| {
+                ui.set_min_width(200.0);
+                if ui.button("Settings  ⌘,").clicked() {
+                    open_settings = true;
+                    ui.close_menu();
+                }
+                if ui.button("Vault").clicked() {
+                    open_vault = true;
+                    ui.close_menu();
+                }
+                let pin_label = if pinned { "✓ Keep window on top" } else { "Keep window on top" };
+                if ui.button(pin_label).clicked() {
+                    toggle_pin = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 3.6, capture_dot_color(theme, c));
+                    ui.label(RichText::new("Capturing your clipboard").size(11.5).color(rgb(c.subtext)));
+                });
+            },
+        )
+        .response
+        .on_hover_text("Settings, vault, keep on top");
+        if open_settings {
+            self.active_tab = MainTab::Settings;
+        }
+        if open_vault {
+            self.active_tab = MainTab::Vault;
+            self.refresh_vault_secrets();
+        }
+        if toggle_pin {
+            self.window_pinned = !self.window_pinned;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                if self.window_pinned { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal },
+            ));
+        }
+    }
+
     /// Settings category pills — General / Clipboard / AI / Appearance / Privacy.
     fn render_settings_category_tabs(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         ui.horizontal_wrapped(|ui| {
@@ -10779,10 +10943,30 @@ impl ClipdGui {
             .inner_margin(Margin::symmetric(10.0, 7.0));
 
         search_frame.show(ui, |ui| {
-            ui.set_width(search_w);
+            // The frame's own padding (10pt a side) sits outside this width;
+            // set to the full width, the field ran past the window's right
+            // edge and cut its border off.
+            ui.set_width(search_w - 20.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                draw_search_icon(ui, rgb(c.subtext));
+                if self.active_tab == MainTab::Text {
+                    // clipd's cat where the magnifier was: the one bit of
+                    // brand the window keeps, small and a little faded so it
+                    // reads as the field's glyph rather than a logo.
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                    if let Some(tex) = clipd_cat_texture(ui.ctx()) {
+                        let size = tex.size_vec2();
+                        let scale = (rect.width() / size.x).min(rect.height() / size.y);
+                        let fitted = egui::Rect::from_center_size(rect.center(), size * scale);
+                        egui::Image::new((tex.id(), fitted.size()))
+                            .tint(Color32::from_white_alpha(185))
+                            .paint_at(ui, fitted);
+                    } else {
+                        draw_search_icon(ui, rgb(c.subtext));
+                    }
+                } else {
+                    draw_search_icon(ui, rgb(c.subtext));
+                }
                 let hint = match self.active_tab {
                     MainTab::Collections => "Search pins and collections…",
                     MainTab::Settings => "Search settings...",
@@ -10814,16 +10998,24 @@ impl ClipdGui {
                     }
                 } else {
                     let search = ui.add_sized(
-                        [field_w, 18.0],
+                        [field_w, 24.0],
                         egui::TextEdit::singleline(&mut self.search_query)
                             .id(egui::Id::new("clip_search"))
                             .hint_text(hint)
                             .frame(false)
-                            .font(egui::TextStyle::Body),
+                            .font(FontId::proportional(17.0)),
                     );
-                    if self.focus_search {
+                    let keep_focus = self
+                        .focus_search_until
+                        .is_some_and(|until| Instant::now() < until);
+                    if self.focus_search || (keep_focus && !search.has_focus()) {
                         search.request_focus();
                         self.focus_search = false;
+                    }
+                    if keep_focus {
+                        ui.ctx().request_repaint_after(Duration::from_millis(16));
+                    } else if self.focus_search_until.take().is_some() {
+                        log::info!("search has the caret after show: {}", search.has_focus());
                     }
                     if search.changed() {
                         if self.in_ask_mode() {
@@ -10841,19 +11033,13 @@ impl ClipdGui {
                             Action::Paste
                         };
                     }
-                    egui::Frame::none()
-                        .fill(surf(c, c.bg_selected))
-                        .rounding(Rounding::same(5.0))
-                        .inner_margin(Margin::symmetric(5.0, 1.0))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new("/")
-                                    .size(10.5)
-                                    .strong()
-                                    .family(egui::FontFamily::Monospace)
-                                    .color(rgb(c.overlay)),
-                            );
-                        });
+                    // The ⚙ menu sits inside the field's right end — where
+                    // the "/" hint was — so the field, the list and the footer
+                    // share one right edge. (The caret is put in the field on
+                    // every open, so "/ to search" had nothing left to say.)
+                    if self.active_tab == MainTab::Text {
+                        self.render_window_menu(ui, c);
+                    }
                 }
             });
         });
@@ -10874,17 +11060,19 @@ impl ClipdGui {
         let full_w = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(egui::vec2(full_w, row_h), egui::Sense::hover());
 
-        // Left, Mono only — the one thing to know about the list.
-        if self.theme.is_flat() {
-            let left = egui::Rect::from_min_size(rect.min, egui::vec2(full_w * 0.6, row_h));
+        // Left — the keys that work right now, while typing in the search:
+        // the whole window can be used without the mouse, and this is where
+        // that is learned (Spotlight's lesson, Raycast's footer).
+        if self.active_tab == MainTab::Text {
+            let left = egui::Rect::from_min_size(rect.min, egui::vec2(full_w * 0.72, row_h));
             ui.allocate_ui_at_rect(left, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("Click to copy · Enter to paste")
-                            .size(12.0)
-                            .color(rgb(c.overlay)),
-                    );
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (keys, what) in [("↑↓", "Select"), ("↵", "Paste"), ("⌘1–9", "Quick paste"), ("esc", "Close")] {
+                        key_caps(ui, keys, rgb(c.subtext), 11.5);
+                        ui.label(RichText::new(what).size(11.5).color(rgb(c.overlay)));
+                        ui.add_space(8.0);
+                    }
                 });
             });
         }
@@ -10896,7 +11084,7 @@ impl ClipdGui {
         );
         ui.allocate_ui_at_rect(right, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                footer_shortcut_badge(ui, "⌘ ⇧ V", c);
+                footer_shortcut_badge(ui, &shortcut_symbols(self.paste_settings.open_gui_hotkey.label()), c);
             });
         });
     }
@@ -14710,6 +14898,14 @@ mod slot_strip_tests {
         assert_eq!(fresh, 2);
         let ids: Vec<i64> = order.iter().map(|&i| clips[i].id).collect();
         assert_eq!(ids, vec![2, 1], "the star is the newest touch");
+    }
+
+    #[test]
+    fn shortcuts_read_the_way_macos_writes_them() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(shortcut_symbols("Option+Space"), "⌥ Space");
+            assert_eq!(shortcut_symbols("Cmd+Shift+G"), "⌘ ⇧ G");
+        }
     }
 
     #[test]
