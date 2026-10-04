@@ -1420,9 +1420,9 @@ fn slot_pill_label(slots: &[u8]) -> String {
 fn draw_slot_pill(ui: &mut egui::Ui, label: &str, c: &clipd_core::ThemeColors) {
     let galley = ui
         .painter()
-        .layout_no_wrap(label.to_string(), FontId::proportional(11.0), rgb(c.accent));
+        .layout_no_wrap(label.to_string(), FontId::proportional(12.0), rgb(c.accent));
     let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(galley.size().x + 14.0, 18.0),
+        egui::vec2(galley.size().x + 14.0, 20.0),
         egui::Sense::hover(),
     );
     ui.painter().rect_filled(rect, Rounding::same(9.0), rgb(c.accent).gamma_multiply(0.18));
@@ -1736,13 +1736,13 @@ fn tiny_filter_chip(
     ui.scope(|ui| {
         ui.spacing_mut().button_padding = egui::vec2(12.0, 4.0);
         ui.add(
-            egui::Button::new(RichText::new(label).size(11.5).color(text_col))
+            egui::Button::new(RichText::new(label).size(12.5).color(text_col))
                 .fill(fill)
                 // Softly rounded, not a capsule: the reference's segments are
                 // rectangles with the corners taken off.
                 .rounding(Rounding::same(9.0))
                 .stroke(stroke)
-                .min_size(egui::vec2(0.0, 26.0)),
+                .min_size(egui::vec2(0.0, 28.0)),
         )
         .clicked()
     })
@@ -1791,7 +1791,7 @@ fn footer_shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeCol
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                key_caps(ui, text, rgb(c.subtext), 11.0);
+                key_caps(ui, text, rgb(c.subtext), 12.0);
             });
         });
 }
@@ -8073,7 +8073,7 @@ impl ClipdGui {
                         ui.add_space(4.0);
                         if ui
                             .add(
-                                egui::Label::new(RichText::new(label).size(11.5).color(rgb(c.accent)))
+                                egui::Label::new(RichText::new(label).size(12.5).color(rgb(c.accent)))
                                     .sense(egui::Sense::click()),
                             )
                             .clicked()
@@ -8130,7 +8130,7 @@ impl ClipdGui {
                             .join("\u{2009}");
                         ui.label(
                             RichText::new(spaced)
-                                .size(10.5)
+                                .size(11.5)
                                 .strong()
                                 .color(rgb(c.overlay)),
                         );
@@ -8324,7 +8324,7 @@ impl ClipdGui {
                                         ui.add(
                                             egui::Label::new(
                                                 RichText::new(format!("{}{}", truncated, suffix))
-                                                    .size(14.0)
+                                                    .size(15.0)
                                                     .color(rgb(c.text)),
                                             )
                                             .truncate(),
@@ -8348,7 +8348,7 @@ impl ClipdGui {
                                             } else {
                                                 ui.label(
                                                     RichText::new(&time)
-                                                        .size(12.5)
+                                                        .size(13.0)
                                                         .color(rgb(c.overlay)),
                                                 );
                                             }
@@ -8372,11 +8372,14 @@ impl ClipdGui {
                                 // between them. This was still reserving the
                                 // 28pt the lone star used to need, so a long
                                 // title ran underneath the new controls.
-                                let right_w = 104.0
+                                // Room for copy · pin · ⋮ only on the row that
+                                // shows them; elsewhere the title takes it.
+                                let actions_w = if is_selected || row_hovered { 104.0 } else { 12.0 };
+                                let right_w = actions_w
                                     + thumb_slot
                                     + if is_sensitive { 12.0 } else { 0.0 };
                                 let content_w = (ui.available_width() - right_w).max(60.0);
-                                ui.allocate_ui(egui::vec2(content_w, 36.0), |ui| {
+                                ui.allocate_ui(egui::vec2(content_w, 40.0), |ui| {
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 1.0;
                                         // The slot sits next to the clip it
@@ -8387,14 +8390,14 @@ impl ClipdGui {
                                             ui.spacing_mut().item_spacing.x = 8.0;
                                             let pill_w = pill
                                                 .as_ref()
-                                                .map_or(0.0, |label| label.chars().count() as f32 * 6.6 + 26.0);
+                                                .map_or(0.0, |label| label.chars().count() as f32 * 7.2 + 26.0);
                                             ui.allocate_ui(
                                                 egui::vec2((ui.available_width() - pill_w).max(40.0), 20.0),
                                                 |ui| {
                                                     ui.add(
                                                         egui::Label::new(
                                                             RichText::new(format!("{}{}", truncated, suffix))
-                                                                .size(13.0)
+                                                                .size(14.5)
                                                                 .strong()
                                                                 .color(rgb(c.text)),
                                                         )
@@ -8418,7 +8421,7 @@ impl ClipdGui {
                                         };
                                         ui.label(
                                             RichText::new(meta)
-                                                .size(10.5)
+                                                .size(12.0)
                                                 .color(rgb(c.subtext)),
                                         );
                                     });
@@ -11003,7 +11006,7 @@ impl ClipdGui {
                             .id(egui::Id::new("clip_search"))
                             .hint_text(hint)
                             .frame(false)
-                            .font(FontId::proportional(17.0)),
+                            .font(FontId::proportional(18.0)),
                     );
                     let keep_focus = self
                         .focus_search_until
@@ -11069,8 +11072,8 @@ impl ClipdGui {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     for (keys, what) in [("↑↓", "Select"), ("↵", "Paste"), ("⌘1–9", "Quick paste"), ("esc", "Close")] {
-                        key_caps(ui, keys, rgb(c.subtext), 11.5);
-                        ui.label(RichText::new(what).size(11.5).color(rgb(c.overlay)));
+                        key_caps(ui, keys, rgb(c.subtext), 12.5);
+                        ui.label(RichText::new(what).size(12.5).color(rgb(c.overlay)));
                         ui.add_space(8.0);
                     }
                 });
