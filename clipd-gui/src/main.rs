@@ -1324,17 +1324,16 @@ fn slots_first(
     (ordered, slot_rows)
 }
 
-/// "Slot 2 · ⌘V ×2 pastes it", or "Slots 2, 3 · ⌘V ×2 or ×3 pastes it" for
-/// a text in two slots.
+/// "⌘V ×2 pastes it", or "⌘V ×2 or ×3 pastes it" for a text in two slots.
+/// The slot number itself is the pill beside the title.
 pub(crate) fn slot_paste_keys(slots: &[u8]) -> String {
     let mut keys = slots.iter().map(|n| slot_chord('V', *n));
     let first = keys.next().unwrap_or_default();
     let rest: Vec<String> = slots[1..].iter().map(|n| if *n == 1 { "⌘V".into() } else { format!("×{n}") }).collect();
-    let names: Vec<String> = slots.iter().map(|n| n.to_string()).collect();
     if rest.is_empty() {
-        format!("Slot {}  ·  {first} pastes it", names.join(""))
+        format!("{first} pastes it")
     } else {
-        format!("Slots {}  ·  {first} or {} pastes it", names.join(", "), rest.join(" or "))
+        format!("{first} or {} pastes it", rest.join(" or "))
     }
 }
 
@@ -1396,6 +1395,31 @@ fn draw_number_box(ui: &mut egui::Ui, slots: &[u8], c: &clipd_core::ThemeColors)
         .rect_stroke(chip, Rounding::same(5.0), Stroke::new(1.0, rgb(c.overlay).gamma_multiply(0.6)));
     ui.painter()
         .galley(chip.center() - galley.size() / 2.0, galley, rgb(c.subtext));
+}
+
+/// "Slot 2", or "Slots 2·3" for a text in two slots.
+fn slot_pill_label(slots: &[u8]) -> String {
+    let numbers: Vec<String> = slots.iter().map(|n| clipd_core::slot_badge(*n)).collect();
+    if numbers.len() == 1 {
+        format!("Slot {}", numbers[0])
+    } else {
+        format!("Slots {}", numbers.join("·"))
+    }
+}
+
+/// The slot pill beside a clip's title: accent-tinted, small, unmistakable.
+fn draw_slot_pill(ui: &mut egui::Ui, label: &str, c: &clipd_core::ThemeColors) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), FontId::proportional(11.0), rgb(c.accent));
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x + 14.0, 18.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, Rounding::same(9.0), rgb(c.accent).gamma_multiply(0.18));
+    ui.painter().rect_stroke(rect, Rounding::same(9.0), Stroke::new(0.8, rgb(c.accent).gamma_multiply(0.55)));
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, rgb(c.accent));
+    resp.on_hover_text("Paste it from any app by tapping ⌘V that many times");
 }
 
 /// A row's slot number(s), drawn where the type glyph would be.
@@ -4191,6 +4215,10 @@ struct ClipdGui {
     /// How many rows at the top of the list are just-copied clips, set ahead
     /// of the pins (see `fresh_first`).
     fresh_rows: usize,
+    /// Pinned clips the main list is not showing ("Show N more pinned"), and
+    /// whether the person asked to see them all.
+    pins_hidden: usize,
+    pins_expanded: bool,
     /// Set when something asked for the keyboard mid-frame.
     want_key_window: bool,
     /// Secret-scan results by clip id, so a reload only scans what is new.
@@ -4458,6 +4486,8 @@ impl ClipdGui {
             slots_by_content,
             hud_slots_view: false,
             fresh_rows: 0,
+            pins_hidden: 0,
+            pins_expanded: false,
             want_key_window: false,
             secret_scan_cache,
             sensitive_cache,
@@ -6020,6 +6050,38 @@ impl ClipdGui {
             );
             self.filtered = ordered;
             self.fresh_rows = fresh;
+        }
+        // The main window shows three pins and a "Show N more pinned" row.
+        // Seven pinned rows filled the first screen, so Recent — what you
+        // copied today — started below the fold. Trimmed here, not when
+        // drawing, so the arrow keys never land on a row that is not shown.
+        self.pins_hidden = 0;
+        if !self.hud
+            && !self.island_surface
+            && content_q.is_empty()
+            && content_filter == ContentFilter::All
+            && !self.pins_expanded
+        {
+            const PINS_SHOWN: usize = 3;
+            let starred = &self.starred_clip_ids;
+            let clips = &self.clips;
+            let mut seen_pins = 0;
+            let fresh = self.fresh_rows;
+            let mut kept = Vec::with_capacity(self.filtered.len());
+            for (pos, &i) in self.filtered.iter().enumerate() {
+                if pos >= fresh && starred.contains(&clips[i].id) {
+                    seen_pins += 1;
+                    if seen_pins > PINS_SHOWN {
+                        continue;
+                    }
+                }
+                kept.push(i);
+            }
+            // Hiding one pin behind a "show 1 more" row saves nothing.
+            if seen_pins > PINS_SHOWN + 1 {
+                self.pins_hidden = seen_pins - PINS_SHOWN;
+                self.filtered = kept;
+            }
         }
         // The popover's Slots view: only what is in slots 1-9, in slot order.
         // A view of its own rather than a section on top, so the clipboard
@@ -7701,6 +7763,35 @@ impl ClipdGui {
                 // Rows in a run share edges, so nothing may be inserted
                 // between them. Section headers add their own space.
                 ui.spacing_mut().item_spacing.y = 0.0;
+                // "Show 4 more pinned" / "Show fewer", drawn where the Pinned
+                // section ends; acted on after the loop.
+                let pins_hidden = self.pins_hidden;
+                let pins_total = self.starred_clip_ids.len();
+                let pins_expanded = self.pins_expanded;
+                let mut toggle_pins = false;
+                let mut pins_toggle_row = |ui: &mut egui::Ui| {
+                    let label = if pins_hidden > 0 {
+                        format!("Show {pins_hidden} more pinned")
+                    } else if pins_expanded && pins_total > 4 {
+                        "Show fewer pinned".to_string()
+                    } else {
+                        return;
+                    };
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        if ui
+                            .add(
+                                egui::Label::new(RichText::new(label).size(11.5).color(rgb(c.accent)))
+                                    .sense(egui::Sense::click()),
+                            )
+                            .clicked()
+                        {
+                            toggle_pins = true;
+                        }
+                    });
+                };
+                let mut last_group: Option<&'static str> = None;
                 for (display_idx, &clip_idx) in visible_indices.iter().enumerate() {
                     let clip = &self.clips[clip_idx];
                     let clip_id_value = clip.id;
@@ -7722,8 +7813,18 @@ impl ClipdGui {
                             fresh_rows,
                         ))
                     });
-                    let row_slots: Vec<u8> =
-                        self.slots_by_content.get(&clip.content).cloned().unwrap_or_default();
+                    // Slots 2-9: what was put there with ⌘C ×N. Slot 1 is the
+                    // plain last copy — marking it would put a badge on
+                    // whatever you copied most recently, every time.
+                    let row_slots: Vec<u8> = self
+                        .slots_by_content
+                        .get(&clip.content)
+                        .map(|slots| slots.iter().copied().filter(|n| *n >= 2).collect())
+                        .unwrap_or_default();
+                    if previous_group == Some("Pinned") && group != "Pinned" {
+                        pins_toggle_row(ui);
+                    }
+                    last_group = Some(group);
                     if previous_group != Some(group) {
                         // Roomy gap before "Recent", then the header, then the
                         // rows. Set as spaced small-caps: at 12pt in sentence
@@ -7970,13 +8071,10 @@ impl ClipdGui {
                                 // single ruled card a bar at the leading edge
                                 // reads as a fourth vertical line rather than
                                 // as emphasis.
-                                // A row in a slot leads with its number, in
-                                // the glyph's place.
-                                if row_slots.is_empty() {
-                                    draw_type_tile(ui, &clip.content_type, is_sensitive, true, c);
-                                } else {
-                                    draw_slot_tile(ui, &row_slots, true, c);
-                                }
+                                // A plain glyph, not a boxed tile: a box on
+                                // every row was a column of identical cards
+                                // the eye had to read past to reach the text.
+                                draw_type_tile(ui, &clip.content_type, is_sensitive, false, c);
 
                                 let thumb_slot = if is_image { 52.0 } else { 0.0 };
                                 // Copy (28) + pin (24) + ⋮ (22) + the spacing
@@ -7990,15 +8088,33 @@ impl ClipdGui {
                                 ui.allocate_ui(egui::vec2(content_w, 36.0), |ui| {
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 1.0;
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(format!("{}{}", truncated, suffix))
-                                                    .size(13.0)
-                                                    .strong()
-                                                    .color(rgb(c.text)),
-                                            )
-                                            .truncate(),
-                                        );
+                                        // The slot sits next to the clip it
+                                        // holds, as a pill after the title.
+                                        let pill = (!row_slots.is_empty())
+                                            .then(|| slot_pill_label(&row_slots));
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 8.0;
+                                            let pill_w = pill
+                                                .as_ref()
+                                                .map_or(0.0, |label| label.chars().count() as f32 * 6.6 + 26.0);
+                                            ui.allocate_ui(
+                                                egui::vec2((ui.available_width() - pill_w).max(40.0), 20.0),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(format!("{}{}", truncated, suffix))
+                                                                .size(13.0)
+                                                                .strong()
+                                                                .color(rgb(c.text)),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                },
+                                            );
+                                            if let Some(label) = &pill {
+                                                draw_slot_pill(ui, label, c);
+                                            }
+                                        });
                                         // The keys, not just the number: this is
                                         // where someone looking at a slot learns
                                         // how to paste it from anywhere.
@@ -8020,27 +8136,23 @@ impl ClipdGui {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        // Right-to-left: added first sits
-                                        // rightmost, so this is ⋮ · pin · copy
-                                        // on screen, the reference's order.
-                                        // A blank button with the dots
-                                        // painted on: the ⋮ character is not
-                                        // in the bundled font and came out as
-                                        // an empty box.
-                                        let (copy, star, delete) = row_more_menu(ui, is_starred, c);
-                                        copy_clicked |= copy;
-                                        star_clicked |= star;
-                                        delete_clicked |= delete;
-                                        // The pin holds its place whether or
-                                        // not it is filled: a control that
-                                        // appears on hover moves the two
-                                        // beside it every time the pointer
-                                        // crosses a row.
-                                        if row_star_quiet(ui, is_starred, c).clicked() {
-                                            star_clicked = true;
-                                        }
-                                        if row_copy_button(ui, c).clicked() {
-                                            copy_clicked = true;
+                                        // Copy, pin and ⋮ only on the row you are
+                                        // on (pointer or selection). On every row
+                                        // they were three icons times twenty —
+                                        // the busiest thing in the window, and
+                                        // the part nobody was reading. The pins
+                                        // already have their own section.
+                                        if is_selected || row_hovered {
+                                            let (copy, star, delete) = row_more_menu(ui, is_starred, c);
+                                            copy_clicked |= copy;
+                                            star_clicked |= star;
+                                            delete_clicked |= delete;
+                                            if row_star_quiet(ui, is_starred, c).clicked() {
+                                                star_clicked = true;
+                                            }
+                                            if row_copy_button(ui, c).clicked() {
+                                                copy_clicked = true;
+                                            }
                                         }
                                         if is_image {
                                             let (tile, _) = ui.allocate_exact_size(
@@ -8157,7 +8269,14 @@ impl ClipdGui {
                         resp.scroll_to_me(Some(egui::Align::Center));
                     }
                 }
+                if last_group == Some("Pinned") {
+                    pins_toggle_row(ui);
+                }
                 self.scroll_to_selected = false;
+                if toggle_pins {
+                    self.pins_expanded = !self.pins_expanded;
+                    self.apply_filter();
+                }
             });
     }
 
@@ -14337,9 +14456,10 @@ mod slot_strip_tests {
 
     #[test]
     fn a_slotted_row_says_the_keys_that_paste_it() {
-        assert_eq!(slot_paste_keys(&[1]), "Slot 1  ·  ⌘V pastes it");
-        assert_eq!(slot_paste_keys(&[4]), "Slot 4  ·  ⌘V ×4 pastes it");
-        assert_eq!(slot_paste_keys(&[2, 3]), "Slots 2, 3  ·  ⌘V ×2 or ×3 pastes it");
+        assert_eq!(slot_paste_keys(&[4]), "⌘V ×4 pastes it");
+        assert_eq!(slot_paste_keys(&[2, 3]), "⌘V ×2 or ×3 pastes it");
+        assert_eq!(slot_pill_label(&[2]), "Slot 2");
+        assert_eq!(slot_pill_label(&[2, 3]), "Slots 2·3");
     }
 
     #[test]
