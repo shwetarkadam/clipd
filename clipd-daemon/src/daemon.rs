@@ -3600,6 +3600,12 @@ fn open_gui() {
     // window, so once those two existed it always said yes, and this returned
     // early every time: the shortcut fronted the parked popover instead of
     // opening the palette, which looks exactly like the shortcut being dead.
+    // The main window is resident: ask it to show itself (it activates and
+    // takes the keyboard on its own).
+    if clipd_core::request_running_surface("gui-main", "main") {
+        clipd_core::hand_focus_to_surface("gui-main");
+        return;
+    }
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     if clipd_core::surface_is_running("gui-main") && focus_existing_gui() {
         return;

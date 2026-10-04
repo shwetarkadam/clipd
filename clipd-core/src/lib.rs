@@ -23,6 +23,7 @@ pub mod secret_clipboard;
 pub mod semantic;
 pub mod session;
 pub mod slots;
+pub mod focus;
 pub mod import;
 pub mod skills;
 pub mod snippets;
@@ -76,7 +77,8 @@ pub use island::{
     island_layout_active, load_island_config, load_shelf, save_island_config, save_shelf,
     ClipCounts, IslandAnchor, IslandConfig, IslandModule, IslandSnapshot, ShelfItem,
 };
-pub use lock::{daemon_lock_pid, surface_is_running, 
+pub use focus::{hand_focus_to_surface, take_focus};
+pub use lock::{daemon_lock_pid, surface_is_running, request_running_surface, surface_pid, 
     is_daemon_running, load_hotkey_status, release_daemon_lock, save_hotkey_status,
     try_acquire_daemon_lock, HotkeyStatus, ProcessLock,
 };

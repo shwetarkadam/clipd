@@ -1444,6 +1444,12 @@ fn open_gui_hud() -> Option<std::process::Child> {
 }
 
 fn open_gui_search() {
+    // The main window stays resident: show it rather than launching a new
+    // process (a cold start is ~300ms; showing it is a frame).
+    if clipd_core::request_running_surface("gui-main", "main") {
+        clipd_core::hand_focus_to_surface("gui-main");
+        return;
+    }
     let exe = resolve_clipd_gui_exe();
     eprintln!("clipd-ui: opening GUI search from {}", exe.display());
     let _ = Command::new(&exe)

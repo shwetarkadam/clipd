@@ -210,6 +210,15 @@ fn popover_left(width: f32, screen: egui::Vec2, anchored: bool) -> f32 {
 /// the full history) opens the real window rather than growing the tray panel
 /// into a second application.
 fn spawn_palette(args: &[&str]) {
+    // The main window is resident: ask it to show, and hand it the keyboard —
+    // this process is the one that was just clicked, so it may.
+    let mode = if args.contains(&"--settings") { "settings" } else { "main" };
+    if (args.is_empty() || args == ["--settings"])
+        && clipd_core::request_running_surface("gui-main", mode)
+    {
+        clipd_core::hand_focus_to_surface("gui-main");
+        return;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -2379,6 +2388,22 @@ pub(crate) fn strip_rows_from_store(
         .collect()
 }
 
+/// Whether the frontmost app is clipd itself (any of its processes: they
+/// share the bundle). Focus moving to the popover or the tray host is not the
+/// person clicking away from the main window.
+#[cfg(target_os = "macos")]
+fn clipd_is_frontmost() -> bool {
+    objc2_app_kit::NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .and_then(|app| app.bundleIdentifier())
+        .is_some_and(|id| id.to_string() == "dev.clipd.app")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clipd_is_frontmost() -> bool {
+    false
+}
+
 /// A native "choose a file" dialog for a JSON file, via AppleScript — no
 /// extra dependency for one button.
 #[cfg(target_os = "macos")]
@@ -2761,7 +2786,11 @@ fn requested_theme(args: &[String]) -> Option<Result<Theme, String>> {
     }))
 }
 
+/// When this process started, for the "first frame" log line.
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
 fn main() -> eframe::Result {
+    PROCESS_START.get_or_init(Instant::now);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp(None)
         .format_target(false)
@@ -4110,6 +4139,20 @@ struct ClipdGui {
     settings_query: String,
     /// Header pin — keep the full GUI above other windows.
     window_pinned: bool,
+    /// The main window stays resident between uses, like Spotlight: closing
+    /// hides it and the next open shows it again, instead of a ~300ms cold
+    /// start of a new process every time.
+    main_hidden: bool,
+    main_watcher_started: bool,
+    /// When the last show was asked for, to log how fast the window came up.
+    main_show_asked: Option<Instant>,
+    /// The window has had the keyboard since it was last shown. Clicking away
+    /// only hides a window that was actually in use — not one that launched
+    /// in the background and never got focus.
+    main_had_focus: bool,
+    /// When the window was last shown; focus churn right after a show (the
+    /// tray or popover handing over) is not "clicking away".
+    main_shown_at: Option<Instant>,
     /// Tracks window focus so summoning clipd lands the cursor in search.
     was_focused: bool,
     /// Vault (1Password / Bitwarden / Keychain) "save clipboard as a password" form.
@@ -4423,6 +4466,11 @@ impl ClipdGui {
             settings_category: SettingsCategory::Clipboard,
             settings_query: String::new(),
             window_pinned: false,
+            main_hidden: false,
+            main_watcher_started: false,
+            main_show_asked: None,
+            main_had_focus: false,
+            main_shown_at: None,
             was_focused: true,
             vault_targets: available_targets(),
             vault_selected: available_targets().first().copied(),
@@ -4702,6 +4750,67 @@ impl ClipdGui {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.focus_search = mode == SurfaceMode::Main;
         }
+        ctx.request_repaint();
+    }
+
+    /// Wake the resident main window the moment the tray or the shortcut asks
+    /// for it (the same 15ms watch the popover uses).
+    fn ensure_main_request_watcher(&mut self, ctx: &egui::Context) {
+        if self.main_watcher_started {
+            return;
+        }
+        self.main_watcher_started = true;
+        let ctx = ctx.clone();
+        let path = surface_request_path(SurfaceMode::Main);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(15));
+            if path.exists() {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Put the main window away and give the keyboard back to the app that
+    /// had it — what ⌘H does, and what Spotlight does on Esc.
+    fn hide_main_window(&mut self, ctx: &egui::Context) {
+        if self.main_hidden {
+            return;
+        }
+        log::info!("main window hidden");
+        self.main_hidden = true;
+        self.set_preview_open(ctx, false);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        clipd_core::set_gui_window_open(false);
+        #[cfg(target_os = "macos")]
+        if let Some(mtm) = objc2::MainThreadMarker::new() {
+            objc2_app_kit::NSApplication::sharedApplication(mtm).hide(None);
+        }
+    }
+
+    /// Bring the resident main window back: fresh search, newest clips, at the
+    /// pointer, in front, keyboard in the search field.
+    fn show_main_window(&mut self, ctx: &egui::Context, mode: SurfaceMode) {
+        let was_hidden = self.main_hidden;
+        log::info!("main window show requested (was hidden: {was_hidden})");
+        self.main_hidden = false;
+        if was_hidden {
+            self.main_show_asked = Some(Instant::now());
+        }
+        if was_hidden {
+            self.refresh();
+            self.pins_expanded = false;
+            self.selected = 0;
+            self.scroll_to_selected = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        self.switch_surface(ctx, mode);
+        // Treat this as a fresh summon: clear the query and place the window.
+        self.was_focused = false;
+        self.main_had_focus = false;
+        self.main_shown_at = Some(Instant::now());
+        clipd_core::set_gui_window_open(true);
+        // Accept the keyboard the requester handed over (see clipd_core::focus).
+        clipd_core::take_focus();
         ctx.request_repaint();
     }
 
@@ -6970,6 +7079,37 @@ impl eframe::App for ClipdGui {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // The main window is resident: every way of closing it (Esc, ⌘W, the
+        // close button, a paste) hides it instead, unless clipd is quitting.
+        if !self.hud && !self.island_surface {
+            self.ensure_main_request_watcher(ctx);
+            if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.hide_main_window(ctx);
+            }
+        }
+        if !self.main_hidden {
+            if let Some(asked) = self.main_show_asked.take() {
+                #[cfg(target_os = "macos")]
+                let active = objc2::MainThreadMarker::new()
+                    .map(|mtm| objc2_app_kit::NSApplication::sharedApplication(mtm).isActive())
+                    .unwrap_or(false);
+                #[cfg(not(target_os = "macos"))]
+                let active = true;
+                log::info!(
+                    "main window shown {}ms after the request (active: {active}, focused: {})",
+                    asked.elapsed().as_millis(),
+                    ctx.input(|i| i.viewport().focused).unwrap_or(false)
+                );
+            }
+        }
+        // How long a window takes to appear is the first thing anyone feels.
+        static FIRST_FRAME: std::sync::Once = std::sync::Once::new();
+        FIRST_FRAME.call_once(|| {
+            if let Some(start) = PROCESS_START.get() {
+                log::info!("first frame {}ms after launch", start.elapsed().as_millis());
+            }
+        });
         // Tell the watchdog the loop is alive. A surface whose `update` stops
         // being called is, from the outside, a window that has stopped
         // responding — which is the half of "it crashes or hangs" that leaves
@@ -7042,7 +7182,14 @@ impl eframe::App for ClipdGui {
             // about a tenth of a core while it was doing nothing at all.
             250
         };
-        if self.last_surface_request_check.elapsed() >= Duration::from_millis(poll_interval) {
+        // A request waiting for the resident main window is handled now, not
+        // at the next poll — the watcher woke us for exactly this.
+        let request_waiting = !self.hud
+            && !self.island_surface
+            && surface_request_path(SurfaceMode::Main).exists();
+        if request_waiting
+            || self.last_surface_request_check.elapsed() >= Duration::from_millis(poll_interval)
+        {
             self.last_surface_request_check = Instant::now();
             // Don't process surface requests here for HUD — drive_hud_hover
             // handles show/hide/quit itself. Processing them here would close
@@ -7053,13 +7200,26 @@ impl eframe::App for ClipdGui {
                         self.quitting = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     } else if mode == SurfaceMode::Hidden {
-                        // No persistent surface to hide now that the pill is
-                        // gone; the HUD handles its own hide via drive_hud_hover.
+                        // The resident main window hides; the HUD handles its
+                        // own hide via drive_hud_hover.
+                        if !self.island_surface {
+                            self.hide_main_window(ctx);
+                        }
+                    } else if !self.island_surface
+                        && matches!(mode, SurfaceMode::Main | SurfaceMode::Settings)
+                    {
+                        self.show_main_window(ctx, mode);
                     } else {
                         self.switch_surface(ctx, mode);
                     }
                 }
             }
+        }
+        // Hidden and waiting: nothing to draw. The watcher thread wakes us when
+        // a request lands; this is only a backstop.
+        if self.main_hidden {
+            ctx.request_repaint_after(Duration::from_secs(1));
+            return;
         }
         // Only clipd-ui owns the daemon. GUI processes don't restart it.
         #[cfg(target_os = "macos")]
@@ -7147,6 +7307,27 @@ impl eframe::App for ClipdGui {
         // When the window is summoned (gains focus), drop the cursor into search
         // with a clean query — so the palette is "type to recall" every time.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        // Click away and it goes away, like Spotlight — unless pinned (📌),
+        // in Settings, or in the middle of reviewing a skill.
+        if focused {
+            self.main_had_focus = true;
+        }
+        if !focused
+            && self.main_had_focus
+            && self.main_shown_at.map_or(true, |at| at.elapsed() > Duration::from_millis(700))
+            && !clipd_is_frontmost()
+            && !self.hud
+            && !self.island_surface
+            && !self.main_hidden
+            && !self.window_pinned
+            && self.active_tab == MainTab::Text
+            && self.skill_review.is_none()
+        {
+            self.was_focused = false;
+            self.main_had_focus = false;
+            self.hide_main_window(ctx);
+            return;
+        }
         if focused && !self.was_focused {
             self.focus_search = true;
             self.search_query.clear();
