@@ -126,30 +126,10 @@ PLIST
 #
 # Since that failure is silent and costs an afternoon to diagnose, an identity in
 # the login keychain is used automatically. Set CLIPD_SIGN_ID="-" to force ad-hoc.
-pick_signing_identity() {
-  local list
-  list="$(security find-identity -v -p codesigning 2>/dev/null)" || return 0
-  local preference
-  # Developer ID first (also valid for distribution), then a dev cert, then any.
-  for preference in 'Developer ID Application' 'Apple Development' ''; do
-    local found
-    found="$(printf '%s\n' "$list" \
-      | grep -F "\"${preference}" \
-      | head -1 \
-      | sed -E 's/^[^"]*"(.*)".*$/\1/')"
-    if [[ -n "$found" ]]; then
-      printf '%s' "$found"
-      return 0
-    fi
-  done
-}
 
-if [[ -n "${CLIPD_SIGN_ID+isset}" ]]; then
-  SIGN_ID="$CLIPD_SIGN_ID"          # explicit wins, including "-" for ad-hoc
-else
-  SIGN_ID="$(pick_signing_identity)"
-  SIGN_ID="${SIGN_ID:--}"
-fi
+# shellcheck source=signing-identity.sh
+source "$(dirname "${BASH_SOURCE[0]}")/signing-identity.sh"
+SIGN_ID="$(clipd_signing_identity)"
 
 if [[ "$SIGN_ID" == "-" ]]; then
   echo "==> codesign (ad-hoc — TCC grants will NOT persist across rebuilds:"

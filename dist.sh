@@ -74,10 +74,9 @@ package_macos() {
   bash packaging/macos/create-app-bundle.sh
 
   APP="target/release/Clipd.app"
-  if command -v codesign &>/dev/null; then
-    echo "==> Code signing (ad-hoc)"
-    codesign --force --deep --sign - "$APP" 2>/dev/null || true
-  fi
+  # Already signed by create-app-bundle.sh with a stable identity when one is
+  # available. Re-signing ad-hoc here replaced it with a per-build hash, and
+  # every build then lost its Accessibility / Input Monitoring grant.
 
   echo "==> Creating ${PKG_NAME}.zip"
   STAGE="target/release/${PKG_NAME}"
