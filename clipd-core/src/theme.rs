@@ -143,8 +143,11 @@ impl Theme {
 }
 
 impl Default for Theme {
+    /// Mono: near-black, grey hairlines, flat one-line rows. Opaque, so it
+    /// reads the same over any desktop and on systems without the native
+    /// glass material.
     fn default() -> Self {
-        Theme::GlassDark
+        Theme::Mono
     }
 }
 
@@ -268,7 +271,9 @@ const MONO: ThemeColors = ThemeColors {
     accent2: Rgb(161, 161, 161),
     text: Rgb(250, 250, 250),
     subtext: Rgb(161, 161, 161),
-    overlay: Rgb(115, 115, 115),
+    // The quietest grey (times, hints, headers) still clears 4.5:1 on the
+    // selected row: 115 was 3.6:1 there, now that Mono is the default.
+    overlay: Rgb(134, 134, 134),
     green: Rgb(237, 237, 237),
     border: Rgb(38, 38, 38),
     surface_alpha: 255,
@@ -972,16 +977,16 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_install_lands_on_glass_dark() {
+    fn a_fresh_install_lands_on_mono() {
         // What a new user sees, and what anyone falls back to when the stored
         // preference is missing or unreadable. Worth pinning: themes get added
         // and retired, and the default is the one value where a quiet change
         // would go unnoticed until someone opened the app for the first time.
-        assert_eq!(Theme::default(), Theme::GlassDark);
+        assert_eq!(Theme::default(), Theme::Mono);
         assert!(!Theme::default().is_light());
         // load_theme() falls back to the same place when nothing is stored.
         let unreadable: Result<Theme, _> = serde_json::from_str("not a theme");
-        assert_eq!(unreadable.ok().unwrap_or_default(), Theme::GlassDark);
+        assert_eq!(unreadable.ok().unwrap_or_default(), Theme::Mono);
     }
 
     /// The default is translucent, so it has to survive having no material.
@@ -991,16 +996,23 @@ mod tests {
     /// only legible where the native material exists is not a default.
     #[test]
     fn the_default_theme_reads_without_a_native_material() {
-        let c = Theme::default().colors();
-        // The brightest the panel ever composites to: a white page behind it,
-        // veiled at the no-material alpha of 186 and nothing else.
-        let veil = Rgb(12, 12, 14);
-        let a = 186.0 / 255.0;
-        let panel = Rgb(
-            (veil.0 as f32 * a + 255.0 * (1.0 - a)) as u8,
-            (veil.1 as f32 * a + 255.0 * (1.0 - a)) as u8,
-            (veil.2 as f32 * a + 255.0 * (1.0 - a)) as u8,
-        );
+        let theme = Theme::default();
+        let c = theme.colors();
+        // A translucent default is checked at the brightest its panel ever
+        // composites to — a white page behind it, veiled at the no-material
+        // alpha of 186. An opaque one is checked on its own lightest row
+        // surface, the selected row.
+        let panel = if theme.is_glass() {
+            let veil = Rgb(12, 12, 14);
+            let a = 186.0 / 255.0;
+            Rgb(
+                (veil.0 as f32 * a + 255.0 * (1.0 - a)) as u8,
+                (veil.1 as f32 * a + 255.0 * (1.0 - a)) as u8,
+                (veil.2 as f32 * a + 255.0 * (1.0 - a)) as u8,
+            )
+        } else {
+            c.bg_selected
+        };
         for (role, fg) in [
             ("text", c.text),
             ("subtext", c.subtext),
