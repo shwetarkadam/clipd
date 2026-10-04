@@ -23,6 +23,7 @@ pub mod secret_clipboard;
 pub mod semantic;
 pub mod session;
 pub mod slots;
+pub mod import;
 pub mod skills;
 pub mod snippets;
 pub mod store;
@@ -83,7 +84,8 @@ pub use lock::{daemon_lock_pid, surface_is_running,
 pub use macos_permissions::{
     accessibility_granted, input_monitoring_granted, keyboard_permissions_granted,
     missing_keyboard_permission_label, open_keyboard_permission_settings,
-    request_keyboard_permissions,
+    request_keyboard_permissions, take_keyboard_access_request, want_keyboard_access,
+    keyboard_ask_due, record_keyboard_ask,
 };
 pub use models::{ClipEntry, ContentType, SearchFilters};
 pub use paste_rules::{
@@ -106,6 +108,10 @@ pub use semantic::{SemanticResult, TfIdfIndex};
 pub use session::{compute_sessions, Session, SessionConfig};
 pub use slots::{SlotManager, MAX_CLIP_SLOT};
 pub use snippets::Snippet;
+pub use import::{
+    apply_import, detect_sources, dismiss_import, find_raycast_export, import_answered,
+    raycast_installed, read_source, FoundSource, ImportBundle, ImportReport, ImportSource,
+};
 pub use skills::{
     agent_skills_dir, clean_skill_name, find_skill_candidates, load_skill_state, render_skill_md,
     save_skill, save_skill_state, step_summary, SkillCandidate, SkillState, SkillStep, StepKind,

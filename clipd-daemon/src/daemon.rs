@@ -299,6 +299,10 @@ pub fn run_daemon_with_stop(
                             Err(e) => log::error!("Failed to save clip: {}", e),
                         }
                     }
+                    ClipEvent::DoubleCopy => {
+                        #[cfg(target_os = "macos")]
+                        offer_keyboard_access_after_double_copy();
+                    }
                     ClipEvent::SensitiveClip {
                         kinds,
                         secret,
@@ -3164,6 +3168,28 @@ fn confirm_vault_save(secret: &str, kinds: &str, target: VaultTarget, stored: bo
             false
         }
     }
+}
+
+/// ⌘C was just pressed twice and clipd cannot hear the keys yet: the one
+/// moment the reason for keyboard access is obvious, so the one moment to ask.
+/// Not at launch, and not as a banner that sits there for days. Rationed by
+/// `keyboard_ask_due`; "Turn on" hands the request to the main thread, where
+/// macOS will actually show its sheet.
+#[cfg(target_os = "macos")]
+fn offer_keyboard_access_after_double_copy() {
+    if clipd_core::keyboard_permissions_granted() || !clipd_core::keyboard_ask_due() {
+        return;
+    }
+    clipd_core::record_keyboard_ask();
+    std::thread::spawn(|| {
+        let payload = "STYLE\tprompt\nBADGE\t⌘\nTITLE\t⌘C twice saves to slot 2\n\
+             HINT\tclipd needs Accessibility to hear the keys. Your history already works without it.\n\
+             BTN\tskip\tNot now\t0\nBTN\tallow\tTurn on\t1\nTIMEOUT\t20";
+        if run_hud_prompt(payload).as_deref() == Some("allow") {
+            log::info!("⌘C ×2 prompt: turning on keyboard access");
+            clipd_core::want_keyboard_access();
+        }
+    });
 }
 
 /// Run the HUD in interactive mode and wait for the user's choice.

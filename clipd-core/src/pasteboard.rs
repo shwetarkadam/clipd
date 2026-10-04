@@ -52,6 +52,20 @@ pub fn write_text(text: &str) -> Result<(), String> {
     clipboard.set_text(text).map_err(|e| e.to_string())
 }
 
+/// The pasteboard's change count: it goes up by one every time anything
+/// takes ownership of the clipboard. Two steps between polls a moment apart is
+/// ⌘C pressed twice — which the watcher can see with no keyboard access.
+#[cfg(target_os = "macos")]
+pub fn change_count() -> Option<i64> {
+    let _lock = guard();
+    Some(objc2_app_kit::NSPasteboard::generalPasteboard().changeCount() as i64)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn change_count() -> Option<i64> {
+    None
+}
+
 /// The files currently on the clipboard, in the order Finder put them there.
 ///
 /// Empty when the clipboard holds anything else, which is the overwhelmingly

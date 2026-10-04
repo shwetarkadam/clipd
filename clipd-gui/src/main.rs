@@ -2149,32 +2149,6 @@ fn shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeColors) {
         });
 }
 
-/// Warning-banner colours that follow the theme.
-///
-/// These were hardcoded to a dark-theme amber, which on a light theme rendered
-/// as tan text on a tan block — the message was there but unreadable, which is
-/// the worst possible outcome for a banner whose whole job is to be read.
-/// Returns `(fill, title, body, button_fill, button_text)`.
-fn warning_colors(light: bool) -> (Color32, Color32, Color32, Color32, Color32) {
-    if light {
-        (
-            Color32::from_rgb(253, 240, 219),
-            Color32::from_rgb(124, 61, 6),
-            Color32::from_rgb(146, 84, 22),
-            Color32::from_rgb(180, 105, 30),
-            Color32::from_rgb(255, 249, 240),
-        )
-    } else {
-        (
-            Color32::from_rgb(90, 50, 20).gamma_multiply(0.55),
-            Color32::from_rgb(255, 200, 120),
-            Color32::from_rgb(230, 190, 140),
-            Color32::from_rgb(120, 70, 30),
-            Color32::from_rgb(255, 220, 160),
-        )
-    }
-}
-
 /// A background surface, honouring the theme's `surface_alpha`.
 ///
 /// Solid themes report 255 and this is identical to `rgb`. The glass themes
@@ -2379,6 +2353,26 @@ pub(crate) fn strip_rows_from_store(
             (n, held)
         })
         .collect()
+}
+
+/// A native "choose a file" dialog for a JSON file, via AppleScript — no
+/// extra dependency for one button.
+#[cfg(target_os = "macos")]
+fn choose_json_file() -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            r#"POSIX path of (choose file with prompt "Choose the snippets file Raycast exported" of type {"public.json"})"#,
+        ])
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn choose_json_file() -> Option<std::path::PathBuf> {
+    None
 }
 
 /// The review sheet for a skill about to be saved.
@@ -4052,8 +4046,6 @@ struct ClipdGui {
     theme: Theme,
     /// User-defined palette that overrides the active theme when enabled.
     custom_colors: CustomColors,
-    /// Reported once per window — see `render_text_banners`.
-    reported_permission_block: bool,
     /// Where the slot introduction is, or `None` when it is not showing.
     /// Decided once per window, on the first frame that draws banners.
     onboard: Option<OnboardStep>,
@@ -4203,6 +4195,15 @@ struct ClipdGui {
     want_key_window: bool,
     /// Secret-scan results by clip id, so a reload only scans what is new.
     secret_scan_cache: HashMap<i64, Option<String>>,
+    /// Import from another clipboard manager (see clipd_core::import): what was
+    /// found on this Mac, read in the background, and an import in flight.
+    import_scan_rx: Option<std::sync::mpsc::Receiver<Vec<(clipd_core::FoundSource, Result<clipd_core::ImportBundle, String>)>>>,
+    import_scanned: bool,
+    import_found: Vec<(clipd_core::FoundSource, Result<clipd_core::ImportBundle, String>)>,
+    import_running: Option<std::sync::mpsc::Receiver<(clipd_core::ImportSource, clipd_core::ImportReport)>>,
+    import_note: Option<(String, Instant)>,
+    /// Sources whose offer was waved off for this window ("Not now").
+    import_later: Vec<clipd_core::ImportSource>,
     /// Skills from the clipboard (see clipd_core::skills): the background scan,
     /// the workflow being offered, and the review sheet when it is open. None
     /// of it leaves the Mac, and none of it is reported to telemetry.
@@ -4375,7 +4376,6 @@ impl ClipdGui {
             focus_search: true,
             theme,
             custom_colors: load_custom_colors(),
-            reported_permission_block: false,
             onboard: None,
             onboard_decided: false,
             onboard_forced: false,
@@ -4461,6 +4461,12 @@ impl ClipdGui {
             want_key_window: false,
             secret_scan_cache,
             sensitive_cache,
+            import_scan_rx: None,
+            import_scanned: false,
+            import_found: Vec::new(),
+            import_running: None,
+            import_note: None,
+            import_later: Vec::new(),
             skill_scan_rx: None,
             skill_scanned_at: None,
             skill_offer: None,
@@ -7454,6 +7460,7 @@ impl eframe::App for ClipdGui {
             self.render_transform_window(ctx, &c);
         }
 
+        self.poll_imports(ctx);
         self.poll_skill_scan(ctx);
         if self.skill_scan_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -9311,61 +9318,13 @@ impl ClipdGui {
         let introducing = self.render_slot_onboarding(ui, c);
         if !introducing {
             self.render_slot_tip(ui, c);
+            self.render_import_offer(ui, c);
             self.render_skill_offer(ui, c);
         }
-        #[cfg(target_os = "macos")]
-        if !introducing && self.hotkey_status() == HotkeyStatus::NeedsAccessibility {
-            // Once per window, not once per frame: this draws at 60fps, and
-            // the fact worth recording is "someone hit this wall", not how
-            // long they sat in front of it. It is the one dead end in clipd
-            // where clicking harder cannot help — the grant is macOS's to
-            // give — so it is the first thing to look at when people install
-            // and never copy anything.
-            if !self.reported_permission_block {
-                self.reported_permission_block = true;
-                clipd_core::telemetry_event("blocked_permission", &[]);
-            }
-            let (warn_fill, warn_title, warn_body, warn_btn_fill, warn_btn_text) =
-                warning_colors(self.theme.is_light());
-            egui::Frame::none()
-                .fill(warn_fill)
-                .rounding(Rounding::same(8.0))
-                .inner_margin(Margin::symmetric(10.0, 8.0))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(
-                        RichText::new("Multi-slot copy & HUD need keyboard access")
-                            .size(11.5)
-                            .strong()
-                            .color(warn_title),
-                    );
-                    ui.label(
-                        RichText::new(format!(
-                            "Enable Clipd under {} in System Settings, in Privacy & Security. \
-                             The daemon retries automatically once toggled on.",
-                            self.missing_permission()
-                        ))
-                        .size(10.5)
-                        .color(warn_body),
-                    );
-                    ui.add_space(4.0);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("Open Privacy Settings")
-                                    .size(11.0)
-                                    .color(warn_btn_text),
-                            )
-                            .fill(warn_btn_fill),
-                        )
-                        .clicked()
-                    {
-                        clipd_core::request_keyboard_permissions();
-                        clipd_core::open_keyboard_permission_settings();
-                    }
-                });
-            ui.add_space(8.0);
-        }
+        // No standing "needs keyboard access" banner. History, search and
+        // pins work without it; the banner sat above the list for days saying
+        // otherwise. Access is asked for the first time ⌘C is pressed twice
+        // (the daemon's prompt), and stays reachable from Settings.
 
         if self.show_quick_settings {
             self.render_quick_settings(ui, c);
@@ -9397,6 +9356,283 @@ impl ClipdGui {
     fn missing_permission(&mut self) -> &'static str {
         self.refresh_permission_state();
         self.missing_permission_seen
+    }
+
+    /// Find other clipboard managers' data once per window, off the UI thread,
+    /// and pick up a finished import.
+    fn poll_imports(&mut self, ctx: &egui::Context) {
+        if self.hud || self.island_surface {
+            return;
+        }
+        if !self.import_scanned {
+            self.import_scanned = true;
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.import_scan_rx = Some(rx);
+            std::thread::spawn(move || {
+                let found = clipd_core::detect_sources()
+                    .into_iter()
+                    .map(|source| {
+                        let bundle = clipd_core::read_source(&source);
+                        (source, bundle)
+                    })
+                    .collect();
+                let _ = tx.send(found);
+            });
+        }
+        if let Some(rx) = &self.import_scan_rx {
+            if let Ok(found) = rx.try_recv() {
+                self.import_scan_rx = None;
+                self.import_found = found;
+                ctx.request_repaint();
+            }
+        }
+        if let Some(rx) = &self.import_running {
+            if let Ok((source, report)) = rx.try_recv() {
+                self.import_running = None;
+                self.import_note = Some((report.summary(source), Instant::now()));
+                self.refresh();
+                self.refresh_snippets();
+                self.refresh_collections();
+                self.apply_filter();
+                ctx.request_repaint();
+            }
+        }
+        if self.import_scan_rx.is_some() || self.import_running.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(300));
+        }
+    }
+
+    /// Import a source that was found, in the background.
+    fn start_import(&mut self, source: clipd_core::ImportSource) {
+        let Some(bundle) = self
+            .import_found
+            .iter()
+            .find(|(found, _)| found.source == source)
+            .and_then(|(_, bundle)| bundle.as_ref().ok())
+            .cloned()
+        else {
+            return;
+        };
+        clipd_core::telemetry_event("import", &[("source", source.label().into())]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.import_running = Some(rx);
+        std::thread::spawn(move || {
+            let report = ClipStore::new(&ClipStore::default_path())
+                .map(|store| {
+                    clipd_core::apply_import(&store, &bundle, &clipd_core::load_privacy_config())
+                })
+                .unwrap_or_default();
+            let _ = tx.send((source, report));
+        });
+    }
+
+    /// "Coming from Maccy? Bring over 1,204 clips, 12 pins and 8 snippets."
+    /// Shown for the first source found that has something to bring and has
+    /// not been imported or waved off.
+    fn render_import_offer(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        if let Some((note, at)) = &self.import_note {
+            if at.elapsed() < Duration::from_secs(12) {
+                ui.label(RichText::new(note).size(11.5).color(rgb(c.subtext)));
+                ui.add_space(6.0);
+            }
+        }
+        if self.import_running.is_some() {
+            ui.label(RichText::new("Importing…").size(11.5).color(rgb(c.subtext)));
+            ui.add_space(6.0);
+            return;
+        }
+        let offer = self.import_found.iter().find_map(|(found, bundle)| {
+            let bundle = bundle.as_ref().ok()?;
+            (!bundle.is_empty()
+                && !clipd_core::import_answered(found.source)
+                && !self.import_later.contains(&found.source))
+            .then(|| bundle.clone())
+        });
+        let Some(bundle) = offer else { return };
+        let source = bundle.source;
+        let mut what: Vec<String> = Vec::new();
+        if !bundle.clips.is_empty() {
+            what.push(format!("{} clips", bundle.clips.len()));
+        }
+        if bundle.pins() > 0 {
+            what.push(format!("{} pins", bundle.pins()));
+        }
+        if !bundle.snippets.is_empty() {
+            what.push(format!("{} snippets", bundle.snippets.len()));
+        }
+        let what = match what.len() {
+            0 => String::new(),
+            1 => what[0].clone(),
+            _ => {
+                let last = what.pop().unwrap_or_default();
+                format!("{} and {last}", what.join(", "))
+            }
+        };
+        let mut answer: Option<&'static str> = None;
+        egui::Frame::none()
+            .fill(surf(c, c.bg_elevated))
+            .stroke(Stroke::new(0.8, rgb(c.border)))
+            .rounding(Rounding::same(10.0))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(format!("Coming from {}?", source.label()))
+                        .size(12.5)
+                        .strong()
+                        .color(rgb(c.text)),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Bring over your {what} in one click. Nothing leaves this Mac."
+                    ))
+                    .size(11.5)
+                    .color(rgb(c.subtext)),
+                );
+                // Paste's format is not published: show what was read, so a
+                // wrong reading is visible before anything is written.
+                if source == clipd_core::ImportSource::Paste {
+                    for clip in bundle.clips.iter().rev().take(2) {
+                        let shown = clipd_core::redacted_display(&clip.text, &self.privacy_config)
+                            .unwrap_or_else(|| clip.text.clone());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("“{}”", one_line_preview(&shown, 60)))
+                                    .size(10.5)
+                                    .color(rgb(c.overlay)),
+                            )
+                            .truncate(),
+                        );
+                    }
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Import").size(12.0)).clicked() {
+                        answer = Some("import");
+                    }
+                    if ui.button(RichText::new("Not now").size(12.0)).clicked() {
+                        answer = Some("later");
+                    }
+                    if ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new("Don't ask").size(11.5).color(rgb(c.overlay)),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        answer = Some("never");
+                    }
+                });
+            });
+        ui.add_space(6.0);
+        match answer {
+            Some("import") => self.start_import(source),
+            Some("later") => self.import_later.push(source),
+            Some("never") => clipd_core::dismiss_import(source),
+            _ => {}
+        }
+    }
+
+    /// Settings: every source found, with an Import button each (importing
+    /// again is safe — clips already here are skipped), and how to bring
+    /// Raycast's snippets.
+    fn render_import_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        settings_section(ui, c, "Import");
+        let mut start: Option<clipd_core::ImportSource> = None;
+        let mut choose_raycast = false;
+        settings_card(ui, c, |ui| {
+            ui.label(
+                RichText::new("Bring your history, pins and snippets from another clipboard manager. Read on this Mac; nothing is uploaded.")
+                    .size(11.5)
+                    .color(rgb(c.subtext)),
+            );
+            ui.add_space(6.0);
+            if self.import_scan_rx.is_some() {
+                ui.label(RichText::new("Looking…").size(11.5).color(rgb(c.overlay)));
+            }
+            let mut any = false;
+            for (found, bundle) in &self.import_found {
+                any = true;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(found.source.label()).size(12.5).strong().color(rgb(c.text)));
+                    match bundle {
+                        Ok(bundle) => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} clips · {} pins · {} snippets",
+                                    bundle.clips.len(),
+                                    bundle.pins(),
+                                    bundle.snippets.len()
+                                ))
+                                .size(11.5)
+                                .color(rgb(c.subtext)),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let label = if clipd_core::import_answered(found.source) { "Import again" } else { "Import" };
+                                if ui
+                                    .add_enabled(
+                                        self.import_running.is_none() && !bundle.is_empty(),
+                                        egui::Button::new(RichText::new(label).size(11.5)),
+                                    )
+                                    .clicked()
+                                {
+                                    start = Some(found.source);
+                                }
+                            });
+                        }
+                        Err(error) => {
+                            ui.label(RichText::new(error).size(11.5).color(rgb(c.overlay)));
+                        }
+                    }
+                });
+            }
+            if !any && self.import_scan_rx.is_none() {
+                ui.label(
+                    RichText::new("No Maccy, Alfred or Paste data found on this Mac.")
+                        .size(11.5)
+                        .color(rgb(c.overlay)),
+                );
+            }
+            let raycast_found = self
+                .import_found
+                .iter()
+                .any(|(found, _)| found.source == clipd_core::ImportSource::Raycast);
+            if !raycast_found && clipd_core::raycast_installed() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Raycast keeps its clipboard history encrypted, so only snippets can come over. \
+                         In Raycast, run “Export Snippets”, then choose the file here.",
+                    )
+                    .size(11.5)
+                    .color(rgb(c.subtext)),
+                );
+                if ui.button(RichText::new("Choose Raycast export…").size(11.5)).clicked() {
+                    choose_raycast = true;
+                }
+            }
+            if let Some((note, _)) = &self.import_note {
+                ui.add_space(4.0);
+                ui.label(RichText::new(note).size(11.5).color(rgb(c.subtext)));
+            }
+        });
+        if let Some(source) = start {
+            self.start_import(source);
+        }
+        if choose_raycast {
+            if let Some(path) = choose_json_file() {
+                let found = clipd_core::FoundSource { source: clipd_core::ImportSource::Raycast, path };
+                let bundle = clipd_core::read_source(&found);
+                self.import_found.retain(|(f, _)| f.source != clipd_core::ImportSource::Raycast);
+                let ok = bundle.is_ok();
+                self.import_found.push((found, bundle));
+                if ok {
+                    self.start_import(clipd_core::ImportSource::Raycast);
+                }
+            }
+        }
     }
 
     /// Look for repeated workflows in the background — on open, then every 15
@@ -10525,6 +10761,7 @@ impl ClipdGui {
             self.render_sending_settings(ui, c);
         });
 
+        self.render_import_settings(ui, c);
         self.render_snippets_settings(ui, c);
         self.render_actions_settings(ui, c);
         self.render_vault_settings(ui, c);

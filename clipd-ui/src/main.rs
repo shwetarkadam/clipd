@@ -658,16 +658,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // down while it is pending.
     #[cfg(target_os = "macos")]
     let introduction = slot_introduction_state();
+    //
+    // And no longer at launch for anyone. History, search and pins need no
+    // permission at all, so clipd is useful from the first copy; keyboard
+    // access is asked for the first time ⌘C is pressed twice — the moment
+    // its reason is in front of the person (see the daemon's
+    // `offer_keyboard_access_after_double_copy`) — or from Settings.
     #[cfg(target_os = "macos")]
-    let should_offer_keyboard_setup = !introduction.asks_for_permission
-        && !keyboard_granted_before_prompt
-        && claim_keyboard_permission_offer();
-    #[cfg(target_os = "macos")]
-    let keyboard_granted = if should_offer_keyboard_setup {
-        clipd_core::request_keyboard_permissions()
-    } else {
-        keyboard_granted_before_prompt
-    };
+    let keyboard_granted = keyboard_granted_before_prompt;
 
     // Auto-start daemon on launch — runs IN-PROCESS (see start_daemon docs) so the
     // macOS keyboard listener inherits clipd-ui's Input Monitoring / Accessibility grants.
@@ -703,33 +701,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "macos")]
     if !keyboard_granted {
-        if should_offer_keyboard_setup {
-            log::warn!(
-                "Keyboard access missing ({}) — opening System Settings once for this version. \
-                 Enable Clipd under Accessibility AND Input Monitoring.",
-                clipd_core::missing_keyboard_permission_label()
-            );
-            clipd_core::open_keyboard_permission_settings();
-            // Non-blocking: daemon + Carbon hotkeys are already running above.
-            let _ = std::process::Command::new("/usr/bin/osascript")
-                .args([
-                    "-e",
-                    r#"display dialog "Clipd shortcuts need two toggles turned ON:
-
-1. System Settings → Privacy & Security → Accessibility
-2. System Settings → Privacy & Security → Input Monitoring
-
-Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi-slot copy also needs Input Monitoring." buttons {"OK"} default button "OK" with title "Clipd — keyboard access needed" with icon caution"#,
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-        } else {
-            log::warn!(
-                "Keyboard access still missing ({}); automatic setup was already offered for this version",
-                clipd_core::missing_keyboard_permission_label()
-            );
-        }
+        log::info!(
+            "Keyboard access missing ({}) — history works; clipd will ask the first time ⌘C is pressed twice",
+            clipd_core::missing_keyboard_permission_label()
+        );
     }
 
     // Open clipd once for a new user, so the introduction is actually seen.
@@ -850,6 +825,12 @@ Enable Clipd in both lists. Ctrl+Space / palette work after Accessibility; multi
                 last_hotkey_sync = std::time::Instant::now();
             }
             settings_hotkeys.poll_and_dispatch();
+            // Someone said "Turn on" to the ⌘C ×2 prompt on a background
+            // thread; macOS shows its sheet only for a main-thread request.
+            if clipd_core::take_keyboard_access_request() {
+                clipd_core::request_keyboard_permissions();
+                clipd_core::open_keyboard_permission_settings();
+            }
         }
 
         if let Event::UserEvent(()) = event {
@@ -1769,8 +1750,6 @@ fn daemon_log_path() -> PathBuf {
 /// Where the slot introduction stands, as far as launch needs to know.
 #[cfg(target_os = "macos")]
 struct SlotIntroduction {
-    /// The introduction is pending and will ask for keyboard access itself.
-    asks_for_permission: bool,
     /// It has never been shown: open the palette once at launch.
     open_palette_once: bool,
 }
@@ -1778,8 +1757,8 @@ struct SlotIntroduction {
 #[cfg(target_os = "macos")]
 fn slot_introduction_state() -> SlotIntroduction {
     let settings = load_paste_transform_settings();
-    // Someone already filling slots 2-9 found the feature on their own;
-    // they get neither the window nor the change in how access is asked for.
+    // Someone already filling slots 2-9 found the feature on their own and
+    // does not need the window.
     let used: Vec<u8> = clipd_core::SlotManager::persistent_default()
         .map(|slots| {
             (2..=9u8)
@@ -1789,34 +1768,8 @@ fn slot_introduction_state() -> SlotIntroduction {
         .unwrap_or_default();
     let pending = clipd_core::slot_onboarding_due(&settings, &used);
     SlotIntroduction {
-        asks_for_permission: pending,
         open_palette_once: pending && !settings.slots_onboarding_presented,
     }
-}
-
-/// Claim the one automatic keyboard-permission offer for this Clipd version.
-///
-/// The file is intentionally persistent across tray restarts. A denied or
-/// not-yet-settled TCC grant should not turn a watchdog restart into an endless
-/// series of macOS permission sheets. Users can always retry deliberately from
-/// the tray's keyboard-access item or the Settings screen.
-#[cfg(target_os = "macos")]
-fn claim_keyboard_permission_offer() -> bool {
-    let dir = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("clipd");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return false;
-    }
-    let marker = dir.join(format!(
-        "keyboard-permission-offered-{}",
-        env!("CARGO_PKG_VERSION")
-    ));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(marker)
-        .is_ok()
 }
 
 /// macOS menu-bar template: pure black strokes on transparent. The system

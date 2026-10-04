@@ -11,6 +11,8 @@ default = []
 telemetry = []
 
 [dependencies]
+# Reading Paste.app's archived pasteboard items for import.
+plist = "1"
 arboard = { workspace = true }
 rusqlite = { workspace = true }
 chrono = { workspace = true }
