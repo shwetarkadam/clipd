@@ -38,3 +38,9 @@ dirs = "5"
 sha2 = "0.10"
 base64 = "0.22"
 ureq = { version = "2", features = ["json"] }
+
+# File clips are hashed with SHA-256 on both ends of every transfer. Unoptimized
+# it runs at a few MB/s, which turns a large file into seconds of dead time in
+# debug builds and tests. It is a leaf crate, so optimizing it costs nothing.
+[profile.dev.package.sha2]
+opt-level = 3

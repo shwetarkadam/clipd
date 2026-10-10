@@ -735,6 +735,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // simpler and more reliable than keeping a process alive off-screen.
 
     event_loop.run(move |event, _, control_flow| {
+        // Tell the watchdog the loop is alive. Without this the tray was the
+        // one surface whose freezes left no trace: the watchdog ran, but with
+        // no heartbeat it read the tray as still starting up, forever. The
+        // loop wakes at least every 50ms, including while the menu is open
+        // (tao's timer runs in the common run-loop modes), so a gap means a
+        // real stall.
+        clipd_core::crashlog::heartbeat();
         #[cfg(target_os = "macos")]
         let _ = &notch_shields;
         // Poll at 50ms so the hover-delay timer fires promptly. Wait would
@@ -883,6 +890,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if button_state == MouseButtonState::Up {
                             match button {
                                 tray_icon::MouseButton::Left => {
+                                    clipd_core::crashlog::breadcrumb("tray.click", "");
                                     hide_pending_at = None;
                                     hover_entered_at = None;
                                     show_hud(&mut hud_child);
@@ -900,6 +908,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Event::NewEvents(_) = event {
             if let Ok(menu_event) = menu_channel.try_recv() {
+                // Menu ids are this file's own constants (plus a row index),
+                // never clip content, so they are safe to carry in a report.
+                clipd_core::crashlog::breadcrumb("tray.menu", menu_event.id.0.as_str());
                 match menu_event.id.0.as_str() {
                     MENU_ID_DAEMON => {
                         match daemon.take() {

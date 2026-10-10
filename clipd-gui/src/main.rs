@@ -2534,6 +2534,29 @@ enum Action {
     UndoSend,
 }
 
+impl Action {
+    /// What a hang report should say the window was doing. Names only: an
+    /// action's payload is a clip id or an index, and neither tells anyone
+    /// anything about why the window stopped.
+    fn crumb(&self) -> Option<&'static str> {
+        Some(match self {
+            Action::None => return None,
+            Action::Copy => "action.copy",
+            Action::Paste => "action.paste",
+            Action::Delete => "action.delete",
+            Action::ToggleStar(_) => "action.star",
+            Action::RunAction(_) => "action.custom",
+            Action::Ask => "action.ask",
+            Action::JumpToClip(_) => "action.jump",
+            Action::OpenAiSettings => "action.ai_settings",
+            Action::AskAboutClip(_) => "action.ask_about",
+            Action::RunSuggestion(_) => "action.suggestion",
+            Action::Send => "action.send",
+            Action::UndoSend => "action.undo_send",
+        })
+    }
+}
+
 /// Where a pairing has got to.
 ///
 /// Discovery blocks for up to a minute, which an immediate-mode UI cannot do,
@@ -2861,6 +2884,27 @@ fn requested_theme(args: &[String]) -> Option<Result<Theme, String>> {
 /// When this process started, for the "first frame" log line.
 static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
+/// A send the window was closed in the middle of, handed over by `on_exit`.
+static UNFINISHED_SEND: std::sync::Mutex<Option<std::sync::mpsc::Receiver<(bool, String)>>> =
+    std::sync::Mutex::new(None);
+
+/// Let a send started just before the window closed finish.
+///
+/// Exiting would kill the worker mid-send, leaving a clip the user believes is
+/// on its way half-delivered. The window is gone by now, so nothing appears
+/// frozen while this waits. Bounded, so a stuck iCloud write cannot keep the
+/// process alive indefinitely.
+fn finish_unfinished_send() {
+    let rx = UNFINISHED_SEND.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(rx) = rx {
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok((true, msg)) => log::info!("send finished after close: {msg}"),
+            Ok((false, msg)) => log::warn!("send failed after close: {msg}"),
+            Err(_) => log::warn!("gave up waiting for a send after close"),
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     PROCESS_START.get_or_init(Instant::now);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -3039,6 +3083,8 @@ fn main() -> eframe::Result {
             Ok(Box::new(ClipdGui::new(theme, hud, island, open_settings)))
         }),
     );
+
+    finish_unfinished_send();
 
     // GUI closed — kill the daemon subprocess
     if let Some(mut child) = daemon_child {
@@ -4262,6 +4308,9 @@ struct ClipdGui {
     new_action_output: ActionOutput,
     /// Last action result banner in the preview pane: (ok, message).
     action_status: Option<(bool, String)>,
+    /// A send or undo-send under way on a worker thread; reports the banner
+    /// to show when it finishes.
+    send_job: Option<std::sync::mpsc::Receiver<(bool, String)>>,
     /// Where the machine-pairing flow has got to.
     pairing: PairingState,
     /// Machines seen on the network, refreshed on a timer rather than every
@@ -4571,6 +4620,7 @@ impl ClipdGui {
             new_action_auto: String::new(),
             new_action_output: ActionOutput::Clipboard,
             action_status: None,
+            send_job: None,
             pairing: PairingState::Idle,
             nearby: Vec::new(),
             nearby_checked: None,
@@ -6600,34 +6650,81 @@ impl ClipdGui {
     ///
     /// Result goes to the status banner rather than a modal: a send that needs
     /// dismissing costs more attention than the send itself saved.
-    fn do_send(&mut self) {
+    fn do_send(&mut self, ctx: &egui::Context) {
         let Some(clip) = self.selected_clip().cloned() else {
             self.action_status = Some((false, "No clip selected.".into()));
             return;
         };
-        match clipd_core::sync::send_clip(&clip, None) {
-            Ok(device) => {
-                self.action_status =
-                    Some((true, format!("Sent to {} · U to undo", device.name)));
+        self.start_send_job(ctx, "Sending…", move || {
+            match clipd_core::sync::send_clip(&clip, None) {
+                Ok(device) => (true, format!("Sent to {} · U to undo", device.name)),
+                Err(e) => (false, e),
             }
-            Err(e) => self.action_status = Some((false, e)),
-        }
+        });
     }
 
     /// Take back the last send, if the other Mac hasn't collected it yet.
-    fn do_undo_send(&mut self) {
-        match clipd_core::sync::recall_last() {
-            Ok((last, true)) => {
-                self.action_status =
-                    Some((true, format!("Took it back before {} got it", last.device_name)));
-            }
-            Ok((last, false)) => {
+    fn do_undo_send(&mut self, ctx: &egui::Context) {
+        self.start_send_job(ctx, "Taking it back…", || {
+            match clipd_core::sync::recall_last() {
+                Ok((last, true)) => (
+                    true,
+                    format!("Took it back before {} got it", last.device_name),
+                ),
                 // Honest rather than reassuring: it is in their history now,
                 // and pretending otherwise would be worse than saying so.
-                self.action_status =
-                    Some((false, format!("Too late — {} already has it", last.device_name)));
+                Ok((last, false)) => (
+                    false,
+                    format!("Too late — {} already has it", last.device_name),
+                ),
+                Err(e) => (false, e),
             }
-            Err(e) => self.action_status = Some((false, e)),
+        });
+    }
+
+    /// Run a send or undo on a worker thread.
+    ///
+    /// Both touch the network or iCloud Drive: a send reads the whole file,
+    /// dials a machine that may have gone to sleep, and can fall back to
+    /// writing into a folder iCloud is syncing. Done inline, that froze the
+    /// window for as long as twenty seconds — long enough that people quit
+    /// clipd rather than wait for it.
+    fn start_send_job(
+        &mut self,
+        ctx: &egui::Context,
+        pending: &str,
+        job: impl FnOnce() -> (bool, String) + Send + 'static,
+    ) {
+        // One at a time: an undo racing the send it is meant to undo could
+        // look for an envelope that has not been written yet.
+        if self.send_job.is_some() {
+            self.action_status = Some((false, "Still working on the last send…".into()));
+            return;
+        }
+        self.action_status = Some((true, pending.to_string()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+            ctx.request_repaint();
+        });
+        self.send_job = Some(rx);
+    }
+
+    fn poll_send(&mut self) {
+        let Some(rx) = &self.send_job else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(status) => {
+                self.action_status = Some(status);
+                self.send_job = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.action_status = Some((false, "The send stopped unexpectedly.".into()));
+                self.send_job = None;
+            }
         }
     }
 
@@ -7130,6 +7227,13 @@ impl ClipdGui {
 
 impl eframe::App for ClipdGui {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // The window is still on screen here, so a send in flight is waited
+        // for in `main`, after it has gone.
+        if let Some(rx) = self.send_job.take() {
+            if let Ok(mut slot) = UNFINISHED_SEND.lock() {
+                *slot = Some(rx);
+            }
+        }
         // The close of the funnel. "Opened, then left with nothing" is the
         // population worth chasing; without this the analytics can only show
         // successes and would make the app look like it always works.
@@ -7346,6 +7450,7 @@ impl eframe::App for ClipdGui {
 
         self.poll_ask();
         self.poll_transform();
+        self.poll_send();
         if self.transform_job.running {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
@@ -7811,6 +7916,9 @@ impl ClipdGui {
     /// Apply one user action. Shared by the palette window and the HUD so
     /// both surfaces behave identically.
     fn dispatch(&mut self, action: Action, ctx: &egui::Context) {
+        if let Some(name) = action.crumb() {
+            clipd_core::crashlog::breadcrumb(name, "");
+        }
         match action {
             Action::Copy => {
                 self.do_copy();
@@ -7822,8 +7930,8 @@ impl ClipdGui {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Action::Delete => self.do_delete(),
-            Action::Send => self.do_send(),
-            Action::UndoSend => self.do_undo_send(),
+            Action::Send => self.do_send(ctx),
+            Action::UndoSend => self.do_undo_send(ctx),
             Action::ToggleStar(clip_id) => {
                 self.toggle_starred(clip_id);
                 ctx.request_repaint();

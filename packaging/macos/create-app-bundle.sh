@@ -98,7 +98,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <array>
     <!-- Everyday discovery: which of your machines are on this network. -->
     <string>_clipd._tcp</string>
-    <!-- Only advertised while `clipd pair` is running. -->
+    <!-- Only advertised while "clipd pair" is running. -->
     <string>_clipd-pair._tcp</string>
   </array>
   <!-- Menu-bar agent: no Dock icon. Status item stays owned by clipd-ui when
