@@ -34,6 +34,11 @@ objc2-app-kit = { version = "0.3", features = [
     "NSWindow",
     "NSScreen",
     "NSGlassEffectView",
+    # Activating / hiding the resident main window like Spotlight.
+    "NSApplication",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSWorkspace",
 ] }
 raw-window-handle = "0.6"
 

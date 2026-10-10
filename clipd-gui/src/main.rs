@@ -210,6 +210,15 @@ fn popover_left(width: f32, screen: egui::Vec2, anchored: bool) -> f32 {
 /// the full history) opens the real window rather than growing the tray panel
 /// into a second application.
 fn spawn_palette(args: &[&str]) {
+    // The main window is resident: ask it to show, and hand it the keyboard —
+    // this process is the one that was just clicked, so it may.
+    let mode = if args.contains(&"--settings") { "settings" } else { "main" };
+    if (args.is_empty() || args == ["--settings"])
+        && clipd_core::request_running_surface("gui-main", mode)
+    {
+        clipd_core::hand_focus_to_surface("gui-main");
+        return;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -1324,17 +1333,16 @@ fn slots_first(
     (ordered, slot_rows)
 }
 
-/// "Slot 2 · ⌘V ×2 pastes it", or "Slots 2, 3 · ⌘V ×2 or ×3 pastes it" for
-/// a text in two slots.
+/// "⌘V ×2 pastes it", or "⌘V ×2 or ×3 pastes it" for a text in two slots.
+/// The slot number itself is the pill beside the title.
 pub(crate) fn slot_paste_keys(slots: &[u8]) -> String {
     let mut keys = slots.iter().map(|n| slot_chord('V', *n));
     let first = keys.next().unwrap_or_default();
     let rest: Vec<String> = slots[1..].iter().map(|n| if *n == 1 { "⌘V".into() } else { format!("×{n}") }).collect();
-    let names: Vec<String> = slots.iter().map(|n| n.to_string()).collect();
     if rest.is_empty() {
-        format!("Slot {}  ·  {first} pastes it", names.join(""))
+        format!("{first} pastes it")
     } else {
-        format!("Slots {}  ·  {first} or {} pastes it", names.join(", "), rest.join(" or "))
+        format!("{first} or {} pastes it", rest.join(" or "))
     }
 }
 
@@ -1376,26 +1384,29 @@ fn row_more_menu(
     (copy, star, delete)
 }
 
-/// Mono's slot marker: a hairline box with the number in grey, as quiet as
-/// the rest of the row. ("2·3" for a text in two slots.)
-fn draw_number_box(ui: &mut egui::Ui, slots: &[u8], c: &clipd_core::ThemeColors) {
-    let label = slots
-        .iter()
-        .map(|n| clipd_core::slot_badge(*n))
-        .collect::<Vec<_>>()
-        .join("·");
+/// "Slot 2", or "Slots 2·3" for a text in two slots.
+fn slot_pill_label(slots: &[u8]) -> String {
+    let numbers: Vec<String> = slots.iter().map(|n| clipd_core::slot_badge(*n)).collect();
+    if numbers.len() == 1 {
+        format!("Slot {}", numbers[0])
+    } else {
+        format!("Slots {}", numbers.join("·"))
+    }
+}
+
+/// The slot pill beside a clip's title: accent-tinted, small, unmistakable.
+fn draw_slot_pill(ui: &mut egui::Ui, label: &str, c: &clipd_core::ThemeColors) {
     let galley = ui
         .painter()
-        .layout_no_wrap(label, FontId::proportional(12.0), rgb(c.subtext));
-    let (cell, _) = ui.allocate_exact_size(
-        egui::vec2((galley.size().x + 12.0).max(26.0), 30.0),
+        .layout_no_wrap(label.to_string(), FontId::proportional(12.0), rgb(c.accent));
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x + 14.0, 20.0),
         egui::Sense::hover(),
     );
-    let chip = egui::Rect::from_center_size(cell.center(), egui::vec2(cell.width(), 24.0));
-    ui.painter()
-        .rect_stroke(chip, Rounding::same(5.0), Stroke::new(1.0, rgb(c.overlay).gamma_multiply(0.6)));
-    ui.painter()
-        .galley(chip.center() - galley.size() / 2.0, galley, rgb(c.subtext));
+    ui.painter().rect_filled(rect, Rounding::same(9.0), rgb(c.accent).gamma_multiply(0.18));
+    ui.painter().rect_stroke(rect, Rounding::same(9.0), Stroke::new(0.8, rgb(c.accent).gamma_multiply(0.55)));
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, rgb(c.accent));
+    resp.on_hover_text("Paste it from any app by tapping ⌘V that many times");
 }
 
 /// A row's slot number(s), drawn where the type glyph would be.
@@ -1703,13 +1714,13 @@ fn tiny_filter_chip(
     ui.scope(|ui| {
         ui.spacing_mut().button_padding = egui::vec2(12.0, 4.0);
         ui.add(
-            egui::Button::new(RichText::new(label).size(11.5).color(text_col))
+            egui::Button::new(RichText::new(label).size(12.5).color(text_col))
                 .fill(fill)
                 // Softly rounded, not a capsule: the reference's segments are
                 // rectangles with the corners taken off.
                 .rounding(Rounding::same(9.0))
                 .stroke(stroke)
-                .min_size(egui::vec2(0.0, 26.0)),
+                .min_size(egui::vec2(0.0, 28.0)),
         )
         .clicked()
     })
@@ -1731,6 +1742,24 @@ fn draw_clock_icon_at(painter: &egui::Painter, center: egui::Pos2, col: Color32)
 }
 
 /// Footer shortcut chip — quiet outline box like the mockup's ⌘⇧V.
+/// "Option+Space" → "⌥ Space", the way macOS writes shortcuts.
+fn shortcut_symbols(label: &str) -> String {
+    if !cfg!(target_os = "macos") {
+        return label.to_string();
+    }
+    label
+        .split('+')
+        .map(|part| match part {
+            "Cmd" => "⌘",
+            "Shift" => "⇧",
+            "Option" | "Alt" => "⌥",
+            "Ctrl" => "⌃",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn footer_shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeColors) {
     egui::Frame::none()
         .fill(Color32::TRANSPARENT)
@@ -1738,13 +1767,63 @@ fn footer_shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeCol
         .stroke(Stroke::new(0.85, rgb(c.border)))
         .inner_margin(Margin::symmetric(7.0, 3.0))
         .show(ui, |ui| {
-            ui.label(
-                RichText::new(text)
-                    .size(11.0)
-                    .family(egui::FontFamily::Monospace)
-                    .color(rgb(c.subtext)),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                key_caps(ui, text, rgb(c.subtext), 12.0);
+            });
         });
+}
+
+/// Draw a shortcut like "⌥ Space" or "↑↓": the symbols the bundled font
+/// lacks (⌥ ⇧ ⌃ ↑↓ ↵) are painted; everything else is text. Typed, they came
+/// out as empty boxes.
+fn key_caps(ui: &mut egui::Ui, text: &str, color: Color32, size: f32) {
+    let mut tokens: Vec<&str> = text.split(' ').filter(|t| !t.is_empty()).collect();
+    // A row laid out right to left places the first token rightmost: "Space ⌥".
+    if ui.layout().prefer_right_to_left() {
+        tokens.reverse();
+    }
+    for token in tokens {
+        if matches!(token, "⌥" | "⇧" | "⌃" | "↑↓" | "↵") {
+            let w = if token == "↑↓" { size * 1.5 } else { size * 0.95 };
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, size + 2.0), egui::Sense::hover());
+            paint_key_symbol(ui.painter(), rect.shrink2(egui::vec2(0.5, 2.5)), token, color);
+        } else {
+            ui.label(RichText::new(token).size(size).color(color));
+        }
+    }
+}
+
+fn paint_key_symbol(painter: &egui::Painter, r: egui::Rect, symbol: &str, color: Color32) {
+    let stroke = Stroke::new(1.2, color);
+    let p = |x: f32, y: f32| egui::pos2(r.left() + r.width() * x, r.top() + r.height() * y);
+    let path = |points: Vec<egui::Pos2>| egui::Shape::line(points, stroke);
+    match symbol {
+        "⌥" => {
+            painter.add(path(vec![p(0.0, 0.2), p(0.35, 0.2), p(0.68, 0.85), p(1.0, 0.85)]));
+            painter.add(path(vec![p(0.6, 0.2), p(1.0, 0.2)]));
+        }
+        "⇧" => {
+            painter.add(egui::Shape::closed_line(
+                vec![p(0.5, 0.0), p(1.0, 0.5), p(0.72, 0.5), p(0.72, 1.0), p(0.28, 1.0), p(0.28, 0.5), p(0.0, 0.5)],
+                stroke,
+            ));
+        }
+        "⌃" => {
+            painter.add(path(vec![p(0.12, 0.65), p(0.5, 0.2), p(0.88, 0.65)]));
+        }
+        "↑↓" => {
+            painter.add(path(vec![p(0.25, 1.0), p(0.25, 0.0)]));
+            painter.add(path(vec![p(0.08, 0.25), p(0.25, 0.0), p(0.42, 0.25)]));
+            painter.add(path(vec![p(0.75, 0.0), p(0.75, 1.0)]));
+            painter.add(path(vec![p(0.58, 0.75), p(0.75, 1.0), p(0.92, 0.75)]));
+        }
+        "↵" => {
+            painter.add(path(vec![p(0.9, 0.05), p(0.9, 0.7), p(0.08, 0.7)]));
+            painter.add(path(vec![p(0.3, 0.42), p(0.08, 0.7), p(0.3, 0.98)]));
+        }
+        _ => {}
+    }
 }
 
 /// Quiet row star: solid green when pinned, outline otherwise.
@@ -1907,6 +1986,32 @@ fn cursor_in_points(ctx: &egui::Context) -> Option<egui::Pos2> {
 
 /// Where to place the window so it feels like it popped up at the cursor:
 /// search bar centered under the pointer, just below it.
+/// Where Spotlight puts itself: centred on the display the pointer is on, a
+/// sixth of the way down — the same place every time, so the eye knows where
+/// to look before the window is there.
+fn spotlight_pos(cursor: egui::Pos2, win_size: egui::Vec2) -> egui::Pos2 {
+    let displays = island::displays();
+    let screen = displays
+        .iter()
+        .map(|d| d.rect)
+        .find(|r| r.contains(cursor))
+        .or_else(|| displays.first().map(|d| d.rect));
+    match screen {
+        Some(r) => {
+            let min_top = if clipd_core::island_layout_active() {
+                clipd_core::ISLAND_RESERVED_TOP
+            } else {
+                32.0
+            };
+            let x = (r.center().x - win_size.x * 0.5).clamp(r.left() + 8.0, (r.right() - win_size.x - 8.0).max(r.left() + 8.0));
+            let y = (r.top() + (r.height() * 0.16).max(min_top))
+                .min((r.bottom() - win_size.y - 8.0).max(r.top() + min_top));
+            egui::pos2(x, y)
+        }
+        None => window_pos_at_cursor(cursor, win_size, None),
+    }
+}
+
 fn window_pos_at_cursor(
     cursor: egui::Pos2,
     win_size: egui::Vec2,
@@ -2149,32 +2254,6 @@ fn shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeColors) {
         });
 }
 
-/// Warning-banner colours that follow the theme.
-///
-/// These were hardcoded to a dark-theme amber, which on a light theme rendered
-/// as tan text on a tan block — the message was there but unreadable, which is
-/// the worst possible outcome for a banner whose whole job is to be read.
-/// Returns `(fill, title, body, button_fill, button_text)`.
-fn warning_colors(light: bool) -> (Color32, Color32, Color32, Color32, Color32) {
-    if light {
-        (
-            Color32::from_rgb(253, 240, 219),
-            Color32::from_rgb(124, 61, 6),
-            Color32::from_rgb(146, 84, 22),
-            Color32::from_rgb(180, 105, 30),
-            Color32::from_rgb(255, 249, 240),
-        )
-    } else {
-        (
-            Color32::from_rgb(90, 50, 20).gamma_multiply(0.55),
-            Color32::from_rgb(255, 200, 120),
-            Color32::from_rgb(230, 190, 140),
-            Color32::from_rgb(120, 70, 30),
-            Color32::from_rgb(255, 220, 160),
-        )
-    }
-}
-
 /// A background surface, honouring the theme's `surface_alpha`.
 ///
 /// Solid themes report 255 and this is identical to `rgb`. The glass themes
@@ -2379,6 +2458,42 @@ pub(crate) fn strip_rows_from_store(
             (n, held)
         })
         .collect()
+}
+
+/// Whether the frontmost app is clipd itself (any of its processes: they
+/// share the bundle). Focus moving to the popover or the tray host is not the
+/// person clicking away from the main window.
+#[cfg(target_os = "macos")]
+fn clipd_is_frontmost() -> bool {
+    objc2_app_kit::NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .and_then(|app| app.bundleIdentifier())
+        .is_some_and(|id| id.to_string() == "dev.clipd.app")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clipd_is_frontmost() -> bool {
+    false
+}
+
+/// A native "choose a file" dialog for a JSON file, via AppleScript — no
+/// extra dependency for one button.
+#[cfg(target_os = "macos")]
+fn choose_json_file() -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("/usr/bin/osascript")
+        .args([
+            "-e",
+            r#"POSIX path of (choose file with prompt "Choose the snippets file Raycast exported" of type {"public.json"})"#,
+        ])
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn choose_json_file() -> Option<std::path::PathBuf> {
+    None
 }
 
 /// The review sheet for a skill about to be saved.
@@ -2743,7 +2858,11 @@ fn requested_theme(args: &[String]) -> Option<Result<Theme, String>> {
     }))
 }
 
+/// When this process started, for the "first frame" log line.
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
 fn main() -> eframe::Result {
+    PROCESS_START.get_or_init(Instant::now);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp(None)
         .format_target(false)
@@ -4052,8 +4171,6 @@ struct ClipdGui {
     theme: Theme,
     /// User-defined palette that overrides the active theme when enabled.
     custom_colors: CustomColors,
-    /// Reported once per window — see `render_text_banners`.
-    reported_permission_block: bool,
     /// Where the slot introduction is, or `None` when it is not showing.
     /// Decided once per window, on the first frame that draws banners.
     onboard: Option<OnboardStep>,
@@ -4094,6 +4211,25 @@ struct ClipdGui {
     settings_query: String,
     /// Header pin — keep the full GUI above other windows.
     window_pinned: bool,
+    /// The main window stays resident between uses, like Spotlight: closing
+    /// hides it and the next open shows it again, instead of a ~300ms cold
+    /// start of a new process every time.
+    main_hidden: bool,
+    main_watcher_started: bool,
+    /// When the last show was asked for, to log how fast the window came up.
+    main_show_asked: Option<Instant>,
+    /// The window has had the keyboard since it was last shown. Clicking away
+    /// only hides a window that was actually in use — not one that launched
+    /// in the background and never got focus.
+    main_had_focus: bool,
+    /// When the window was last shown; focus churn right after a show (the
+    /// tray or popover handing over) is not "clicking away".
+    main_shown_at: Option<Instant>,
+    /// Keep putting the caret in the search field until this moment. One
+    /// request on the frame the window appears can land before macOS has made
+    /// it the key window and be dropped — the window came up focused with no
+    /// caret, and the first keystrokes went nowhere.
+    focus_search_until: Option<Instant>,
     /// Tracks window focus so summoning clipd lands the cursor in search.
     was_focused: bool,
     /// Vault (1Password / Bitwarden / Keychain) "save clipboard as a password" form.
@@ -4199,10 +4335,23 @@ struct ClipdGui {
     /// How many rows at the top of the list are just-copied clips, set ahead
     /// of the pins (see `fresh_first`).
     fresh_rows: usize,
+    /// Pinned clips the main list is not showing ("Show N more pinned"), and
+    /// whether the person asked to see them all.
+    pins_hidden: usize,
+    pins_expanded: bool,
     /// Set when something asked for the keyboard mid-frame.
     want_key_window: bool,
     /// Secret-scan results by clip id, so a reload only scans what is new.
     secret_scan_cache: HashMap<i64, Option<String>>,
+    /// Import from another clipboard manager (see clipd_core::import): what was
+    /// found on this Mac, read in the background, and an import in flight.
+    import_scan_rx: Option<std::sync::mpsc::Receiver<Vec<(clipd_core::FoundSource, Result<clipd_core::ImportBundle, String>)>>>,
+    import_scanned: bool,
+    import_found: Vec<(clipd_core::FoundSource, Result<clipd_core::ImportBundle, String>)>,
+    import_running: Option<std::sync::mpsc::Receiver<(clipd_core::ImportSource, clipd_core::ImportReport)>>,
+    import_note: Option<(String, Instant)>,
+    /// Sources whose offer was waved off for this window ("Not now").
+    import_later: Vec<clipd_core::ImportSource>,
     /// Skills from the clipboard (see clipd_core::skills): the background scan,
     /// the workflow being offered, and the review sheet when it is open. None
     /// of it leaves the Mac, and none of it is reported to telemetry.
@@ -4375,7 +4524,6 @@ impl ClipdGui {
             focus_search: true,
             theme,
             custom_colors: load_custom_colors(),
-            reported_permission_block: false,
             onboard: None,
             onboard_decided: false,
             onboard_forced: false,
@@ -4395,6 +4543,12 @@ impl ClipdGui {
             settings_category: SettingsCategory::Clipboard,
             settings_query: String::new(),
             window_pinned: false,
+            main_hidden: false,
+            main_watcher_started: false,
+            main_show_asked: None,
+            main_had_focus: false,
+            main_shown_at: None,
+            focus_search_until: None,
             was_focused: true,
             vault_targets: available_targets(),
             vault_selected: available_targets().first().copied(),
@@ -4458,9 +4612,17 @@ impl ClipdGui {
             slots_by_content,
             hud_slots_view: false,
             fresh_rows: 0,
+            pins_hidden: 0,
+            pins_expanded: false,
             want_key_window: false,
             secret_scan_cache,
             sensitive_cache,
+            import_scan_rx: None,
+            import_scanned: false,
+            import_found: Vec::new(),
+            import_running: None,
+            import_note: None,
+            import_later: Vec::new(),
             skill_scan_rx: None,
             skill_scanned_at: None,
             skill_offer: None,
@@ -4657,15 +4819,73 @@ impl ClipdGui {
             ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             if let Some(cursor) = global_cursor_position() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(window_pos_at_cursor(
-                    cursor,
-                    size,
-                    main_display_size(),
-                )));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(spotlight_pos(cursor, size)));
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.focus_search = mode == SurfaceMode::Main;
         }
+        ctx.request_repaint();
+    }
+
+    /// Wake the resident main window the moment the tray or the shortcut asks
+    /// for it (the same 15ms watch the popover uses).
+    fn ensure_main_request_watcher(&mut self, ctx: &egui::Context) {
+        if self.main_watcher_started {
+            return;
+        }
+        self.main_watcher_started = true;
+        let ctx = ctx.clone();
+        let path = surface_request_path(SurfaceMode::Main);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(15));
+            if path.exists() {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Put the main window away and give the keyboard back to the app that
+    /// had it — what ⌘H does, and what Spotlight does on Esc.
+    fn hide_main_window(&mut self, ctx: &egui::Context) {
+        if self.main_hidden {
+            return;
+        }
+        log::info!("main window hidden");
+        self.main_hidden = true;
+        self.set_preview_open(ctx, false);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        clipd_core::set_gui_window_open(false);
+        #[cfg(target_os = "macos")]
+        if let Some(mtm) = objc2::MainThreadMarker::new() {
+            objc2_app_kit::NSApplication::sharedApplication(mtm).hide(None);
+        }
+    }
+
+    /// Bring the resident main window back: fresh search, newest clips, at the
+    /// pointer, in front, keyboard in the search field.
+    fn show_main_window(&mut self, ctx: &egui::Context, mode: SurfaceMode) {
+        let was_hidden = self.main_hidden;
+        log::info!("main window show requested (was hidden: {was_hidden})");
+        self.main_hidden = false;
+        if was_hidden {
+            self.main_show_asked = Some(Instant::now());
+        }
+        if was_hidden {
+            self.refresh();
+            self.pins_expanded = false;
+            self.selected = 0;
+            self.scroll_to_selected = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        self.switch_surface(ctx, mode);
+        // Treat this as a fresh summon: clear the query and place the window.
+        self.was_focused = false;
+        self.main_had_focus = false;
+        self.main_shown_at = Some(Instant::now());
+        self.focus_search_until = Some(Instant::now() + Duration::from_millis(700));
+        clipd_core::set_gui_window_open(true);
+        // Accept the keyboard the requester handed over (see clipd_core::focus).
+        clipd_core::take_focus();
         ctx.request_repaint();
     }
 
@@ -6015,6 +6235,38 @@ impl ClipdGui {
             self.filtered = ordered;
             self.fresh_rows = fresh;
         }
+        // The main window shows three pins and a "Show N more pinned" row.
+        // Seven pinned rows filled the first screen, so Recent — what you
+        // copied today — started below the fold. Trimmed here, not when
+        // drawing, so the arrow keys never land on a row that is not shown.
+        self.pins_hidden = 0;
+        if !self.hud
+            && !self.island_surface
+            && content_q.is_empty()
+            && content_filter == ContentFilter::All
+            && !self.pins_expanded
+        {
+            const PINS_SHOWN: usize = 3;
+            let starred = &self.starred_clip_ids;
+            let clips = &self.clips;
+            let mut seen_pins = 0;
+            let fresh = self.fresh_rows;
+            let mut kept = Vec::with_capacity(self.filtered.len());
+            for (pos, &i) in self.filtered.iter().enumerate() {
+                if pos >= fresh && starred.contains(&clips[i].id) {
+                    seen_pins += 1;
+                    if seen_pins > PINS_SHOWN {
+                        continue;
+                    }
+                }
+                kept.push(i);
+            }
+            // Hiding one pin behind a "show 1 more" row saves nothing.
+            if seen_pins > PINS_SHOWN + 1 {
+                self.pins_hidden = seen_pins - PINS_SHOWN;
+                self.filtered = kept;
+            }
+        }
         // The popover's Slots view: only what is in slots 1-9, in slot order.
         // A view of its own rather than a section on top, so the clipboard
         // keeps its order — pins first, then newest. Slots hold what you set
@@ -6902,6 +7154,37 @@ impl eframe::App for ClipdGui {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // The main window is resident: every way of closing it (Esc, ⌘W, the
+        // close button, a paste) hides it instead, unless clipd is quitting.
+        if !self.hud && !self.island_surface {
+            self.ensure_main_request_watcher(ctx);
+            if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.hide_main_window(ctx);
+            }
+        }
+        if !self.main_hidden {
+            if let Some(asked) = self.main_show_asked.take() {
+                #[cfg(target_os = "macos")]
+                let active = objc2::MainThreadMarker::new()
+                    .map(|mtm| objc2_app_kit::NSApplication::sharedApplication(mtm).isActive())
+                    .unwrap_or(false);
+                #[cfg(not(target_os = "macos"))]
+                let active = true;
+                log::info!(
+                    "main window shown {}ms after the request (active: {active}, focused: {})",
+                    asked.elapsed().as_millis(),
+                    ctx.input(|i| i.viewport().focused).unwrap_or(false)
+                );
+            }
+        }
+        // How long a window takes to appear is the first thing anyone feels.
+        static FIRST_FRAME: std::sync::Once = std::sync::Once::new();
+        FIRST_FRAME.call_once(|| {
+            if let Some(start) = PROCESS_START.get() {
+                log::info!("first frame {}ms after launch", start.elapsed().as_millis());
+            }
+        });
         // Tell the watchdog the loop is alive. A surface whose `update` stops
         // being called is, from the outside, a window that has stopped
         // responding — which is the half of "it crashes or hangs" that leaves
@@ -6974,7 +7257,14 @@ impl eframe::App for ClipdGui {
             // about a tenth of a core while it was doing nothing at all.
             250
         };
-        if self.last_surface_request_check.elapsed() >= Duration::from_millis(poll_interval) {
+        // A request waiting for the resident main window is handled now, not
+        // at the next poll — the watcher woke us for exactly this.
+        let request_waiting = !self.hud
+            && !self.island_surface
+            && surface_request_path(SurfaceMode::Main).exists();
+        if request_waiting
+            || self.last_surface_request_check.elapsed() >= Duration::from_millis(poll_interval)
+        {
             self.last_surface_request_check = Instant::now();
             // Don't process surface requests here for HUD — drive_hud_hover
             // handles show/hide/quit itself. Processing them here would close
@@ -6985,13 +7275,26 @@ impl eframe::App for ClipdGui {
                         self.quitting = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     } else if mode == SurfaceMode::Hidden {
-                        // No persistent surface to hide now that the pill is
-                        // gone; the HUD handles its own hide via drive_hud_hover.
+                        // The resident main window hides; the HUD handles its
+                        // own hide via drive_hud_hover.
+                        if !self.island_surface {
+                            self.hide_main_window(ctx);
+                        }
+                    } else if !self.island_surface
+                        && matches!(mode, SurfaceMode::Main | SurfaceMode::Settings)
+                    {
+                        self.show_main_window(ctx, mode);
                     } else {
                         self.switch_surface(ctx, mode);
                     }
                 }
             }
+        }
+        // Hidden and waiting: nothing to draw. The watcher thread wakes us when
+        // a request lands; this is only a backstop.
+        if self.main_hidden {
+            ctx.request_repaint_after(Duration::from_secs(1));
+            return;
         }
         // Only clipd-ui owns the daemon. GUI processes don't restart it.
         #[cfg(target_os = "macos")]
@@ -7079,8 +7382,30 @@ impl eframe::App for ClipdGui {
         // When the window is summoned (gains focus), drop the cursor into search
         // with a clean query — so the palette is "type to recall" every time.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        // Click away and it goes away, like Spotlight — unless pinned (📌),
+        // in Settings, or in the middle of reviewing a skill.
+        if focused {
+            self.main_had_focus = true;
+        }
+        if !focused
+            && self.main_had_focus
+            && self.main_shown_at.map_or(true, |at| at.elapsed() > Duration::from_millis(700))
+            && !clipd_is_frontmost()
+            && !self.hud
+            && !self.island_surface
+            && !self.main_hidden
+            && !self.window_pinned
+            && self.active_tab == MainTab::Text
+            && self.skill_review.is_none()
+        {
+            self.was_focused = false;
+            self.main_had_focus = false;
+            self.hide_main_window(ctx);
+            return;
+        }
         if focused && !self.was_focused {
             self.focus_search = true;
+            self.focus_search_until = Some(Instant::now() + Duration::from_millis(700));
             self.search_query.clear();
             self.apply_filter();
             // Summoned (Ctrl+G): jump to the mouse cursor — but NEVER while a
@@ -7101,11 +7426,8 @@ impl eframe::App for ClipdGui {
                         .map_or(true, |r| !r.contains(cursor));
                     if outside {
                         let size = ctx.input(|i| i.screen_rect().size());
-                        let monitor = ctx
-                            .input(|i| i.viewport().monitor_size)
-                            .or_else(main_display_size);
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                            window_pos_at_cursor(cursor, size, monitor),
+                            spotlight_pos(cursor, size),
                         ));
                     }
                 }
@@ -7313,13 +7635,28 @@ impl eframe::App for ClipdGui {
                         sw: 0.0,
                         se: 0.0,
                     })
-                    .inner_margin(Margin::symmetric(16.0, 14.0)),
+                    // The list below keeps ~12pt on its right for the scroll
+                    // bar; the header matches it so the search field, the
+                    // cards and the footer badge end on one line.
+                    .inner_margin(Margin {
+                        left: 16.0,
+                        right: if self.active_tab == MainTab::Text { 28.0 } else { 16.0 },
+                        top: 14.0,
+                        bottom: 14.0,
+                    }),
             )
             .show(ctx, |ui| {
                 paint_panel_glass_gradient(ui, self.theme);
-                self.render_brand_header(ui, &c);
-                ui.add_space(12.0);
-                self.render_search_bar(ui, &mut action, &c);
+                if self.active_tab == MainTab::Text {
+                    // Spotlight's shape: the search field is the top of the
+                    // window. No title, no row of icons — one menu for the
+                    // rest, and Esc or a click elsewhere to close.
+                    self.render_search_bar(ui, &mut action, &c);
+                } else {
+                    self.render_brand_header(ui, &c);
+                    ui.add_space(12.0);
+                    self.render_search_bar(ui, &mut action, &c);
+                }
                 if self.active_tab == MainTab::Text {
                     ui.add_space(12.0);
                     self.render_filter_pills(ui, &c);
@@ -7454,6 +7791,7 @@ impl eframe::App for ClipdGui {
             self.render_transform_window(ctx, &c);
         }
 
+        self.poll_imports(ctx);
         self.poll_skill_scan(ctx);
         if self.skill_scan_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -7694,6 +8032,35 @@ impl ClipdGui {
                 // Rows in a run share edges, so nothing may be inserted
                 // between them. Section headers add their own space.
                 ui.spacing_mut().item_spacing.y = 0.0;
+                // "Show 4 more pinned" / "Show fewer", drawn where the Pinned
+                // section ends; acted on after the loop.
+                let pins_hidden = self.pins_hidden;
+                let pins_total = self.starred_clip_ids.len();
+                let pins_expanded = self.pins_expanded;
+                let mut toggle_pins = false;
+                let mut pins_toggle_row = |ui: &mut egui::Ui| {
+                    let label = if pins_hidden > 0 {
+                        format!("Show {pins_hidden} more pinned")
+                    } else if pins_expanded && pins_total > 4 {
+                        "Show fewer pinned".to_string()
+                    } else {
+                        return;
+                    };
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        if ui
+                            .add(
+                                egui::Label::new(RichText::new(label).size(12.5).color(rgb(c.accent)))
+                                    .sense(egui::Sense::click()),
+                            )
+                            .clicked()
+                        {
+                            toggle_pins = true;
+                        }
+                    });
+                };
+                let mut last_group: Option<&'static str> = None;
                 for (display_idx, &clip_idx) in visible_indices.iter().enumerate() {
                     let clip = &self.clips[clip_idx];
                     let clip_id_value = clip.id;
@@ -7715,8 +8082,18 @@ impl ClipdGui {
                             fresh_rows,
                         ))
                     });
-                    let row_slots: Vec<u8> =
-                        self.slots_by_content.get(&clip.content).cloned().unwrap_or_default();
+                    // Slots 2-9: what was put there with ⌘C ×N. Slot 1 is the
+                    // plain last copy — marking it would put a badge on
+                    // whatever you copied most recently, every time.
+                    let row_slots: Vec<u8> = self
+                        .slots_by_content
+                        .get(&clip.content)
+                        .map(|slots| slots.iter().copied().filter(|n| *n >= 2).collect())
+                        .unwrap_or_default();
+                    if previous_group == Some("Pinned") && group != "Pinned" {
+                        pins_toggle_row(ui);
+                    }
+                    last_group = Some(group);
                     if previous_group != Some(group) {
                         // Roomy gap before "Recent", then the header, then the
                         // rows. Set as spaced small-caps: at 12pt in sentence
@@ -7731,7 +8108,7 @@ impl ClipdGui {
                             .join("\u{2009}");
                         ui.label(
                             RichText::new(spaced)
-                                .size(10.5)
+                                .size(11.5)
                                 .strong()
                                 .color(rgb(c.overlay)),
                         );
@@ -7912,24 +8289,38 @@ impl ClipdGui {
                                     // which gives way to the actions under the
                                     // pointer or the selection.
                                     ui.spacing_mut().item_spacing.x = 12.0;
-                                    if row_slots.is_empty() {
-                                        let quiet = clipd_core::ThemeColors { text: c.overlay, ..*c };
-                                        draw_type_tile(ui, &clip.content_type, is_sensitive, false, &quiet);
-                                    } else {
-                                        draw_number_box(ui, &row_slots, c);
-                                    }
+                                    let quiet = clipd_core::ThemeColors { text: c.overlay, ..*c };
+                                    draw_type_tile(ui, &clip.content_type, is_sensitive, false, &quiet);
                                     let lit = is_selected || row_hovered;
                                     let right_w = if lit { 96.0 } else { 52.0 };
                                     let content_w = (ui.available_width() - right_w).max(60.0);
                                     ui.allocate_ui(egui::vec2(content_w, 26.0), |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(format!("{}{}", truncated, suffix))
-                                                    .size(14.0)
-                                                    .color(rgb(c.text)),
-                                            )
-                                            .truncate(),
-                                        );
+                                        // The slot as a pill right after the
+                                        // title, as on every other theme.
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 8.0;
+                                            let pill = (!row_slots.is_empty())
+                                                .then(|| slot_pill_label(&row_slots));
+                                            let pill_w = pill
+                                                .as_ref()
+                                                .map_or(0.0, |label| label.chars().count() as f32 * 7.2 + 26.0);
+                                            ui.allocate_ui(
+                                                egui::vec2((ui.available_width() - pill_w).max(40.0), 22.0),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(format!("{}{}", truncated, suffix))
+                                                                .size(15.0)
+                                                                .color(rgb(c.text)),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                },
+                                            );
+                                            if let Some(label) = &pill {
+                                                draw_slot_pill(ui, label, c);
+                                            }
+                                        });
                                     });
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
@@ -7949,7 +8340,7 @@ impl ClipdGui {
                                             } else {
                                                 ui.label(
                                                     RichText::new(&time)
-                                                        .size(12.5)
+                                                        .size(13.0)
                                                         .color(rgb(c.overlay)),
                                                 );
                                             }
@@ -7963,35 +8354,53 @@ impl ClipdGui {
                                 // single ruled card a bar at the leading edge
                                 // reads as a fourth vertical line rather than
                                 // as emphasis.
-                                // A row in a slot leads with its number, in
-                                // the glyph's place.
-                                if row_slots.is_empty() {
-                                    draw_type_tile(ui, &clip.content_type, is_sensitive, true, c);
-                                } else {
-                                    draw_slot_tile(ui, &row_slots, true, c);
-                                }
+                                // A plain glyph, not a boxed tile: a box on
+                                // every row was a column of identical cards
+                                // the eye had to read past to reach the text.
+                                draw_type_tile(ui, &clip.content_type, is_sensitive, false, c);
 
                                 let thumb_slot = if is_image { 52.0 } else { 0.0 };
                                 // Copy (28) + pin (24) + ⋮ (22) + the spacing
                                 // between them. This was still reserving the
                                 // 28pt the lone star used to need, so a long
                                 // title ran underneath the new controls.
-                                let right_w = 104.0
+                                // Room for copy · pin · ⋮ only on the row that
+                                // shows them; elsewhere the title takes it.
+                                let actions_w = if is_selected || row_hovered { 104.0 } else { 12.0 };
+                                let right_w = actions_w
                                     + thumb_slot
                                     + if is_sensitive { 12.0 } else { 0.0 };
                                 let content_w = (ui.available_width() - right_w).max(60.0);
-                                ui.allocate_ui(egui::vec2(content_w, 36.0), |ui| {
+                                ui.allocate_ui(egui::vec2(content_w, 40.0), |ui| {
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 1.0;
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(format!("{}{}", truncated, suffix))
-                                                    .size(13.0)
-                                                    .strong()
-                                                    .color(rgb(c.text)),
-                                            )
-                                            .truncate(),
-                                        );
+                                        // The slot sits next to the clip it
+                                        // holds, as a pill after the title.
+                                        let pill = (!row_slots.is_empty())
+                                            .then(|| slot_pill_label(&row_slots));
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 8.0;
+                                            let pill_w = pill
+                                                .as_ref()
+                                                .map_or(0.0, |label| label.chars().count() as f32 * 7.2 + 26.0);
+                                            ui.allocate_ui(
+                                                egui::vec2((ui.available_width() - pill_w).max(40.0), 20.0),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(format!("{}{}", truncated, suffix))
+                                                                .size(14.5)
+                                                                .strong()
+                                                                .color(rgb(c.text)),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                },
+                                            );
+                                            if let Some(label) = &pill {
+                                                draw_slot_pill(ui, label, c);
+                                            }
+                                        });
                                         // The keys, not just the number: this is
                                         // where someone looking at a slot learns
                                         // how to paste it from anywhere.
@@ -8004,7 +8413,7 @@ impl ClipdGui {
                                         };
                                         ui.label(
                                             RichText::new(meta)
-                                                .size(10.5)
+                                                .size(12.0)
                                                 .color(rgb(c.subtext)),
                                         );
                                     });
@@ -8013,27 +8422,23 @@ impl ClipdGui {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        // Right-to-left: added first sits
-                                        // rightmost, so this is ⋮ · pin · copy
-                                        // on screen, the reference's order.
-                                        // A blank button with the dots
-                                        // painted on: the ⋮ character is not
-                                        // in the bundled font and came out as
-                                        // an empty box.
-                                        let (copy, star, delete) = row_more_menu(ui, is_starred, c);
-                                        copy_clicked |= copy;
-                                        star_clicked |= star;
-                                        delete_clicked |= delete;
-                                        // The pin holds its place whether or
-                                        // not it is filled: a control that
-                                        // appears on hover moves the two
-                                        // beside it every time the pointer
-                                        // crosses a row.
-                                        if row_star_quiet(ui, is_starred, c).clicked() {
-                                            star_clicked = true;
-                                        }
-                                        if row_copy_button(ui, c).clicked() {
-                                            copy_clicked = true;
+                                        // Copy, pin and ⋮ only on the row you are
+                                        // on (pointer or selection). On every row
+                                        // they were three icons times twenty —
+                                        // the busiest thing in the window, and
+                                        // the part nobody was reading. The pins
+                                        // already have their own section.
+                                        if is_selected || row_hovered {
+                                            let (copy, star, delete) = row_more_menu(ui, is_starred, c);
+                                            copy_clicked |= copy;
+                                            star_clicked |= star;
+                                            delete_clicked |= delete;
+                                            if row_star_quiet(ui, is_starred, c).clicked() {
+                                                star_clicked = true;
+                                            }
+                                            if row_copy_button(ui, c).clicked() {
+                                                copy_clicked = true;
+                                            }
                                         }
                                         if is_image {
                                             let (tile, _) = ui.allocate_exact_size(
@@ -8150,7 +8555,14 @@ impl ClipdGui {
                         resp.scroll_to_me(Some(egui::Align::Center));
                     }
                 }
+                if last_group == Some("Pinned") {
+                    pins_toggle_row(ui);
+                }
                 self.scroll_to_selected = false;
+                if toggle_pins {
+                    self.pins_expanded = !self.pins_expanded;
+                    self.apply_filter();
+                }
             });
     }
 
@@ -9274,6 +9686,60 @@ impl ClipdGui {
         });
     }
 
+    /// The ⚙ menu beside the search field: Settings, the vault, keep on top,
+    /// and whether clipd is capturing.
+    fn render_window_menu(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        let mut open_settings = false;
+        let mut open_vault = false;
+        let mut toggle_pin = false;
+        let pinned = self.window_pinned;
+        let theme = self.theme;
+        egui::menu::menu_custom_button(
+            ui,
+            egui::Button::new(RichText::new("⚙").size(14.0).color(rgb(c.overlay)))
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::NONE)
+                .min_size(egui::vec2(24.0, 24.0)),
+            |ui| {
+                ui.set_min_width(200.0);
+                if ui.button("Settings  ⌘,").clicked() {
+                    open_settings = true;
+                    ui.close_menu();
+                }
+                if ui.button("Vault").clicked() {
+                    open_vault = true;
+                    ui.close_menu();
+                }
+                let pin_label = if pinned { "✓ Keep window on top" } else { "Keep window on top" };
+                if ui.button(pin_label).clicked() {
+                    toggle_pin = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 3.6, capture_dot_color(theme, c));
+                    ui.label(RichText::new("Capturing your clipboard").size(11.5).color(rgb(c.subtext)));
+                });
+            },
+        )
+        .response
+        .on_hover_text("Settings, vault, keep on top");
+        if open_settings {
+            self.active_tab = MainTab::Settings;
+        }
+        if open_vault {
+            self.active_tab = MainTab::Vault;
+            self.refresh_vault_secrets();
+        }
+        if toggle_pin {
+            self.window_pinned = !self.window_pinned;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                if self.window_pinned { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal },
+            ));
+        }
+    }
+
     /// Settings category pills — General / Clipboard / AI / Appearance / Privacy.
     fn render_settings_category_tabs(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         ui.horizontal_wrapped(|ui| {
@@ -9311,61 +9777,13 @@ impl ClipdGui {
         let introducing = self.render_slot_onboarding(ui, c);
         if !introducing {
             self.render_slot_tip(ui, c);
+            self.render_import_offer(ui, c);
             self.render_skill_offer(ui, c);
         }
-        #[cfg(target_os = "macos")]
-        if !introducing && self.hotkey_status() == HotkeyStatus::NeedsAccessibility {
-            // Once per window, not once per frame: this draws at 60fps, and
-            // the fact worth recording is "someone hit this wall", not how
-            // long they sat in front of it. It is the one dead end in clipd
-            // where clicking harder cannot help — the grant is macOS's to
-            // give — so it is the first thing to look at when people install
-            // and never copy anything.
-            if !self.reported_permission_block {
-                self.reported_permission_block = true;
-                clipd_core::telemetry_event("blocked_permission", &[]);
-            }
-            let (warn_fill, warn_title, warn_body, warn_btn_fill, warn_btn_text) =
-                warning_colors(self.theme.is_light());
-            egui::Frame::none()
-                .fill(warn_fill)
-                .rounding(Rounding::same(8.0))
-                .inner_margin(Margin::symmetric(10.0, 8.0))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(
-                        RichText::new("Multi-slot copy & HUD need keyboard access")
-                            .size(11.5)
-                            .strong()
-                            .color(warn_title),
-                    );
-                    ui.label(
-                        RichText::new(format!(
-                            "Enable Clipd under {} in System Settings, in Privacy & Security. \
-                             The daemon retries automatically once toggled on.",
-                            self.missing_permission()
-                        ))
-                        .size(10.5)
-                        .color(warn_body),
-                    );
-                    ui.add_space(4.0);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new("Open Privacy Settings")
-                                    .size(11.0)
-                                    .color(warn_btn_text),
-                            )
-                            .fill(warn_btn_fill),
-                        )
-                        .clicked()
-                    {
-                        clipd_core::request_keyboard_permissions();
-                        clipd_core::open_keyboard_permission_settings();
-                    }
-                });
-            ui.add_space(8.0);
-        }
+        // No standing "needs keyboard access" banner. History, search and
+        // pins work without it; the banner sat above the list for days saying
+        // otherwise. Access is asked for the first time ⌘C is pressed twice
+        // (the daemon's prompt), and stays reachable from Settings.
 
         if self.show_quick_settings {
             self.render_quick_settings(ui, c);
@@ -9397,6 +9815,283 @@ impl ClipdGui {
     fn missing_permission(&mut self) -> &'static str {
         self.refresh_permission_state();
         self.missing_permission_seen
+    }
+
+    /// Find other clipboard managers' data once per window, off the UI thread,
+    /// and pick up a finished import.
+    fn poll_imports(&mut self, ctx: &egui::Context) {
+        if self.hud || self.island_surface {
+            return;
+        }
+        if !self.import_scanned {
+            self.import_scanned = true;
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.import_scan_rx = Some(rx);
+            std::thread::spawn(move || {
+                let found = clipd_core::detect_sources()
+                    .into_iter()
+                    .map(|source| {
+                        let bundle = clipd_core::read_source(&source);
+                        (source, bundle)
+                    })
+                    .collect();
+                let _ = tx.send(found);
+            });
+        }
+        if let Some(rx) = &self.import_scan_rx {
+            if let Ok(found) = rx.try_recv() {
+                self.import_scan_rx = None;
+                self.import_found = found;
+                ctx.request_repaint();
+            }
+        }
+        if let Some(rx) = &self.import_running {
+            if let Ok((source, report)) = rx.try_recv() {
+                self.import_running = None;
+                self.import_note = Some((report.summary(source), Instant::now()));
+                self.refresh();
+                self.refresh_snippets();
+                self.refresh_collections();
+                self.apply_filter();
+                ctx.request_repaint();
+            }
+        }
+        if self.import_scan_rx.is_some() || self.import_running.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(300));
+        }
+    }
+
+    /// Import a source that was found, in the background.
+    fn start_import(&mut self, source: clipd_core::ImportSource) {
+        let Some(bundle) = self
+            .import_found
+            .iter()
+            .find(|(found, _)| found.source == source)
+            .and_then(|(_, bundle)| bundle.as_ref().ok())
+            .cloned()
+        else {
+            return;
+        };
+        clipd_core::telemetry_event("import", &[("source", source.label().into())]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.import_running = Some(rx);
+        std::thread::spawn(move || {
+            let report = ClipStore::new(&ClipStore::default_path())
+                .map(|store| {
+                    clipd_core::apply_import(&store, &bundle, &clipd_core::load_privacy_config())
+                })
+                .unwrap_or_default();
+            let _ = tx.send((source, report));
+        });
+    }
+
+    /// "Coming from Maccy? Bring over 1,204 clips, 12 pins and 8 snippets."
+    /// Shown for the first source found that has something to bring and has
+    /// not been imported or waved off.
+    fn render_import_offer(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        if let Some((note, at)) = &self.import_note {
+            if at.elapsed() < Duration::from_secs(12) {
+                ui.label(RichText::new(note).size(11.5).color(rgb(c.subtext)));
+                ui.add_space(6.0);
+            }
+        }
+        if self.import_running.is_some() {
+            ui.label(RichText::new("Importing…").size(11.5).color(rgb(c.subtext)));
+            ui.add_space(6.0);
+            return;
+        }
+        let offer = self.import_found.iter().find_map(|(found, bundle)| {
+            let bundle = bundle.as_ref().ok()?;
+            (!bundle.is_empty()
+                && !clipd_core::import_answered(found.source)
+                && !self.import_later.contains(&found.source))
+            .then(|| bundle.clone())
+        });
+        let Some(bundle) = offer else { return };
+        let source = bundle.source;
+        let mut what: Vec<String> = Vec::new();
+        if !bundle.clips.is_empty() {
+            what.push(format!("{} clips", bundle.clips.len()));
+        }
+        if bundle.pins() > 0 {
+            what.push(format!("{} pins", bundle.pins()));
+        }
+        if !bundle.snippets.is_empty() {
+            what.push(format!("{} snippets", bundle.snippets.len()));
+        }
+        let what = match what.len() {
+            0 => String::new(),
+            1 => what[0].clone(),
+            _ => {
+                let last = what.pop().unwrap_or_default();
+                format!("{} and {last}", what.join(", "))
+            }
+        };
+        let mut answer: Option<&'static str> = None;
+        egui::Frame::none()
+            .fill(surf(c, c.bg_elevated))
+            .stroke(Stroke::new(0.8, rgb(c.border)))
+            .rounding(Rounding::same(10.0))
+            .inner_margin(Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new(format!("Coming from {}?", source.label()))
+                        .size(12.5)
+                        .strong()
+                        .color(rgb(c.text)),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Bring over your {what} in one click. Nothing leaves this Mac."
+                    ))
+                    .size(11.5)
+                    .color(rgb(c.subtext)),
+                );
+                // Paste's format is not published: show what was read, so a
+                // wrong reading is visible before anything is written.
+                if source == clipd_core::ImportSource::Paste {
+                    for clip in bundle.clips.iter().rev().take(2) {
+                        let shown = clipd_core::redacted_display(&clip.text, &self.privacy_config)
+                            .unwrap_or_else(|| clip.text.clone());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("“{}”", one_line_preview(&shown, 60)))
+                                    .size(10.5)
+                                    .color(rgb(c.overlay)),
+                            )
+                            .truncate(),
+                        );
+                    }
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Import").size(12.0)).clicked() {
+                        answer = Some("import");
+                    }
+                    if ui.button(RichText::new("Not now").size(12.0)).clicked() {
+                        answer = Some("later");
+                    }
+                    if ui
+                        .add(
+                            egui::Label::new(
+                                RichText::new("Don't ask").size(11.5).color(rgb(c.overlay)),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        answer = Some("never");
+                    }
+                });
+            });
+        ui.add_space(6.0);
+        match answer {
+            Some("import") => self.start_import(source),
+            Some("later") => self.import_later.push(source),
+            Some("never") => clipd_core::dismiss_import(source),
+            _ => {}
+        }
+    }
+
+    /// Settings: every source found, with an Import button each (importing
+    /// again is safe — clips already here are skipped), and how to bring
+    /// Raycast's snippets.
+    fn render_import_settings(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        settings_section(ui, c, "Import");
+        let mut start: Option<clipd_core::ImportSource> = None;
+        let mut choose_raycast = false;
+        settings_card(ui, c, |ui| {
+            ui.label(
+                RichText::new("Bring your history, pins and snippets from another clipboard manager. Read on this Mac; nothing is uploaded.")
+                    .size(11.5)
+                    .color(rgb(c.subtext)),
+            );
+            ui.add_space(6.0);
+            if self.import_scan_rx.is_some() {
+                ui.label(RichText::new("Looking…").size(11.5).color(rgb(c.overlay)));
+            }
+            let mut any = false;
+            for (found, bundle) in &self.import_found {
+                any = true;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(found.source.label()).size(12.5).strong().color(rgb(c.text)));
+                    match bundle {
+                        Ok(bundle) => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} clips · {} pins · {} snippets",
+                                    bundle.clips.len(),
+                                    bundle.pins(),
+                                    bundle.snippets.len()
+                                ))
+                                .size(11.5)
+                                .color(rgb(c.subtext)),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let label = if clipd_core::import_answered(found.source) { "Import again" } else { "Import" };
+                                if ui
+                                    .add_enabled(
+                                        self.import_running.is_none() && !bundle.is_empty(),
+                                        egui::Button::new(RichText::new(label).size(11.5)),
+                                    )
+                                    .clicked()
+                                {
+                                    start = Some(found.source);
+                                }
+                            });
+                        }
+                        Err(error) => {
+                            ui.label(RichText::new(error).size(11.5).color(rgb(c.overlay)));
+                        }
+                    }
+                });
+            }
+            if !any && self.import_scan_rx.is_none() {
+                ui.label(
+                    RichText::new("No Maccy, Alfred or Paste data found on this Mac.")
+                        .size(11.5)
+                        .color(rgb(c.overlay)),
+                );
+            }
+            let raycast_found = self
+                .import_found
+                .iter()
+                .any(|(found, _)| found.source == clipd_core::ImportSource::Raycast);
+            if !raycast_found && clipd_core::raycast_installed() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Raycast keeps its clipboard history encrypted, so only snippets can come over. \
+                         In Raycast, run “Export Snippets”, then choose the file here.",
+                    )
+                    .size(11.5)
+                    .color(rgb(c.subtext)),
+                );
+                if ui.button(RichText::new("Choose Raycast export…").size(11.5)).clicked() {
+                    choose_raycast = true;
+                }
+            }
+            if let Some((note, _)) = &self.import_note {
+                ui.add_space(4.0);
+                ui.label(RichText::new(note).size(11.5).color(rgb(c.subtext)));
+            }
+        });
+        if let Some(source) = start {
+            self.start_import(source);
+        }
+        if choose_raycast {
+            if let Some(path) = choose_json_file() {
+                let found = clipd_core::FoundSource { source: clipd_core::ImportSource::Raycast, path };
+                let bundle = clipd_core::read_source(&found);
+                self.import_found.retain(|(f, _)| f.source != clipd_core::ImportSource::Raycast);
+                let ok = bundle.is_ok();
+                self.import_found.push((found, bundle));
+                if ok {
+                    self.start_import(clipd_core::ImportSource::Raycast);
+                }
+            }
+        }
     }
 
     /// Look for repeated workflows in the background — on open, then every 15
@@ -10243,10 +10938,30 @@ impl ClipdGui {
             .inner_margin(Margin::symmetric(10.0, 7.0));
 
         search_frame.show(ui, |ui| {
-            ui.set_width(search_w);
+            // The frame's own padding (10pt a side) sits outside this width;
+            // set to the full width, the field ran past the window's right
+            // edge and cut its border off.
+            ui.set_width(search_w - 20.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                draw_search_icon(ui, rgb(c.subtext));
+                if self.active_tab == MainTab::Text {
+                    // clipd's cat where the magnifier was: the one bit of
+                    // brand the window keeps, small and a little faded so it
+                    // reads as the field's glyph rather than a logo.
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
+                    if let Some(tex) = clipd_cat_texture(ui.ctx()) {
+                        let size = tex.size_vec2();
+                        let scale = (rect.width() / size.x).min(rect.height() / size.y);
+                        let fitted = egui::Rect::from_center_size(rect.center(), size * scale);
+                        egui::Image::new((tex.id(), fitted.size()))
+                            .tint(Color32::from_white_alpha(185))
+                            .paint_at(ui, fitted);
+                    } else {
+                        draw_search_icon(ui, rgb(c.subtext));
+                    }
+                } else {
+                    draw_search_icon(ui, rgb(c.subtext));
+                }
                 let hint = match self.active_tab {
                     MainTab::Collections => "Search pins and collections…",
                     MainTab::Settings => "Search settings...",
@@ -10278,16 +10993,24 @@ impl ClipdGui {
                     }
                 } else {
                     let search = ui.add_sized(
-                        [field_w, 18.0],
+                        [field_w, 24.0],
                         egui::TextEdit::singleline(&mut self.search_query)
                             .id(egui::Id::new("clip_search"))
                             .hint_text(hint)
                             .frame(false)
-                            .font(egui::TextStyle::Body),
+                            .font(FontId::proportional(18.0)),
                     );
-                    if self.focus_search {
+                    let keep_focus = self
+                        .focus_search_until
+                        .is_some_and(|until| Instant::now() < until);
+                    if self.focus_search || (keep_focus && !search.has_focus()) {
                         search.request_focus();
                         self.focus_search = false;
+                    }
+                    if keep_focus {
+                        ui.ctx().request_repaint_after(Duration::from_millis(16));
+                    } else if self.focus_search_until.take().is_some() {
+                        log::info!("search has the caret after show: {}", search.has_focus());
                     }
                     if search.changed() {
                         if self.in_ask_mode() {
@@ -10305,19 +11028,13 @@ impl ClipdGui {
                             Action::Paste
                         };
                     }
-                    egui::Frame::none()
-                        .fill(surf(c, c.bg_selected))
-                        .rounding(Rounding::same(5.0))
-                        .inner_margin(Margin::symmetric(5.0, 1.0))
-                        .show(ui, |ui| {
-                            ui.label(
-                                RichText::new("/")
-                                    .size(10.5)
-                                    .strong()
-                                    .family(egui::FontFamily::Monospace)
-                                    .color(rgb(c.overlay)),
-                            );
-                        });
+                    // The ⚙ menu sits inside the field's right end — where
+                    // the "/" hint was — so the field, the list and the footer
+                    // share one right edge. (The caret is put in the field on
+                    // every open, so "/ to search" had nothing left to say.)
+                    if self.active_tab == MainTab::Text {
+                        self.render_window_menu(ui, c);
+                    }
                 }
             });
         });
@@ -10338,17 +11055,19 @@ impl ClipdGui {
         let full_w = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(egui::vec2(full_w, row_h), egui::Sense::hover());
 
-        // Left, Mono only — the one thing to know about the list.
-        if self.theme.is_flat() {
-            let left = egui::Rect::from_min_size(rect.min, egui::vec2(full_w * 0.6, row_h));
+        // Left — the keys that work right now, while typing in the search:
+        // the whole window can be used without the mouse, and this is where
+        // that is learned (Spotlight's lesson, Raycast's footer).
+        if self.active_tab == MainTab::Text {
+            let left = egui::Rect::from_min_size(rect.min, egui::vec2(full_w * 0.72, row_h));
             ui.allocate_ui_at_rect(left, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("Click to copy · Enter to paste")
-                            .size(12.0)
-                            .color(rgb(c.overlay)),
-                    );
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (keys, what) in [("↑↓", "Select"), ("↵", "Paste"), ("⌘1–9", "Quick paste"), ("esc", "Close")] {
+                        key_caps(ui, keys, rgb(c.subtext), 12.5);
+                        ui.label(RichText::new(what).size(12.5).color(rgb(c.overlay)));
+                        ui.add_space(8.0);
+                    }
                 });
             });
         }
@@ -10360,7 +11079,7 @@ impl ClipdGui {
         );
         ui.allocate_ui_at_rect(right, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                footer_shortcut_badge(ui, "⌘ ⇧ V", c);
+                footer_shortcut_badge(ui, &shortcut_symbols(self.paste_settings.open_gui_hotkey.label()), c);
             });
         });
     }
@@ -10525,6 +11244,7 @@ impl ClipdGui {
             self.render_sending_settings(ui, c);
         });
 
+        self.render_import_settings(ui, c);
         self.render_snippets_settings(ui, c);
         self.render_actions_settings(ui, c);
         self.render_vault_settings(ui, c);
@@ -14100,9 +14820,10 @@ mod slot_strip_tests {
 
     #[test]
     fn a_slotted_row_says_the_keys_that_paste_it() {
-        assert_eq!(slot_paste_keys(&[1]), "Slot 1  ·  ⌘V pastes it");
-        assert_eq!(slot_paste_keys(&[4]), "Slot 4  ·  ⌘V ×4 pastes it");
-        assert_eq!(slot_paste_keys(&[2, 3]), "Slots 2, 3  ·  ⌘V ×2 or ×3 pastes it");
+        assert_eq!(slot_paste_keys(&[4]), "⌘V ×4 pastes it");
+        assert_eq!(slot_paste_keys(&[2, 3]), "⌘V ×2 or ×3 pastes it");
+        assert_eq!(slot_pill_label(&[2]), "Slot 2");
+        assert_eq!(slot_pill_label(&[2, 3]), "Slots 2·3");
     }
 
     #[test]
@@ -14172,6 +14893,14 @@ mod slot_strip_tests {
         assert_eq!(fresh, 2);
         let ids: Vec<i64> = order.iter().map(|&i| clips[i].id).collect();
         assert_eq!(ids, vec![2, 1], "the star is the newest touch");
+    }
+
+    #[test]
+    fn shortcuts_read_the_way_macos_writes_them() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(shortcut_symbols("Option+Space"), "⌥ Space");
+            assert_eq!(shortcut_symbols("Cmd+Shift+G"), "⌘ ⇧ G");
+        }
     }
 
     #[test]

@@ -150,6 +150,26 @@ pub fn surface_is_running(name: &str) -> bool {
     ProcessLock::try_acquire(name).is_none()
 }
 
+/// The process id holding a surface's lock, if that process is alive.
+pub fn surface_pid(name: &str) -> Option<u32> {
+    let pid = fs::read_to_string(named_lock_path(name)).ok()?.trim().parse::<u32>().ok()?;
+    is_process_alive(pid).then_some(pid)
+}
+
+/// Ask a running surface (`gui-main`, `gui-hud`, `gui-island`) to switch to
+/// `mode` by writing its request file. Returns false when it is not running —
+/// the caller should launch it instead.
+pub fn request_running_surface(name: &str, mode: &str) -> bool {
+    if !surface_is_running(name) {
+        return false;
+    }
+    let dir = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("clipd");
+    let _ = fs::create_dir_all(&dir);
+    fs::write(dir.join(format!("{name}.request")), mode).is_ok()
+}
+
 pub fn is_daemon_running() -> bool {
     let path = lock_path();
     if !path.exists() {
