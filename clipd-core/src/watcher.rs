@@ -43,18 +43,39 @@ pub enum ClipEvent {
         secret: String,
         stored: bool,
     },
+    /// ⌘C pressed twice in a row, seen from the clipboard alone. With keyboard
+    /// access that is multi-slot copy, handled by the key listener; without
+    /// it, it is the moment to ask for access — the person just tried the
+    /// gesture it unlocks.
+    DoubleCopy,
+}
+
+/// How close two copies have to be to count as one double press.
+const DOUBLE_COPY_WINDOW: Duration = Duration::from_millis(1200);
+
+/// Whether a clipboard change is the second half of ⌘C ×2: the change count
+/// jumped by two or more since the last poll, or it moved again with the same
+/// content just after the previous change.
+fn is_double_copy(count_step: i64, same_content: bool, since_previous_change: Option<Duration>) -> bool {
+    count_step >= 2
+        || (count_step >= 1
+            && same_content
+            && since_previous_change.is_some_and(|gap| gap < DOUBLE_COPY_WINDOW))
 }
 
 /// True when the frontmost app is one of clipd's own windows, so the watcher
 /// can ignore its own UI (search text, re-copied clips).
+///
+/// Only the windows with something to copy out of — the palette and the tray
+/// popover, both `clipd-gui`. The tray host (`clipd-ui`) has no text, and it
+/// is frontmost after every launch and whenever its menu opens; matching it
+/// silently dropped every copy made until you clicked another app — including
+/// any made by a script, a background app or a keyboard tool that leaves the
+/// focus where it was.
 fn is_own_ui(app: Option<&str>) -> bool {
     let Some(app) = app else { return false };
     let a = app.to_lowercase();
-    a == "clipd"
-        || a == "clipd-gui"
-        || a == "clipd-ui"
-        || a.starts_with("clipd-")
-        || a == "clipd.app"
+    a == "clipd-gui" || a == "clipd" || a == "clipd.app"
 }
 
 /// Watches the OS clipboard for changes by polling.
@@ -106,6 +127,10 @@ impl ClipWatcher {
             self.poll_interval
         );
 
+        // Change-count tracking for ⌘C ×2 (see `is_double_copy`).
+        let mut last_count = crate::pasteboard::change_count();
+        let mut last_change: Option<(std::time::Instant, Option<String>)> = None;
+
         loop {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 log::info!("Clipboard watcher stopping");
@@ -116,13 +141,40 @@ impl ClipWatcher {
             // Must be checked BEFORE get_text() to avoid a race where the paste
             // function clears suppress between our read and our check.
             if suppress.load(std::sync::atomic::Ordering::SeqCst) {
+                // clipd's own writes are not a double press.
+                last_count = crate::pasteboard::change_count();
+                last_change = None;
                 std::thread::sleep(self.poll_interval);
                 continue;
+            }
+
+            if let Some(count) = crate::pasteboard::change_count() {
+                let step = last_count.map_or(0, |previous| count - previous);
+                if step > 0 {
+                    let now = std::time::Instant::now();
+                    let hash = crate::pasteboard::read_text().map(|text| Self::hash_content(&text));
+                    let (since, same) = match &last_change {
+                        Some((at, previous)) => (Some(now - *at), hash.is_some() && *previous == hash),
+                        None => (None, false),
+                    };
+                    if is_double_copy(step, same, since) {
+                        let (app, _) = Self::get_frontmost_context();
+                        if !is_own_ui(app.as_deref()) {
+                            let _ = sender.try_send(ClipEvent::DoubleCopy);
+                        }
+                        // One double press, not a run of them.
+                        last_change = None;
+                    } else {
+                        last_change = Some((now, hash));
+                    }
+                }
+                last_count = Some(count);
             }
 
             // The daemon mutated the clipboard (e.g. restored slot 1 after multi-tap copy).
             // Re-sync last_hash so we don't emit a duplicate NewClip.
             if refresh_hash.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                last_change = None;
                 if let Some(text) = crate::pasteboard::read_text() {
                     if !text.is_empty() {
                         last_hash = Self::hash_content(&text);
@@ -467,6 +519,31 @@ impl Default for ClipWatcher {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cmd_c_twice_is_seen_from_the_clipboard_alone() {
+        use std::time::Duration;
+        // Both presses between two polls: the count jumps by two.
+        assert!(super::is_double_copy(2, false, None));
+        // One press per poll, same text, close together.
+        assert!(super::is_double_copy(1, true, Some(Duration::from_millis(400))));
+        // The same text again much later is a re-copy, not a double press.
+        assert!(!super::is_double_copy(1, true, Some(Duration::from_secs(5))));
+        // A new copy of something else is just a copy.
+        assert!(!super::is_double_copy(1, false, Some(Duration::from_millis(300))));
+    }
+
+    #[test]
+    fn only_clipds_own_windows_count_as_its_ui() {
+        assert!(super::is_own_ui(Some("clipd-gui")));
+        assert!(super::is_own_ui(Some("Clipd")));
+        // The tray host and the prompt have no text to copy out of.
+        assert!(!super::is_own_ui(Some("clipd-ui")));
+        assert!(!super::is_own_ui(Some("clipd-hud")));
+        assert!(!super::is_own_ui(Some("Brave Browser")));
+        assert!(!super::is_own_ui(None));
+    }
+
     use super::*;
 
     #[test]

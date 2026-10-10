@@ -1772,10 +1772,10 @@ impl ClipdGui {
         // `AXIsProcessTrusted` answers for whoever asks, and the island is not
         // the process running the event tap — clipd-ui is. Asking here said
         // "granted" while the listener had been failing 7,000 times over.
-        self.island.hotkeys_ok = !matches!(
-            clipd_core::load_hotkey_status(),
-            clipd_core::HotkeyStatus::NeedsAccessibility
-        );
+        // The island no longer warns either: missing access is asked for at
+        // ⌘C ×2, and a strip of red above the clips said clipd was broken
+        // when everything but multi-slot worked.
+        self.island.hotkeys_ok = true;
     }
 
     /// A banner when the hotkeys are down, with the one button that fixes it.

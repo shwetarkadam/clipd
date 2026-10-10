@@ -11,6 +11,8 @@ default = []
 telemetry = []
 
 [dependencies]
+# Reading Paste.app's archived pasteboard items for import.
+plist = "1"
 arboard = { workspace = true }
 rusqlite = { workspace = true }
 chrono = { workspace = true }
@@ -45,7 +47,14 @@ core-foundation-sys = "0.8"
 # Direct NSPasteboard access, for the concealed-copy flavour that arboard
 # doesn't expose. Same versions arboard already pulls in.
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSPasteboard",
+    "NSPasteboardItem",
+    # Handing keyboard focus to the resident main window (focus.rs).
+    "NSApplication",
+    "NSResponder",
+    "NSRunningApplication",
+] }
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSString", "NSURL"] }
 
 # Daemon-lock liveness check (OpenProcess) — the lock must know whether the
