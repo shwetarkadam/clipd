@@ -543,7 +543,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
 
         let handle = std::thread::spawn(move || {
-            let identity = Identity::load_or_create().expect("identity");
+            let identity = Identity::generate();
             let (mut stream, _) = listener.accept().expect("accept");
             let check: Box<dyn Fn(&str, &PublicKey) -> bool> = if trusted {
                 Box::new(allow_all())
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn a_clip_survives_an_encrypted_round_trip() {
         let (addr, rx, handle) = spawn_server(true);
-        let identity = Identity::load_or_create().expect("identity");
+        let identity = Identity::generate();
         let sent = envelope("https://example.com/lan");
 
         let clip_id = send_envelope(addr, &sent, &identity, &allow_all()).expect("send");
@@ -582,7 +582,7 @@ mod tests {
     #[test]
     fn an_unpaired_machine_is_refused_with_a_reason() {
         let (addr, rx, handle) = spawn_server(false);
-        let identity = Identity::load_or_create().expect("identity");
+        let identity = Identity::generate();
 
         let err = send_envelope(addr, &envelope("secret"), &identity, &allow_all())
             .expect_err("must be refused");
@@ -597,7 +597,7 @@ mod tests {
     #[test]
     fn the_sender_also_checks_the_receiver() {
         let (addr, _rx, handle) = spawn_server(true);
-        let identity = Identity::load_or_create().expect("identity");
+        let identity = Identity::generate();
 
         // Server is happy; the *client* refuses because it doesn't trust it.
         // Without this, anyone could impersonate the machine you meant to send to.

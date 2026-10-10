@@ -14,11 +14,16 @@ use x25519_dalek::PublicKey;
 
 /// Point HOME at a throwaway directory before anything resolves a data dir.
 ///
-/// The identity key and device id live under the user's data dir, so without
-/// this these tests would read — or on a fresh machine, create — the real
-/// clipd's files, and share them with a clipd running alongside. Every test
-/// calls this first; the `OnceLock` makes the rest wait until HOME is set, so
-/// nothing reads the environment while it changes.
+/// Identities here come from `Identity::generate`, which never touches disk.
+/// This covers what is left: the device id, which lives under the user's data
+/// dir and would otherwise be read — or on a fresh machine, created — in the
+/// real clipd's files. Every test calls this first; the `OnceLock` makes the
+/// rest wait until HOME is set, so nothing reads the environment while it
+/// changes.
+///
+/// macOS and Linux only in effect: on Windows the data dir comes from the
+/// Known Folders API, which ignores HOME, so the device id there is still
+/// the real one.
 fn isolate_home() {
     static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     HOME.get_or_init(|| {
@@ -46,7 +51,7 @@ fn spawn_receiver(
     let (tx, rx) = mpsc::channel();
 
     let handle = std::thread::spawn(move || {
-        let identity = Identity::load_or_create().expect("identity");
+        let identity = Identity::generate();
         let (mut stream, _) = listener.accept().expect("accept");
         let store = ClipStore::in_memory().expect("store");
 
@@ -74,7 +79,7 @@ fn a_link_goes_straight_to_the_other_machine() {
     let clip = ClipEntry::new("https://example.com/lan-link".into(), Some("Safari".into()), None);
     let envelope = clipd_core::envelope_from_clip(&clip).expect("package");
 
-    let identity = Identity::load_or_create().expect("identity");
+    let identity = Identity::generate();
     let clip_id = send_envelope(addr, &envelope, &identity, &allow_all).expect("send");
     assert!(clip_id > 0, "the receiver's clip id comes back");
 
@@ -99,7 +104,7 @@ fn a_file_arrives_with_its_bytes_over_the_network() {
     let clip = ClipEntry::new_files(refs, Some("Finder".into()));
     let envelope = clipd_core::envelope_from_clip(&clip).expect("package");
 
-    let identity = Identity::load_or_create().expect("identity");
+    let identity = Identity::generate();
     send_envelope(addr, &envelope, &identity, &allow_all).expect("send");
 
     let received = rx.recv().expect("received").expect("no error");
@@ -138,7 +143,7 @@ fn a_multi_megabyte_file_goes_over_lan_that_the_folder_would_refuse() {
     assert!(clipd_core::encode_envelope(&envelope).is_err());
 
     // ...and the LAN route carries it anyway.
-    let identity = Identity::load_or_create().expect("identity");
+    let identity = Identity::generate();
     send_envelope(addr, &envelope, &identity, &allow_all).expect("send over lan");
 
     let received = rx.recv().expect("received").expect("no error");
