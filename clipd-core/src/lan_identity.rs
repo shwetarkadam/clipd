@@ -72,6 +72,18 @@ impl Identity {
         Ok(Identity { secret })
     }
 
+    /// A fresh identity that is never written anywhere.
+    ///
+    /// For tests and anything else that needs to speak the protocol without
+    /// being this machine. `load_or_create` reads — and on a fresh machine
+    /// writes — the real key in the user's data dir, which no test should
+    /// touch.
+    pub fn generate() -> Self {
+        Identity {
+            secret: StaticSecret::random_from_rng(rand_core::OsRng),
+        }
+    }
+
     pub fn public_key(&self) -> PublicKey {
         PublicKey::from(&self.secret)
     }
