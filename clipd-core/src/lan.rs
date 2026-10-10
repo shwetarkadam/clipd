@@ -24,6 +24,16 @@
 //! Both feed HKDF, salted with a transcript hash over every public value in the
 //! exchange, which binds the keys to *this* connection and stops a recorded
 //! handshake being replayed against a different one.
+//!
+//! ## Messages
+//!
+//! A clip can be hundreds of megabytes, so it is not sealed as one block: it
+//! goes as a stream of [`CHUNK_BYTES`] chunks, each sealed on its own. Bytes
+//! then flow from the first moment rather than after the whole clip has been
+//! encrypted, so `IO_TIMEOUT` measures a silent peer, not a busy one. Each
+//! chunk's nonce carries its sequence number and whether it is the last one,
+//! so chunks cannot be reordered, dropped or replayed, and a message cannot be
+//! cut short at a chunk boundary.
 
 use crate::lan_identity::{decode_key, encode_key, Identity};
 use crate::sync::Envelope;
@@ -40,18 +50,27 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 /// The service clipd advertises and looks for over mDNS.
 pub const SERVICE_TYPE: &str = "_clipd._tcp.local.";
 
-/// Wire protocol version. Bumped when the handshake changes shape; mismatched
-/// peers are told to update rather than failing with a decryption error.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Wire protocol version. Bumped when the handshake or message format changes
+/// shape; mismatched peers are told to update rather than failing with a
+/// decryption error.
+///
+/// v2: messages are streamed as sealed chunks instead of one sealed frame.
+pub const PROTOCOL_VERSION: u32 = 2;
 
-/// Largest frame accepted, in bytes.
+/// Largest frame, or sealed message, accepted, in bytes.
 ///
 /// Generous compared to the folder transport's 25 MB, because a LAN is a real
 /// network rather than a sync service — but still bounded, so a hostile or
 /// buggy peer cannot make us allocate without limit.
 pub const MAX_FRAME_BYTES: u32 = 256 * 1024 * 1024;
 
-/// How long to wait on a peer before giving up.
+/// Plaintext carried by each sealed chunk of a message.
+pub const CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Poly1305 tag appended to every sealed chunk.
+const TAG_BYTES: usize = 16;
+
+/// How long a peer may go silent before giving up on it.
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Opening message from whoever dialled.
@@ -93,11 +112,13 @@ pub enum Receipt {
 /// An established, encrypted channel.
 ///
 /// Keys are per-direction so the two sides never encrypt different plaintexts
-/// under the same key and nonce. Each direction sends one message per
-/// connection, so a fixed nonce is safe and there is no counter to get wrong.
+/// under the same key and nonce. Within a direction every chunk takes the next
+/// sequence number, so no nonce repeats under a key either.
 pub struct Session {
     send_key: [u8; 32],
     recv_key: [u8; 32],
+    send_seq: u64,
+    recv_seq: u64,
     /// The other side, as it identified itself. Already checked against the
     /// trust store by the time a `Session` exists.
     pub peer_device_id: String,
@@ -109,29 +130,98 @@ impl Session {
         ChaCha20Poly1305::new_from_slice(key).map_err(|e| format!("Bad session key: {e}"))
     }
 
-    /// A single fixed nonce: safe only because each key encrypts exactly one
-    /// message before the connection is closed and the key discarded.
-    fn nonce() -> Nonce {
-        *Nonce::from_slice(&[0u8; 12])
+    fn new(
+        send_key: [u8; 32],
+        recv_key: [u8; 32],
+        peer_device_id: String,
+        peer_name: String,
+    ) -> Session {
+        Session {
+            send_key,
+            recv_key,
+            send_seq: 0,
+            recv_seq: 0,
+            peer_device_id,
+            peer_name,
+        }
     }
 
-    pub fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-        Self::cipher(&self.send_key)?
-            .encrypt(&Self::nonce(), plaintext)
-            .map_err(|_| "Couldn't encrypt the clip.".to_string())
+    /// The chunk's sequence number, and a flag marking the final chunk of a
+    /// message. Sealing the flag into the nonce is what stops a truncated
+    /// message from passing as a complete one.
+    fn nonce(seq: u64, last: bool) -> Nonce {
+        let mut n = [0u8; 12];
+        n[..8].copy_from_slice(&seq.to_be_bytes());
+        n[11] = last as u8;
+        *Nonce::from_slice(&n)
     }
 
-    pub fn open(&self, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
-        Self::cipher(&self.recv_key)?
-            .decrypt(&Self::nonce(), ciphertext)
-            .map_err(|_| {
-                // Authentication failure is not a decoding hiccup: it means the
-                // bytes were altered, or the peer is not who it claimed.
-                "The clip failed its integrity check — it was altered in transit, \
-                 or that machine isn't who it said it was."
-                    .to_string()
-            })
+    fn next(seq: &mut u64) -> Result<u64, String> {
+        let this = *seq;
+        *seq = this
+            .checked_add(1)
+            .ok_or("This connection has carried too much; reconnect.")?;
+        Ok(this)
     }
+
+    /// Seal and send one message, as a stream of chunks.
+    pub fn send(&mut self, w: &mut impl Write, plaintext: &[u8]) -> Result<(), String> {
+        if plaintext.len() > MAX_FRAME_BYTES as usize {
+            return Err("That clip is too large to send.".into());
+        }
+        let cipher = Self::cipher(&self.send_key)?;
+        // An empty message is still one (empty, final) chunk.
+        let count = plaintext.len().div_ceil(CHUNK_BYTES).max(1);
+        let mut chunks = plaintext.chunks(CHUNK_BYTES);
+        for i in 0..count {
+            let chunk = chunks.next().unwrap_or_default();
+            let last = i + 1 == count;
+            let nonce = Self::nonce(Self::next(&mut self.send_seq)?, last);
+            let sealed = cipher
+                .encrypt(&nonce, chunk)
+                .map_err(|_| "Couldn't encrypt the clip.".to_string())?;
+            // The flag travels in the clear so the receiver knows which nonce
+            // to try; flipping it makes the chunk fail authentication.
+            let mut frame = Vec::with_capacity(1 + sealed.len());
+            frame.push(last as u8);
+            frame.extend_from_slice(&sealed);
+            write_frame(w, &frame)?;
+        }
+        Ok(())
+    }
+
+    /// Receive and open one message sent with [`Session::send`].
+    pub fn recv(&mut self, r: &mut impl Read) -> Result<Vec<u8>, String> {
+        let cipher = Self::cipher(&self.recv_key)?;
+        let mut message = Vec::new();
+        loop {
+            let frame = read_frame_max(r, (1 + CHUNK_BYTES + TAG_BYTES) as u32)?;
+            let (last, sealed) = match frame.split_first() {
+                Some((0, rest)) => (false, rest),
+                Some((1, rest)) => (true, rest),
+                _ => return Err(integrity_failure()),
+            };
+            let nonce = Self::nonce(Self::next(&mut self.recv_seq)?, last);
+            let chunk = cipher
+                .decrypt(&nonce, sealed)
+                .map_err(|_| integrity_failure())?;
+            if message.len() + chunk.len() > MAX_FRAME_BYTES as usize {
+                return Err("That machine sent a message over the size limit.".into());
+            }
+            message.extend_from_slice(&chunk);
+            if last {
+                return Ok(message);
+            }
+        }
+    }
+}
+
+/// Authentication failure is not a decoding hiccup: it means the bytes were
+/// altered, or the peer is not who it claimed.
+fn integrity_failure() -> String {
+    "The clip failed its integrity check — it was altered in transit, \
+     or that machine isn't who it said it was."
+        .to_string()
 }
 
 // ── Framing ────────────────────────────────────────────────────────────────
@@ -155,11 +245,15 @@ pub fn write_frame(w: &mut impl Write, bytes: &[u8]) -> Result<(), String> {
 
 /// Read a length-prefixed frame, refusing anything over [`MAX_FRAME_BYTES`].
 pub fn read_frame(r: &mut impl Read) -> Result<Vec<u8>, String> {
+    read_frame_max(r, MAX_FRAME_BYTES)
+}
+
+fn read_frame_max(r: &mut impl Read, max: u32) -> Result<Vec<u8>, String> {
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes)
         .map_err(|e| format!("Connection lost while receiving: {e}"))?;
     let len = u32::from_be_bytes(len_bytes);
-    if len > MAX_FRAME_BYTES {
+    if len > max {
         // Refuse *before* allocating — otherwise a four-byte lie is a denial of
         // service.
         return Err(format!(
@@ -280,12 +374,7 @@ pub fn handshake_initiator(
     let t = transcript(&identity.public_key(), &eph_public, &peer_static, &peer_eph);
     let (i2r, r2i) = derive_keys(ee.as_bytes(), ss.as_bytes(), &t)?;
 
-    Ok(Session {
-        send_key: i2r,
-        recv_key: r2i,
-        peer_device_id: device_id,
-        peer_name: name,
-    })
+    Ok(Session::new(i2r, r2i, device_id, name))
 }
 
 /// Listen side of the handshake. Returns the session plus the peer's static
@@ -347,14 +436,9 @@ pub fn handshake_responder(
     let t = transcript(&peer_static, &peer_eph, &identity.public_key(), &eph_public);
     let (i2r, r2i) = derive_keys(ee.as_bytes(), ss.as_bytes(), &t)?;
 
+    // Mirrored: what the initiator sends is what we receive.
     Ok((
-        Session {
-            // Mirrored: what the initiator sends is what we receive.
-            send_key: r2i,
-            recv_key: i2r,
-            peer_device_id: hello.device_id,
-            peer_name: hello.name,
-        },
+        Session::new(r2i, i2r, hello.device_id, hello.name),
         peer_static,
     ))
 }
@@ -375,13 +459,13 @@ pub fn send_envelope(
     // Clips are small and latency is the whole point; don't wait to coalesce.
     stream.set_nodelay(true).ok();
 
-    let session = handshake_initiator(&mut stream, identity, trusted)?;
+    let mut session = handshake_initiator(&mut stream, identity, trusted)?;
 
     let plaintext =
         serde_json::to_vec(envelope).map_err(|e| format!("Couldn't package that clip: {e}"))?;
-    write_frame(&mut stream, &session.seal(&plaintext)?)?;
+    session.send(&mut stream, &plaintext)?;
 
-    match serde_json::from_slice::<Receipt>(&session.open(&read_frame(&mut stream)?)?)
+    match serde_json::from_slice::<Receipt>(&session.recv(&mut stream)?)
         .map_err(|e| format!("Couldn't understand the reply: {e}"))?
     {
         Receipt::Accepted { clip_id } => Ok(clip_id),
@@ -400,8 +484,8 @@ pub fn serve_connection(
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
 
-    let (session, _peer_static) = handshake_responder(stream, identity, trusted)?;
-    let envelope: Envelope = serde_json::from_slice(&session.open(&read_frame(stream)?)?)
+    let (mut session, _peer_static) = handshake_responder(stream, identity, trusted)?;
+    let envelope: Envelope = serde_json::from_slice(&session.recv(stream)?)
         .map_err(|e| format!("Couldn't understand that clip: {e}"))?;
 
     let receipt = match accept(envelope, &session.peer_name) {
@@ -410,7 +494,7 @@ pub fn serve_connection(
     };
     let bytes =
         serde_json::to_vec(&receipt).map_err(|e| format!("Couldn't encode the reply: {e}"))?;
-    write_frame(stream, &session.seal(&bytes)?)
+    session.send(stream, &bytes)
 }
 
 #[cfg(test)]
@@ -515,39 +599,113 @@ mod tests {
         handle.join().expect("server thread");
     }
 
+    /// Both ends of a session, sharing a key in the sender → receiver direction.
+    fn session_pair(key: [u8; 32]) -> (Session, Session) {
+        let other = [0xEEu8; 32];
+        (
+            Session::new(key, other, "x".into(), "x".into()),
+            Session::new(other, key, "x".into(), "x".into()),
+        )
+    }
+
+    /// Split a sent message back into its length-prefixed frames.
+    fn frames_of(mut wire: &[u8]) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        while !wire.is_empty() {
+            frames.push(read_frame(&mut wire).expect("frame"));
+        }
+        frames
+    }
+
+    fn reframe(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for f in frames {
+            write_frame(&mut wire, f).expect("write");
+        }
+        wire
+    }
+
     #[test]
     fn tampered_ciphertext_is_rejected() {
-        let a = Identity::load_or_create().expect("identity");
-        let t = transcript(
-            &a.public_key(),
-            &a.public_key(),
-            &a.public_key(),
-            &a.public_key(),
-        );
-        let (k1, k2) = derive_keys(&[7u8; 32], &[9u8; 32], &t).expect("derive");
-        let session = Session {
-            send_key: k1,
-            recv_key: k1,
-            peer_device_id: "x".into(),
-            peer_name: "x".into(),
-        };
+        let (k1, k2) = derive_keys(&[7u8; 32], &[9u8; 32], &[3u8; 32]).expect("derive");
+        let (mut tx, mut rx) = session_pair(k1);
 
-        let mut sealed = session.seal(b"a link").expect("seal");
-        assert_eq!(session.open(&sealed).expect("open"), b"a link");
+        let mut wire = Vec::new();
+        tx.send(&mut wire, b"a link").expect("send");
+        assert_eq!(rx.recv(&mut wire.as_slice()).expect("recv"), b"a link");
 
-        // Flip one bit anywhere and it must not decrypt.
-        sealed[0] ^= 0x01;
-        let err = session.open(&sealed).expect_err("must reject");
+        // Flip one bit of the ciphertext (past the length prefix and the
+        // last-chunk flag) and it must not decrypt.
+        let (mut tx, mut rx) = session_pair(k1);
+        let mut wire = Vec::new();
+        tx.send(&mut wire, b"a link").expect("send");
+        wire[5] ^= 0x01;
+        let err = rx.recv(&mut wire.as_slice()).expect_err("must reject");
         assert!(err.contains("integrity check"), "{err}");
 
         // A different key must not open it either.
-        let other = Session {
-            send_key: k2,
-            recv_key: k2,
-            peer_device_id: "x".into(),
-            peer_name: "x".into(),
-        };
-        assert!(other.open(&session.seal(b"a link").unwrap()).is_err());
+        let (mut tx, _) = session_pair(k1);
+        let (_, mut wrong) = session_pair(k2);
+        let mut wire = Vec::new();
+        tx.send(&mut wire, b"a link").expect("send");
+        assert!(wrong.recv(&mut wire.as_slice()).is_err());
+    }
+
+    #[test]
+    fn a_large_message_travels_as_many_chunks() {
+        let (mut tx, mut rx) = session_pair([5u8; 32]);
+        let message: Vec<u8> = (0..CHUNK_BYTES * 3 + 17).map(|i| i as u8).collect();
+
+        let mut wire = Vec::new();
+        tx.send(&mut wire, &message).expect("send");
+        assert_eq!(
+            frames_of(&wire).len(),
+            4,
+            "streamed, not sealed as one block"
+        );
+        assert_eq!(rx.recv(&mut wire.as_slice()).expect("recv"), message);
+
+        // The sequence carries on, so a second message on the same session
+        // uses fresh nonces and still opens.
+        let mut wire = Vec::new();
+        tx.send(&mut wire, b"").expect("send empty");
+        assert_eq!(rx.recv(&mut wire.as_slice()).expect("recv empty"), b"");
+    }
+
+    #[test]
+    fn a_message_cut_short_or_reordered_is_rejected() {
+        let message = vec![0xABu8; CHUNK_BYTES * 2 + 1];
+        let mut wire = Vec::new();
+        session_pair([5u8; 32])
+            .0
+            .send(&mut wire, &message)
+            .expect("send");
+        let frames = frames_of(&wire);
+
+        // Dropping the final chunk leaves the receiver waiting for it — never
+        // handing over a truncated clip as if it were whole.
+        let truncated = reframe(&frames[..2]);
+        assert!(session_pair([5u8; 32])
+            .1
+            .recv(&mut truncated.as_slice())
+            .is_err());
+
+        // Relabelling an early chunk as the last one fails authentication.
+        let mut relabelled = frames[..1].to_vec();
+        relabelled[0][0] = 1;
+        let err = session_pair([5u8; 32])
+            .1
+            .recv(&mut reframe(&relabelled).as_slice())
+            .expect_err("must reject");
+        assert!(err.contains("integrity check"), "{err}");
+
+        // Swapping two chunks fails authentication too.
+        let swapped = reframe(&[frames[1].clone(), frames[0].clone(), frames[2].clone()]);
+        let err = session_pair([5u8; 32])
+            .1
+            .recv(&mut swapped.as_slice())
+            .expect_err("must reject");
+        assert!(err.contains("integrity check"), "{err}");
     }
 
     #[test]

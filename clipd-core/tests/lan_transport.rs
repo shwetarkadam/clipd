@@ -9,8 +9,24 @@ use clipd_core::lan::{send_envelope, serve_connection};
 use clipd_core::lan_identity::Identity;
 use clipd_core::{ClipEntry, ClipStore, ContentType, Envelope};
 use std::net::TcpListener;
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use x25519_dalek::PublicKey;
+
+/// Point HOME at a throwaway directory before anything resolves a data dir.
+///
+/// The identity key and device id live under the user's data dir, so without
+/// this these tests would read — or on a fresh machine, create — the real
+/// clipd's files, and share them with a clipd running alongside. Every test
+/// calls this first; the `OnceLock` makes the rest wait until HOME is set, so
+/// nothing reads the environment while it changes.
+fn isolate_home() {
+    static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("temp home");
+        std::env::set_var("HOME", home.path());
+        home
+    });
+}
 
 fn allow_all(_: &str, _: &PublicKey) -> bool {
     true
@@ -51,6 +67,7 @@ fn spawn_receiver(
 
 #[test]
 fn a_link_goes_straight_to_the_other_machine() {
+    isolate_home();
     let tmp = tempfile::tempdir().expect("tempdir");
     let (addr, rx, handle) = spawn_receiver(tmp.path().join("blobs"));
 
@@ -69,6 +86,7 @@ fn a_link_goes_straight_to_the_other_machine() {
 
 #[test]
 fn a_file_arrives_with_its_bytes_over_the_network() {
+    isolate_home();
     let sender_side = tempfile::tempdir().expect("tempdir");
     let receiver_side = tempfile::tempdir().expect("tempdir");
     let blobs = receiver_side.path().join("blobs");
@@ -101,6 +119,7 @@ fn a_file_arrives_with_its_bytes_over_the_network() {
 
 #[test]
 fn a_multi_megabyte_file_goes_over_lan_that_the_folder_would_refuse() {
+    isolate_home();
     let sender_side = tempfile::tempdir().expect("tempdir");
     let receiver_side = tempfile::tempdir().expect("tempdir");
     let (addr, rx, handle) = spawn_receiver(receiver_side.path().join("blobs"));
