@@ -73,6 +73,14 @@ const TAG_BYTES: usize = 16;
 /// How long a peer may go silent before giving up on it.
 const IO_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long to wait for a peer to answer at all.
+///
+/// Much shorter than [`IO_TIMEOUT`]: a machine on the same network answers in
+/// milliseconds, and the usual reason it doesn't is that it has gone to sleep
+/// since mDNS last saw it. Waiting the full idle timeout for that only delays
+/// the fallback to the shared folder, which is the route that will work.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Opening message from whoever dialled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
@@ -452,7 +460,7 @@ pub fn send_envelope(
     identity: &Identity,
     trusted: TrustCheck<'_>,
 ) -> Result<i64, String> {
-    let mut stream = TcpStream::connect_timeout(&addr, IO_TIMEOUT)
+    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .map_err(|e| format!("Couldn't reach that machine: {e}"))?;
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
