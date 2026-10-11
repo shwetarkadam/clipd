@@ -13,10 +13,10 @@ jobs:
     strategy:
       matrix:
         include:
+          # Intel (macos-13) removed, as in release.yml: GitHub retired those
+          # runners, so the job sat queued forever and the run never finished.
           - runner: macos-14
             arch: arm64
-          - runner: macos-13
-            arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
