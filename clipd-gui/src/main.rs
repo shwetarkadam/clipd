@@ -2767,6 +2767,19 @@ fn send_surface_request_to(target: SurfaceMode, mode: SurfaceMode) {
     let _ = std::fs::write(path, mode.request_value());
 }
 
+/// Remove the request waiting for `mode` if it is older than `max_age`.
+fn discard_stale_surface_request(mode: SurfaceMode, max_age: Duration) {
+    let path = surface_request_path(mode);
+    let stale = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|written| written.elapsed().ok())
+        .is_some_and(|age| age > max_age);
+    if stale {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn take_surface_request_for(mode: SurfaceMode) -> Option<SurfaceMode> {
     let path = surface_request_path(mode);
     let request = std::fs::read_to_string(&path).ok();
@@ -2961,8 +2974,17 @@ fn main() -> eframe::Result {
         }
     };
     // A request left by a launcher racing the first process is superseded by
-    // the explicit mode that won the lease.
-    let _ = take_surface_request_for(requested_mode);
+    // the explicit mode that won the lease — except the popover's. Its
+    // explicit mode means "start parked off-screen", and a fresh request
+    // beside it is the hover that started this process: when the popover has
+    // died, the tray writes "show" and then launches a new one. Discarding
+    // that made the hover do nothing at all. A stale request still goes, so a
+    // popover started at login never opens by itself.
+    if requested_mode == SurfaceMode::Hud {
+        discard_stale_surface_request(requested_mode, Duration::from_secs(3));
+    } else {
+        let _ = take_surface_request_for(requested_mode);
+    }
     save_surface_state(requested_mode);
 
     // Spawn daemon as a child process (rdev's keyboard hook conflicts with
