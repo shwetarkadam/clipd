@@ -136,7 +136,7 @@ The HUD shows the active slot bank while tapping, so you can stop when the targe
 | `Ctrl+Shift+V` | Smart paste (transform clipboard before pasting) |
 | `Cmd+Option+V` | Sequence paste (auto-increment through slots) |
 
-Action fires **0.35s** after the last tap.
+Action fires **0.65s** after the last tap — long enough to count taps deliberately.
 
 ---
 

@@ -580,7 +580,10 @@ pub fn run_daemon_with_stop(
         load_paste_transform_settings().open_gui_hotkey.label()
     );
     println!("     Ctrl+R → open search TUI");
-    println!("     (action fires 0.35s after last tap)");
+    println!(
+        "     (action fires {:.2}s after last tap)",
+        TAP_WINDOW.as_secs_f32()
+    );
     println!();
     println!("  👀 Watching clipboard... (Ctrl+C to stop)");
     println!();
@@ -2028,37 +2031,107 @@ fn execute_context_paste(
     }
 }
 
+/// Keystrokes clipd sends on the person's behalf: ⌘Z, ⌘V, ⌘C.
+///
+/// These went through `osascript` → System Events: a process launch plus an
+/// Apple event round trip, measured at ~185ms each and ~480ms for the first,
+/// on the thread that times taps. A ⌘V×3 paste sends three of them, so the
+/// right text landed well over a second after the last tap. A CGEvent post is
+/// a function call.
+///
+/// Two properties keep this from feeding back into the slot listener, which
+/// is a CGEvent tap at the HID level:
+/// - the events are posted at the *session* tap, which is past the HID tap, so
+///   the listener never sees them at all;
+/// - ⌘ rides on the key event's flags instead of being pressed as a key of its
+///   own, so it is never added to what the person is physically holding.
+///
+/// The key code comes from the current layout (see
+/// `clipd_core::keyboard_layout`): sent by QWERTY position, "undo" on AZERTY
+/// would be ⌘W and close the person's window. Until the tray host has read
+/// the layout — or in a headless `clipd daemon`, where nothing does — the
+/// layout-aware AppleScript path is used instead.
+#[cfg(target_os = "macos")]
+mod synth {
+    use std::ffi::c_void;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceCreate(state_id: i32) -> *mut c_void;
+        fn CGEventCreateKeyboardEvent(source: *mut c_void, key: u16, down: bool) -> *mut c_void;
+        fn CGEventSetFlags(event: *mut c_void, flags: u64);
+        fn CGEventPost(tap: u32, event: *mut c_void);
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
+
+    /// kCGEventSourceStatePrivate: our presses do not join the shared state.
+    const PRIVATE_STATE: i32 = -1;
+    /// kCGSessionEventTap: past the HID tap the slot listener sits on.
+    const SESSION_TAP: u32 = 1;
+    const MASK_COMMAND: u64 = 0x0010_0000;
+
+    /// ⌘ + `letter`, down then up. False when the layout is not known yet or
+    /// the event could not be made, so the caller can fall back.
+    pub fn command(letter: char) -> bool {
+        let Some(key) = clipd_core::keyboard_layout::keycode(letter) else {
+            return false;
+        };
+        unsafe {
+            let source = CGEventSourceCreate(PRIVATE_STATE);
+            if source.is_null() {
+                return false;
+            }
+            let mut posted = true;
+            for down in [true, false] {
+                let event = CGEventCreateKeyboardEvent(source, key, down);
+                if event.is_null() {
+                    posted = false;
+                    break;
+                }
+                CGEventSetFlags(event, MASK_COMMAND);
+                CGEventPost(SESSION_TAP, event);
+                CFRelease(event);
+            }
+            CFRelease(source);
+            posted
+        }
+    }
+
+    /// The old path: slow, but it resolves the letter in the current layout
+    /// itself. Used when `command` cannot be.
+    pub fn command_via_system_events(letter: char) {
+        let script = format!(
+            "tell application \"System Events\"\n  keystroke \"{letter}\" using command down\nend tell"
+        );
+        let _ = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(script)
+            .output();
+    }
+
+    pub fn press(letter: char) {
+        if !command(letter) {
+            command_via_system_events(letter);
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn simulate_undo() {
-    let script = r#"tell application "System Events"
-  keystroke "z" using command down
-end tell"#;
-    let _ = std::process::Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .output();
+    synth::press('z');
 }
 
 #[cfg(target_os = "macos")]
 fn simulate_paste() {
-    let script = r#"tell application "System Events"
-  keystroke "v" using command down
-end tell"#;
-    let _ = std::process::Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .output();
+    synth::press('v');
 }
 
 #[cfg(target_os = "macos")]
 fn simulate_copy() {
-    let script = r#"tell application "System Events"
-  keystroke "c" using command down
-end tell"#;
-    let _ = std::process::Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .output();
+    synth::press('c');
     std::thread::sleep(Duration::from_millis(80));
 }
 
@@ -2153,6 +2226,12 @@ fn simulate_paste() {
 
 #[cfg(target_os = "macos")]
 fn get_frontmost_app_name() -> Option<String> {
+    // Runs on every captured clip (to record where it came from) and before
+    // every shortcut-opened window, so the ~200ms AppleScript fallback is only
+    // for a process without an AppKit main loop.
+    if let Some((name, _)) = clipd_core::frontmost_application() {
+        return (!name.is_empty()).then_some(name);
+    }
     let output = std::process::Command::new("osascript")
         .arg("-e")
         .arg("tell application \"System Events\" to get name of first application process whose frontmost is true")
@@ -2173,6 +2252,9 @@ fn get_frontmost_app_name() -> Option<String> {
 /// Name + bundle of the frontmost app (one AppleScript round-trip).
 #[cfg(target_os = "macos")]
 fn get_frontmost_app_name_and_bundle() -> Option<(String, String)> {
+    if let Some(app) = clipd_core::frontmost_application() {
+        return (!app.0.is_empty()).then_some(app);
+    }
     const SEP: &str = "\u{241f}"; // SYMBOL FOR UNIT SEPARATOR — won't appear in app names
     let script = format!(
         r#"tell application "System Events"

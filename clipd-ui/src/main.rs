@@ -669,6 +669,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Auto-start daemon on launch — runs IN-PROCESS (see start_daemon docs) so the
     // macOS keyboard listener inherits clipd-ui's Input Monitoring / Accessibility grants.
+    // The in-process daemon sends its keystrokes and reads the frontmost app
+    // through APIs that need this main thread: read the keyboard layout here,
+    // and say NSWorkspace will be kept current by this run loop. Both before
+    // the daemon starts, so its first paste already takes the fast path.
+    #[cfg(target_os = "macos")]
+    {
+        clipd_core::keyboard_layout::refresh();
+        clipd_core::mark_appkit_main_loop();
+    }
     let mut daemon: Option<DaemonHandle> = Some(start_daemon());
     item_daemon.set_text(daemon_tray_label(daemon.is_some()));
 
@@ -829,6 +838,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // without restarting the tray host.
             if last_hotkey_sync.elapsed() >= std::time::Duration::from_secs(2) {
                 settings_hotkeys.sync_from_settings();
+                // Someone may have switched keyboard layout; the daemon's
+                // keystrokes have to follow it.
+                clipd_core::keyboard_layout::refresh();
                 last_hotkey_sync = std::time::Instant::now();
             }
             settings_hotkeys.poll_and_dispatch();
