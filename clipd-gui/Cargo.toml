@@ -39,7 +39,10 @@ objc2-app-kit = { version = "0.3", features = [
     "NSResponder",
     "NSRunningApplication",
     "NSWorkspace",
+    # Pointer tracking for the popover while clipd is not the active app.
+    "NSTrackingArea",
 ] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSDictionary"] }
 raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
