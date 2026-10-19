@@ -24,6 +24,7 @@ pub mod semantic;
 pub mod session;
 pub mod slots;
 pub mod focus;
+pub mod keyboard_layout;
 pub mod import;
 pub mod skills;
 pub mod snippets;
@@ -77,7 +78,7 @@ pub use island::{
     island_layout_active, load_island_config, load_shelf, save_island_config, save_shelf,
     ClipCounts, IslandAnchor, IslandConfig, IslandModule, IslandSnapshot, ShelfItem,
 };
-pub use focus::{hand_focus_to_surface, take_focus};
+pub use focus::{frontmost_application, hand_focus_to_surface, mark_appkit_main_loop, take_focus};
 pub use lock::{daemon_lock_pid, surface_is_running, request_running_surface, surface_pid, 
     is_daemon_running, load_hotkey_status, release_daemon_lock, save_hotkey_status,
     try_acquire_daemon_lock, HotkeyStatus, ProcessLock,

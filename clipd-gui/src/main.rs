@@ -57,7 +57,8 @@ const HUD_H: f32 = 480.0;
 const HUD_TOP_MARGIN: f32 = 30.0;
 /// Grace period before collapsing, so crossing a gap between chips or
 /// overshooting the edge by a pixel doesn't slam the panel shut mid-read.
-const HUD_COLLAPSE_DELAY: Duration = Duration::from_millis(200);
+/// Short: the popover should be gone the moment you have plainly left it.
+const HUD_COLLAPSE_DELAY: Duration = Duration::from_millis(150);
 /// Keep the popover this far from the screen edges when the tray icon sits
 /// near a corner.
 const POPOVER_EDGE_PAD: f32 = 8.0;
@@ -2767,6 +2768,19 @@ fn send_surface_request_to(target: SurfaceMode, mode: SurfaceMode) {
     let _ = std::fs::write(path, mode.request_value());
 }
 
+/// Remove the request waiting for `mode` if it is older than `max_age`.
+fn discard_stale_surface_request(mode: SurfaceMode, max_age: Duration) {
+    let path = surface_request_path(mode);
+    let stale = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|written| written.elapsed().ok())
+        .is_some_and(|age| age > max_age);
+    if stale {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn take_surface_request_for(mode: SurfaceMode) -> Option<SurfaceMode> {
     let path = surface_request_path(mode);
     let request = std::fs::read_to_string(&path).ok();
@@ -2881,6 +2895,76 @@ fn requested_theme(args: &[String]) -> Option<Result<Theme, String>> {
     }))
 }
 
+/// Frames a person would feel, written down.
+///
+/// The popover runs with its output discarded, so "it froze for a moment"
+/// used to leave nothing to look at. This notes, in
+/// `clipd-gui-slow.log` (beside the tray's log), any frame slower than [`SLOW`] (and
+/// which part was slow), and any gap longer than [`STALL`] in a popover that
+/// was on screen and should have been drawing every 60ms at most. Normal
+/// frames cost one clock read.
+mod frame_diag {
+    use std::io::Write;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    pub const SLOW: Duration = Duration::from_millis(40);
+    pub const STALL: Duration = Duration::from_millis(250);
+    const MAX_BYTES: u64 = 1024 * 1024;
+    static LAST_FRAME_END: Mutex<Option<Instant>> = Mutex::new(None);
+
+    /// Next to the tray's log: `~/Library/Logs` on macOS, clipd's own `logs`
+    /// folder elsewhere (`%LOCALAPPDATA%\clipd\logs` on Windows).
+    fn log_path() -> Option<std::path::PathBuf> {
+        let dir = if cfg!(target_os = "macos") {
+            dirs::home_dir()?.join("Library/Logs")
+        } else {
+            dirs::data_local_dir()?.join("clipd").join("logs")
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir.join("clipd-gui-slow.log"))
+    }
+
+    pub fn note(line: &str) {
+        let Some(path) = log_path() else {
+            return;
+        };
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES) {
+            let _ = std::fs::rename(&path, path.with_extension("log.1"));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(
+                f,
+                "{} [pid {}] {line}",
+                chrono::Local::now().format("%H:%M:%S%.3f"),
+                std::process::id()
+            );
+        }
+    }
+
+    /// At the start of a popover frame: was there a gap while it was showing?
+    pub fn popover_frame_started(showing: bool) {
+        let now = Instant::now();
+        let last = LAST_FRAME_END.lock().ok().and_then(|g| *g);
+        if let (true, Some(last)) = (showing, last) {
+            let gap = now.duration_since(last);
+            if gap > STALL {
+                note(&format!("popover stalled {}ms between frames while showing", gap.as_millis()));
+            }
+        }
+    }
+
+    pub fn frame_ended() {
+        if let Ok(mut g) = LAST_FRAME_END.lock() {
+            *g = Some(Instant::now());
+        }
+    }
+
+    pub fn ms(d: Duration) -> u128 {
+        d.as_millis()
+    }
+}
+
 /// When this process started, for the "first frame" log line.
 static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
@@ -2961,8 +3045,17 @@ fn main() -> eframe::Result {
         }
     };
     // A request left by a launcher racing the first process is superseded by
-    // the explicit mode that won the lease.
-    let _ = take_surface_request_for(requested_mode);
+    // the explicit mode that won the lease — except the popover's. Its
+    // explicit mode means "start parked off-screen", and a fresh request
+    // beside it is the hover that started this process: when the popover has
+    // died, the tray writes "show" and then launches a new one. Discarding
+    // that made the hover do nothing at all. A stale request still goes, so a
+    // popover started at login never opens by itself.
+    if requested_mode == SurfaceMode::Hud {
+        discard_stale_surface_request(requested_mode, Duration::from_secs(3));
+    } else {
+        let _ = take_surface_request_for(requested_mode);
+    }
     save_surface_state(requested_mode);
 
     // Spawn daemon as a child process (rdev's keyboard hook conflicts with
@@ -3376,6 +3469,39 @@ pub(crate) fn make_window_key(frame: &eframe::Frame) {
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn make_window_key(_frame: &eframe::Frame) {}
+
+/// Let the popover follow the pointer while clipd is not the active app.
+///
+/// winit tracks the mouse with old-style tracking rects, and AppKit sends
+/// `mouseMoved:` only to the key window. The popover is never key — it must
+/// not take the keyboard from the app you are typing in — so it saw no pointer
+/// movement at all: rows did not highlight under the cursor and egui's idea of
+/// where the pointer was went stale, which read as the popover being frozen.
+/// A tracking area that is always active delivers moved/entered/exited to
+/// winit's view whatever the app's state, and winit already handles them.
+#[cfg(target_os = "macos")]
+fn track_pointer_while_inactive(frame: &eframe::Frame) -> bool {
+    use objc2::AllocAnyThread;
+    use objc2_app_kit::{NSTrackingArea, NSTrackingAreaOptions};
+    let Some(view) = ns_metal_view(frame) else {
+        return false;
+    };
+    let options = NSTrackingAreaOptions::MouseMoved
+        | NSTrackingAreaOptions::MouseEnteredAndExited
+        | NSTrackingAreaOptions::ActiveAlways
+        | NSTrackingAreaOptions::InVisibleRect;
+    let area = unsafe {
+        NSTrackingArea::initWithRect_options_owner_userInfo(
+            NSTrackingArea::alloc(),
+            objc2_foundation::NSRect::ZERO,
+            options,
+            Some(view),
+            None,
+        )
+    };
+    view.addTrackingArea(&area);
+    true
+}
 
 #[cfg(target_os = "macos")]
 pub(crate) fn activate_for_keyboard_input() {
@@ -4374,6 +4500,8 @@ struct ClipdGui {
     island_surface: bool,
     /// Whether the HUD's request-file watcher thread has been started.
     hud_watcher_started: bool,
+    /// The popover's always-active pointer tracking is installed.
+    hud_pointer_tracked: bool,
     /// Clips whose preview is a redaction, so their tooltip stays hidden.
     masked_clip_ids: HashSet<i64>,
     /// Every slot each text is in. `ClipEntry.slot` holds one; the same text
@@ -4658,6 +4786,7 @@ impl ClipdGui {
             hud,
             island_surface,
             hud_watcher_started: false,
+            hud_pointer_tracked: false,
             masked_clip_ids,
             slots_by_content,
             hud_slots_view: false,
@@ -4770,6 +4899,19 @@ impl ClipdGui {
     }
 
     fn refresh(&mut self) {
+        let refresh_started = Instant::now();
+        self.refresh_inner();
+        let took = refresh_started.elapsed();
+        if took > frame_diag::SLOW {
+            frame_diag::note(&format!(
+                "refresh took {}ms ({} clips)",
+                frame_diag::ms(took),
+                self.clips.len()
+            ));
+        }
+    }
+
+    fn refresh_inner(&mut self) {
         // Resolve the selection to a clip id *before* `clips` is replaced —
         // afterwards `filtered` holds indices into a vector that no longer
         // exists, and reading through them can be out of bounds.
@@ -5075,7 +5217,9 @@ impl ClipdGui {
         match self.hud_left_at {
             None => {
                 self.hud_left_at = Some(Instant::now());
-                self.animate_hud(ctx);
+                // Wake exactly when the grace runs out, not on the next
+                // 60ms tick after it.
+                ctx.request_repaint_after(HUD_COLLAPSE_DELAY);
             }
             Some(left) if left.elapsed() >= HUD_COLLAPSE_DELAY => {
                 self.search_query.clear();
@@ -5084,8 +5228,8 @@ impl ClipdGui {
                 self.hide_hud_offscreen(ctx);
                 self.hud_left_at = None;
             }
-            Some(_) => {
-                self.animate_hud(ctx);
+            Some(left) => {
+                ctx.request_repaint_after(HUD_COLLAPSE_DELAY.saturating_sub(left.elapsed()));
             }
         }
     }
@@ -7258,6 +7402,10 @@ impl eframe::App for ClipdGui {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let frame_started = Instant::now();
+        if self.hud {
+            frame_diag::popover_frame_started(self.hud_expanded);
+        }
         // The main window is resident: every way of closing it (Esc, ⌘W, the
         // close button, a paste) hides it instead, unless clipd is quitting.
         if !self.hud && !self.island_surface {
@@ -7479,8 +7627,31 @@ impl eframe::App for ClipdGui {
         if self.hud {
             let mut c = resolved_theme(ctx, self.theme).colors();
             self.custom_colors.apply_to(&mut c);
+            #[cfg(target_os = "macos")]
+            if !self.hud_pointer_tracked {
+                self.hud_pointer_tracked = track_pointer_while_inactive(frame);
+            }
+            let was_showing = self.hud_expanded;
+            let hover_started = Instant::now();
             self.drive_hud_hover(ctx);
+            let hover_took = hover_started.elapsed();
+            if self.hud_expanded != was_showing {
+                frame_diag::note(if self.hud_expanded { "popover shown" } else { "popover hidden" });
+            }
+            let draw_started = Instant::now();
             self.render_hud_popover(ctx, &c);
+            let draw_took = draw_started.elapsed();
+            let total = frame_started.elapsed();
+            if total > frame_diag::SLOW {
+                frame_diag::note(&format!(
+                    "popover frame {}ms: hover/show {}ms, draw {}ms, before {}ms",
+                    frame_diag::ms(total),
+                    frame_diag::ms(hover_took),
+                    frame_diag::ms(draw_took),
+                    frame_diag::ms(hover_started.duration_since(frame_started)),
+                ));
+            }
+            frame_diag::frame_ended();
             return;
         }
 
