@@ -109,6 +109,12 @@ class PromptPanel: NSPanel {
 class HUD: NSObject {
     var panel: NSPanel!
     var root: NSView!
+    /// `--serve`: stay running and show each message read from stdin, rather
+    /// than drawing one and quitting.
+    var serving = false
+    /// Bumped by every message, so a stale fade-out timer leaves a newer
+    /// toast alone.
+    var generation = 0
     /// Button ids for the `prompt` style, indexed by the button's tag.
     var choices: [String] = []
 
@@ -360,8 +366,14 @@ class HUD: NSObject {
     /// with gaps between them; a backing plate would put a visible rectangle
     /// around the lot.
     func makePlainPanel(_ rect: NSRect) {
+        // A newer message replaces what is on screen at once, rather than
+        // queueing behind its fade.
+        if let old = panel {
+            old.orderOut(nil)
+        }
         let mask: NSWindow.StyleMask = [.borderless, .nonactivatingPanel]
         panel = NSPanel(contentRect: rect, styleMask: mask, backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
         panel.becomesKeyOnlyIfNeeded = true
         panel.ignoresMouseEvents = true
         panel.level = .floating
@@ -502,10 +514,16 @@ class HUD: NSObject {
     }
 
     func makePanel(_ rect: NSRect, interactive: Bool = false) {
+        // A newer message replaces what is on screen at once, rather than
+        // queueing behind its fade.
+        if let old = panel {
+            old.orderOut(nil)
+        }
         let mask: NSWindow.StyleMask = [.borderless, .nonactivatingPanel]
         panel = interactive
             ? PromptPanel(contentRect: rect, styleMask: mask, backing: .buffered, defer: false)
             : NSPanel(contentRect: rect, styleMask: mask, backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
         panel.becomesKeyOnlyIfNeeded = true
         // Passive HUDs must never swallow a click meant for the app underneath;
         // only the prompt is interactive.
@@ -530,18 +548,73 @@ class HUD: NSObject {
 
     func present(duration: Double) {
         let app = NSApplication.shared
-        panel.alphaValue = 0
-        panel.orderFront(nil)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.10
-            self.panel.animator().alphaValue = 1
+        generation += 1
+        let mine = generation
+        let shown = panel!
+        // Serving, the toast appears at once: it usually replaces one already
+        // on screen, and a fade-in would put the strip behind the taps again.
+        shown.alphaValue = serving ? 1 : 0
+        shown.orderFront(nil)
+        if !serving {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.10
+                shown.animator().alphaValue = 1
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+            guard mine == self.generation else { return }
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.22
-                self.panel.animator().alphaValue = 0
-            }, completionHandler: { app.terminate(nil) })
+                shown.animator().alphaValue = 0
+            }, completionHandler: {
+                if self.serving {
+                    if mine == self.generation { shown.orderOut(nil) }
+                } else {
+                    app.terminate(nil)
+                }
+            })
         }
+    }
+
+    /// Show one message from the stream. Prompts are not served: they answer
+    /// on stdout, so they keep their own one-shot process.
+    func display(_ text: String) {
+        let p = parse(text)
+        switch p.style {
+        case "slot": showSlotToast(p)
+        case "toast": showToast(p)
+        case "list": showList(p)
+        case "prompt": return
+        default: showSimple(text)
+        }
+    }
+
+    /// Stay up and draw each NUL-terminated message arriving on stdin.
+    ///
+    /// The daemon used to launch a fresh copy of this app for every keystroke
+    /// it acknowledged: ~160ms before anything appeared (~640ms cold), and the
+    /// next tap killed it first, so a multi-tap never saw its strip move.
+    /// Served, a message is a redraw. Closing stdin (the daemon exiting) ends
+    /// the process.
+    func serve() {
+        serving = true
+        NSApplication.shared.setActivationPolicy(.accessory)
+        Thread.detachNewThread {
+            var pending = Data()
+            while true {
+                let chunk = FileHandle.standardInput.availableData
+                if chunk.isEmpty { break }
+                pending.append(chunk)
+                while let end = pending.firstIndex(of: 0) {
+                    let message = String(decoding: pending[pending.startIndex..<end], as: UTF8.self)
+                    pending.removeSubrange(pending.startIndex...end)
+                    guard !message.isEmpty else { continue }
+                    DispatchQueue.main.async { self.display(message) }
+                }
+            }
+            DispatchQueue.main.async { exit(0) }
+        }
+        NSApplication.shared.run()
     }
 
     func show(text: String) {
@@ -558,6 +631,14 @@ class HUD: NSObject {
     }
 }
 
-let text = CommandLine.arguments.dropFirst().joined(separator: " ")
-guard !text.isEmpty else { exit(0) }
-HUD().show(text: text)
+let args = Array(CommandLine.arguments.dropFirst())
+// Serve mode is asked for in the environment, with no arguments, so a daemon
+// paired with an older overlay that lacks it gets a silent exit (the empty
+// text guard below) rather than a toast reading "--serve" — and falls back.
+if ProcessInfo.processInfo.environment["CLIPD_HUD_SERVE"] == "1" && args.isEmpty {
+    HUD().serve()
+} else {
+    let text = args.joined(separator: " ")
+    guard !text.isEmpty else { exit(0) }
+    HUD().show(text: text)
+}

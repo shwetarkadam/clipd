@@ -176,6 +176,12 @@ pub fn run_daemon_with_stop(
     let persist_tx = clip_tx.clone();
     let watcher = ClipWatcher::new(500);
     let watcher_slot_mgr = slot_manager.clone();
+    // Start the slot overlay now, so the first toast doesn't wait on a launch.
+    #[cfg(target_os = "macos")]
+    if load_paste_transform_settings().hud_enabled {
+        hud_server::warm();
+    }
+
     let watcher_handle = std::thread::Builder::new()
         .name("clipd-watcher".into())
         .spawn(move || {
@@ -638,6 +644,14 @@ pub fn run_daemon_with_stop(
 
         let mut sequence_slot: u8 = 1;
         let mut cmd_v_saved_clipboard: Option<String> = None;
+        // The slot pasted on the latest ⌘V tap, and its text: the window's end
+        // only tidies up after it.
+        let mut cmd_v_live: Option<(u8, String)> = None;
+        // Whether a paste is showing in the person's app that the next tap
+        // should replace (the native one from tap 1, or our last swap).
+        let mut cmd_v_showing = false;
+        // The slot filled on the latest ⌘C tap, and what it held before.
+        let mut cmd_c_live: Option<LiveCopy> = None;
 
         // ── Collect mode ──
         // When collecting, each plain Cmd+C lands in the next numbered slot
@@ -676,6 +690,14 @@ pub fn run_daemon_with_stop(
                             #[cfg(target_os = "macos")]
                             show_slot_notification("Copy", slot);
                         }
+                        // Fill the slot on its tap, not when the window closes:
+                        // waiting meant a slot copied a moment ago still held
+                        // its old text for 0.65s. The next tap moves it on and
+                        // puts back what this slot held.
+                        if cmd_c_taps >= 2 {
+                            let slot = primary_slot_for_taps(cmd_c_taps, &paste_transform);
+                            cmd_c_live = fill_slot_live(slot, cmd_c_live.take(), &hotkey_slot_mgr);
+                        }
                     }
                     HotkeyTick::CmdVTap => {
                         let now = Instant::now();
@@ -686,26 +708,34 @@ pub fn run_daemon_with_stop(
                         cmd_v_taps = (cmd_v_taps + 1).min(primary_tap_slot_limit(&paste_transform));
                         cmd_v_deadline = Some(now + TAP_WINDOW);
                         if cmd_v_taps == 1 {
-                            // First tap: just save the clipboard content.
-                            // Don't clear yet — the app may still be reading
-                            // the clipboard for this paste.
-                            if let Ok(mut cb) = Clipboard::new() {
-                                cmd_v_saved_clipboard = cb.get_text().ok();
-                            }
-                        }
-                        if cmd_v_taps == 2 {
-                            // Second tap confirms multi-tap intent.
-                            // NOW clear clipboard so taps 3+ paste nothing.
-                            suppress.store(true, Ordering::SeqCst);
-                            if let Ok(mut cb) = Clipboard::new() {
-                                let _ = cb.set_text("");
-                            }
+                            // First tap: an ordinary paste, which went through.
+                            // Remember the clipboard so it can be put back.
+                            cmd_v_saved_clipboard = clipd_core::pasteboard::read_text();
+                            cmd_v_showing = cmd_v_saved_clipboard
+                                .as_deref()
+                                .is_some_and(|text| !text.is_empty());
+                            cmd_v_live = None;
                         }
                         if cmd_v_taps >= 2 {
+                            // The listener swallowed this ⌘V; answer it now.
+                            //
+                            // This used to let taps 1 and 2 paste the clipboard
+                            // for real, wait out the 0.65s window, undo both and
+                            // paste the slot — wrong text on screen, then the
+                            // right text over a second after the last tap. Now
+                            // each tap replaces what the last one pasted, so
+                            // the slot is in place the moment you stop tapping.
+                            suppress.store(true, Ordering::SeqCst);
                             let slot = primary_slot_for_taps(cmd_v_taps, &paste_transform);
                             log::info!("⌨️  Cmd+V tap #{} → slot {}", cmd_v_taps, slot);
                             #[cfg(target_os = "macos")]
                             show_slot_notification("Paste", slot);
+                            if let Some(text) =
+                                paste_slot_live(slot, cmd_v_showing, &hotkey_slot_mgr)
+                            {
+                                cmd_v_showing = true;
+                                cmd_v_live = Some((slot, text));
+                            }
                         }
                     }
                     HotkeyTick::CtrlCTap => {
@@ -923,7 +953,16 @@ pub fn run_daemon_with_stop(
                         last_single_copy = Some(commit);
                     } else {
                         let slot = primary_slot_for_taps(cmd_c_taps, &paste_transform);
-                        execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
+                        match cmd_c_live.take() {
+                            // In the slot since its tap; record it.
+                            Some(live) => save_text_to_slot(
+                                live.slot,
+                                &live.text,
+                                &hotkey_slot_mgr,
+                                &persist_tx,
+                            ),
+                            None => execute_copy(slot, &hotkey_slot_mgr, &persist_tx),
+                        }
                         // Only restore to slot 1 if the user wants that behavior
                         if paste_transform.copy_multi_tap_restore {
                             restore_clipboard_to_slot(
@@ -945,19 +984,28 @@ pub fn run_daemon_with_stop(
             if let Some(dl) = cmd_v_deadline {
                 if now >= dl && cmd_v_taps > 0 {
                     if cmd_v_taps >= 2 {
-                        let slot = primary_slot_for_taps(cmd_v_taps, &paste_transform);
-                        execute_undo_paste(slot, cmd_v_taps.min(2), &hotkey_slot_mgr, &suppress);
-                        // Restore original clipboard content
-                        if let Some(ref orig) = cmd_v_saved_clipboard {
-                            std::thread::sleep(Duration::from_millis(50));
-                            if let Ok(mut cb) = Clipboard::new() {
-                                let _ = cb.set_text(orig);
+                        // The paste already happened, on its tap. What is left
+                        // is bookkeeping, and handing the clipboard back.
+                        if let Some((slot, text)) = cmd_v_live.take() {
+                            clipd_core::record_slot_paste(slot);
+                            log::info!("📋 Pasted from slot {} on its tap: {}", slot, truncate(&text, 40));
+                            #[cfg(target_os = "macos")]
+                            show_slot_content_notification("Pasted", slot, &text);
+                            // Unless they copied something since.
+                            let untouched = clipd_core::pasteboard::read_text().as_deref()
+                                == Some(text.as_str());
+                            if let (true, Some(orig)) = (untouched, cmd_v_saved_clipboard.as_deref()) {
+                                if let Ok(mut cb) = Clipboard::new() {
+                                    let _ = cb.set_text(orig);
+                                }
+                                refresh_hash.store(true, Ordering::SeqCst);
                             }
-                            refresh_hash.store(true, Ordering::SeqCst);
                         }
                         suppress.store(false, Ordering::SeqCst);
                     }
                     cmd_v_saved_clipboard = None;
+                    cmd_v_live = None;
+                    cmd_v_showing = false;
                     cmd_v_taps = 0;
                     cmd_v_deadline = None;
                 }
@@ -1659,9 +1707,73 @@ fn save_text_to_slot(
     let _ = persist_tx.try_send(ClipEvent::NewClip(entry));
 }
 
+/// A slot filled on a ⌘C tap, and what it held before, so a further tap can
+/// move on and put it back.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct LiveCopy {
+    slot: u8,
+    text: String,
+    previous: Option<String>,
+}
+
+/// Put what was just copied into `slot`, now. `previous` is the slot the last
+/// tap filled: it gets its old content back, since the count has moved past it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn fill_slot_live(slot: u8, previous: Option<LiveCopy>, mgr: &SlotManager) -> Option<LiveCopy> {
+    if previous.as_ref().is_some_and(|live| live.slot == slot) {
+        // Taps past the last slot keep landing on it: nothing moves.
+        return previous;
+    }
+    if let Some(live) = previous {
+        let _ = match live.previous {
+            Some(text) => mgr.copy_to_slot(live.slot, &text),
+            None => mgr.clear_slot(live.slot),
+        };
+    }
+    // The app writes the pasteboard as the ⌘C lands; it can be mid-write.
+    let text = (0..4).find_map(|attempt| {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(12));
+        }
+        clipd_core::pasteboard::read_text().filter(|t| !t.is_empty())
+    })?;
+    let before = mgr.get_slot(slot).ok().flatten();
+    mgr.copy_to_slot(slot, &text).ok()?;
+    Some(LiveCopy {
+        slot,
+        text,
+        previous: before,
+    })
+}
+
+/// Replace what the last paste put in the person's app with `slot`, now.
+///
+/// `undo_first` is false when nothing is showing to replace (tap 1 found an
+/// empty clipboard, or every slot so far was empty) — undoing then would undo
+/// the person's own last edit. An empty slot pastes nothing and leaves the
+/// previous paste in place, so the next tap still replaces the right thing.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn paste_slot_live(slot: u8, undo_first: bool, mgr: &SlotManager) -> Option<String> {
+    let content = match mgr.get_slot(slot) {
+        Ok(Some(content)) => content,
+        _ => {
+            log::info!("📋 Slot {} is empty", slot);
+            return None;
+        }
+    };
+    let mut cb = Clipboard::new().ok()?;
+    cb.set_text(&content).ok()?;
+    if undo_first {
+        simulate_undo();
+    }
+    simulate_paste();
+    Some(content)
+}
+
 /// Cmd+V multi-tap path: the foreground app already received the first one or two
 /// native Cmd+V events, so validate the slot, undo those native inserts, then paste
 /// the selected slot in one sequential operation.
+#[cfg(target_os = "windows")]
 fn execute_undo_paste(
     slot: u8,
     native_paste_count: u8,
@@ -2809,7 +2921,117 @@ fn show_hud(text: &str) {
         return;
     }
     let text = &hud_payload_with_clearance(text);
+    if hud_server::send(text) {
+        return;
+    }
+    show_hud_one_shot(text);
+}
 
+/// The overlay, kept running and fed one message per toast.
+///
+/// Every acknowledged keystroke used to kill the previous overlay (waiting on
+/// `/bin/kill`) and launch a fresh Swift app, on the thread that times taps.
+/// A launch took ~160ms to put anything on screen (~640ms cold), and taps come
+/// ~150–200ms apart, so the next tap killed each toast before it appeared and
+/// the slot strip never visibly moved. Served, a toast is a NUL-terminated
+/// message on the overlay's stdin: ~20–30ms to screen, and nothing to wait on.
+#[cfg(target_os = "macos")]
+mod hud_server {
+    use std::io::Write;
+    use std::process::{Child, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    struct Server {
+        child: Child,
+        started: Instant,
+    }
+
+    static SERVER: Mutex<Option<Server>> = Mutex::new(None);
+    /// The overlay next to us has no serve mode (an older build): it exits as
+    /// soon as it starts. Stop relaunching it and use one-shot toasts.
+    static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+    /// An overlay that dies sooner than this after launch did not serve.
+    const MIN_LIFETIME: Duration = Duration::from_secs(2);
+
+    /// Launch the overlay ahead of the first toast, so that one does not pay
+    /// for a cold start either.
+    pub fn warm() {
+        if let Ok(mut server) = SERVER.lock() {
+            let _ = running(&mut server);
+        }
+    }
+
+    fn running(server: &mut Option<Server>) -> Option<&mut Server> {
+        if let Some(current) = server.as_mut() {
+            if matches!(current.child.try_wait(), Ok(None)) {
+                return server.as_mut();
+            }
+            let lived = current.started.elapsed();
+            let _ = current.child.wait();
+            *server = None;
+            if lived < MIN_LIFETIME {
+                log::warn!("HUD: overlay exited {lived:?} after launch — no serve mode; using one-shot toasts");
+                UNSUPPORTED.store(true, Ordering::Relaxed);
+                return None;
+            }
+        }
+        if UNSUPPORTED.load(Ordering::Relaxed) {
+            return None;
+        }
+        let bin = super::find_hud_binary();
+        match std::process::Command::new(&bin)
+            .env("CLIPD_HUD_SERVE", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                log::info!("HUD: overlay serving (pid {})", child.id());
+                *server = Some(Server {
+                    child,
+                    started: Instant::now(),
+                });
+                server.as_mut()
+            }
+            Err(e) => {
+                log::warn!("HUD overlay failed: {} (looked for {})", e, bin.display());
+                None
+            }
+        }
+    }
+
+    /// Show `text` through the running overlay. False when it cannot be, and
+    /// the caller should fall back.
+    pub fn send(text: &str) -> bool {
+        let Ok(mut server) = SERVER.lock() else { return false };
+        // Twice: the overlay may have died since the last toast.
+        for _ in 0..2 {
+            let Some(current) = running(&mut server) else { return false };
+            let sent = current.child.stdin.as_mut().is_some_and(|stdin| {
+                stdin
+                    .write_all(text.as_bytes())
+                    .and_then(|_| stdin.write_all(&[0]))
+                    .and_then(|_| stdin.flush())
+                    .is_ok()
+            });
+            if sent {
+                return true;
+            }
+            if let Some(mut dead) = server.take() {
+                let _ = dead.child.kill();
+                let _ = dead.child.wait();
+            }
+        }
+        false
+    }
+}
+
+/// One process per toast: the fallback for an overlay without serve mode.
+#[cfg(target_os = "macos")]
+fn show_hud_one_shot(text: &str) {
     use std::sync::Mutex;
     use std::sync::OnceLock;
 
@@ -4128,6 +4350,7 @@ fn start_macos_hotkey_listener(
         latch_ctrl_v: bool,
         /// Time of the last plain Cmd+C press — for double-tap quick letter save.
         cmd_c_last_press: Option<Instant>,
+        cmd_v_last_press: Option<Instant>,
         /// Last bare Option tap, for the double-tap letter gesture.
         opt_last_tap: Option<Instant>,
         /// A letter copy or paste waiting for the chord's modifiers to be
@@ -4165,6 +4388,7 @@ fn start_macos_hotkey_listener(
         latch_ctrl_c: false,
         latch_ctrl_v: false,
         cmd_c_last_press: None,
+        cmd_v_last_press: None,
         opt_last_tap: None,
         pending_letter_paste: None,
         pending_letter_copy: None,
@@ -4609,7 +4833,17 @@ fn start_macos_hotkey_listener(
                     // back. Letter paste stays on Ctrl+Option+letter, which is
                     // one chord, no timing, and collides with nothing.
                     let _ = tx.send(HotkeyTick::CmdVTap);
-                    return Some(event);
+                    // A ⌘V that continues a multi-tap is not a paste of the
+                    // clipboard: the daemon pastes the slot for this count
+                    // itself, at once. Letting it through put the wrong text
+                    // in the app for clipd to undo later.
+                    let now = Instant::now();
+                    let continues = s
+                        .cmd_v_last_press
+                        .is_some_and(|prev| now.duration_since(prev) < TAP_WINDOW)
+                        && load_paste_transform_settings().multi_slot_enabled;
+                    s.cmd_v_last_press = Some(now);
+                    return if continues { None } else { Some(event) };
                 }
 
                 // Ctrl+C (just Ctrl, no Cmd/Shift/Option)
