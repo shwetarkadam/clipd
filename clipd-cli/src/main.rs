@@ -106,6 +106,16 @@ enum Commands {
     /// Show clipboard statistics
     Stats,
 
+    /// Stop recording copies into history: `15m`, `2h`, `tomorrow`, or
+    /// nothing for "until resumed". Slots filled with ⌘C×N still work.
+    Pause {
+        /// How long: e.g. 15m, 1h, 90m, tomorrow. Omit to pause until resumed.
+        duration: Option<String>,
+    },
+
+    /// Start recording copies again after `clipd pause`
+    Resume,
+
     /// Clear clipboard history or slots
     Clear {
         /// Clear a specific slot
@@ -371,6 +381,31 @@ fn main() {
 
         Some(Commands::Stats) => {
             cmd_stats();
+        }
+
+        Some(Commands::Pause { duration }) => {
+            match parse_pause(duration.as_deref()) {
+                Ok(length) => {
+                    clipd_core::pause::pause(length);
+                    println!(
+                        "⏸  {}",
+                        clipd_core::pause::status_label().unwrap_or_else(|| "Capture paused".into())
+                    );
+                }
+                Err(e) => {
+                    eprintln!("❌ {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+
+        Some(Commands::Resume) => {
+            let was_paused = clipd_core::pause::is_paused();
+            clipd_core::pause::resume();
+            println!(
+                "{}",
+                if was_paused { "▶️  Capture resumed" } else { "Capture wasn't paused" }
+            );
         }
 
         Some(Commands::Clear { slot, all, before }) => {
@@ -968,6 +1003,26 @@ fn cmd_slots() {
     println!("    Cmd+C × N or Ctrl+C × N  → save to slot");
     println!("    Cmd+V × N or Ctrl+V × N  → paste from slot");
     println!("  {}", "─".repeat(50));
+}
+
+/// `15m`, `2h`, `90m`, `tomorrow`, or nothing (until resumed).
+fn parse_pause(duration: Option<&str>) -> Result<clipd_core::pause::PauseFor, String> {
+    use clipd_core::pause::PauseFor;
+    let Some(raw) = duration.map(str::trim).filter(|d| !d.is_empty()) else {
+        return Ok(PauseFor::Indefinitely);
+    };
+    if raw.eq_ignore_ascii_case("tomorrow") {
+        return Ok(PauseFor::UntilTomorrow);
+    }
+    let (number, unit) = raw.split_at(raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len()));
+    let n: i64 = number
+        .parse()
+        .map_err(|_| format!("\"{raw}\" isn't a duration — try 15m, 1h or tomorrow"))?;
+    match unit.trim() {
+        "" | "m" | "min" | "mins" | "minutes" => Ok(PauseFor::Minutes(n)),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Ok(PauseFor::Minutes(n * 60)),
+        other => Err(format!("unknown unit \"{other}\" — use m or h (e.g. 15m, 1h)")),
+    }
 }
 
 fn cmd_stats() {
@@ -1817,5 +1872,23 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{}…", end)
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod pause_cli_tests {
+    use super::parse_pause;
+    use clipd_core::pause::PauseFor;
+
+    #[test]
+    fn durations_parse_the_way_people_type_them() {
+        assert_eq!(parse_pause(None), Ok(PauseFor::Indefinitely));
+        assert_eq!(parse_pause(Some("15m")), Ok(PauseFor::Minutes(15)));
+        assert_eq!(parse_pause(Some("90")), Ok(PauseFor::Minutes(90)));
+        assert_eq!(parse_pause(Some("2h")), Ok(PauseFor::Minutes(120)));
+        assert_eq!(parse_pause(Some("1 hour")), Ok(PauseFor::Minutes(60)));
+        assert_eq!(parse_pause(Some("Tomorrow")), Ok(PauseFor::UntilTomorrow));
+        assert!(parse_pause(Some("soon")).is_err());
+        assert!(parse_pause(Some("5d")).is_err());
     }
 }

@@ -25,6 +25,8 @@ pub mod session;
 pub mod slots;
 pub mod focus;
 pub mod keyboard_layout;
+pub mod link_clean;
+pub mod pause;
 pub mod import;
 pub mod skills;
 pub mod snippets;

@@ -3470,6 +3470,29 @@ pub(crate) fn make_window_key(frame: &eframe::Frame) {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn make_window_key(_frame: &eframe::Frame) {}
 
+/// Let screen sharing, recordings and screenshots see this process's windows,
+/// or not. Every window, not just the one egui draws in: AppKit keeps helper
+/// windows too, and "hidden from screen sharing" should not have exceptions.
+#[cfg(target_os = "macos")]
+fn set_window_capturable(frame: &eframe::Frame, capturable: bool) -> bool {
+    use objc2_app_kit::{NSApplication, NSWindowSharingType};
+    let sharing = if capturable {
+        NSWindowSharingType::ReadOnly
+    } else {
+        NSWindowSharingType::None
+    };
+    let Some(window) = ns_metal_view(frame).and_then(|v| v.window()) else {
+        return false;
+    };
+    window.setSharingType(sharing);
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
+        for other in NSApplication::sharedApplication(mtm).windows().iter() {
+            other.setSharingType(sharing);
+        }
+    }
+    true
+}
+
 /// Let the popover follow the pointer while clipd is not the active app.
 ///
 /// winit tracks the mouse with old-style tracking rects, and AppKit sends
@@ -4502,6 +4525,10 @@ struct ClipdGui {
     hud_watcher_started: bool,
     /// The popover's always-active pointer tracking is installed.
     hud_pointer_tracked: bool,
+    /// What the window's screen-capture setting was last set to.
+    screen_share_hidden: Option<bool>,
+    /// When privacy settings were last read from disk.
+    privacy_read_at: Instant,
     /// Clips whose preview is a redaction, so their tooltip stays hidden.
     masked_clip_ids: HashSet<i64>,
     /// Every slot each text is in. `ClipEntry.slot` holds one; the same text
@@ -4787,6 +4814,8 @@ impl ClipdGui {
             island_surface,
             hud_watcher_started: false,
             hud_pointer_tracked: false,
+            screen_share_hidden: None,
+            privacy_read_at: Instant::now(),
             masked_clip_ids,
             slots_by_content,
             hud_slots_view: false,
@@ -4921,6 +4950,8 @@ impl ClipdGui {
             .and_then(|&i| self.clips.get(i))
             .map(|c| c.id);
 
+        // Privacy switches can change in another clipd window; pick them up.
+        self.privacy_config = clipd_core::privacy::load_privacy_config();
         let before: Vec<i64> = self.clips.iter().map(|clip| clip.id).collect();
         self.clips = self.store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
         self.slots_by_content = sync_active_slot_labels(&self.store, &mut self.clips);
@@ -7428,6 +7459,21 @@ impl eframe::App for ClipdGui {
                     asked.elapsed().as_millis(),
                     ctx.input(|i| i.viewport().focused).unwrap_or(false)
                 );
+            }
+        }
+        // "Hide clipd from screen sharing": keep this window out of shares,
+        // recordings and screenshots — applied when the setting changes.
+        // Re-read every couple of seconds, hidden or not: the switch must be
+        // in force before a parked window is next shown, not a frame after.
+        if self.privacy_read_at.elapsed() >= Duration::from_secs(2) {
+            self.privacy_config = clipd_core::privacy::load_privacy_config();
+            self.privacy_read_at = Instant::now();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let hide = self.privacy_config.hide_from_screen_share;
+            if self.screen_share_hidden != Some(hide) && set_window_capturable(frame, !hide) {
+                self.screen_share_hidden = Some(hide);
             }
         }
         // How long a window takes to appear is the first thing anyone feels.
@@ -11922,6 +11968,115 @@ impl ClipdGui {
                     "Skip social-security-number patterns",
                 );
             });
+        });
+
+        settings_section(ui, c, "History & sharing");
+        settings_card(ui, c, |ui| {
+            // Pause: a stretch that leaves no history.
+            settings_card_body(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let status = clipd_core::pause::status_label();
+                    ui.label(
+                        RichText::new(status.as_deref().unwrap_or("Recording copies"))
+                            .size(12.0)
+                            .color(rgb(if status.is_some() { c.accent } else { c.text })),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        use clipd_core::pause::{pause, resume, PauseFor};
+                        if status.is_some() {
+                            if ui.button("Resume").clicked() {
+                                resume();
+                            }
+                        } else {
+                            if ui.button("Pause 1 h").clicked() {
+                                pause(PauseFor::Minutes(60));
+                            }
+                            if ui.button("Pause 15 min").clicked() {
+                                pause(PauseFor::Minutes(15));
+                            }
+                        }
+                    });
+                });
+            });
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Send,
+                &mut self.privacy_config.strip_link_trackers,
+                "Clean copied links",
+                "Remove utm_ and click-tracking parameters, so you paste the clean link",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Key,
+                &mut self.privacy_config.expire_one_time_codes,
+                "Forget one-time codes",
+                "2FA codes copied from Messages, Mail or an authenticator are deleted after a few minutes",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Lock,
+                &mut self.privacy_config.expire_likely_passwords,
+                "Forget likely passwords too",
+                "Also delete clips that look like generated passwords (may catch tokens you meant to keep)",
+            );
+            settings_card_divider(ui, c);
+            settings_card_body(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Delete them after").size(12.0).color(rgb(c.text)));
+                    dirty |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.privacy_config.short_lived_minutes)
+                                .range(1..=1440)
+                                .suffix(" min"),
+                        )
+                        .changed();
+                });
+            });
+            settings_card_divider(ui, c);
+            settings_card_body(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Keep history").size(12.0).color(rgb(c.text)));
+                    const KEEP: [(u32, &str); 6] = [
+                        (0, "Forever"),
+                        (1, "1 day"),
+                        (7, "1 week"),
+                        (30, "30 days"),
+                        (90, "90 days"),
+                        (365, "1 year"),
+                    ];
+                    let days = self.privacy_config.keep_history_days;
+                    let current = KEEP
+                        .iter()
+                        .find(|(d, _)| *d == days)
+                        .map(|(_, l)| l.to_string())
+                        .unwrap_or_else(|| format!("{days} days"));
+                    egui::ComboBox::from_id_salt("keep_history_days")
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for (d, label) in KEEP {
+                                dirty |= ui
+                                    .selectable_value(&mut self.privacy_config.keep_history_days, d, label)
+                                    .changed();
+                            }
+                        });
+                    ui.label(RichText::new("pinned clips are always kept").size(11.0).color(rgb(c.subtext)));
+                });
+            });
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Eye,
+                &mut self.privacy_config.hide_from_screen_share,
+                "Hide clipd from screen sharing",
+                "Keep clipd's windows and toasts out of Zoom, Meet, recordings and screenshots",
+            );
         });
 
         settings_section(ui, c, "Excluded apps");

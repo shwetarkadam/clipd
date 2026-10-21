@@ -36,6 +36,11 @@ const MENU_ID_SETTINGS: &str = "settings";
 const MENU_ID_FIX_KEYBOARD: &str = "fix_keyboard";
 const MENU_ID_HOVER: &str = "hover_opens_hud";
 const MENU_ID_ISLAND: &str = "island_layout";
+const MENU_ID_PAUSE_15: &str = "pause_15";
+const MENU_ID_PAUSE_60: &str = "pause_60";
+const MENU_ID_PAUSE_TOMORROW: &str = "pause_tomorrow";
+const MENU_ID_PAUSE_ON: &str = "pause_until_resumed";
+const MENU_ID_RESUME: &str = "resume_capture";
 /// Menu ids for saved passwords are `vault:<row>`, indexing into the snapshot
 /// the menu was last built from.
 const MENU_ID_VAULT_PREFIX: &str = "vault:";
@@ -397,6 +402,11 @@ fn notify(title: &str, body: &str) {
     log::info!("{title}: {body}");
 }
 
+/// "Pause capture", or when it is paused, until when.
+fn pause_menu_title() -> String {
+    clipd_core::pause::status_label().unwrap_or_else(|| "Pause capture".to_string())
+}
+
 fn hud_tray_label(hud_on: bool) -> String {
     // macOS shows the Swift HUD overlay; Windows shows overlay/toast
     // notifications — same setting, platform-accurate name.
@@ -583,7 +593,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&item_fix_keyboard)?;
     }
+    // Pause capture: a stretch that leaves no history (a screen share, a
+    // banking session). Its title says when it ends, so the state is visible
+    // every time the menu opens.
+    let pause_menu = Submenu::new(pause_menu_title(), true);
+    let item_resume = MenuItem::with_id(MENU_ID_RESUME, "Resume capture", clipd_core::pause::is_paused(), None);
+    pause_menu.append(&MenuItem::with_id(MENU_ID_PAUSE_15, "For 15 minutes", true, None))?;
+    pause_menu.append(&MenuItem::with_id(MENU_ID_PAUSE_60, "For 1 hour", true, None))?;
+    pause_menu.append(&MenuItem::with_id(MENU_ID_PAUSE_TOMORROW, "Until tomorrow", true, None))?;
+    pause_menu.append(&MenuItem::with_id(MENU_ID_PAUSE_ON, "Until I resume", true, None))?;
+    pause_menu.append(&PredefinedMenuItem::separator())?;
+    pause_menu.append(&item_resume)?;
+
     menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&pause_menu)?;
     menu.append(&item_daemon)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&item_quit)?;
@@ -801,6 +824,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // window, and a tray row offering to show an island already at the
             // notch is worse than no row at all.
             item_island.set_text(island_tray_label(clipd_core::island_layout_active()));
+            // A pause ends on its own; the menu has to notice.
+            pause_menu.set_text(pause_menu_title());
+            item_resume.set_enabled(clipd_core::pause::is_paused());
             last_clip_refresh = std::time::Instant::now();
         }
 
@@ -996,6 +1022,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         s.hud_enabled = !s.hud_enabled;
                         save_paste_transform_settings(&s);
                         item_hud.set_text(hud_tray_label(s.hud_enabled));
+                    }
+                    MENU_ID_PAUSE_15 | MENU_ID_PAUSE_60 | MENU_ID_PAUSE_TOMORROW | MENU_ID_PAUSE_ON => {
+                        use clipd_core::pause::PauseFor;
+                        clipd_core::pause::pause(match menu_event.id.0.as_str() {
+                            MENU_ID_PAUSE_15 => PauseFor::Minutes(15),
+                            MENU_ID_PAUSE_60 => PauseFor::Minutes(60),
+                            MENU_ID_PAUSE_TOMORROW => PauseFor::UntilTomorrow,
+                            _ => PauseFor::Indefinitely,
+                        });
+                        pause_menu.set_text(pause_menu_title());
+                        item_resume.set_enabled(true);
+                    }
+                    MENU_ID_RESUME => {
+                        clipd_core::pause::resume();
+                        pause_menu.set_text(pause_menu_title());
+                        item_resume.set_enabled(false);
                     }
                     MENU_ID_TUI_MODE => {
                         let enabled = !load_tui_mode();

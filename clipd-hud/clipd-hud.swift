@@ -40,6 +40,8 @@ struct Payload {
     /// open — so when it is the active layout the daemon sends the depth it
     /// occupies and the HUD opens below it instead of on top of it.
     var avoidTop: CGFloat = 0
+    /// Keep this toast out of screen sharing, recordings and screenshots.
+    var hidden = false
 }
 
 /// Where a panel of this height belongs, in AppKit's bottom-left origin.
@@ -75,6 +77,7 @@ func parse(_ text: String) -> Payload {
         case "PREVIEW": if f.count > 2 { p.previewKind = f[1]; p.preview = f[2] }
         case "TIMEOUT": if f.count > 1 { p.timeout = Double(f[1]) ?? 0 }
         case "AVOIDTOP": if f.count > 1 { p.avoidTop = CGFloat(Double(f[1]) ?? 0) }
+        case "PRIVATE": p.hidden = f.count > 1 && f[1] == "1"
         case "BTN":
             if f.count > 2 { p.buttons.append(Button(id: f[1], label: f[2], primary: f.count > 3 && f[3] == "1")) }
         case "ROW":
@@ -115,6 +118,8 @@ class HUD: NSObject {
     /// Bumped by every message, so a stale fade-out timer leaves a newer
     /// toast alone.
     var generation = 0
+    /// From the message being drawn: keep its panel out of screen capture.
+    var hideFromCapture = false
     /// Button ids for the `prompt` style, indexed by the button's tag.
     var choices: [String] = []
 
@@ -374,6 +379,7 @@ class HUD: NSObject {
         let mask: NSWindow.StyleMask = [.borderless, .nonactivatingPanel]
         panel = NSPanel(contentRect: rect, styleMask: mask, backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
+        panel.sharingType = hideFromCapture ? .none : .readOnly
         panel.becomesKeyOnlyIfNeeded = true
         panel.ignoresMouseEvents = true
         panel.level = .floating
@@ -524,6 +530,7 @@ class HUD: NSObject {
             ? PromptPanel(contentRect: rect, styleMask: mask, backing: .buffered, defer: false)
             : NSPanel(contentRect: rect, styleMask: mask, backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
+        panel.sharingType = hideFromCapture ? .none : .readOnly
         panel.becomesKeyOnlyIfNeeded = true
         // Passive HUDs must never swallow a click meant for the app underneath;
         // only the prompt is interactive.
@@ -580,6 +587,7 @@ class HUD: NSObject {
     /// on stdout, so they keep their own one-shot process.
     func display(_ text: String) {
         let p = parse(text)
+        hideFromCapture = p.hidden
         switch p.style {
         case "slot": showSlotToast(p)
         case "toast": showToast(p)
@@ -620,6 +628,7 @@ class HUD: NSObject {
     func show(text: String) {
         NSApplication.shared.setActivationPolicy(.accessory)
         let p = parse(text)
+        hideFromCapture = p.hidden
         switch p.style {
         case "slot": showSlotToast(p)
         case "toast": showToast(p)
