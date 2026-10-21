@@ -7667,8 +7667,10 @@ impl eframe::App for ClipdGui {
             // one?" asks a cheap question expensively — and it is the only
             // work this process does at rest. Read the newest row, and reload
             // the rest only when the answer changed.
-            let only_watching = self.island_surface
-                && self.island.phase == island::IslandPhase::Hidden;
+            // Open or closed, the island asks the cheap question. A full
+            // reload is 60–110ms on the main thread, and running it every 3s
+            // while the panel was open froze the island mid-read.
+            let only_watching = self.island_surface;
             if only_watching {
                 let newest = self
                     .store
