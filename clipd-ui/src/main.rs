@@ -624,6 +624,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // they use the same agent + template pattern.
     #[cfg(target_os = "macos")]
     adopt_accessory_activation_policy();
+    #[cfg(target_os = "macos")]
+    claim_visible_menu_bar_spot();
 
     let main_tray_id = TrayIconId::new(MAIN_TRAY_ID);
     let tray_icon = {
@@ -1256,6 +1258,38 @@ impl SettingsHotkeys {
     }
 }
 
+
+/// Start the status item near the right of the menu bar, unless it already
+/// has a place.
+///
+/// macOS puts a new status item at the far left of the extras, next to the
+/// notch. On a full menu bar — common on a 14" MacBook — that spot is *under*
+/// the notch, and the icon is invisible: Clipd is running, and there is no way
+/// to find it. Every app's item position is a default, "NSStatusItem Preferred
+/// Position <autosave name>" (points from the right edge), which macOS writes
+/// when you ⌘-drag the icon. Seeding it before the item exists puts Clipd
+/// among the system icons, where the notch never reaches; a ⌘-drag afterwards
+/// overwrites it like for any other app.
+#[cfg(target_os = "macos")]
+fn claim_visible_menu_bar_spot() {
+    // The main tray icon is this app's first status item.
+    const KEY: &str = "NSStatusItem Preferred Position Item-0";
+    // Just left of Wi-Fi / battery / Control Centre on a default bar.
+    const FROM_RIGHT_EDGE: &str = "380";
+    let domain = "dev.clipd.app";
+    let known = Command::new("/usr/bin/defaults")
+        .args(["read", domain, KEY])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !known {
+        let _ = Command::new("/usr/bin/defaults")
+            .args(["write", domain, KEY, "-float", FROM_RIGHT_EDGE])
+            .status();
+        log::info!("clipd-ui: placing the status item {FROM_RIGHT_EDGE}pt from the right edge");
+    }
+}
 
 // ── Updates ──
 //
