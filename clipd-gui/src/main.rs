@@ -2013,6 +2013,36 @@ fn spotlight_pos(cursor: egui::Pos2, win_size: egui::Vec2) -> egui::Pos2 {
     }
 }
 
+/// Beside the text cursor the daemon read for this summon, if it read one
+/// (see `clipd_core::caret`). Kept clear of the island band like everything
+/// else that opens at the top.
+fn caret_window_pos(win_size: egui::Vec2) -> Option<egui::Pos2> {
+    let caret = clipd_core::caret::take_fresh()?;
+    let point = egui::pos2(caret.x as f32, caret.y as f32);
+    let displays = island::displays();
+    let r = displays
+        .iter()
+        .map(|d| d.rect)
+        .find(|r| r.contains(point))
+        .or_else(|| displays.first().map(|d| d.rect))?;
+    let min_top = if clipd_core::island_layout_active() {
+        clipd_core::ISLAND_RESERVED_TOP
+    } else {
+        24.0
+    };
+    let (x, y) = clipd_core::caret::place_near(
+        caret,
+        (win_size.x as f64, win_size.y as f64),
+        (
+            r.left() as f64,
+            (r.top() + min_top) as f64,
+            r.right() as f64,
+            r.bottom() as f64,
+        ),
+    );
+    Some(egui::pos2(x as f32, y as f32))
+}
+
 fn window_pos_at_cursor(
     cursor: egui::Pos2,
     win_size: egui::Vec2,
@@ -2967,6 +2997,9 @@ mod frame_diag {
 
 /// When this process started, for the "first frame" log line.
 static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+/// The window was created beside the text cursor (see `caret_window_pos`).
+static PLACED_AT_CARET_ON_LAUNCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// A send the window was closed in the middle of, handed over by `on_exit`.
 static UNFINISHED_SEND: std::sync::Mutex<Option<std::sync::mpsc::Receiver<(bool, String)>>> =
@@ -3125,11 +3158,15 @@ fn main() -> eframe::Result {
         };
         viewport = viewport.with_position([left, top]);
     } else if cfg!(target_os = "macos") {
-        // Open where the user is working: palette appears at the mouse cursor.
-        // macOS only at startup (CG reports points directly); on Windows the
-        // scale factor isn't known until the first frame, where the focus-gain
-        // handler repositions to the cursor anyway.
-        if let Some(cursor) = global_cursor_position() {
+        // Open where the user is working: beside the text cursor when the
+        // daemon read one, else at the mouse cursor. macOS only at startup (CG
+        // reports points directly); on Windows the scale factor isn't known
+        // until the first frame, where the focus-gain handler repositions to
+        // the cursor anyway.
+        if let Some(pos) = caret_window_pos(egui::vec2(COMPACT_W, WIN_H)) {
+            viewport = viewport.with_position([pos.x, pos.y]);
+            PLACED_AT_CARET_ON_LAUNCH.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if let Some(cursor) = global_cursor_position() {
             let pos =
                 window_pos_at_cursor(cursor, egui::vec2(COMPACT_W, WIN_H), main_display_size());
             viewport = viewport.with_position([pos.x, pos.y]);
@@ -4420,6 +4457,9 @@ struct ClipdGui {
     /// When the window was last shown; focus churn right after a show (the
     /// tray or popover handing over) is not "clicking away".
     main_shown_at: Option<Instant>,
+    /// This summon put the window beside the text cursor; the focus-gain
+    /// reposition to the pointer's display must leave it there.
+    placed_at_caret: bool,
     /// Keep putting the caret in the search field until this moment. One
     /// request on the frame the window appears can land before macOS has made
     /// it the key window and be dropped — the window came up focused with no
@@ -4752,6 +4792,7 @@ impl ClipdGui {
             main_show_asked: None,
             main_had_focus: false,
             main_shown_at: None,
+            placed_at_caret: PLACED_AT_CARET_ON_LAUNCH.load(std::sync::atomic::Ordering::Relaxed),
             focus_search_until: None,
             was_focused: true,
             vault_targets: available_targets(),
@@ -5041,7 +5082,13 @@ impl ClipdGui {
             ));
             ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-            if let Some(cursor) = global_cursor_position() {
+            let at_caret = (mode == SurfaceMode::Main)
+                .then(|| caret_window_pos(size))
+                .flatten();
+            self.placed_at_caret = at_caret.is_some();
+            if let Some(pos) = at_caret {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            } else if let Some(cursor) = global_cursor_position() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(spotlight_pos(cursor, size)));
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -7741,7 +7788,7 @@ impl eframe::App for ClipdGui {
                 || ctx
                     .input(|i| i.viewport().native_pixels_per_point)
                     .is_some();
-            if !pointer_down && scale_known {
+            if !pointer_down && scale_known && !self.placed_at_caret {
                 if let Some(cursor) = cursor_in_points(ctx) {
                     let outside = ctx
                         .input(|i| i.viewport().outer_rect)
@@ -8385,6 +8432,38 @@ impl ClipdGui {
                         }
                     });
                 };
+                // Slots view: offer to type slots 1…N into a form, Tab
+                // between fields (see clipd_core::form_fill).
+                let mut fill_form = false;
+                if self.content_filter == ContentFilter::Slots || (self.hud && self.hud_slots_view) {
+                    let active = self.active_slots_cached();
+                    let fields = clipd_core::form_fill::fields(|n| {
+                        active.iter().find(|(slot, _)| *slot == n).map(|(_, text)| text.clone())
+                    })
+                    .len();
+                    if fields >= 2 {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            let resp = ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(format!("⇥  Fill a form with slots 1–{fields}"))
+                                            .size(12.5)
+                                            .color(rgb(c.accent)),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text(
+                                    "Click into the form's first field first. Clipd pastes each slot and presses Tab between them.",
+                                );
+                            if resp.clicked() {
+                                fill_form = true;
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                }
                 let mut last_group: Option<&'static str> = None;
                 for (display_idx, &clip_idx) in visible_indices.iter().enumerate() {
                     let clip = &self.clips[clip_idx];
@@ -8888,7 +8967,23 @@ impl ClipdGui {
                     self.pins_expanded = !self.pins_expanded;
                     self.apply_filter();
                 }
+                if fill_form {
+                    self.start_form_fill(ui.ctx());
+                }
             });
+    }
+
+    /// Get out of the way of the form, then have the daemon type into it.
+    fn start_form_fill(&mut self, ctx: &egui::Context) {
+        if self.hud {
+            // The popover never took focus: the form's app still has it.
+            self.hide_hud_offscreen(ctx);
+            clipd_core::form_fill::request(150);
+        } else {
+            self.hide_main_window(ctx);
+            return_focus_to_previous_app();
+            clipd_core::form_fill::request(400);
+        }
     }
 
     #[allow(dead_code)]
@@ -9025,6 +9120,15 @@ impl ClipdGui {
                 &mut self.paste_settings.return_focus_after_copy,
                 "Paste into previous app",
                 "Jump back and paste after you pick a clip",
+            );
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Keyboard,
+                &mut self.paste_settings.open_at_caret,
+                "Open at the text cursor",
+                "The shortcut opens Clipd beside where you're typing",
             );
             settings_card_divider(ui, c);
             dirty |= settings_toggle_row(
@@ -12076,6 +12180,25 @@ impl ClipdGui {
                 &mut self.privacy_config.hide_from_screen_share,
                 "Hide clipd from screen sharing",
                 "Keep clipd's windows and toasts out of Zoom, Meet, recordings and screenshots",
+            );
+        });
+
+        settings_section(ui, c, "AI apps (MCP)");
+        settings_card(ui, c, |ui| {
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Sparkle,
+                &mut self.privacy_config.mcp_writes_need_approval,
+                "Ask before AI apps change anything",
+                "Claude, Cursor and others can search your clips; putting text on your clipboard or saving clips needs your OK",
+            );
+            settings_card_divider(ui, c);
+            settings_card_copy(
+                ui,
+                c,
+                "Secrets are never shared",
+                "Clips that look like passwords, keys or one-time codes are withheld from AI apps. Every request is logged in clipd-mcp.log.",
             );
         });
 

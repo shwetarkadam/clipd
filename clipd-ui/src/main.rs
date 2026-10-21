@@ -41,6 +41,7 @@ const MENU_ID_PAUSE_60: &str = "pause_60";
 const MENU_ID_PAUSE_TOMORROW: &str = "pause_tomorrow";
 const MENU_ID_PAUSE_ON: &str = "pause_until_resumed";
 const MENU_ID_RESUME: &str = "resume_capture";
+const MENU_ID_FILL_FORM: &str = "fill_form";
 /// Menu ids for saved passwords are `vault:<row>`, indexing into the snapshot
 /// the menu was last built from.
 const MENU_ID_VAULT_PREFIX: &str = "vault:";
@@ -606,6 +607,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pause_menu.append(&item_resume)?;
 
     menu.append(&PredefinedMenuItem::separator())?;
+    // Types slots 1…N into the focused form, Tab between fields.
+    menu.append(&MenuItem::with_id(MENU_ID_FILL_FORM, "Fill form from slots", true, None))?;
     menu.append(&pause_menu)?;
     menu.append(&item_daemon)?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -1033,6 +1036,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                         pause_menu.set_text(pause_menu_title());
                         item_resume.set_enabled(true);
+                    }
+                    MENU_ID_FILL_FORM => {
+                        // The menu closing hands focus straight back to the
+                        // form; a moment more lets it settle first.
+                        clipd_core::form_fill::request(250);
                     }
                     MENU_ID_RESUME => {
                         clipd_core::pause::resume();

@@ -116,6 +116,13 @@ enum Commands {
     /// Start recording copies again after `clipd pause`
     Resume,
 
+    /// Type slots 1…N into a form, pressing Tab between fields
+    Fill {
+        /// Seconds to wait first, to click into the form's first field
+        #[arg(long, default_value_t = 3)]
+        delay: u64,
+    },
+
     /// Clear clipboard history or slots
     Clear {
         /// Clear a specific slot
@@ -396,6 +403,27 @@ fn main() {
                     eprintln!("❌ {e}");
                     std::process::exit(2);
                 }
+            }
+        }
+
+        Some(Commands::Fill { delay }) => {
+            let slots = SlotManager::persistent_default().ok();
+            let fields = clipd_core::form_fill::fields(|n| {
+                slots.as_ref().and_then(|s| s.get_slot(n).ok().flatten())
+            });
+            if fields.is_empty() {
+                println!("Nothing to fill: slot 1 is empty. Copy into slots with ⌘C ⌘C, ⌘C ⌘C ⌘C…");
+            } else if !clipd_core::is_daemon_running() {
+                println!("clipd isn't running, so nothing can type for you. Start it with `clipd daemon` or open Clipd.");
+            } else {
+                // The request itself waits (up to 3s); count down here for longer.
+                let delay = delay.min(30);
+                println!(
+                    "Click into the first field — filling {} field(s) in {delay}s…",
+                    fields.len()
+                );
+                std::thread::sleep(std::time::Duration::from_secs(delay.saturating_sub(1)));
+                clipd_core::form_fill::request(delay.min(1) * 1000);
             }
         }
 

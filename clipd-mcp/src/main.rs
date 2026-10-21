@@ -1,4 +1,5 @@
 use chrono::{Duration, Utc};
+use clipd_core::mcp_consent;
 use clipd_core::{
     all_transforms, apply_transform, compute_sessions, embedding_cosine, generate_embedding,
     is_embedding_available, load_transform_config, AskConfig, AskFilters, AskThread, ClipEntry,
@@ -64,7 +65,7 @@ fn tool_definitions() -> Value {
         "tools": [
             {
                 "name": "search_clips",
-                "description": "Search clipboard history. 'hybrid' (default) merges exact full-text matches with semantic (by-meaning) matches; semantic uses stored embeddings when available, TF-IDF otherwise. Image clips match via their OCR text.",
+                "description": "Search clipboard history. 'hybrid' (default) merges exact full-text matches with semantic (by-meaning) matches; semantic uses stored embeddings when available, TF-IDF otherwise. Image clips match via their OCR text. Clips that look like passwords, keys or one-time codes are withheld.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -79,7 +80,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "set_clipboard",
-                "description": "Put text on the user's clipboard so they can paste it anywhere. clipd's history records it automatically.",
+                "description": "Put text on the user's clipboard so they can paste it anywhere. clipd's history records it automatically. clipd asks the user to approve this first; if they decline, say so rather than retrying.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -90,7 +91,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "add_clip",
-                "description": "Save text into clipd history WITHOUT touching the live clipboard (e.g. stash a result for later).",
+                "description": "Save text into clipd history WITHOUT touching the live clipboard (e.g. stash a result for later). clipd asks the user to approve this first; if they decline, say so rather than retrying.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -112,7 +113,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "save_snippet",
-                "description": "Create or update a snippet: reusable text the user recalls by typing its trigger in clipd's search.",
+                "description": "Create or update a snippet: reusable text the user recalls by typing its trigger in clipd's search. clipd asks the user to approve this first; if they decline, say so rather than retrying.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -222,18 +223,73 @@ fn tool_definitions() -> Value {
 
 struct McpServer {
     store: ClipStore,
+    /// The AI app on the other end, as it named itself in `initialize`.
+    client: std::cell::RefCell<String>,
+    /// Privacy settings, re-read for each tool call.
+    privacy: std::cell::RefCell<clipd_core::PrivacyConfig>,
+    /// Clips withheld as secrets during the current tool call.
+    withheld: std::cell::Cell<usize>,
 }
 
 impl McpServer {
     fn new() -> Self {
         let db_path = ClipStore::default_path();
         let store = ClipStore::new(&db_path).expect("Failed to open clip database");
-        Self { store }
+        Self {
+            store,
+            client: std::cell::RefCell::new("An AI app".to_string()),
+            privacy: std::cell::RefCell::new(clipd_core::privacy::load_privacy_config()),
+            withheld: std::cell::Cell::new(0),
+        }
+    }
+
+    /// `text` to show for a clip whose content is `content` — or the
+    /// placeholder, if that clip must not reach an AI. See `mcp_consent`.
+    fn shown(&self, text: &str, content: &str, source_app: Option<&str>) -> String {
+        if mcp_consent::withhold_from_ai(content, source_app, &self.privacy.borrow()) {
+            self.withheld.set(self.withheld.get() + 1);
+            mcp_consent::WITHHELD.to_string()
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn clip_json(&self, clip: &clipd_core::ClipEntry) -> Value {
+        let mut v = clip_to_json(clip);
+        let app = clip.source_app.as_deref();
+        if mcp_consent::withhold_from_ai(&clip.content, app, &self.privacy.borrow()) {
+            self.withheld.set(self.withheld.get() + 1);
+            v["content"] = Value::String(mcp_consent::WITHHELD.to_string());
+            v["preview"] = Value::String(mcp_consent::WITHHELD.to_string());
+        }
+        v
+    }
+
+    /// Ask the person before a write. Err carries what to tell the AI.
+    fn approve(&self, tool: &str, action: &str, preview: &str) -> Result<(), String> {
+        if mcp_consent::approve_write(&self.client.borrow(), tool, action, preview) {
+            Ok(())
+        } else {
+            Err("The user declined this request in clipd, so nothing was changed. \
+                 Tell them, rather than trying again."
+                .to_string())
+        }
     }
 
     fn handle_request(&self, req: &JsonRpcRequest) -> JsonRpcResponse {
         match req.method.as_str() {
-            "initialize" => self.handle_initialize(req.id.clone()),
+            "initialize" => {
+                if let Some(name) = req
+                    .params
+                    .get("clientInfo")
+                    .and_then(|c| c.get("name"))
+                    .and_then(|n| n.as_str())
+                    .filter(|n| !n.trim().is_empty())
+                {
+                    *self.client.borrow_mut() = name.trim().to_string();
+                }
+                self.handle_initialize(req.id.clone())
+            }
             "notifications/initialized" => ok_response(req.id.clone(), Value::Null),
             "tools/list" => self.handle_tools_list(req.id.clone()),
             "tools/call" => self.handle_tools_call(req.id.clone(), &req.params),
@@ -270,6 +326,16 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let arguments = params.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
+        *self.privacy.borrow_mut() = clipd_core::privacy::load_privacy_config();
+        self.withheld.set(0);
+        let text_arg = |key: &str| {
+            arguments
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let is_write = matches!(tool_name, "set_clipboard" | "add_clip" | "save_snippet");
 
         let result = match tool_name {
             "search_clips" => self.tool_search_clips(&arguments),
@@ -279,16 +345,29 @@ impl McpServer {
             "list_transforms" => self.tool_list_transforms(),
             "get_sessions" => self.tool_get_sessions(&arguments),
             "stats" => self.tool_stats(),
-            "set_clipboard" => self.tool_set_clipboard(&arguments),
-            "add_clip" => self.tool_add_clip(&arguments),
+            "set_clipboard" => self
+                .approve("set_clipboard", "put text on your clipboard", &text_arg("content"))
+                .and_then(|()| self.tool_set_clipboard(&arguments)),
+            "add_clip" => self
+                .approve("add_clip", "save a clip to your clipd history", &text_arg("content"))
+                .and_then(|()| self.tool_add_clip(&arguments)),
             "list_slots" => self.tool_list_slots(),
             "list_snippets" => self.tool_list_snippets(),
-            "save_snippet" => self.tool_save_snippet(&arguments),
+            "save_snippet" => self
+                .approve(
+                    "save_snippet",
+                    &format!("save a snippet triggered by \"{}\"", text_arg("trigger")),
+                    &text_arg("body"),
+                )
+                .and_then(|()| self.tool_save_snippet(&arguments)),
             "list_collections" => self.tool_list_collections(),
             "get_collection" => self.tool_get_collection(&arguments),
             "ask" => self.tool_ask(&arguments),
             _ => Err(format!("Unknown tool: {}", tool_name)),
         };
+        if !is_write {
+            mcp_consent::audit_read(&self.client.borrow(), tool_name, self.withheld.get());
+        }
 
         match result {
             Ok(content) => ok_response(
@@ -337,7 +416,7 @@ impl McpServer {
                     .map(|c| {
                         serde_json::json!({
                             "id": c.id,
-                            "preview": c.preview,
+                            "preview": self.shown(&c.preview, &c.content, c.source_app.as_deref()),
                             "content_type": c.content_type.as_str(),
                             "source_app": c.source_app,
                             "timestamp": c.timestamp.to_rfc3339(),
@@ -440,7 +519,7 @@ impl McpServer {
             })
             .collect();
 
-        let entries: Vec<Value> = clips.iter().map(clip_to_json).collect();
+        let entries: Vec<Value> = clips.iter().map(|c| self.clip_json(c)).collect();
         serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
     }
 
@@ -531,7 +610,7 @@ impl McpServer {
                     n.to_string()
                 };
                 let preview: String = content.chars().take(120).collect();
-                serde_json::json!({ "slot": label, "preview": preview })
+                serde_json::json!({ "slot": label, "preview": self.shown(&preview, content, None) })
             })
             .collect();
         serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
@@ -605,7 +684,7 @@ impl McpServer {
             .map(|i| {
                 serde_json::json!({
                     "clip_id": i.clip_id,
-                    "content": i.content,
+                    "content": self.shown(&i.content, &i.content, None),
                     "added_at": i.added_at.to_rfc3339(),
                 })
             })
@@ -620,7 +699,7 @@ impl McpServer {
             .unwrap_or(10) as usize;
 
         let clips = self.store.get_recent(limit).map_err(|e| e.to_string())?;
-        let entries: Vec<Value> = clips.iter().map(clip_to_json).collect();
+        let entries: Vec<Value> = clips.iter().map(|c| self.clip_json(c)).collect();
         serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())
     }
 
@@ -631,7 +710,7 @@ impl McpServer {
             .ok_or("Missing 'id' parameter")?;
 
         let clip = self.store.get_by_id(id).map_err(|e| e.to_string())?;
-        serde_json::to_string_pretty(&clip_to_json(&clip)).map_err(|e| e.to_string())
+        serde_json::to_string_pretty(&self.clip_json(&clip)).map_err(|e| e.to_string())
     }
 
     fn tool_transform(&self, args: &Value) -> Result<String, String> {
@@ -766,7 +845,7 @@ impl McpServer {
             "invalid_citations": answer.invalid_citations,
             "sources": answer.sources.iter().map(|s| serde_json::json!({
                 "clip_id": s.clip_id,
-                "preview": s.preview,
+                "preview": self.shown(&s.preview, &s.preview, s.source_app.as_deref()),
                 "source_app": s.source_app,
                 "timestamp": s.timestamp.to_rfc3339(),
                 "matched_by": s.matched_by,
@@ -774,7 +853,7 @@ impl McpServer {
             })).collect::<Vec<_>>(),
             "retrieved": answer.retrieved.iter().map(|r| serde_json::json!({
                 "clip_id": r.clip.id,
-                "preview": r.clip.preview,
+                "preview": self.shown(&r.clip.preview, &r.clip.content, r.clip.source_app.as_deref()),
                 "source_app": r.clip.source_app,
                 "timestamp": r.clip.timestamp.to_rfc3339(),
                 "fused_score": r.fused_score,

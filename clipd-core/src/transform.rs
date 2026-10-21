@@ -496,6 +496,11 @@ pub struct PasteTransformSettings {
     #[serde(default = "default_true_val")]
     pub hover_opens_hud: bool,
 
+    /// Open the palette next to the text cursor when it is summoned from the
+    /// keyboard (falls back to the usual spot in apps that do not report one).
+    #[serde(default = "default_true_val")]
+    pub open_at_caret: bool,
+
     /// Show the running clip count in the popover. Some people read it as
     /// useful state, others as noise on a panel meant to be glanced at.
     #[serde(default = "default_true_val")]
@@ -608,6 +613,7 @@ impl Default for PasteTransformSettings {
             slot_tip_dismissed: false,
             hud_enabled: true,
             hover_opens_hud: true,
+            open_at_caret: true,
             show_clip_count: true,
             gui_layout: GuiLayout::Palette,
             copy_multi_tap_restore: true,

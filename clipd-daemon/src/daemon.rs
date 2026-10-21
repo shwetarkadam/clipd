@@ -239,6 +239,24 @@ pub fn run_daemon_with_stop(
             );
         })?;
 
+    // ── Form fill ──
+    // Fills asked for by the palette, the tray or `clipd fill`. A stat every
+    // 150ms of a file that is almost never there.
+    let fill_slot_mgr = slot_manager.clone();
+    let fill_suppress = suppress.clone();
+    let fill_stop = stop.clone();
+    let _fill_handle = std::thread::Builder::new()
+        .name("clipd-form-fill".into())
+        .spawn(move || {
+            while !fill_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(150));
+                if let Some(delay) = clipd_core::form_fill::take_request() {
+                    std::thread::sleep(delay);
+                    fill_form(&fill_slot_mgr, &fill_suppress);
+                }
+            }
+        })?;
+
     // ── Sync Inbox Thread ──
     // Announce this Mac in the shared iCloud folder and collect anything other
     // Macs have sent it. Polling rather than FSEvents: iCloud materialises
@@ -2292,11 +2310,98 @@ mod synth {
             command_via_system_events(letter);
         }
     }
+
+    /// kVK_Tab: the same key on every layout.
+    const TAB: u16 = 48;
+
+    /// A bare Tab, down then up.
+    pub fn tab() {
+        unsafe {
+            let source = CGEventSourceCreate(PRIVATE_STATE);
+            if source.is_null() {
+                return;
+            }
+            for down in [true, false] {
+                let event = CGEventCreateKeyboardEvent(source, TAB, down);
+                if event.is_null() {
+                    break;
+                }
+                CGEventSetFlags(event, 0);
+                CGEventPost(SESSION_TAP, event);
+                CFRelease(event);
+            }
+            CFRelease(source);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn simulate_undo() {
     synth::press('z');
+}
+
+#[cfg(target_os = "macos")]
+fn simulate_tab() {
+    synth::tab();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn simulate_tab() {
+    if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
+        #[cfg(target_os = "windows")]
+        release_windows_shortcut_modifiers(&mut enigo);
+        let _ = enigo.key(Key::Tab, Direction::Click);
+    }
+}
+
+/// Type slots 1…N into the focused form, Tab between fields (see
+/// `clipd_core::form_fill`), then put the clipboard back as it was.
+fn fill_form(mgr: &SlotManager, suppress: &AtomicBool) {
+    let fields = clipd_core::form_fill::fields(|n| mgr.get_slot(n).ok().flatten());
+    if fields.is_empty() {
+        log::info!("📝 Fill form: slot 1 is empty, nothing to fill");
+        #[cfg(target_os = "macos")]
+        show_hud("Nothing to fill — copy into slot 1 first (⌘C ⌘C)");
+        return;
+    }
+    let mut cb = match Clipboard::new() {
+        Ok(cb) => cb,
+        Err(e) => {
+            log::warn!("Fill form: no clipboard ({e})");
+            return;
+        }
+    };
+    let original = cb.get_text().ok();
+    suppress.store(true, Ordering::SeqCst);
+    let last = fields.len() - 1;
+    for (i, (slot, text)) in fields.iter().enumerate() {
+        if cb.set_text(text).is_err() {
+            log::warn!("Fill form: could not stage slot {slot}");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+        simulate_paste();
+        // The app reads the clipboard when it handles ⌘V, not when it is
+        // sent: changing it sooner would paste the next field's text here.
+        std::thread::sleep(Duration::from_millis(160));
+        if i < last {
+            simulate_tab();
+            std::thread::sleep(Duration::from_millis(70));
+        }
+    }
+    if let Some(orig) = original {
+        let _ = cb.set_text(orig);
+    }
+    std::thread::sleep(Duration::from_millis(60));
+    suppress.store(false, Ordering::SeqCst);
+    log::info!("📝 Filled {} field(s) from slots", fields.len());
+    #[cfg(target_os = "macos")]
+    show_hud(&format!(
+        "Filled {} field{} from slots 1–{}",
+        fields.len(),
+        if fields.len() == 1 { "" } else { "s" },
+        fields.len()
+    ));
 }
 
 #[cfg(target_os = "macos")]
@@ -3964,6 +4069,11 @@ fn open_gui() {
         if app != "clipd-gui" && app != "Clipd" && app != "clipd" {
             clipd_core::save_last_active_app(&app);
         }
+    }
+    // Read where the text cursor is while that app still has focus, so the
+    // palette can open beside it.
+    if load_paste_transform_settings().open_at_caret {
+        clipd_core::caret::capture();
     }
 
     // Only front an existing *palette*. The island and the tray popover are

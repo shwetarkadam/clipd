@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod ask;
 pub mod ask_eval;
+pub mod caret;
 pub mod enrichment;
 #[cfg(target_os = "macos")]
 pub mod macos_permissions;
@@ -24,8 +25,10 @@ pub mod semantic;
 pub mod session;
 pub mod slots;
 pub mod focus;
+pub mod form_fill;
 pub mod keyboard_layout;
 pub mod link_clean;
+pub mod mcp_consent;
 pub mod pause;
 pub mod import;
 pub mod skills;

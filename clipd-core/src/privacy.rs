@@ -99,6 +99,10 @@ pub struct PrivacyConfig {
     /// vanishes from your own screenshots surprises people who didn't ask.
     #[serde(default)]
     pub hide_from_screen_share: bool,
+    /// AI apps (over MCP) must ask before changing anything: putting text on
+    /// the clipboard, saving a clip or a snippet. Reading is never gated.
+    #[serde(default = "default_true")]
+    pub mcp_writes_need_approval: bool,
 }
 
 fn default_true() -> bool {
@@ -136,6 +140,7 @@ impl Default for PrivacyConfig {
             short_lived_minutes: default_short_lived_minutes(),
             keep_history_days: 0,
             hide_from_screen_share: false,
+            mcp_writes_need_approval: true,
         }
     }
 }
@@ -765,6 +770,7 @@ mod tests {
         let config: PrivacyConfig = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
         assert!(config.strip_link_trackers && config.expire_one_time_codes);
         assert!(!config.expire_likely_passwords && !config.hide_from_screen_share);
+        assert!(config.mcp_writes_need_approval, "AI writes ask first unless turned off");
         assert_eq!((config.short_lived_minutes, config.keep_history_days), (10, 0));
     }
 
