@@ -41,6 +41,9 @@ RES="$APP/Contents/Resources"
 mkdir -p "$MACOS" "$RES"
 
 cp -f target/release/clipd target/release/clipd-gui target/release/clipd-ui "$MACOS/"
+# The MCP server AI apps launch (README: Contents/MacOS/clipd-mcp). It asks
+# for approval through the clipd-hud next to it.
+cp -f target/release/clipd-mcp "$MACOS/"
 chmod +x "$MACOS/clipd" "$MACOS/clipd-gui" "$MACOS/clipd-ui"
 if [[ -f target/release/clipd-hud ]]; then
   cp -f target/release/clipd-hud "$MACOS/"
@@ -142,7 +145,7 @@ else
   echo "==> codesign (identity: ${SIGN_ID} — TCC grants persist across rebuilds)"
 fi
 if command -v codesign &>/dev/null; then
-  for bin in clipd clipd-gui clipd-ui clipd-hud clipd-ocr; do
+  for bin in clipd clipd-gui clipd-ui clipd-mcp clipd-hud clipd-ocr; do
     [[ -f "$MACOS/$bin" ]] || continue
     if ! codesign --force --sign "$SIGN_ID" "$MACOS/$bin"; then
       echo "ERROR: codesign failed for $MACOS/$bin using '$SIGN_ID'" >&2
