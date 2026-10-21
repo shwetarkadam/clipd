@@ -425,6 +425,9 @@ fn hud_tray_label(hud_on: bool) -> String {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
+    // Launched straight from a download: offer to install into Applications
+    // first, before anything is granted to (or started from) a temporary path.
+    clipd_core::install_location::offer_move_to_applications();
     // Before anything else: this notices whether the *last* run of the tray
     // ever exited cleanly, which is the only way to see a hard kill or a
     // crash below Rust's level.

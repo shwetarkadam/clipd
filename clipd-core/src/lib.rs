@@ -31,6 +31,7 @@ pub mod link_clean;
 pub mod mcp_consent;
 pub mod pause;
 pub mod import;
+pub mod install_location;
 pub mod skills;
 pub mod snippets;
 pub mod store;

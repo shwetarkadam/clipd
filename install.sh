@@ -243,6 +243,10 @@ install_macos() {
   fi
 
   INSTALL_DIR="/usr/local/bin"
+  # Releases from v0.4.24 carry the CLI only inside the app.
+  if [ ! -f "$SRC/clipd" ] && [ -f "$SRC/Clipd.app/Contents/MacOS/clipd" ]; then
+    cp -f "$SRC/Clipd.app/Contents/MacOS/clipd" "$SRC/clipd"
+  fi
   if [ -f "$SRC/clipd" ]; then
     if sudo mkdir -p "$INSTALL_DIR" 2>/dev/null && sudo cp -f "$SRC/clipd" "${INSTALL_DIR}/clipd" 2>/dev/null && sudo chmod +x "${INSTALL_DIR}/clipd" 2>/dev/null; then
       ok "Copied clipd CLI → ${INSTALL_DIR}/clipd"
