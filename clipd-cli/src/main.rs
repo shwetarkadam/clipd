@@ -1277,30 +1277,7 @@ fn cmd_clear(slot: Option<u8>, all: bool, before: Option<String>) {
 
 // ── Update ──
 
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const GITHUB_REPO: &str = "shwetarkadam/clipd";
-
-fn fetch_latest_version() -> Option<String> {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
-    let resp = ureq::get(&url)
-        .set("User-Agent", "clipd-updater")
-        .call()
-        .ok()?;
-    let body: serde_json::Value = resp.into_json().ok()?;
-    body["tag_name"]
-        .as_str()
-        .map(|s| s.strip_prefix('v').unwrap_or(s).to_string())
-}
-
-fn version_is_newer(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split(|c: char| !c.is_ascii_digit())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
-    parse(latest) > parse(current)
-}
+use clipd_core::updater::{self, CURRENT_VERSION};
 
 /// `clipd send` — put a clip on another Mac.
 fn cmd_send(target: Option<&str>, id: Option<i64>, files: &[std::path::PathBuf]) {
@@ -1615,56 +1592,91 @@ fn cmd_devices() {
 fn cmd_update() {
     println!("  Current version: {}", CURRENT_VERSION);
     print!("  Checking for updates... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 
-    match fetch_latest_version() {
-        Some(latest) if version_is_newer(&latest, CURRENT_VERSION) => {
-            println!("v{} available!", latest);
-            println!();
-            println!("  To update, run:");
-            println!("    curl -fsSL https://raw.githubusercontent.com/{}/main/install.sh | bash", GITHUB_REPO);
-            println!();
-            println!("  Or download from:");
-            println!("    https://github.com/{}/releases/latest", GITHUB_REPO);
-        }
-        Some(latest) => {
-            println!("you're on the latest (v{}).", latest);
-        }
+    let latest = match updater::fetch_latest() {
+        Some(latest) => latest,
         None => {
             println!("couldn't reach GitHub. Check your connection.");
+            return;
+        }
+    };
+    if !updater::is_newer(&latest.version, CURRENT_VERSION) {
+        println!("you're on the latest (v{}).", latest.version);
+        return;
+    }
+    println!("v{} available.", latest.version);
+    install_update(&latest);
+}
+
+#[cfg(target_os = "macos")]
+fn install_update(release: &updater::Release) {
+    let Some(app) = updater::installed_app() else {
+        print_manual_update(release);
+        return;
+    };
+    println!("  Updating {}...", app.display());
+    if let Err(e) = updater::install(release, &app) {
+        println!("  ❌ {e}");
+        print_manual_update(release);
+        return;
+    }
+    // A copy of the CLI on the PATH (from install.sh) is a separate file: bring
+    // it along, so `clipd --version` agrees with the app.
+    if let Ok(me) = std::env::current_exe() {
+        if !me.starts_with(&app) {
+            let fresh = app.join("Contents/MacOS/clipd");
+            let staged = me.with_extension("new");
+            if std::fs::copy(&fresh, &staged).is_ok() && std::fs::rename(&staged, &me).is_ok() {
+                println!("  ✓ Updated {}", me.display());
+            } else {
+                let _ = std::fs::remove_file(&staged);
+            }
+        }
+    }
+    updater::relaunch(&app);
+    println!("  ✓ Clipd v{} installed — it restarts in a moment.", release.version);
+}
+
+#[cfg(target_os = "windows")]
+fn install_update(release: &updater::Release) {
+    println!("  Downloading the installer...");
+    match updater::install(release) {
+        Ok(()) => println!("  ✓ The installer is open — follow it to finish."),
+        Err(e) => {
+            println!("  ❌ {e}");
+            print_manual_update(release);
         }
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn install_update(release: &updater::Release) {
+    print_manual_update(release);
+}
+
+fn print_manual_update(release: &updater::Release) {
+    println!();
+    println!("  To update, run:");
+    println!("    {}", updater::INSTALL_COMMAND);
+    println!();
+    println!("  Or download from:");
+    println!("    {}", release.page_url);
+}
+
 /// Check for updates in the background (non-blocking). Prints a one-line
-/// notice to stderr if a newer version exists — runs at most once per day.
+/// notice to stderr if a newer version exists. GitHub is asked at most once a
+/// day (`updater::available_update` remembers the answer).
 fn check_update_background() {
-    use std::path::PathBuf;
-
-    let marker = dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("clipd")
-        .join("last_update_check");
-
-    if let Ok(meta) = std::fs::metadata(&marker) {
-        if let Ok(modified) = meta.modified() {
-            if modified.elapsed().unwrap_or_default() < std::time::Duration::from_secs(86400) {
-                return;
-            }
-        }
+    if updater::running_dev_build() {
+        return;
     }
-
-    std::thread::spawn(move || {
-        if let Some(latest) = fetch_latest_version() {
-            if version_is_newer(&latest, CURRENT_VERSION) {
-                eprintln!(
-                    "  💡 clipd v{} is available (you have v{}). Run: clipd update",
-                    latest, CURRENT_VERSION
-                );
-            }
-            if let Some(parent) = marker.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&marker, "");
+    std::thread::spawn(|| {
+        if let Some(latest) = updater::available_update() {
+            eprintln!(
+                "  💡 clipd v{} is available (you have v{}). Run: clipd update",
+                latest.version, CURRENT_VERSION
+            );
         }
     });
 }

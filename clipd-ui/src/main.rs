@@ -42,6 +42,7 @@ const MENU_ID_PAUSE_TOMORROW: &str = "pause_tomorrow";
 const MENU_ID_PAUSE_ON: &str = "pause_until_resumed";
 const MENU_ID_RESUME: &str = "resume_capture";
 const MENU_ID_FILL_FORM: &str = "fill_form";
+const MENU_ID_UPDATE: &str = "update_clipd";
 /// Menu ids for saved passwords are `vault:<row>`, indexing into the snapshot
 /// the menu was last built from.
 const MENU_ID_VAULT_PREFIX: &str = "vault:";
@@ -659,6 +660,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         build_menu_bar_shields_n(count)
     };
 
+    // "Update to v…" joins the top of the menu once a newer release is found.
+    let item_update = MenuItem::with_id(MENU_ID_UPDATE, "Update Clipd", true, None);
+    let mut update_shown: Option<String> = None;
+    spawn_update_checker();
+
     let menu_channel = MenuEvent::receiver();
     let mut last_tray_keep_alive = std::time::Instant::now();
     // Sacrificial status items parked to the LEFT of Clipd while menu-heavy
@@ -833,6 +839,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A pause ends on its own; the menu has to notice.
             pause_menu.set_text(pause_menu_title());
             item_resume.set_enabled(clipd_core::pause::is_paused());
+            refresh_update_item(&menu, &item_update, &mut update_shown);
             last_clip_refresh = std::time::Instant::now();
         }
 
@@ -1040,6 +1047,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         pause_menu.set_text(pause_menu_title());
                         item_resume.set_enabled(true);
                     }
+                    MENU_ID_UPDATE => start_update(&item_update),
                     MENU_ID_FILL_FORM => {
                         // The menu closing hands focus straight back to the
                         // form; a moment more lets it settle first.
@@ -1246,6 +1254,140 @@ impl SettingsHotkeys {
             }
         }
     }
+}
+
+
+// ── Updates ──
+//
+// Checked once a day (see clipd_core::updater). Found, the tray offers it at
+// the top of its menu and says so once; chosen, it installs and relaunches.
+
+/// The newer release the checker found, if any.
+static UPDATE_FOUND: std::sync::Mutex<Option<clipd_core::updater::Release>> =
+    std::sync::Mutex::new(None);
+/// An update is being installed; cleared again if it fails.
+static UPDATING: AtomicBool = AtomicBool::new(false);
+
+fn spawn_update_checker() {
+    if clipd_core::updater::running_dev_build() || std::env::var_os("CLIPD_NO_UPDATE_CHECK").is_some() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("clipd-update-check".into())
+        .spawn(|| {
+            // Out of the way of startup.
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            loop {
+                if let Some(release) = clipd_core::updater::available_update() {
+                    log::info!("Update available: v{}", release.version);
+                    if let Ok(mut found) = UPDATE_FOUND.lock() {
+                        *found = Some(release);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(6 * 60 * 60));
+            }
+        });
+}
+
+fn refresh_update_item(menu: &Menu, item: &MenuItem, shown: &mut Option<String>) {
+    let Some(release) = UPDATE_FOUND.lock().ok().and_then(|found| found.clone()) else {
+        return;
+    };
+    if UPDATING.load(Ordering::Relaxed) {
+        return;
+    }
+    if shown.as_deref() != Some(release.version.as_str()) {
+        if shown.is_none() {
+            let _ = menu.insert(item, 0);
+            let _ = menu.insert(&PredefinedMenuItem::separator(), 1);
+        }
+        *shown = Some(release.version.clone());
+        if clipd_core::updater::take_first_notice(&release.version) {
+            notify_update_available(&release.version);
+        }
+    }
+    item.set_text(format!("Update to v{}…", release.version));
+    item.set_enabled(true);
+}
+
+fn start_update(item: &MenuItem) {
+    let Some(release) = UPDATE_FOUND.lock().ok().and_then(|found| found.clone()) else {
+        return;
+    };
+    if UPDATING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    item.set_text(format!("Updating to v{}…", release.version));
+    item.set_enabled(false);
+    let _ = std::thread::Builder::new()
+        .name("clipd-update".into())
+        .spawn(move || {
+            if let Err(e) = run_update(&release) {
+                log::warn!("Update to v{} failed: {e}", release.version);
+                update_failed(&e, &release);
+            }
+            UPDATING.store(false, Ordering::SeqCst);
+        });
+}
+
+#[cfg(target_os = "macos")]
+fn run_update(release: &clipd_core::updater::Release) -> Result<(), String> {
+    let app = clipd_core::updater::installed_app().ok_or("couldn't find the installed Clipd.app")?;
+    clipd_core::updater::install(release, &app)?;
+    clipd_core::updater::relaunch(&app);
+    std::process::exit(0);
+}
+
+#[cfg(target_os = "windows")]
+fn run_update(release: &clipd_core::updater::Release) -> Result<(), String> {
+    clipd_core::updater::install(release)?;
+    // The installer replaces files this process holds open.
+    std::process::exit(0);
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn run_update(release: &clipd_core::updater::Release) -> Result<(), String> {
+    // Installed from the script into ~/.local/bin: the same script updates it.
+    let _ = Command::new("xdg-open").arg(&release.page_url).spawn();
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn notify_update_available(version: &str) {
+    let script = format!(
+        "display notification \"Choose Update in the Clipd menu bar icon. It takes a few seconds.\" \
+         with title \"Clipd v{version} is available\""
+    );
+    let _ = Command::new("/usr/bin/osascript").arg("-e").arg(script).spawn();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn notify_update_available(version: &str) {
+    log::info!("Clipd v{version} is available");
+}
+
+#[cfg(target_os = "macos")]
+fn update_failed(error: &str, release: &clipd_core::updater::Release) {
+    let message = format!(
+        "{error}.\n\nYou can update from Terminal instead:\n{}",
+        clipd_core::updater::INSTALL_COMMAND
+    )
+    .replace('\\', "\\\\")
+    .replace('"', "\\\"");
+    let script = format!(
+        "display alert \"Couldn't update Clipd to v{}\" message \"{message}\" as warning",
+        release.version
+    );
+    let _ = Command::new("/usr/bin/osascript").arg("-e").arg(script).output();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn update_failed(_error: &str, release: &clipd_core::updater::Release) {
+    // The release page has the installer to run by hand.
+    #[cfg(target_os = "windows")]
+    let _ = Command::new("cmd").args(["/C", "start", "", &release.page_url]).spawn();
+    #[cfg(not(target_os = "windows"))]
+    let _ = Command::new("xdg-open").arg(&release.page_url).spawn();
 }
 
 #[cfg(target_os = "macos")]

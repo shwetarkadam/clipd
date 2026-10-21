@@ -42,6 +42,7 @@ pub mod telemetry;
 pub mod theme;
 pub mod transform;
 pub mod tray;
+pub mod updater;
 pub mod vault;
 pub mod watcher;
 
