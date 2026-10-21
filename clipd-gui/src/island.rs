@@ -118,10 +118,15 @@ const SHELF_TILES: usize = 12;
 const ISLAND_MIN_W: f32 = 380.0;
 const CLIPS_TAB_W: f32 = 420.0;
 
-/// Animation speed: how fast the island morphs between sizes. Higher = snappier.
-// Higher is snappier. At 24 the expand was a visible glide; the island is a
-// HUD you summon, not a thing you watch arrive.
-const ANIM_SPEED: f32 = 38.0;
+/// How fast the island fades in. Higher = snappier.
+///
+/// Only opacity animates now. The size used to glide too, and a glide is a
+/// window resize on every frame: each one makes the window server rebuild the
+/// surface and the blur behind it, a dozen times per open and again per close.
+/// That was the stutter — the island froze mid-morph and arrived late. The
+/// window now takes its final size in one step and the content fades over it,
+/// which costs a repaint, not a reconfigure. ~95% visible in 50ms.
+const ANIM_SPEED: f32 = 60.0;
 
 /// How long a copy (or any one-off announcement) holds the peek open.
 const ACTIVITY_HOLD: Duration = Duration::from_millis(2200);
@@ -132,11 +137,10 @@ const ACTIVITY_HOLD: Duration = Duration::from_millis(2200);
 // feels like it goes away rather than lingers.
 /// How long the panel stays up after the pointer leaves.
 ///
-/// 90ms was tuned for a surface you *act* on: get in, click, get out. As a
-/// status surface the only thing it does is get read, and reading means the
-/// pointer wanders — to the row you are checking, off the edge, back again.
-/// At 90ms the panel vanished on the way to the thing you were looking at.
-const COLLAPSE_DELAY: Duration = Duration::from_millis(650);
+/// 90ms vanished on the way to a row near the edge; 650ms read as the island
+/// hanging around after you were done with it. 250ms covers a wobble off the
+/// edge and back, and still feels like it goes the moment you leave.
+const COLLAPSE_DELAY: Duration = Duration::from_millis(250);
 
 /// Height the slot strip occupies: the 16pt chips plus the gap under them.
 const SLOT_STRIP_H: f32 = 22.0;
@@ -1508,6 +1512,11 @@ impl ClipdGui {
 
         if want != self.island.phase {
             self.island.phase = want;
+            // Leaving is instant: no fade-out to sit through, the window is
+            // parked this frame.
+            if want == IslandPhase::Hidden {
+                self.island.anim_opacity = 0.0;
+            }
         }
         self.island.open_flag.store(
             !matches!(self.island.phase, IslandPhase::Resting | IslandPhase::Hidden),
@@ -1536,27 +1545,16 @@ impl ClipdGui {
         let dt = ctx.input(|i| i.unstable_dt).min(0.1);
         let lerp = 1.0 - (-ANIM_SPEED * dt).exp();
         if !tab_changed {
-            self.island.anim_size = egui::vec2(
-                self.island.anim_size.x + (target.x - self.island.anim_size.x) * lerp,
-                self.island.anim_size.y + (target.y - self.island.anim_size.y) * lerp,
-            );
+            // Size and position snap (see ANIM_SPEED); only opacity eases.
+            self.island.anim_size = target;
+            self.island.anim_top = self.island.target_top();
             self.island.anim_opacity =
                 self.island.anim_opacity + (target_op - self.island.anim_opacity) * lerp;
-            // Snap all three. An exponential approach never actually arrives,
-            // so `settled` below was never true and the island held a 60fps
-            // repaint forever — about a tenth of a core to draw a 200pt strip
-            // with two dots on it. The tail is also a run of sub-pixel window
-            // resizes, each one a surface reconfigure nobody can see.
-            if (self.island.anim_size - target).length() < 2.0 {
-                self.island.anim_size = target;
-            }
+            // An exponential approach never actually arrives, so `settled`
+            // below was never true and the island held a 60fps repaint
+            // forever. Snap the tail.
             if (self.island.anim_opacity - target_op).abs() < 0.02 {
                 self.island.anim_opacity = target_op;
-            }
-            let target_top = self.island.target_top();
-            self.island.anim_top += (target_top - self.island.anim_top) * lerp;
-            if (self.island.anim_top - target_top).abs() < 1.5 {
-                self.island.anim_top = target_top;
             }
         }
 
@@ -4324,8 +4322,11 @@ mod tests {
         // screen; one that lingers reads as stuck rather than considerate, and
         // an implicit pin has to outlast it (asserted above) or pinning does
         // nothing.
+        // The floor was 300ms while closing was itself a fade; now the island
+        // is gone the moment the delay ends, so the delay *is* the lingering
+        // people notice, and 650ms of it read as "stuck".
         assert!(
-            COLLAPSE_DELAY >= Duration::from_millis(300),
+            COLLAPSE_DELAY >= Duration::from_millis(200),
             "too brief to read — the panel closes while the eye is still moving"
         );
         assert!(

@@ -104,6 +104,51 @@ const QUICK_LETTER_GRACE: Duration = Duration::from_millis(2000);
 /// Ignore duplicate key events faster than this (macOS key-repeat / missing KeyRelease on C/V).
 const TAP_DEBOUNCE: Duration = Duration::from_millis(65);
 
+/// How often the store writer applies retention and expiry.
+const HISTORY_SWEEP_EVERY: Duration = Duration::from_secs(60);
+
+/// Longest clip the short-lived sweep looks at: codes are 6–8 characters and
+/// generated passwords rarely reach 64.
+const SHORT_LIVED_MAX_LEN: usize = 128;
+
+/// Retention and expiry: drop history older than "keep history for N days",
+/// and one-time codes (and, if asked, likely passwords) once they have had
+/// their few minutes. Pinned clips are never touched.
+fn sweep_history(store: &ClipStore) {
+    let config = clipd_core::privacy::load_privacy_config();
+    let now = chrono::Utc::now();
+    if config.keep_history_days > 0 {
+        let cutoff = now - chrono::Duration::days(i64::from(config.keep_history_days));
+        match store.delete_unpinned_before(&cutoff) {
+            Ok(0) => {}
+            Ok(n) => log::info!(
+                "🗑️  Removed {n} clip(s) older than {} days",
+                config.keep_history_days
+            ),
+            Err(e) => log::warn!("History retention failed (non-fatal): {e}"),
+        }
+    }
+    if config.enabled && (config.expire_one_time_codes || config.expire_likely_passwords) {
+        let until = now - chrono::Duration::minutes(i64::from(config.short_lived_minutes.max(1)));
+        let since = now - chrono::Duration::days(7);
+        match store.short_unpinned_clips_between(&since, &until, SHORT_LIVED_MAX_LEN) {
+            Ok(rows) => {
+                let expired = rows
+                    .into_iter()
+                    .filter(|(_, content, app)| {
+                        clipd_core::privacy::is_short_lived(content, app.as_deref(), &config)
+                    })
+                    .filter(|(id, _, _)| store.delete(*id).unwrap_or(false))
+                    .count();
+                if expired > 0 {
+                    log::info!("⏱  Expired {expired} short-lived clip(s) (one-time codes / passwords)");
+                }
+            }
+            Err(e) => log::warn!("Short-lived clip expiry failed (non-fatal): {e}"),
+        }
+    }
+}
+
 pub fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     run_daemon_with_stop(Arc::new(AtomicBool::new(false)), true)
 }
@@ -194,6 +239,24 @@ pub fn run_daemon_with_stop(
             );
         })?;
 
+    // ── Form fill ──
+    // Fills asked for by the palette, the tray or `clipd fill`. A stat every
+    // 150ms of a file that is almost never there.
+    let fill_slot_mgr = slot_manager.clone();
+    let fill_suppress = suppress.clone();
+    let fill_stop = stop.clone();
+    let _fill_handle = std::thread::Builder::new()
+        .name("clipd-form-fill".into())
+        .spawn(move || {
+            while !fill_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(150));
+                if let Some(delay) = clipd_core::form_fill::take_request() {
+                    std::thread::sleep(delay);
+                    fill_form(&fill_slot_mgr, &fill_suppress);
+                }
+            }
+        })?;
+
     // ── Sync Inbox Thread ──
     // Announce this Mac in the shared iCloud folder and collect anything other
     // Macs have sent it. Polling rather than FSEvents: iCloud materialises
@@ -239,14 +302,32 @@ pub fn run_daemon_with_stop(
             } else {
                 log::info!("🔍 Semantic search will use TF-IDF (no API key for embeddings)");
             }
-            for event in clip_rx {
+            // Retention and expiry run between events, about once a minute.
+            let mut last_sweep: Option<Instant> = None;
+            loop {
+                let event = match clip_rx.recv_timeout(HISTORY_SWEEP_EVERY) {
+                    Ok(event) => Some(event),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                if last_sweep.is_none_or(|at| at.elapsed() >= HISTORY_SWEEP_EVERY) {
+                    sweep_history(&store);
+                    last_sweep = Some(Instant::now());
+                }
+                let Some(event) = event else { continue };
                 match event {
                     ClipEvent::NewClip(mut entry) => {
                         // Slot 0 (the live OS-clipboard mirror) always tracks the
                         // latest copy so paste works; persisting to searchable
-                        // history is what "Remember copied items" gates.
+                        // history is what "Remember copied items" gates — and a
+                        // pause. Slots filled on purpose still work while paused;
+                        // nothing reaches history.
                         slot_writer.copy_to_slot(0, &entry.content).ok();
                         if !load_paste_transform_settings().remember_clipboard {
+                            continue;
+                        }
+                        if clipd_core::pause::is_paused() {
+                            log::info!("⏸  Clip not recorded (capture paused)");
                             continue;
                         }
                         // Capture the frontmost app at copy time — used both to
@@ -2229,11 +2310,98 @@ mod synth {
             command_via_system_events(letter);
         }
     }
+
+    /// kVK_Tab: the same key on every layout.
+    const TAB: u16 = 48;
+
+    /// A bare Tab, down then up.
+    pub fn tab() {
+        unsafe {
+            let source = CGEventSourceCreate(PRIVATE_STATE);
+            if source.is_null() {
+                return;
+            }
+            for down in [true, false] {
+                let event = CGEventCreateKeyboardEvent(source, TAB, down);
+                if event.is_null() {
+                    break;
+                }
+                CGEventSetFlags(event, 0);
+                CGEventPost(SESSION_TAP, event);
+                CFRelease(event);
+            }
+            CFRelease(source);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn simulate_undo() {
     synth::press('z');
+}
+
+#[cfg(target_os = "macos")]
+fn simulate_tab() {
+    synth::tab();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn simulate_tab() {
+    if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
+        #[cfg(target_os = "windows")]
+        release_windows_shortcut_modifiers(&mut enigo);
+        let _ = enigo.key(Key::Tab, Direction::Click);
+    }
+}
+
+/// Type slots 1…N into the focused form, Tab between fields (see
+/// `clipd_core::form_fill`), then put the clipboard back as it was.
+fn fill_form(mgr: &SlotManager, suppress: &AtomicBool) {
+    let fields = clipd_core::form_fill::fields(|n| mgr.get_slot(n).ok().flatten());
+    if fields.is_empty() {
+        log::info!("📝 Fill form: slot 1 is empty, nothing to fill");
+        #[cfg(target_os = "macos")]
+        show_hud("Nothing to fill — copy into slot 1 first (⌘C ⌘C)");
+        return;
+    }
+    let mut cb = match Clipboard::new() {
+        Ok(cb) => cb,
+        Err(e) => {
+            log::warn!("Fill form: no clipboard ({e})");
+            return;
+        }
+    };
+    let original = cb.get_text().ok();
+    suppress.store(true, Ordering::SeqCst);
+    let last = fields.len() - 1;
+    for (i, (slot, text)) in fields.iter().enumerate() {
+        if cb.set_text(text).is_err() {
+            log::warn!("Fill form: could not stage slot {slot}");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+        simulate_paste();
+        // The app reads the clipboard when it handles ⌘V, not when it is
+        // sent: changing it sooner would paste the next field's text here.
+        std::thread::sleep(Duration::from_millis(160));
+        if i < last {
+            simulate_tab();
+            std::thread::sleep(Duration::from_millis(70));
+        }
+    }
+    if let Some(orig) = original {
+        let _ = cb.set_text(orig);
+    }
+    std::thread::sleep(Duration::from_millis(60));
+    suppress.store(false, Ordering::SeqCst);
+    log::info!("📝 Filled {} field(s) from slots", fields.len());
+    #[cfg(target_os = "macos")]
+    show_hud(&format!(
+        "Filled {} field{} from slots 1–{}",
+        fields.len(),
+        if fields.len() == 1 { "" } else { "s" },
+        fields.len()
+    ));
 }
 
 #[cfg(target_os = "macos")]
@@ -2901,7 +3069,13 @@ const ISLAND_RESERVED_TOP: u32 = clipd_core::ISLAND_RESERVED_TOP as u32;
 /// other. The island is the one that belongs there — it *is* the top of the
 /// screen — so the HUD is the one that moves.
 fn hud_payload_with_clearance(text: &str) -> String {
-    add_hud_clearance(text, clipd_core::island_layout_active())
+    let text = add_hud_clearance(text, clipd_core::island_layout_active());
+    // "Hide clipd from screen sharing" covers the toasts too.
+    if clipd_core::privacy::load_privacy_config().hide_from_screen_share {
+        format!("{text}\nPRIVATE\t1")
+    } else {
+        text
+    }
 }
 
 fn add_hud_clearance(text: &str, island_active: bool) -> String {
@@ -3895,6 +4069,11 @@ fn open_gui() {
         if app != "clipd-gui" && app != "Clipd" && app != "clipd" {
             clipd_core::save_last_active_app(&app);
         }
+    }
+    // Read where the text cursor is while that app still has focus, so the
+    // palette can open beside it.
+    if load_paste_transform_settings().open_at_caret {
+        clipd_core::caret::capture();
     }
 
     // Only front an existing *palette*. The island and the tray popover are

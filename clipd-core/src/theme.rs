@@ -143,11 +143,11 @@ impl Theme {
 }
 
 impl Default for Theme {
-    /// Mono: near-black, grey hairlines, flat one-line rows. Opaque, so it
-    /// reads the same over any desktop and on systems without the native
-    /// glass material.
+    /// Glass Dark: the dark translucent launcher sheet. It is what Clipd
+    /// looks like in its screenshots and demo, so a fresh install should
+    /// open to it rather than to a flat panel.
     fn default() -> Self {
-        Theme::Mono
+        Theme::GlassDark
     }
 }
 
@@ -977,16 +977,16 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_install_lands_on_mono() {
+    fn a_fresh_install_lands_on_glass_dark() {
         // What a new user sees, and what anyone falls back to when the stored
         // preference is missing or unreadable. Worth pinning: themes get added
         // and retired, and the default is the one value where a quiet change
         // would go unnoticed until someone opened the app for the first time.
-        assert_eq!(Theme::default(), Theme::Mono);
+        assert_eq!(Theme::default(), Theme::GlassDark);
         assert!(!Theme::default().is_light());
         // load_theme() falls back to the same place when nothing is stored.
         let unreadable: Result<Theme, _> = serde_json::from_str("not a theme");
-        assert_eq!(unreadable.ok().unwrap_or_default(), Theme::Mono);
+        assert_eq!(unreadable.ok().unwrap_or_default(), Theme::GlassDark);
     }
 
     /// The default is translucent, so it has to survive having no material.

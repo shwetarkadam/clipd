@@ -243,6 +243,10 @@ install_macos() {
   fi
 
   INSTALL_DIR="/usr/local/bin"
+  # Releases from v0.4.24 carry the CLI only inside the app.
+  if [ ! -f "$SRC/clipd" ] && [ -f "$SRC/Clipd.app/Contents/MacOS/clipd" ]; then
+    cp -f "$SRC/Clipd.app/Contents/MacOS/clipd" "$SRC/clipd"
+  fi
   if [ -f "$SRC/clipd" ]; then
     if sudo mkdir -p "$INSTALL_DIR" 2>/dev/null && sudo cp -f "$SRC/clipd" "${INSTALL_DIR}/clipd" 2>/dev/null && sudo chmod +x "${INSTALL_DIR}/clipd" 2>/dev/null; then
       ok "Copied clipd CLI → ${INSTALL_DIR}/clipd"
@@ -261,16 +265,16 @@ install_macos() {
   echo ""
   ok "Done! Clipd ${VERSION} installed."
   echo ""
-  echo "  Next steps:"
   if [ -n "$APP_PATH" ]; then
-    echo "    1. Open Clipd from Applications or Spotlight
-       (any previously running copy was stopped, so this launches the new one)"
+    echo "  Clipd is starting now — look for its icon in the menu bar."
+    echo "  It also starts by itself when you log in."
+    echo ""
   fi
-  echo "    2. macOS will ask for permissions — grant them:"
-  echo "       - Accessibility (System Settings → Privacy & Security → Accessibility)"
-  echo "       - Input Monitoring (System Settings → Privacy & Security → Input Monitoring)"
-  echo "    3. Restart Clipd after granting permissions"
-  echo "    4. Clipd will auto-start on login (LaunchAgent)"
+  echo "  Next: macOS asks for two permissions. Grant both, then quit and"
+  echo "  reopen Clipd from the menu bar icon:"
+  echo "    - Accessibility     (pastes for you)"
+  echo "    - Input Monitoring  (notices ⌘C ⌘C for slots)"
+  echo "  Both are in System Settings → Privacy & Security."
   echo ""
   echo "  CLI: clipd list | clipd search | clipd slots"
   echo ""

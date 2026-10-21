@@ -106,6 +106,23 @@ enum Commands {
     /// Show clipboard statistics
     Stats,
 
+    /// Stop recording copies into history: `15m`, `2h`, `tomorrow`, or
+    /// nothing for "until resumed". Slots filled with ⌘C×N still work.
+    Pause {
+        /// How long: e.g. 15m, 1h, 90m, tomorrow. Omit to pause until resumed.
+        duration: Option<String>,
+    },
+
+    /// Start recording copies again after `clipd pause`
+    Resume,
+
+    /// Type slots 1…N into a form, pressing Tab between fields
+    Fill {
+        /// Seconds to wait first, to click into the form's first field
+        #[arg(long, default_value_t = 3)]
+        delay: u64,
+    },
+
     /// Clear clipboard history or slots
     Clear {
         /// Clear a specific slot
@@ -371,6 +388,52 @@ fn main() {
 
         Some(Commands::Stats) => {
             cmd_stats();
+        }
+
+        Some(Commands::Pause { duration }) => {
+            match parse_pause(duration.as_deref()) {
+                Ok(length) => {
+                    clipd_core::pause::pause(length);
+                    println!(
+                        "⏸  {}",
+                        clipd_core::pause::status_label().unwrap_or_else(|| "Capture paused".into())
+                    );
+                }
+                Err(e) => {
+                    eprintln!("❌ {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+
+        Some(Commands::Fill { delay }) => {
+            let slots = SlotManager::persistent_default().ok();
+            let fields = clipd_core::form_fill::fields(|n| {
+                slots.as_ref().and_then(|s| s.get_slot(n).ok().flatten())
+            });
+            if fields.is_empty() {
+                println!("Nothing to fill: slot 1 is empty. Copy into slots with ⌘C ⌘C, ⌘C ⌘C ⌘C…");
+            } else if !clipd_core::is_daemon_running() {
+                println!("clipd isn't running, so nothing can type for you. Start it with `clipd daemon` or open Clipd.");
+            } else {
+                // The request itself waits (up to 3s); count down here for longer.
+                let delay = delay.min(30);
+                println!(
+                    "Click into the first field — filling {} field(s) in {delay}s…",
+                    fields.len()
+                );
+                std::thread::sleep(std::time::Duration::from_secs(delay.saturating_sub(1)));
+                clipd_core::form_fill::request(delay.min(1) * 1000);
+            }
+        }
+
+        Some(Commands::Resume) => {
+            let was_paused = clipd_core::pause::is_paused();
+            clipd_core::pause::resume();
+            println!(
+                "{}",
+                if was_paused { "▶️  Capture resumed" } else { "Capture wasn't paused" }
+            );
         }
 
         Some(Commands::Clear { slot, all, before }) => {
@@ -970,6 +1033,26 @@ fn cmd_slots() {
     println!("  {}", "─".repeat(50));
 }
 
+/// `15m`, `2h`, `90m`, `tomorrow`, or nothing (until resumed).
+fn parse_pause(duration: Option<&str>) -> Result<clipd_core::pause::PauseFor, String> {
+    use clipd_core::pause::PauseFor;
+    let Some(raw) = duration.map(str::trim).filter(|d| !d.is_empty()) else {
+        return Ok(PauseFor::Indefinitely);
+    };
+    if raw.eq_ignore_ascii_case("tomorrow") {
+        return Ok(PauseFor::UntilTomorrow);
+    }
+    let (number, unit) = raw.split_at(raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len()));
+    let n: i64 = number
+        .parse()
+        .map_err(|_| format!("\"{raw}\" isn't a duration — try 15m, 1h or tomorrow"))?;
+    match unit.trim() {
+        "" | "m" | "min" | "mins" | "minutes" => Ok(PauseFor::Minutes(n)),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Ok(PauseFor::Minutes(n * 60)),
+        other => Err(format!("unknown unit \"{other}\" — use m or h (e.g. 15m, 1h)")),
+    }
+}
+
 fn cmd_stats() {
     let store = open_store();
     let stats = match store.stats() {
@@ -1194,30 +1277,7 @@ fn cmd_clear(slot: Option<u8>, all: bool, before: Option<String>) {
 
 // ── Update ──
 
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const GITHUB_REPO: &str = "shwetarkadam/clipd";
-
-fn fetch_latest_version() -> Option<String> {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
-    let resp = ureq::get(&url)
-        .set("User-Agent", "clipd-updater")
-        .call()
-        .ok()?;
-    let body: serde_json::Value = resp.into_json().ok()?;
-    body["tag_name"]
-        .as_str()
-        .map(|s| s.strip_prefix('v').unwrap_or(s).to_string())
-}
-
-fn version_is_newer(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split(|c: char| !c.is_ascii_digit())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
-    parse(latest) > parse(current)
-}
+use clipd_core::updater::{self, CURRENT_VERSION};
 
 /// `clipd send` — put a clip on another Mac.
 fn cmd_send(target: Option<&str>, id: Option<i64>, files: &[std::path::PathBuf]) {
@@ -1532,56 +1592,91 @@ fn cmd_devices() {
 fn cmd_update() {
     println!("  Current version: {}", CURRENT_VERSION);
     print!("  Checking for updates... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 
-    match fetch_latest_version() {
-        Some(latest) if version_is_newer(&latest, CURRENT_VERSION) => {
-            println!("v{} available!", latest);
-            println!();
-            println!("  To update, run:");
-            println!("    curl -fsSL https://raw.githubusercontent.com/{}/main/install.sh | bash", GITHUB_REPO);
-            println!();
-            println!("  Or download from:");
-            println!("    https://github.com/{}/releases/latest", GITHUB_REPO);
-        }
-        Some(latest) => {
-            println!("you're on the latest (v{}).", latest);
-        }
+    let latest = match updater::fetch_latest() {
+        Some(latest) => latest,
         None => {
             println!("couldn't reach GitHub. Check your connection.");
+            return;
+        }
+    };
+    if !updater::is_newer(&latest.version, CURRENT_VERSION) {
+        println!("you're on the latest (v{}).", latest.version);
+        return;
+    }
+    println!("v{} available.", latest.version);
+    install_update(&latest);
+}
+
+#[cfg(target_os = "macos")]
+fn install_update(release: &updater::Release) {
+    let Some(app) = updater::installed_app() else {
+        print_manual_update(release);
+        return;
+    };
+    println!("  Updating {}...", app.display());
+    if let Err(e) = updater::install(release, &app) {
+        println!("  ❌ {e}");
+        print_manual_update(release);
+        return;
+    }
+    // A copy of the CLI on the PATH (from install.sh) is a separate file: bring
+    // it along, so `clipd --version` agrees with the app.
+    if let Ok(me) = std::env::current_exe() {
+        if !me.starts_with(&app) {
+            let fresh = app.join("Contents/MacOS/clipd");
+            let staged = me.with_extension("new");
+            if std::fs::copy(&fresh, &staged).is_ok() && std::fs::rename(&staged, &me).is_ok() {
+                println!("  ✓ Updated {}", me.display());
+            } else {
+                let _ = std::fs::remove_file(&staged);
+            }
+        }
+    }
+    updater::relaunch(&app);
+    println!("  ✓ Clipd v{} installed — it restarts in a moment.", release.version);
+}
+
+#[cfg(target_os = "windows")]
+fn install_update(release: &updater::Release) {
+    println!("  Downloading the installer...");
+    match updater::install(release) {
+        Ok(()) => println!("  ✓ The installer is open — follow it to finish."),
+        Err(e) => {
+            println!("  ❌ {e}");
+            print_manual_update(release);
         }
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn install_update(release: &updater::Release) {
+    print_manual_update(release);
+}
+
+fn print_manual_update(release: &updater::Release) {
+    println!();
+    println!("  To update, run:");
+    println!("    {}", updater::INSTALL_COMMAND);
+    println!();
+    println!("  Or download from:");
+    println!("    {}", release.page_url);
+}
+
 /// Check for updates in the background (non-blocking). Prints a one-line
-/// notice to stderr if a newer version exists — runs at most once per day.
+/// notice to stderr if a newer version exists. GitHub is asked at most once a
+/// day (`updater::available_update` remembers the answer).
 fn check_update_background() {
-    use std::path::PathBuf;
-
-    let marker = dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("clipd")
-        .join("last_update_check");
-
-    if let Ok(meta) = std::fs::metadata(&marker) {
-        if let Ok(modified) = meta.modified() {
-            if modified.elapsed().unwrap_or_default() < std::time::Duration::from_secs(86400) {
-                return;
-            }
-        }
+    if updater::running_dev_build() {
+        return;
     }
-
-    std::thread::spawn(move || {
-        if let Some(latest) = fetch_latest_version() {
-            if version_is_newer(&latest, CURRENT_VERSION) {
-                eprintln!(
-                    "  💡 clipd v{} is available (you have v{}). Run: clipd update",
-                    latest, CURRENT_VERSION
-                );
-            }
-            if let Some(parent) = marker.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&marker, "");
+    std::thread::spawn(|| {
+        if let Some(latest) = updater::available_update() {
+            eprintln!(
+                "  💡 clipd v{} is available (you have v{}). Run: clipd update",
+                latest.version, CURRENT_VERSION
+            );
         }
     });
 }
@@ -1817,5 +1912,23 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{}…", end)
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod pause_cli_tests {
+    use super::parse_pause;
+    use clipd_core::pause::PauseFor;
+
+    #[test]
+    fn durations_parse_the_way_people_type_them() {
+        assert_eq!(parse_pause(None), Ok(PauseFor::Indefinitely));
+        assert_eq!(parse_pause(Some("15m")), Ok(PauseFor::Minutes(15)));
+        assert_eq!(parse_pause(Some("90")), Ok(PauseFor::Minutes(90)));
+        assert_eq!(parse_pause(Some("2h")), Ok(PauseFor::Minutes(120)));
+        assert_eq!(parse_pause(Some("1 hour")), Ok(PauseFor::Minutes(60)));
+        assert_eq!(parse_pause(Some("Tomorrow")), Ok(PauseFor::UntilTomorrow));
+        assert!(parse_pause(Some("soon")).is_err());
+        assert!(parse_pause(Some("5d")).is_err());
     }
 }

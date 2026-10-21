@@ -556,6 +556,49 @@ impl ClipStore {
         Ok(orphans)
     }
 
+    /// Delete clips copied before `cutoff`, except those kept in a collection
+    /// (pinned). Goes through [`delete`](Self::delete) so image files and file
+    /// blobs go with them.
+    pub fn delete_unpinned_before(&self, cutoff: &DateTime<Utc>) -> SqlResult<usize> {
+        let ids: Vec<i64> = self
+            .conn
+            .prepare(
+                "SELECT id FROM clips WHERE timestamp < ?1
+                 AND id NOT IN (SELECT clip_id FROM collection_items)",
+            )?
+            .query_map(params![cutoff.to_rfc3339()], |row| row.get(0))?
+            .collect::<SqlResult<_>>()?;
+        let mut deleted = 0;
+        for id in ids {
+            if self.delete(id)? {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Unpinned clips of at most `max_len` characters copied between `since`
+    /// and `until`: `(id, content, source_app)`. The length bound keeps a
+    /// periodic sweep for short secrets from reading large clips at all.
+    pub fn short_unpinned_clips_between(
+        &self,
+        since: &DateTime<Utc>,
+        until: &DateTime<Utc>,
+        max_len: usize,
+    ) -> SqlResult<Vec<(i64, String, Option<String>)>> {
+        self.conn
+            .prepare(
+                "SELECT id, content, source_app FROM clips
+                 WHERE timestamp >= ?1 AND timestamp < ?2 AND length(content) <= ?3
+                 AND id NOT IN (SELECT clip_id FROM collection_items)",
+            )?
+            .query_map(
+                params![since.to_rfc3339(), until.to_rfc3339(), max_len as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?
+            .collect()
+    }
+
     /// Delete clips older than the given date.
     pub fn delete_before(&self, before: &DateTime<Utc>) -> SqlResult<usize> {
         let count = self.conn.execute(
@@ -680,10 +723,14 @@ impl ClipStore {
             return Ok(0);
         }
         let to_delete = count - max_clips;
-        // Delete oldest clips (lowest id = earliest)
+        // Delete the oldest clips — never ones kept in a collection. Pins are
+        // the clips someone chose to keep, and they are usually old; the cap
+        // used to take them first.
         let deleted = self.conn.execute(
             "DELETE FROM clips WHERE id IN (
-                SELECT id FROM clips ORDER BY timestamp ASC LIMIT ?1
+                SELECT id FROM clips
+                WHERE id NOT IN (SELECT clip_id FROM collection_items)
+                ORDER BY timestamp ASC LIMIT ?1
             )",
             params![to_delete as i64],
         )?;
@@ -1075,6 +1122,61 @@ mod tests {
             blob_path: blob.map(|b| b.to_string()),
             size: 1234,
         }
+    }
+
+    /// Insert `content` as if copied `days_ago` days ago, from `app`.
+    fn insert_aged(store: &ClipStore, content: &str, days_ago: i64, app: &str) -> i64 {
+        let mut entry = ClipEntry::new(content.to_string(), Some(app.to_string()), None);
+        entry.timestamp = Utc::now() - chrono::Duration::days(days_ago);
+        store.insert(&entry).unwrap()
+    }
+
+    #[test]
+    fn history_older_than_the_cutoff_goes_but_pins_stay() {
+        let store = ClipStore::in_memory().unwrap();
+        let old = insert_aged(&store, "an old note", 40, "Notes");
+        let pinned = insert_aged(&store, "my address, pinned", 40, "Notes");
+        let recent = insert_aged(&store, "yesterday's link", 1, "Safari");
+        let pins = store.create_collection("Pinned", None).unwrap();
+        store.add_clip_to_collection(pins, pinned).unwrap();
+
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        assert_eq!(store.delete_unpinned_before(&cutoff).unwrap(), 1);
+        assert!(store.get_by_id(old).is_err());
+        assert!(store.get_by_id(pinned).is_ok(), "a pinned clip is never aged out");
+        assert!(store.get_by_id(recent).is_ok());
+    }
+
+    #[test]
+    fn the_short_lived_sweep_sees_only_short_unpinned_clips_in_its_window() {
+        let store = ClipStore::in_memory().unwrap();
+        let code = insert_aged(&store, "483920", 1, "Messages");
+        let _long = insert_aged(&store, &"x".repeat(500), 1, "Notes");
+        let pinned = insert_aged(&store, "112233", 1, "Messages");
+        let _too_old = insert_aged(&store, "556677", 30, "Messages");
+        let pins = store.create_collection("Pinned", None).unwrap();
+        store.add_clip_to_collection(pins, pinned).unwrap();
+
+        let now = Utc::now();
+        let rows = store
+            .short_unpinned_clips_between(&(now - chrono::Duration::days(7)), &now, 128)
+            .unwrap();
+        let ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, vec![code]);
+        assert_eq!(rows[0].2.as_deref(), Some("Messages"));
+    }
+
+    #[test]
+    fn the_size_cap_never_takes_pinned_clips() {
+        let store = ClipStore::in_memory().unwrap();
+        let pinned = insert_aged(&store, "oldest, pinned", 10, "Notes");
+        let pins = store.create_collection("Pinned", None).unwrap();
+        store.add_clip_to_collection(pins, pinned).unwrap();
+        for i in 0..3 {
+            insert_aged(&store, &format!("clip {i}"), 5 - i, "Notes");
+        }
+        assert_eq!(store.prune_old_clips(2).unwrap(), 2);
+        assert!(store.get_by_id(pinned).is_ok(), "the oldest clip survives because it is pinned");
     }
 
     #[test]

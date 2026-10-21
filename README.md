@@ -28,10 +28,12 @@ This downloads the latest release, copies **Clipd.app** to `/Applications`, and 
 
 ### Option 2 — Manual download
 
-1. Go to [**Releases**](https://github.com/shwetarkadam/clipd/releases)
-2. Download **`Clipd-macos-arm64-vX.X.X.zip`** (Apple Silicon) or **`Clipd-macos-x86_64-vX.X.X.zip`** (Intel)
-3. Unzip, drag **Clipd.app** into **Applications**
-4. Double-click **Clipd** to launch
+1. Go to [**Releases**](https://github.com/shwetarkadam/clipd/releases) and download **`Clipd-macos-arm64-vX.X.X.zip`** (Apple Silicon)
+2. Unzip and double-click **Clipd**. macOS says *"Apple could not verify Clipd…"*: click **Done**. (clipd is free and open source, so it isn't notarized by Apple.)
+3. Open **System Settings → Privacy & Security**, scroll to Security, click **Open Anyway** and enter your password. On macOS 14 and older you can right-click Clipd → **Open** instead.
+4. Clipd offers to **Move to Applications**. Say yes and it relaunches from there.
+
+The zip includes these steps as *How to open Clipd.txt*. The one-line install above skips them entirely.
 
 ### Option 3 — Build from source
 
@@ -58,7 +60,7 @@ macOS requires two permissions for clipd to work. You'll be prompted automatical
 
 Grant both, then **restart Clipd** (Quit from menu bar → reopen).
 
-> **Gatekeeper warning?** If macOS says "Clipd can't be opened because it is from an unidentified developer", go to **System Settings → Privacy & Security** and click **Open Anyway**.
+> **Gatekeeper warning?** If macOS says "Apple could not verify Clipd…" or "Clipd can't be opened because it is from an unidentified developer", go to **System Settings → Privacy & Security** and click **Open Anyway** (see Option 2 above).
 
 ---
 

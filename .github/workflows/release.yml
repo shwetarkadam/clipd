@@ -137,11 +137,17 @@ jobs:
           VERSION="${GITHUB_REF_NAME}"
           ZIP_NAME="Clipd-macos-${{ matrix.arch }}-${VERSION}"
           mkdir -p "target/release/${ZIP_NAME}"
+          # Two things, nothing to guess between: the app, and how to open it.
+          # A loose `clipd` binary here got double-clicked (it opens Terminal
+          # and prints CLI help) and install.sh and README.md read as steps to
+          # follow. The CLI ships inside the app (Contents/MacOS/clipd), and
+          # install.sh takes it from there.
           cp -R target/release/Clipd.app "target/release/${ZIP_NAME}/"
-          cp -f target/release/clipd "target/release/${ZIP_NAME}/"
-          chmod +x "target/release/${ZIP_NAME}/clipd"
-          cp -f install.sh README.md "target/release/${ZIP_NAME}/" || true
-          cd target/release && zip -qr "${ZIP_NAME}.zip" "${ZIP_NAME}/"
+          cp -f "packaging/macos/How to open Clipd.txt" "target/release/${ZIP_NAME}/"
+          # ditto, not zip: keeps symlinks as symlinks. No resource forks or
+          # xattrs, so plain `unzip` (install.sh) never drops ._ files into
+          # the signed bundle.
+          cd target/release && ditto -c -k --norsrc --noextattr --noacl --keepParent "${ZIP_NAME}" "${ZIP_NAME}.zip"
 
       - name: Create DMG
         run: |
@@ -336,61 +342,33 @@ jobs:
           body: |
             ## Install
 
-            **macOS and Linux** — one line:
+            **Mac — easiest, no security prompts.** Paste into Terminal:
 
             ```
             curl -fsSL https://raw.githubusercontent.com/shwetarkadam/clipd/main/install.sh | bash
             ```
 
-            Downloads the build below, puts **Clipd.app** in `/Applications`
-            and the `clipd` CLI in `/usr/local/bin`, and clears the download's
-            quarantine flag so macOS opens it without a security prompt.
+            It puts **Clipd.app** in Applications and the `clipd` CLI on your
+            PATH, and macOS opens it without the download warning.
+
+            **Mac — downloading the zip instead?** macOS asks you to confirm
+            Clipd once, because a free open-source app isn't notarized by Apple:
+
+            1. Unzip and double-click **Clipd**. At *"Apple could not verify
+               Clipd…"* click **Done**.
+            2. **System Settings → Privacy & Security**, scroll to Security,
+               click **Open Anyway** and enter your password. (macOS 14 and
+               older: right-click Clipd → **Open** → **Open**.)
+            3. Clipd offers to **Move to Applications**. Say yes, then grant
+               **Accessibility** and **Input Monitoring** when asked.
+
+            The zip has the same steps in *How to open Clipd.txt*.
+
+            **Linux** — the same one-line command above.
 
             **Windows** — download `Clipd-Setup-*.exe`. SmartScreen warns on
             first run: *More info → Run anyway*. clipd is open source and
             unsigned.
-
-            After installing, macOS asks for **Accessibility** and **Input
-            Monitoring** — multi-slot copy reads the keyboard, so it cannot
-            work without them.
-
-            <details>
-            <summary>If you download the .zip by hand instead</summary>
-
-            macOS will refuse to open the app: *"Apple could not verify
-            Clipd.app is free of malware that may harm your Mac."*
-
-            Nothing is wrong with the build. clipd is code-signed, but Apple
-            only stops showing that warning for apps that have been
-            **notarized**, which requires a paid Apple Developer account. This
-            project is open source and earns nothing, so it is not notarized.
-
-            The flag comes from your *browser*, not from the app — so the
-            quickest fix is to install the way the box above describes.
-            Re-running the one-liner over a hand-downloaded copy clears it too:
-
-            ```
-            curl -fsSL https://raw.githubusercontent.com/shwetarkadam/clipd/main/install.sh | bash
-            ```
-
-            Or open it as-is: **System Settings → Privacy & Security**, scroll
-            to Security, click **Open Anyway**. On macOS 15 the warning dialog
-            itself has only a *Done* button — the old right-click → Open
-            shortcut no longer works.
-
-            Homebrew is not an option: as of 1 September 2026 Homebrew removes
-            casks that fail Gatekeeper, so an unnotarized cask cannot be
-            published there.
-
-            Or clear the flag yourself:
-
-            ```
-            xattr -dr com.apple.quarantine /Applications/Clipd.app
-            ```
-
-            The install command does this for you, which is why it is the
-            recommended path.
-            </details>
 
             ---
 

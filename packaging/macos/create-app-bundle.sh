@@ -41,6 +41,9 @@ RES="$APP/Contents/Resources"
 mkdir -p "$MACOS" "$RES"
 
 cp -f target/release/clipd target/release/clipd-gui target/release/clipd-ui "$MACOS/"
+# The MCP server AI apps launch (README: Contents/MacOS/clipd-mcp). It asks
+# for approval through the clipd-hud next to it.
+cp -f target/release/clipd-mcp "$MACOS/"
 chmod +x "$MACOS/clipd" "$MACOS/clipd-gui" "$MACOS/clipd-ui"
 if [[ -f target/release/clipd-hud ]]; then
   cp -f target/release/clipd-hud "$MACOS/"
@@ -49,6 +52,23 @@ fi
 if [[ -f target/release/clipd-ocr ]]; then
   cp -f target/release/clipd-ocr "$MACOS/"
   chmod +x "$MACOS/clipd-ocr"
+fi
+
+# App icon. Without one Finder shows a blank page for Clipd.app — next to an
+# unverified-developer warning, that reads as "broken or fake" and people
+# stop there. Built from the committed 1024px render with tools every Mac has.
+ICON_SRC="packaging/icons/AppIcon-1024.png"
+if [[ -f "$ICON_SRC" ]] && command -v iconutil &>/dev/null; then
+  ICONSET="$(mktemp -d)/AppIcon.iconset"
+  mkdir -p "$ICONSET"
+  for size in 16 32 128 256 512; do
+    sips -z $size $size "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+    sips -z $((size * 2)) $((size * 2)) "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$ICONSET" -o "$RES/AppIcon.icns"
+  rm -rf "$(dirname "$ICONSET")"
+else
+  echo "    (warning: no app icon — $ICON_SRC or iconutil missing)"
 fi
 
 # Info.plist MUST be written before codesign — writing it after invalidates
@@ -71,6 +91,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <string>Clipd</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleShortVersionString</key>
   <string>${APP_VERSION}</string>
   <key>CFBundleVersion</key>
@@ -142,7 +164,7 @@ else
   echo "==> codesign (identity: ${SIGN_ID} — TCC grants persist across rebuilds)"
 fi
 if command -v codesign &>/dev/null; then
-  for bin in clipd clipd-gui clipd-ui clipd-hud clipd-ocr; do
+  for bin in clipd clipd-gui clipd-ui clipd-mcp clipd-hud clipd-ocr; do
     [[ -f "$MACOS/$bin" ]] || continue
     if ! codesign --force --sign "$SIGN_ID" "$MACOS/$bin"; then
       echo "ERROR: codesign failed for $MACOS/$bin using '$SIGN_ID'" >&2

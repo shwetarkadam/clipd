@@ -105,7 +105,10 @@ impl ClipWatcher {
         let mut last_hash = String::new();
         let mut last_image_hash = String::new();
         let mut last_files_hash = String::new();
-        let privacy_config = load_privacy_config();
+        let mut privacy_config = load_privacy_config();
+        // Re-read every few seconds, so a setting changed in clipd's window
+        // (tracker stripping, the privacy switches) applies without a restart.
+        let mut privacy_read_at = std::time::Instant::now();
 
         // Try to create the clipboard handle.
         // On macOS 13+, if this fails the most likely cause is missing
@@ -136,6 +139,14 @@ impl ClipWatcher {
                 log::info!("Clipboard watcher stopping");
                 break;
             }
+            if privacy_read_at.elapsed() >= std::time::Duration::from_secs(5) {
+                privacy_config = load_privacy_config();
+                privacy_read_at = std::time::Instant::now();
+            }
+            // While capture is paused the pollers still note what is on the
+            // clipboard, so nothing copied during the pause is picked up the
+            // moment it ends — they just never save or send it.
+            let paused = crate::pause::is_paused();
 
             // Don't read clipboard while our own paste operations are in progress.
             // Must be checked BEFORE get_text() to avoid a race where the paste
@@ -188,7 +199,7 @@ impl ClipWatcher {
             // the pasteboard alongside the file URLs, so polling text first
             // would file "report.pdf" away as a string and lose the file that
             // copy was actually about.
-            if Self::poll_files(&mut last_files_hash, &privacy_config, &sender) {
+            if Self::poll_files(&mut last_files_hash, &privacy_config, &sender, paused) {
                 std::thread::sleep(self.poll_interval);
                 continue;
             }
@@ -202,6 +213,7 @@ impl ClipWatcher {
                     &mut last_image_hash,
                     &privacy_config,
                     &sender,
+                    paused,
                 );
             }
             if let Some(text) = text {
@@ -210,6 +222,11 @@ impl ClipWatcher {
 
                     if hash != last_hash {
                         last_hash = hash;
+                        if paused {
+                            log::debug!("Clip not recorded (capture paused)");
+                            std::thread::sleep(self.poll_interval);
+                            continue;
+                        }
 
                         // The copier explicitly marked this as a secret. That is
                         // a far stronger signal than any text heuristic, and it
@@ -246,6 +263,24 @@ impl ClipWatcher {
                                 }
                             }
                         }
+
+                        // A copied link loses its tracking tail — in history
+                        // and on the clipboard, so ⌘V pastes the clean link.
+                        let text = match crate::link_clean::clean_link(&text) {
+                            Some(clean)
+                                if privacy_config.enabled
+                                    && privacy_config.strip_link_trackers
+                                    && crate::pasteboard::write_text(&clean).is_ok() =>
+                            {
+                                log::info!("🔗 Removed tracking parameters from a copied link");
+                                // Our own write is not a new copy.
+                                last_hash = Self::hash_content(&clean);
+                                last_count = crate::pasteboard::change_count();
+                                last_change = None;
+                                clean
+                            }
+                            _ => text,
+                        };
 
                         // A confidently-detected secret is never stored in
                         // history; we surface it so the user can vault it.
@@ -335,6 +370,7 @@ impl ClipWatcher {
         last_files_hash: &mut String,
         privacy_config: &PrivacyConfig,
         sender: &mpsc::SyncSender<ClipEvent>,
+        paused: bool,
     ) -> bool {
         let paths = crate::pasteboard::read_file_urls();
         if paths.is_empty() {
@@ -354,6 +390,9 @@ impl ClipWatcher {
             return true; // same selection still sitting on the clipboard
         }
         *last_files_hash = hash;
+        if paused {
+            return true; // noted, not saved: capture is paused
+        }
 
         let (source_app, source_title) = Self::get_frontmost_context();
 
@@ -390,6 +429,7 @@ impl ClipWatcher {
         last_image_hash: &mut String,
         privacy_config: &PrivacyConfig,
         sender: &mpsc::SyncSender<ClipEvent>,
+        paused: bool,
     ) {
         let img = match clipboard.get_image() {
             Ok(i) => i,
@@ -404,6 +444,9 @@ impl ClipWatcher {
             return; // same image still sitting on the clipboard
         }
         *last_image_hash = hash;
+        if paused {
+            return; // noted, not saved: capture is paused
+        }
 
         let source_app = Self::get_frontmost_app();
         if privacy_config.enabled {

@@ -73,10 +73,44 @@ pub struct PrivacyConfig {
     /// something clipd should decide on the user's behalf.
     #[serde(default)]
     pub vault_auto_save: bool,
+    /// Remove tracking parameters (`utm_*`, click ids) from a link as it is
+    /// copied, so ⌘V pastes the clean link. See `link_clean`.
+    #[serde(default = "default_true")]
+    pub strip_link_trackers: bool,
+    /// Delete one-time codes (2FA / sign-in codes) from history once they are
+    /// [`short_lived_minutes`](Self::short_lived_minutes) old. A code is only
+    /// good for minutes; keeping it for years is all risk.
+    #[serde(default = "default_true")]
+    pub expire_one_time_codes: bool,
+    /// Also expire clips that merely *look* like generated passwords. Off by
+    /// default: that guess is fuzzy, and a false positive would delete a token
+    /// someone meant to keep (the reason such clips stay in history at all).
+    #[serde(default)]
+    pub expire_likely_passwords: bool,
+    /// How long short-lived clips (codes, and passwords if enabled) live.
+    #[serde(default = "default_short_lived_minutes")]
+    pub short_lived_minutes: u32,
+    /// Delete history older than this many days. 0 keeps everything. Pinned
+    /// and collected clips are always kept.
+    #[serde(default)]
+    pub keep_history_days: u32,
+    /// Keep clipd's windows out of screen sharing, recordings and screenshots.
+    /// Off by default: some recorders still capture them, and a window that
+    /// vanishes from your own screenshots surprises people who didn't ask.
+    #[serde(default)]
+    pub hide_from_screen_share: bool,
+    /// AI apps (over MCP) must ask before changing anything: putting text on
+    /// the clipboard, saving a clip or a snippet. Reading is never gated.
+    #[serde(default = "default_true")]
+    pub mcp_writes_need_approval: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_short_lived_minutes() -> u32 {
+    10
 }
 
 impl Default for PrivacyConfig {
@@ -100,6 +134,13 @@ impl Default for PrivacyConfig {
             custom_skip_patterns: Vec::new(),
             offer_vault_on_secret: true,
             vault_auto_save: false,
+            strip_link_trackers: true,
+            expire_one_time_codes: true,
+            expire_likely_passwords: false,
+            short_lived_minutes: default_short_lived_minutes(),
+            keep_history_days: 0,
+            hide_from_screen_share: false,
+            mcp_writes_need_approval: true,
         }
     }
 }
@@ -145,6 +186,45 @@ pub fn is_excluded_app(app: &str, config: &PrivacyConfig) -> bool {
 /// To keep false positives low it requires the WHOLE clipboard to be one token
 /// (no whitespace), of password-ish length, mixing ≥3 character classes, and it
 /// excludes the common high-entropy non-passwords (hex hashes, UUIDs).
+/// Apps a one-time code is copied out of: where texts and mail arrive, and the
+/// authenticators. Matched as for excluded apps (case-insensitive, substring).
+const ONE_TIME_CODE_APPS: &[&str] = &[
+    "Messages", "Mail", "FaceTime", "Outlook", "Spark", "Authy", "Authenticator", "Okta Verify",
+    "Duo", "2FAS", "Step Two", "OTP Auth", "Raivo", "Ente Auth",
+];
+
+/// A 2FA / sign-in code: the whole clip is 6–8 digits (one space or dash
+/// allowed, as in "123 456"), copied from a messaging, mail or authenticator
+/// app.
+///
+/// Deliberately narrow. Six digits from anywhere else — an order number, a
+/// postcode, an amount — are left alone, because deleting them would be clipd
+/// losing something the person wanted.
+pub fn is_one_time_code(content: &str, source_app: Option<&str>) -> bool {
+    let code = content.trim();
+    let digits: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+    let separators = code.chars().filter(|c| *c == ' ' || *c == '-').count();
+    let shape_ok = (6..=8).contains(&digits.len())
+        && separators <= 1
+        && digits.len() + separators == code.chars().count()
+        && !code.starts_with([' ', '-'])
+        && !code.ends_with([' ', '-']);
+    let app_ok = source_app.is_some_and(|app| {
+        let app = app.to_ascii_lowercase();
+        ONE_TIME_CODE_APPS
+            .iter()
+            .any(|known| app.contains(&known.to_ascii_lowercase()))
+    });
+    shape_ok && app_ok
+}
+
+/// A clip that should not outlive [`PrivacyConfig::short_lived_minutes`].
+pub fn is_short_lived(content: &str, source_app: Option<&str>, config: &PrivacyConfig) -> bool {
+    config.enabled
+        && ((config.expire_one_time_codes && is_one_time_code(content, source_app))
+            || (config.expire_likely_passwords && looks_like_password(content)))
+}
+
 pub fn looks_like_password(content: &str) -> bool {
     let t = content.trim();
     if t.is_empty() || t.chars().any(|c| c.is_whitespace()) {
@@ -651,6 +731,47 @@ mod tests {
         let m = detect_sensitive("password=super_secret_123", &cfg());
         assert!(!m.is_empty());
         assert_eq!(m[0].kind, SensitiveKind::GenericSecret);
+    }
+
+    #[test]
+    fn one_time_codes_need_the_shape_and_the_app() {
+        assert!(is_one_time_code("483920", Some("Messages")));
+        assert!(is_one_time_code(" 483 920 ", Some("Mail")));
+        assert!(is_one_time_code("48392017", Some("Authy Desktop")));
+        assert!(is_one_time_code("483-920", Some("Google Authenticator")));
+        // Same digits from elsewhere: an order number, not a code.
+        assert!(!is_one_time_code("483920", Some("Safari")));
+        assert!(!is_one_time_code("483920", None));
+        // Wrong shape, even from Messages.
+        assert!(!is_one_time_code("4839", Some("Messages")));
+        assert!(!is_one_time_code("483920123", Some("Messages")));
+        assert!(!is_one_time_code("48 39 20", Some("Messages")));
+        assert!(!is_one_time_code("Your code is 483920", Some("Messages")));
+    }
+
+    #[test]
+    fn short_lived_follows_the_settings() {
+        let mut config = PrivacyConfig::default();
+        assert!(is_short_lived("483920", Some("Messages"), &config));
+        config.expire_one_time_codes = false;
+        assert!(!is_short_lived("483920", Some("Messages"), &config));
+        // Likely passwords only when asked for.
+        let guess = "Xq7!vR2#pLm9@Tz4";
+        assert!(looks_like_password(guess));
+        assert!(!is_short_lived(guess, None, &config));
+        config.expire_likely_passwords = true;
+        assert!(is_short_lived(guess, None, &config));
+        config.enabled = false;
+        assert!(!is_short_lived(guess, None, &config));
+    }
+
+    #[test]
+    fn older_privacy_files_get_the_new_defaults() {
+        let config: PrivacyConfig = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
+        assert!(config.strip_link_trackers && config.expire_one_time_codes);
+        assert!(!config.expire_likely_passwords && !config.hide_from_screen_share);
+        assert!(config.mcp_writes_need_approval, "AI writes ask first unless turned off");
+        assert_eq!((config.short_lived_minutes, config.keep_history_days), (10, 0));
     }
 
     #[test]
