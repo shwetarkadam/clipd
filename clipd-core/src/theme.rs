@@ -33,6 +33,12 @@ pub enum Theme {
     /// Dark glass has room — the backdrop shows through as luminance instead
     /// of having to out-brighten white.
     GlassDark,
+    /// Clear Glass — the same dark ink and quiet rows as Glass Dark on a
+    /// near-clear pane: the desktop shows straight through, lensed rather
+    /// than frosted, with just enough tint to keep white text off a bright
+    /// patch. Minimal on purpose — no cards, no rules; a row only gets a
+    /// band under the pointer or when selected.
+    ClearGlass,
     /// Deep navy background with a periwinkle accent.
     Midnight,
     /// Dark green background with a sage accent.
@@ -55,11 +61,12 @@ pub enum Theme {
 }
 
 impl Theme {
-    pub const ALL: [Theme; 10] = [
+    pub const ALL: [Theme; 11] = [
         Theme::System,
         Theme::Light,
         Theme::Dark,
         Theme::GlassDark,
+        Theme::ClearGlass,
         Theme::Midnight,
         Theme::Forest,
         Theme::Slate,
@@ -74,6 +81,7 @@ impl Theme {
             Theme::Light => "Paper Light",
             Theme::Dark => "Dark",
             Theme::GlassDark => "Glass Dark",
+            Theme::ClearGlass => "Clear Glass",
             Theme::Midnight => "Midnight",
             Theme::Forest => "Forest",
             Theme::Slate => "Slate",
@@ -88,7 +96,8 @@ impl Theme {
             Theme::System => Theme::Light,
             Theme::Light => Theme::Dark,
             Theme::Dark => Theme::GlassDark,
-            Theme::GlassDark => Theme::Midnight,
+            Theme::GlassDark => Theme::ClearGlass,
+            Theme::ClearGlass => Theme::Midnight,
             Theme::Midnight => Theme::Forest,
             Theme::Forest => Theme::Slate,
             Theme::Slate => Theme::CompactCapsule,
@@ -104,6 +113,7 @@ impl Theme {
             Theme::Light => LIGHT,
             Theme::Dark => DARK,
             Theme::GlassDark => GLASS_DARK,
+            Theme::ClearGlass => CLEAR_GLASS,
             Theme::Midnight => MIDNIGHT,
             Theme::Forest => FOREST,
             Theme::Slate => SLATE,
@@ -122,9 +132,14 @@ impl Theme {
         matches!(self, Theme::Mono)
     }
 
-    /// True for frosted translucent shells (Glass Light / Glass Dark).
+    /// True for translucent shells (Glass Dark, Clear Glass).
     pub fn is_glass(&self) -> bool {
-        matches!(self, Theme::GlassDark)
+        matches!(self, Theme::GlassDark | Theme::ClearGlass)
+    }
+
+    /// The near-clear pane: lensing glass and a thin tint instead of frost.
+    pub fn is_clear_glass(&self) -> bool {
+        matches!(self, Theme::ClearGlass)
     }
 
     /// Soft glassmorphism blooms under the frost plate. `None` = flat opaque shell.
@@ -136,7 +151,7 @@ impl Theme {
             // surface and is mottling on a transparent one — the eye reads
             // the brightness variation as dirt on the glass rather than as
             // light in it. An even sheet is what "clean" means here.
-            Theme::GlassDark => None,
+            Theme::GlassDark | Theme::ClearGlass => None,
             _ => None,
         }
     }
@@ -329,6 +344,34 @@ const GLASS_DARK: ThemeColors = ThemeColors {
     url: Rgb(206, 208, 214),
     email: Rgb(190, 193, 199),
     path: Rgb(190, 193, 199),
+};
+
+// Clear Glass: Glass Dark's ink on a pane that hides almost nothing.
+//
+// The ink is Glass Dark's — already chosen to hold 4.5:1 on the brightest the
+// panel gets. What changes is how much stands between the reader and the
+// desktop: surfaces (search field, chips) drop from 165 to 110, the floor for
+// carrying text on glass, so they read as a faint lift on the glass rather
+// than a slab; the border lightens so the few hairlines left still separate on
+// a darker, clearer ground.
+const CLEAR_GLASS: ThemeColors = ThemeColors {
+    bg_base: Rgb(22, 22, 24),
+    bg_surface: Rgb(40, 40, 44),
+    bg_elevated: Rgb(48, 48, 52),
+    bg_selected: Rgb(58, 58, 63),
+    bg_hover: Rgb(50, 50, 55),
+    accent: Rgb(236, 236, 240),
+    accent2: Rgb(198, 201, 208),
+    text: Rgb(246, 246, 248),
+    subtext: Rgb(206, 209, 215),
+    overlay: Rgb(200, 203, 210),
+    green: Rgb(236, 236, 240),
+    border: Rgb(92, 92, 98),
+    surface_alpha: 110,
+    code: Rgb(206, 208, 214),
+    url: Rgb(214, 216, 222),
+    email: Rgb(200, 203, 209),
+    path: Rgb(200, 203, 209),
 };
 
 /// Cool silver highlight for Compact Capsule.
@@ -1057,6 +1100,11 @@ mod tests {
         assert!(Theme::ALL.contains(&Theme::Dark));
         assert!(Theme::ALL.contains(&Theme::Slate));
         assert!(Theme::ALL.contains(&Theme::GlassDark));
+        assert!(Theme::ALL.contains(&Theme::ClearGlass));
+        assert!(Theme::ClearGlass.is_glass() && Theme::ClearGlass.is_clear_glass());
+        assert!(!Theme::GlassDark.is_clear_glass());
+        let clear: Theme = serde_json::from_str("\"ClearGlass\"").expect("ClearGlass parses");
+        assert_eq!(clear, Theme::ClearGlass);
         // And Glass Light has joined them. A translucent light panel takes
         // its brightness from the backdrop while its ink does not, so it was
         // harsh over a white page and fell to 2.35:1 over black — under the
@@ -1065,7 +1113,7 @@ mod tests {
         let glass_light: Theme =
             serde_json::from_str("\"GlassLight\"").expect("GlassLight still parses");
         assert_eq!(glass_light, Theme::Light);
-        assert_eq!(Theme::ALL.len(), 10);
+        assert_eq!(Theme::ALL.len(), 11);
         // Nothing in the list still calls itself by a retired name. Glass Dark
         // is off this list: it is a theme again, not a tombstone.
         for theme in Theme::ALL {
