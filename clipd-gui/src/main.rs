@@ -2285,6 +2285,16 @@ fn shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeColors) {
         });
 }
 
+/// A theme's swatch in the pickers. Clear Glass is see-through, so its
+/// swatch is too; otherwise it would be a twin of Glass Dark's.
+fn swatch_fill(theme: Theme, tc: &clipd_core::ThemeColors) -> Color32 {
+    if theme.is_clear_glass() {
+        rgba(tc.bg_base, 70)
+    } else {
+        rgb(tc.bg_base)
+    }
+}
+
 /// A background surface, honouring the theme's `surface_alpha`.
 ///
 /// Solid themes report 255 and this is identical to `rgb`. The glass themes
@@ -2900,11 +2910,10 @@ fn theme_named(name: &str) -> Option<Theme> {
         // dark backdrop. Anyone asking for it by name gets the light theme
         // that works.
         "glass-light" | "glasslight" => Some(Theme::Light),
-        // Retired: Glass Dark's job — a dark surface with no colour in it —
-        // is what Dark already does, without a translucency layer to fight.
         "glass-dark" | "glassdark" | "glass" | "glass-minimal" | "glassminimal" => {
-            Some(Theme::Dark)
+            Some(Theme::GlassDark)
         }
+        "clear-glass" | "clearglass" | "clear" | "transparent" => Some(Theme::ClearGlass),
         // Legacy names map to the closest curated theme so existing configs/cli
         // calls don't break. The old colorful themes are gone, but users land in
         // a readable palette instead of an error.
@@ -3822,7 +3831,17 @@ fn paint_glass_shell(
         } else {
             // Neutral to match the grounds: a blue veil over neutral surfaces
             // just puts the cast back on top of the fix.
-            Color32::from_rgba_unmultiplied(12, 12, 14, if native_glass { 142 } else { 186 })
+            // Clear Glass keeps two thirds of Glass Dark's veil over the
+            // lens: the wallpaper stays vivid and white ink stays legible on
+            // its bright patches. Without native glass there is no lens to
+            // see through, so the veil carries the panel alone.
+            let alpha = match (theme.is_clear_glass(), native_glass) {
+                (true, true) => 95,
+                (true, false) => 120,
+                (false, true) => 142,
+                (false, false) => 186,
+            };
+            Color32::from_rgba_unmultiplied(12, 12, 14, alpha)
         };
         painter.rect_filled(rect, rounding, veil);
 
@@ -4030,7 +4049,10 @@ fn paint_soft_radial_glow(
 /// Older macOS releases fall back to classic vibrancy.
 #[cfg(target_os = "macos")]
 fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>) {
-    let want = theme.is_glass().then_some(false);
+    // Tracked as "is it the clear pane", so switching between the two glass
+    // themes rebuilds the material. (The light glass this once tracked is
+    // retired: every glass theme is dark.)
+    let want = theme.is_glass().then(|| theme.is_clear_glass());
     if want == *on {
         return;
     }
@@ -4040,12 +4062,14 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
     let _ = window_vibrancy::clear_vibrancy(frame);
     *on = None;
 
-    let Some(light) = want else {
+    let Some(clear) = want else {
         write_glass_status("off", false);
         return;
     };
 
     force_view_transparent(frame);
+    let light = false;
+
 
     // Both modes go through the sibling Liquid Glass view.
     //
@@ -4060,10 +4084,10 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
     // The whiteness that prompted the switch is handled where it belongs: in
     // the tint on the glass view, and in the single frost layer painted over
     // it, neither of which can hide the UI.
-    match apply_sibling_liquid_glass(frame, light) {
+    match apply_sibling_liquid_glass(frame, light, clear) {
         Ok(()) => {
-            *on = Some(light);
-            write_glass_status("liquid-regular", light);
+            *on = Some(clear);
+            write_glass_status(if clear { "liquid-clear" } else { "liquid-regular" }, light);
         }
         Err(err) => {
             log::info!("Liquid Glass unavailable ({err}); using classic vibrancy");
@@ -4089,7 +4113,7 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
                 Some(SHELL_ROUND as f64),
             ) {
                 Ok(()) => {
-                    *on = Some(light);
+                    *on = Some(clear);
                     write_glass_status("vibrancy", light);
                 }
                 Err(err) => {
@@ -4181,7 +4205,7 @@ const SIBLING_LIQUID_TAG: isize = 96945937;
 
 /// Tahoe Liquid Glass behind (never around) the egui render surface.
 #[cfg(target_os = "macos")]
-fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool) -> Result<(), String> {
+fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool, clear: bool) -> Result<(), String> {
     use objc2::rc::Retained;
     use objc2::MainThreadMarker;
     use objc2_app_kit::{
@@ -4211,10 +4235,23 @@ fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool) -> Result<(), 
     // Regular resolves toward white only when what is painted on top of it is
     // near-white too; with translucent rows and one even frost it stays a
     // proper frosted sheet.
-    let style = objc2_app_kit::NSGlassEffectViewStyle(
-        window_vibrancy::NSGlassEffectViewStyle::Regular as isize,
-    );
-    let tint = if light {
+    //
+    // Clear Glass is the exception, on purpose: the lens is the look. Compared
+    // side by side over a colourful wallpaper, Regular with a thin tint came
+    // out muddy grey (the diffusion averages the colours toward grey) and an
+    // untinted Regular washed out to milk; only Clear kept the wallpaper vivid,
+    // which is the whole point of the theme. The cost is that a window full of
+    // text behind shows through sharply. Glass Dark is the choice for that.
+    let style = objc2_app_kit::NSGlassEffectViewStyle(if clear {
+        window_vibrancy::NSGlassEffectViewStyle::Clear as isize
+    } else {
+        window_vibrancy::NSGlassEffectViewStyle::Regular as isize
+    });
+    let tint = if clear {
+        // A light smoke: enough that white ink holds over the bright parts of
+        // a wallpaper, not so much that the colours dull.
+        NSColor::colorWithRed_green_blue_alpha(0.045, 0.045, 0.05, 0.18)
+    } else if light {
         // AppKit's untinted light style approaches pure white, and clipd is
         // nearly always over a white document — so at 0.24 the panel was
         // white with a hint of grey, which is what "still white, no glass"
@@ -11537,7 +11574,7 @@ impl ClipdGui {
                     let (rect, resp) =
                         ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
                     let center = rect.center();
-                    ui.painter().circle_filled(center, 8.0, rgb(tc.bg_base));
+                    ui.painter().circle_filled(center, 8.0, swatch_fill(theme, &tc));
                     if theme.is_glass() {
                         if let Some((tl, br)) = theme.shell_glows() {
                             ui.painter().circle_filled(
@@ -11931,7 +11968,7 @@ impl ClipdGui {
                             let (rect, resp) =
                                 ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
                             let center = rect.center();
-                            ui.painter().circle_filled(center, 12.0, rgb(tc.bg_base));
+                            ui.painter().circle_filled(center, 12.0, swatch_fill(theme, &tc));
                             if theme.is_glass() {
                                 if let Some((tl, br)) = theme.shell_glows() {
                                     ui.painter().circle_filled(
