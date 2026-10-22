@@ -3831,11 +3831,12 @@ fn paint_glass_shell(
         } else {
             // Neutral to match the grounds: a blue veil over neutral surfaces
             // just puts the cast back on top of the fix.
-            // Clear Glass keeps about two thirds of Glass Dark's veil: the
-            // desktop's colour reads through, and white ink stays legible
-            // over a light window (the row bands carry the brightest case).
+            // Clear Glass keeps two thirds of Glass Dark's veil over the
+            // lens: the wallpaper stays vivid and white ink stays legible on
+            // its bright patches. Without native glass there is no lens to
+            // see through, so the veil carries the panel alone.
             let alpha = match (theme.is_clear_glass(), native_glass) {
-                (true, true) => 108,
+                (true, true) => 95,
                 (true, false) => 120,
                 (false, true) => 142,
                 (false, false) => 186,
@@ -4069,6 +4070,7 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
     force_view_transparent(frame);
     let light = false;
 
+
     // Both modes go through the sibling Liquid Glass view.
     //
     // Light was briefly routed to classic vibrancy instead, to get away from
@@ -4234,17 +4236,21 @@ fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool, clear: bool) -
     // near-white too; with translucent rows and one even frost it stays a
     // proper frosted sheet.
     //
-    // Clear Glass stays on Regular too. The lensing style was tried for it
-    // and, over a light window, showed that window's text sharp through the
-    // panel, interleaved with clipd's own rows. What makes it "clear" is the
-    // thin tint and veil: colour comes through, detail is still diffused.
-    let style = objc2_app_kit::NSGlassEffectViewStyle(
-        window_vibrancy::NSGlassEffectViewStyle::Regular as isize,
-    );
+    // Clear Glass is the exception, on purpose: the lens is the look. Compared
+    // side by side over a colourful wallpaper, Regular with a thin tint came
+    // out muddy grey (the diffusion averages the colours toward grey) and an
+    // untinted Regular washed out to milk; only Clear kept the wallpaper vivid,
+    // which is the whole point of the theme. The cost is that a window full of
+    // text behind shows through sharply. Glass Dark is the choice for that.
+    let style = objc2_app_kit::NSGlassEffectViewStyle(if clear {
+        window_vibrancy::NSGlassEffectViewStyle::Clear as isize
+    } else {
+        window_vibrancy::NSGlassEffectViewStyle::Regular as isize
+    });
     let tint = if clear {
-        // Half of Glass Dark's: the wallpaper keeps its colour, and the pane
-        // still has an edge over a white window.
-        NSColor::colorWithRed_green_blue_alpha(0.045, 0.045, 0.05, 0.20)
+        // A light smoke: enough that white ink holds over the bright parts of
+        // a wallpaper, not so much that the colours dull.
+        NSColor::colorWithRed_green_blue_alpha(0.045, 0.045, 0.05, 0.18)
     } else if light {
         // AppKit's untinted light style approaches pure white, and clipd is
         // nearly always over a white document — so at 0.24 the panel was
