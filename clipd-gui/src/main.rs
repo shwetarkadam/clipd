@@ -2517,6 +2517,17 @@ fn clipd_is_frontmost() -> bool {
     false
 }
 
+/// Step clipd out of the front, so the app that was there before is again.
+#[cfg(target_os = "macos")]
+fn hide_clipd_app() {
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
+        objc2_app_kit::NSApplication::sharedApplication(mtm).hide(None);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hide_clipd_app() {}
+
 /// A native "choose a file" dialog for a JSON file, via AppleScript — no
 /// extra dependency for one button.
 #[cfg(target_os = "macos")]
@@ -4564,6 +4575,12 @@ struct ClipdGui {
     main_watcher_started: bool,
     /// When the last show was asked for, to log how fast the window came up.
     main_show_asked: Option<Instant>,
+    /// When the palette was last summoned, and whether anything was picked
+    /// since: the before/after for "how long does fetching a clip take".
+    summoned_at: Option<Instant>,
+    picked_since_summon: bool,
+    /// How the next pick is being made, for the pick event.
+    pick_via: &'static str,
     /// The window has had the keyboard since it was last shown. Clicking away
     /// only hides a window that was actually in use — not one that launched
     /// in the background and never got focus.
@@ -4908,6 +4925,9 @@ impl ClipdGui {
             main_hidden: false,
             main_watcher_started: false,
             main_show_asked: None,
+            summoned_at: None,
+            picked_since_summon: false,
+            pick_via: "click",
             main_had_focus: false,
             main_shown_at: None,
             placed_at_caret: PLACED_AT_CARET_ON_LAUNCH.load(std::sync::atomic::Ordering::Relaxed),
@@ -5264,6 +5284,16 @@ impl ClipdGui {
         }
         log::info!("main window hidden");
         self.main_hidden = true;
+        if let Some(at) = self.summoned_at.take() {
+            if !self.picked_since_summon {
+                // Opened and left without a pick: the friction the pick
+                // changes are meant to remove, counted.
+                clipd_core::telemetry_event(
+                    "palette_closed_without_pick",
+                    &[("ms_open", at.elapsed().as_millis().to_string())],
+                );
+            }
+        }
         self.set_preview_open(ctx, false);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         clipd_core::set_gui_window_open(false);
@@ -5281,6 +5311,9 @@ impl ClipdGui {
         self.main_hidden = false;
         if was_hidden {
             self.main_show_asked = Some(Instant::now());
+            self.summoned_at = Some(Instant::now());
+            self.picked_since_summon = false;
+            clipd_core::telemetry_event("palette_shown", &[]);
         }
         if was_hidden {
             self.refresh();
@@ -6258,9 +6291,16 @@ impl ClipdGui {
                         egui::Id::new(("hud_row", clip_id)),
                         egui::Sense::click(),
                     );
+                    // A click is the pick: the popover is for grabbing something
+                    // and getting on, and it pastes where you already are. The
+                    // copy button on the row is there for copy-only.
                     if hit.clicked() && !star_clicked && !copy_clicked {
                         self.selected = pos;
-                        *action = Action::Copy;
+                        *action = if self.paste_settings.paste_on_pick {
+                            Action::Paste
+                        } else {
+                            Action::Copy
+                        };
                     }
                     if hit.double_clicked() && !star_clicked && !copy_clicked {
                         self.selected = pos;
@@ -7119,9 +7159,62 @@ impl ClipdGui {
         } else {
             self.do_copy()
         };
-        if pasted && self.paste_settings.return_focus_after_copy {
+        if !pasted {
+            return;
+        }
+        let auto = self.paste_settings.paste_on_pick;
+        self.note_pick(auto);
+        if auto {
+            self.paste_into_previous_app();
+        } else if self.paste_settings.return_focus_after_copy {
             return_focus_to_previous_app();
         }
+    }
+
+    /// The clip is on the clipboard: get back to where the person was and
+    /// have the daemon paste it there (see `clipd_core::pick_paste`).
+    fn paste_into_previous_app(&self) {
+        if self.hud {
+            // The popover is a panel over the app, not an app switch: the
+            // app under it is the target. If a click did bring clipd forward,
+            // step back so that app is in front again.
+            if clipd_is_frontmost() {
+                hide_clipd_app();
+            }
+            clipd_core::pick_paste::request(None);
+        } else {
+            let target = clipd_core::load_last_active_app();
+            return_focus_to_previous_app();
+            clipd_core::pick_paste::request(target);
+        }
+    }
+
+    /// One pick, for the "is fetching a clip getting easier" numbers. No clip
+    /// content, only how and how fast.
+    fn note_pick(&mut self, auto_paste: bool) {
+        let surface = if self.hud { "popover" } else { "palette" };
+        let ms = self
+            .summoned_at
+            .map(|at| at.elapsed().as_millis().to_string())
+            .unwrap_or_default();
+        let row = match self.selected {
+            0 => "1",
+            1..=2 => "2-3",
+            3..=8 => "4-9",
+            _ => "10+",
+        };
+        clipd_core::telemetry_event(
+            "clip_picked",
+            &[
+                ("surface", surface.to_string()),
+                ("via", if self.hud { "popover".to_string() } else { self.pick_via.to_string() }),
+                ("auto_paste", if auto_paste { "yes" } else { "no" }.to_string()),
+                ("ms_to_pick", ms),
+                ("row", row.to_string()),
+                ("searched", if self.search_query.trim().is_empty() { "no" } else { "yes" }.to_string()),
+            ],
+        );
+        self.picked_since_summon = true;
     }
 
     fn persist_actions(&self) {
@@ -8025,6 +8118,7 @@ impl eframe::App for ClipdGui {
                 self.scroll_to_selected = true;
             }
             if i.key_pressed(egui::Key::Enter) && !search_has_focus {
+                self.pick_via = "enter";
                 // Never paste-and-hide out of a question — re-ask instead.
                 action = if self.in_ask_mode() {
                     Action::Ask
@@ -8085,6 +8179,7 @@ impl eframe::App for ClipdGui {
                 for (n, key) in DIGITS.iter().enumerate() {
                     if i.key_pressed(*key) && n < self.filtered.len() {
                         self.selected = n;
+                        self.pick_via = "quick";
                         action = Action::Paste;
                     }
                 }
@@ -8332,10 +8427,18 @@ impl ClipdGui {
                 self.do_copy();
             }
             Action::Paste => {
-                // Pick = copy + get out of the way: hide clipd so the user is
-                // back where they were, ready to Cmd+V.
+                // Pick = paste: hide clipd, put the person back where they
+                // were, and paste there (or just copy, if that is switched off).
                 self.do_paste();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.pick_via = "click";
+                if self.hud {
+                    // The popover is resident and only the palette turns a
+                    // Close into a hide: a Close here quit the process, and
+                    // the next hover waited on a relaunch.
+                    self.hide_hud_offscreen(ctx);
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
             Action::Delete => self.do_delete(),
             Action::Send => self.do_send(ctx),
@@ -8535,11 +8638,15 @@ impl ClipdGui {
                         egui::Sense::click(),
                     );
                     if resp.clicked() || resp.double_clicked() {
-                        if self.set_clipboard(&snip.body)
-                            && self.paste_settings.return_focus_after_copy
-                        {
-                            return_focus_to_previous_app();
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        if self.set_clipboard(&snip.body) {
+                            if self.paste_settings.paste_on_pick {
+                                self.note_pick(true);
+                                self.paste_into_previous_app();
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            } else if self.paste_settings.return_focus_after_copy {
+                                return_focus_to_previous_app();
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
                         }
                     }
                     ui.add_space(ROW_GAP);
@@ -9261,9 +9368,9 @@ impl ClipdGui {
                 ui,
                 c,
                 FooterIcon::Clipboard,
-                &mut self.paste_settings.return_focus_after_copy,
-                "Paste into previous app",
-                "Jump back and paste after you pick a clip",
+                &mut self.paste_settings.paste_on_pick,
+                "Paste when you pick a clip",
+                "Enter, ⌘1–9 or a click in the popover pastes into the app you were in",
             );
             settings_card_divider(ui, c);
             dirty |= settings_toggle_row(

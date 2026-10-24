@@ -30,6 +30,7 @@ pub mod keyboard_layout;
 pub mod link_clean;
 pub mod mcp_consent;
 pub mod pause;
+pub mod pick_paste;
 pub mod import;
 pub mod install_location;
 pub mod skills;
