@@ -363,8 +363,10 @@ const CLEAR_GLASS: ThemeColors = ThemeColors {
     accent: Rgb(236, 236, 240),
     accent2: Rgb(198, 201, 208),
     text: Rgb(246, 246, 248),
-    subtext: Rgb(206, 209, 215),
-    overlay: Rgb(200, 203, 210),
+    // Brighter than Glass Dark's: on a see-through panel the timestamps
+    // and section labels are what fade first over a light window.
+    subtext: Rgb(224, 226, 231),
+    overlay: Rgb(222, 224, 229),
     green: Rgb(236, 236, 240),
     border: Rgb(92, 92, 98),
     surface_alpha: 110,

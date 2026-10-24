@@ -3831,12 +3831,14 @@ fn paint_glass_shell(
         } else {
             // Neutral to match the grounds: a blue veil over neutral surfaces
             // just puts the cast back on top of the fix.
-            // Clear Glass keeps two thirds of Glass Dark's veil over the
-            // lens: the wallpaper stays vivid and white ink stays legible on
-            // its bright patches. Without native glass there is no lens to
-            // see through, so the veil carries the panel alone.
+            // Clear Glass sits on the HUD material, which blurs what is behind
+            // and keeps its colour. Compared at 20/45/50/80 over a wallpaper,
+            // a dark window and a white one: the wallpaper stays vivid up to
+            // 80, but over a white window anything under ~80 left the
+            // timestamps and section labels too faint to read. Without native
+            // glass the veil carries the panel alone.
             let alpha = match (theme.is_clear_glass(), native_glass) {
-                (true, true) => 95,
+                (true, true) => 85,
                 (true, false) => 120,
                 (false, true) => 142,
                 (false, false) => 186,
@@ -4084,6 +4086,21 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
     // The whiteness that prompted the switch is handled where it belongs: in
     // the tint on the glass view, and in the single frost layer painted over
     // it, neither of which can hide the UI.
+    // Clear Glass: the classic material, which blurs *and* saturates what is
+    // behind. Liquid Glass gave a choice of two wrongs for this theme —
+    // Regular averaged the wallpaper to grey, Clear left a text window behind
+    // sharp enough to read through the rows. This keeps the colour and drops
+    // the detail. Falls through to Liquid Glass if it cannot be attached.
+    if clear {
+        match apply_sibling_vibrancy(frame) {
+            Ok(()) => {
+                *on = Some(clear);
+                write_glass_status("vibrancy-behind", light);
+                return;
+            }
+            Err(err) => log::info!("Clear Glass vibrancy unavailable ({err}); using Liquid Glass"),
+        }
+    }
     match apply_sibling_liquid_glass(frame, light, clear) {
         Ok(()) => {
             *on = Some(clear);
@@ -4236,17 +4253,13 @@ fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool, clear: bool) -
     // near-white too; with translucent rows and one even frost it stays a
     // proper frosted sheet.
     //
-    // Clear Glass is the exception, on purpose: the lens is the look. Compared
-    // side by side over a colourful wallpaper, Regular with a thin tint came
-    // out muddy grey (the diffusion averages the colours toward grey) and an
-    // untinted Regular washed out to milk; only Clear kept the wallpaper vivid,
-    // which is the whole point of the theme. The cost is that a window full of
-    // text behind shows through sharply. Glass Dark is the choice for that.
-    let style = objc2_app_kit::NSGlassEffectViewStyle(if clear {
-        window_vibrancy::NSGlassEffectViewStyle::Clear as isize
-    } else {
-        window_vibrancy::NSGlassEffectViewStyle::Regular as isize
-    });
+    // That holds for Clear Glass too, which only lands here when its own
+    // material (`apply_sibling_vibrancy`) cannot attach: the lensing style
+    // was tried for it and left a text window behind readable through the
+    // rows.
+    let style = objc2_app_kit::NSGlassEffectViewStyle(
+        window_vibrancy::NSGlassEffectViewStyle::Regular as isize,
+    );
     let tint = if clear {
         // A light smoke: enough that white ink holds over the bright parts of
         // a wallpaper, not so much that the colours dull.
@@ -4290,6 +4303,59 @@ fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool, clear: bool) -
     Ok(())
 }
 
+/// Marks the Clear Glass material view, so it can be found and removed.
+const SIBLING_VIBRANCY_ID: &str = "clipd.clear-glass";
+
+/// The blurred, saturating HUD material behind (never inside) the egui
+/// render surface. Inside the content view, as `window_vibrancy` puts it, it
+/// covers everything clipd draws; as a sibling below it, it is a backdrop.
+#[cfg(target_os = "macos")]
+fn apply_sibling_vibrancy(frame: &eframe::Frame) -> Result<(), String> {
+    use objc2::rc::Retained;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{
+        NSAutoresizingMaskOptions, NSColor, NSUserInterfaceItemIdentification, NSView,
+        NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+        NSVisualEffectView, NSWindowOrderingMode,
+    };
+    use objc2_foundation::NSString;
+
+    let mtm = MainThreadMarker::new().ok_or("not on main thread")?;
+    let metal = ns_metal_view(frame).ok_or("no ns_view")?;
+    let window = metal.window().ok_or("ns_view has no window yet")?;
+    let content = window.contentView().ok_or("window has no contentView")?;
+    let parent = unsafe { content.superview() }.ok_or("contentView has no superview")?;
+
+    let fx = NSVisualEffectView::initWithFrame(mtm.alloc(), content.frame());
+    // HUD: the dark, high-saturation panel material — the wallpaper comes
+    // through as vivid colour, text behind as soft shapes.
+    fx.setMaterial(NSVisualEffectMaterial::HUDWindow);
+    fx.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+    fx.setState(NSVisualEffectState::Active);
+    fx.setIdentifier(Some(&NSString::from_str(SIBLING_VIBRANCY_ID)));
+    fx.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable
+            | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    fx.setWantsLayer(true);
+    if let Some(layer) = fx.layer() {
+        layer.setCornerRadius(SHELL_ROUND as f64);
+        layer.setMasksToBounds(true);
+    }
+    let fx_view: Retained<NSView> = Retained::into_super(fx);
+    parent.addSubview_positioned_relativeTo(
+        &fx_view,
+        NSWindowOrderingMode::Below,
+        Some(content.as_ref()),
+    );
+    // A HUD material renders in the window's appearance: pin it dark.
+    force_glass_appearance(frame, false);
+    window.setOpaque(false);
+    window.setBackgroundColor(Some(&NSColor::clearColor()));
+    force_view_transparent(frame);
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn clear_sibling_glass(frame: &eframe::Frame) {
     let Some(metal) = ns_metal_view(frame) else {
@@ -4306,6 +4372,17 @@ fn clear_sibling_glass(frame: &eframe::Frame) {
     };
     if let Some(view) = parent.viewWithTag(SIBLING_LIQUID_TAG) {
         view.removeFromSuperview();
+    }
+    {
+        use objc2_app_kit::NSUserInterfaceItemIdentification;
+        for view in parent.subviews().iter() {
+            if view
+                .identifier()
+                .is_some_and(|id| id.to_string() == SIBLING_VIBRANCY_ID)
+            {
+                view.removeFromSuperview();
+            }
+        }
     }
 }
 

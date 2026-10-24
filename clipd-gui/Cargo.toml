@@ -34,6 +34,9 @@ objc2-app-kit = { version = "0.3", features = [
     "NSWindow",
     "NSScreen",
     "NSGlassEffectView",
+    # Clear Glass: the classic blurred, saturating material, behind the UI.
+    "NSVisualEffectView",
+    "NSUserInterfaceItemIdentification",
     # Activating / hiding the resident main window like Spotlight.
     "NSApplication",
     "NSResponder",
