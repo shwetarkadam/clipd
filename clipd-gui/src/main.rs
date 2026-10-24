@@ -4688,6 +4688,8 @@ struct ClipdGui {
     /// Every slot each text is in. `ClipEntry.slot` holds one; the same text
     /// in slots 2 and 3 is one clip, and its row should say both.
     slots_by_content: HashMap<String, Vec<u8>>,
+    /// Slot texts with no clip in history (see `sync_active_slot_labels`).
+    slot_texts_not_in_history: HashSet<String>,
     /// The popover is showing its Slots view instead of the clipboard.
     hud_slots_view: bool,
     /// How many rows at the top of the list are just-copied clips, set ahead
@@ -4842,7 +4844,9 @@ impl ClipdGui {
         let db_path = ClipStore::default_path();
         let store = ClipStore::new(&db_path).expect("Failed to open clip database");
         let mut clips = store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
-        let slots_by_content = sync_active_slot_labels(&store, &mut clips);
+        let mut slot_texts_not_in_history = HashSet::new();
+        let slots_by_content =
+            sync_active_slot_labels(&store, &mut clips, &mut slot_texts_not_in_history);
         let mut secret_scan_cache: HashMap<i64, Option<String>> = HashMap::new();
         let masked_clip_ids = mask_secret_previews(&mut clips, &mut secret_scan_cache);
         // Warm now, not on the first refresh: a parked popover skips refresh
@@ -4973,6 +4977,7 @@ impl ClipdGui {
             privacy_read_at: Instant::now(),
             masked_clip_ids,
             slots_by_content,
+            slot_texts_not_in_history,
             hud_slots_view: false,
             fresh_rows: 0,
             pins_hidden: 0,
@@ -5084,18 +5089,32 @@ impl ClipdGui {
 
     fn refresh(&mut self) {
         let refresh_started = Instant::now();
-        self.refresh_inner();
+        let mut steps: Vec<(&'static str, Duration)> = Vec::new();
+        self.refresh_inner(&mut steps);
         let took = refresh_started.elapsed();
-        if took > frame_diag::SLOW {
+        // CLIPD_REFRESH_TRACE=1 logs every refresh, not just the slow ones.
+        if took > frame_diag::SLOW || std::env::var_os("CLIPD_REFRESH_TRACE").is_some() {
+            // Which step, not just how long: "refresh took 130ms" says the
+            // window will hitch, not why.
+            let breakdown = steps
+                .iter()
+                .map(|(step, d)| format!("{step} {}ms", frame_diag::ms(*d)))
+                .collect::<Vec<_>>()
+                .join(", ");
             frame_diag::note(&format!(
-                "refresh took {}ms ({} clips)",
+                "refresh took {}ms ({} clips): {breakdown}",
                 frame_diag::ms(took),
                 self.clips.len()
             ));
         }
     }
 
-    fn refresh_inner(&mut self) {
+    fn refresh_inner(&mut self, steps: &mut Vec<(&'static str, Duration)>) {
+        let mut mark = Instant::now();
+        let mut lap = |steps: &mut Vec<(&'static str, Duration)>, step: &'static str| {
+            steps.push((step, mark.elapsed()));
+            mark = Instant::now();
+        };
         // Resolve the selection to a clip id *before* `clips` is replaced —
         // afterwards `filtered` holds indices into a vector that no longer
         // exists, and reading through them can be out of bounds.
@@ -5107,13 +5126,20 @@ impl ClipdGui {
 
         // Privacy switches can change in another clipd window; pick them up.
         self.privacy_config = clipd_core::privacy::load_privacy_config();
+        lap(steps, "privacy");
         let before: Vec<i64> = self.clips.iter().map(|clip| clip.id).collect();
         self.clips = self.store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
-        self.slots_by_content = sync_active_slot_labels(&self.store, &mut self.clips);
+        lap(steps, "load");
+        self.slots_by_content =
+            sync_active_slot_labels(&self.store, &mut self.clips, &mut self.slot_texts_not_in_history);
+        lap(steps, "slots");
         self.masked_clip_ids =
             mask_secret_previews(&mut self.clips, &mut self.secret_scan_cache);
+        lap(steps, "mask");
         warm_sensitive_cache(&self.clips, &self.privacy_config, &mut self.sensitive_cache);
+        lap(steps, "sensitive");
         self.sessions = compute_sessions(&self.clips, self.session_config.window_minutes);
+        lap(steps, "sessions");
         // Rebuild the search index only when the clips changed. This runs every
         // 3s while the window is open, and throwing the index away each time
         // made the next keystroke — or the refresh itself, mid-search — rebuild
@@ -5122,7 +5148,9 @@ impl ClipdGui {
             self.cached_tfidf = None;
         }
         self.refresh_snippets();
+        lap(steps, "snippets");
         self.apply_filter();
+        lap(steps, "filter");
 
         // Ask mode keeps its own list (the retrieved clips), which apply_filter
         // deliberately leaves alone — so re-derive those indices here against
@@ -14268,9 +14296,16 @@ fn mask_secret_previews(
 }
 
 /// Label clips with their slot, and return every slot each text is in.
+///
+/// `not_in_history` remembers slot texts the store has no clip for (a slot
+/// filled while capture was paused, say). Looking one up misses the index and
+/// scans the whole table, and without the memo that scan ran for every such
+/// slot on every refresh. A text that is later saved arrives as the newest
+/// clip, inside the loaded window, so it never needs looking up again.
 fn sync_active_slot_labels(
     store: &ClipStore,
     clips: &mut Vec<ClipEntry>,
+    not_in_history: &mut HashSet<String>,
 ) -> HashMap<String, Vec<u8>> {
     let active = store.list_active_slots().unwrap_or_default();
     let mut all_slots: HashMap<String, Vec<u8>> = HashMap::new();
@@ -14298,12 +14333,18 @@ fn sync_active_slot_labels(
     let present: HashSet<&str> = clips.iter().map(|c| c.content.as_str()).collect();
     let mut extras: Vec<ClipEntry> = Vec::new();
     for (slot, content) in &active {
-        if *slot == 0 || present.contains(content.as_str()) {
+        if *slot == 0 || present.contains(content.as_str()) || not_in_history.contains(content) {
             continue;
         }
-        if let Ok(Some(mut clip)) = store.find_by_content(content) {
-            clip.slot = Some(*slot);
-            extras.push(clip);
+        match store.find_by_content(content) {
+            Ok(Some(mut clip)) => {
+                clip.slot = Some(*slot);
+                extras.push(clip);
+            }
+            Ok(None) => {
+                not_in_history.insert(content.clone());
+            }
+            Err(_) => {}
         }
     }
     // At the end, not the front: these are older clips kept loaded so their
