@@ -52,11 +52,29 @@ mod imp {
     const NO_DEAD_KEYS: u32 = 1;
 
     use super::{codes_for, LETTERS};
+    use std::sync::atomic::AtomicU32;
     static CODES: [AtomicI32; 3] = [AtomicI32::new(-1), AtomicI32::new(-1), AtomicI32::new(-1)];
     static READY: AtomicBool = AtomicBool::new(false);
+    /// What each key code types, plain and with Shift (0 = nothing). For
+    /// recognising what someone typed — the `;;` trigger — from a key event
+    /// that carries only a code.
+    static TYPED: [[AtomicU32; 128]; 2] = {
+        const Z: AtomicU32 = AtomicU32::new(0);
+        const ROW: [AtomicU32; 128] = [Z; 128];
+        [ROW, ROW]
+    };
+    /// shiftKey >> 8
+    const SHIFT_MODIFIER: u32 = 0x02;
+
+    /// The character `code` types in the current layout, if known.
+    pub fn typed_char(code: u16, shift: bool) -> Option<char> {
+        let v = TYPED[usize::from(shift)].get(usize::from(code))?.load(Ordering::Relaxed);
+        (v != 0).then(|| char::from_u32(v)).flatten()
+    }
 
     /// Re-read the layout. Main thread only — see the module docs.
     pub fn refresh() {
+        unsafe { fill_typed() };
         let found = unsafe { lookup() };
         let mut changed = !READY.load(Ordering::Acquire);
         for (slot, code) in CODES.iter().zip(found) {
@@ -79,6 +97,44 @@ mod imp {
 
     pub fn is_ready() -> bool {
         READY.load(Ordering::Acquire)
+    }
+
+    /// Fill `TYPED` from the current layout. Main thread only.
+    unsafe fn fill_typed() {
+        let source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource();
+        if source.is_null() {
+            return;
+        }
+        let data = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData);
+        if !data.is_null() {
+            let layout = CFDataGetBytePtr(data) as *const c_void;
+            let kbd = u32::from(LMGetKbdType());
+            for (row, modifiers) in [(0usize, 0u32), (1, SHIFT_MODIFIER)] {
+                for code in 0u16..128 {
+                    let mut dead = 0u32;
+                    let mut len = 0usize;
+                    let mut chars = [0u16; 4];
+                    let status = UCKeyTranslate(
+                        layout,
+                        code,
+                        ACTION_DISPLAY,
+                        modifiers,
+                        kbd,
+                        NO_DEAD_KEYS,
+                        &mut dead,
+                        chars.len(),
+                        &mut len,
+                        chars.as_mut_ptr(),
+                    );
+                    let ch = (status == 0 && len == 1)
+                        .then(|| char::from_u32(u32::from(chars[0])))
+                        .flatten()
+                        .filter(|c| !c.is_control() || *c == ' ' || *c == '\t');
+                    TYPED[row][usize::from(code)].store(ch.map_or(0, u32::from), Ordering::Relaxed);
+                }
+            }
+        }
+        CFRelease(source);
     }
 
     unsafe fn lookup() -> [Option<u16>; 3] {
@@ -139,7 +195,7 @@ fn codes_for(types: impl Fn(u16) -> Option<char>) -> [Option<u16>; 3] {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{is_ready, keycode, refresh};
+pub use imp::{is_ready, keycode, refresh, typed_char};
 
 #[cfg(not(target_os = "macos"))]
 pub fn refresh() {}
@@ -150,6 +206,10 @@ pub fn keycode(_letter: char) -> Option<u16> {
 #[cfg(not(target_os = "macos"))]
 pub fn is_ready() -> bool {
     false
+}
+#[cfg(not(target_os = "macos"))]
+pub fn typed_char(_code: u16, _shift: bool) -> Option<char> {
+    None
 }
 
 #[cfg(test)]

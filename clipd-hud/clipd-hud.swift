@@ -10,6 +10,15 @@ struct Row {
     let active: Bool
 }
 
+/// One clip in the `switcher` strip.
+struct Card {
+    let number: String
+    let kind: String
+    let app: String
+    let source: String
+    let preview: String
+}
+
 /// A clickable choice in a `prompt` HUD. `id` is what gets written to stdout.
 struct Button {
     let id: String
@@ -42,6 +51,14 @@ struct Payload {
     var avoidTop: CGFloat = 0
     /// Keep this toast out of screen sharing, recordings and screenshots.
     var hidden = false
+    /// Where to draw, for the overlays that sit at the text cursor: the
+    /// point under the caret, top-left origin (Accessibility's space).
+    var at: CGPoint? = nil
+    /// `switcher`: the cards and which one is selected (0-based).
+    var cards: [Card] = []
+    var sel = 0
+    /// `peek`: chord, then what it pastes.
+    var lines: [(String, String)] = []
 }
 
 /// Where a panel of this height belongs, in AppKit's bottom-left origin.
@@ -78,6 +95,12 @@ func parse(_ text: String) -> Payload {
         case "TIMEOUT": if f.count > 1 { p.timeout = Double(f[1]) ?? 0 }
         case "AVOIDTOP": if f.count > 1 { p.avoidTop = CGFloat(Double(f[1]) ?? 0) }
         case "PRIVATE": p.hidden = f.count > 1 && f[1] == "1"
+        case "AT":
+            if f.count > 2, let x = Double(f[1]), let y = Double(f[2]) { p.at = CGPoint(x: x, y: y) }
+        case "SEL": if f.count > 1 { p.sel = Int(f[1]) ?? 0 }
+        case "CARD":
+            if f.count > 5 { p.cards.append(Card(number: f[1], kind: f[2], app: f[3], source: f[4], preview: f[5])) }
+        case "LINE": if f.count > 2 { p.lines.append((f[1], f[2])) }
         case "BTN":
             if f.count > 2 { p.buttons.append(Button(id: f[1], label: f[2], primary: f.count > 3 && f[3] == "1")) }
         case "ROW":
@@ -519,6 +542,114 @@ class HUD: NSObject {
         present(duration: p.timeout > 0 ? p.timeout : 1.9)
     }
 
+    /// A frame of `size` just under the text cursor at `at` (top-left space),
+    /// flipped above it near the bottom of the screen and kept on screen.
+    /// Without a cursor position it sits low and centred, like a toast.
+    func frameNearCaret(_ size: NSSize, at: CGPoint?) -> NSRect {
+        let primaryH = NSScreen.screens.first?.frame.height ?? 900
+        guard let at = at else {
+            let screen = NSScreen.main ?? NSScreen.screens[0]
+            let f = screen.visibleFrame
+            return NSRect(x: f.midX - size.width / 2, y: f.minY + f.height * 0.28,
+                          width: size.width, height: size.height)
+        }
+        // AppKit's y runs up from the bottom of the primary display.
+        let pt = NSPoint(x: at.x, y: primaryH - at.y)
+        let screen = NSScreen.screens.first { $0.frame.contains(pt) } ?? NSScreen.main ?? NSScreen.screens[0]
+        let f = screen.visibleFrame
+        var x = pt.x - 18
+        var y = pt.y - 8 - size.height
+        if y < f.minY + 6 {
+            // No room below: above the line (caret height is ~18pt).
+            y = pt.y + 26
+        }
+        x = min(max(x, f.minX + 6), f.maxX - size.width - 6)
+        y = min(max(y, f.minY + 6), f.maxY - size.height - 6)
+        return NSRect(x: x, y: y, width: size.width, height: size.height)
+    }
+
+    /// The clipboard switcher: recent clips as cards, the selected one lit.
+    /// Redrawn on every tap; the daemon sends `hide` when ⌃ is let go.
+    func showSwitcher(_ p: Payload) {
+        guard !p.cards.isEmpty else { hideNow(); return }
+        let n = CGFloat(p.cards.count)
+        let pad: CGFloat = 8, gap: CGFloat = 6, cardH: CGFloat = 76
+        let screenW = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame.width
+        let cardW = min(150, (screenW - 40 - pad * 2 - gap * (n - 1)) / n)
+        let size = NSSize(width: pad * 2 + cardW * n + gap * (n - 1), height: cardH + pad * 2)
+        makePlainPanel(frameNearCaret(size, at: p.at))
+        let ink = NSColor(calibratedWhite: 0.07, alpha: 0.96)
+        _ = shape(NSRect(origin: .zero, size: size), fill: ink, radius: 14,
+                  border: NSColor(calibratedWhite: 1.0, alpha: 0.08), borderWidth: 1)
+        for (i, card) in p.cards.enumerated() {
+            let selected = i == p.sel
+            let x = pad + CGFloat(i) * (cardW + gap)
+            let frame = NSRect(x: x, y: pad, width: cardW, height: cardH)
+            _ = shape(frame,
+                      fill: selected ? NSColor(calibratedWhite: 1.0, alpha: 0.14)
+                                     : NSColor(calibratedWhite: 1.0, alpha: 0.04),
+                      radius: 10,
+                      border: selected ? NSColor(calibratedRed: 0.45, green: 0.62, blue: 0.95, alpha: 0.95)
+                                       : NSColor(calibratedWhite: 1.0, alpha: 0.05),
+                      borderWidth: selected ? 2 : 1)
+            let num = label(card.number, size: 11, weight: .semibold,
+                            color: NSColor(calibratedWhite: 1.0, alpha: selected ? 0.9 : 0.4))
+            num.frame = NSRect(x: x + 8, y: pad + cardH - 20, width: 14, height: 14)
+            root.addSubview(num)
+            symbol(card.kind, frame: NSRect(x: x + 22, y: pad + cardH - 21, width: 14, height: 14),
+                   point: 11, color: NSColor(calibratedWhite: 1.0, alpha: 0.55))
+            let app = label(card.app, size: 10.5, weight: .medium,
+                            color: NSColor(calibratedWhite: 1.0, alpha: 0.55))
+            app.frame = NSRect(x: x + 40, y: pad + cardH - 20, width: cardW - 48, height: 14)
+            root.addSubview(app)
+            let pv = label(card.preview, size: 12.5, weight: selected ? .semibold : .regular,
+                           color: NSColor(calibratedWhite: 1.0, alpha: selected ? 0.97 : 0.8))
+            pv.lineBreakMode = .byWordWrapping
+            pv.maximumNumberOfLines = 2
+            pv.cell?.truncatesLastVisibleLine = true
+            pv.frame = NSRect(x: x + 8, y: pad + 18, width: cardW - 16, height: 34)
+            root.addSubview(pv)
+            if !card.source.isEmpty {
+                let src = label(card.source, size: 9.5, weight: .regular,
+                                color: NSColor(calibratedWhite: 1.0, alpha: 0.38))
+                src.frame = NSRect(x: x + 8, y: pad + 5, width: cardW - 16, height: 12)
+                root.addSubview(src)
+            }
+        }
+        // Up until it is let go; the long safety only matters if the release
+        // is somehow never seen.
+        present(duration: 30)
+    }
+
+    /// The peek: what ⌘V pastes, and ⌘V ×2 / ×3 when slots apply.
+    func showPeek(_ p: Payload) {
+        guard !p.lines.isEmpty else { hideNow(); return }
+        let rowH: CGFloat = 22, pad: CGFloat = 10, keysW: CGFloat = 58
+        let size = NSSize(width: 380, height: pad * 2 + rowH * CGFloat(p.lines.count))
+        makePlainPanel(frameNearCaret(size, at: p.at))
+        _ = shape(NSRect(origin: .zero, size: size), fill: NSColor(calibratedWhite: 0.07, alpha: 0.95),
+                  radius: 11, border: NSColor(calibratedWhite: 1.0, alpha: 0.08), borderWidth: 1)
+        for (i, line) in p.lines.enumerated() {
+            let y = size.height - pad - rowH * CGFloat(i + 1) + 3
+            let k = label(line.0, size: 12, weight: .semibold,
+                          color: NSColor(calibratedWhite: 1.0, alpha: 0.95))
+            k.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
+            k.frame = NSRect(x: pad + 2, y: y, width: keysW, height: 16)
+            root.addSubview(k)
+            let t = label(line.1, size: 12.5, weight: .regular,
+                          color: NSColor(calibratedWhite: 1.0, alpha: i == 0 ? 0.9 : 0.7))
+            t.frame = NSRect(x: pad + keysW + 6, y: y, width: size.width - keysW - pad * 2 - 8, height: 16)
+            root.addSubview(t)
+        }
+        present(duration: 8)
+    }
+
+    /// Take down whatever is showing, now.
+    func hideNow() {
+        generation += 1
+        panel?.orderOut(nil)
+    }
+
     func makePanel(_ rect: NSRect, interactive: Bool = false) {
         // A newer message replaces what is on screen at once, rather than
         // queueing behind its fade.
@@ -592,6 +723,9 @@ class HUD: NSObject {
         case "slot": showSlotToast(p)
         case "toast": showToast(p)
         case "list": showList(p)
+        case "switcher": showSwitcher(p)
+        case "peek": showPeek(p)
+        case "hide": hideNow()
         case "prompt": return
         default: showSimple(text)
         }

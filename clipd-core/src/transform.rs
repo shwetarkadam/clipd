@@ -509,6 +509,25 @@ pub struct PasteTransformSettings {
     #[serde(default = "default_true_val")]
     pub paste_on_pick: bool,
 
+    /// Faster ways to paste (see `crate::fast_paste`). All opt-in: each one
+    /// listens to the keyboard in a new way, so it is the person's call.
+    ///
+    /// Hold ⌃ and tap V: a strip of recent clips at the text cursor; let go
+    /// to paste the selected one.
+    #[serde(default)]
+    pub switcher_enabled: bool,
+    /// Hold ⌘ on its own for a moment: see what ⌘V (and ⌘V ×2, ×3) pastes.
+    #[serde(default)]
+    pub peek_enabled: bool,
+    /// Type `;;` and a few letters, then a space: replaced by the matching
+    /// clip.
+    #[serde(default)]
+    pub type_to_paste_enabled: bool,
+    /// Whether the person has been asked about the three above (onboarding,
+    /// or the one-time card for people who onboarded before they existed).
+    #[serde(default)]
+    pub fast_paste_offered: bool,
+
     /// Show the running clip count in the popover. Some people read it as
     /// useful state, others as noise on a panel meant to be glanced at.
     #[serde(default = "default_true_val")]
@@ -623,6 +642,10 @@ impl Default for PasteTransformSettings {
             hover_opens_hud: true,
             open_at_caret: true,
             paste_on_pick: true,
+            switcher_enabled: false,
+            peek_enabled: false,
+            type_to_paste_enabled: false,
+            fast_paste_offered: false,
             show_clip_count: true,
             gui_layout: GuiLayout::Palette,
             copy_multi_tap_restore: true,
