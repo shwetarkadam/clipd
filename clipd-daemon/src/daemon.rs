@@ -254,6 +254,9 @@ pub fn run_daemon_with_stop(
                     std::thread::sleep(delay);
                     fill_form(&fill_slot_mgr, &fill_suppress);
                 }
+                if let Some(request) = clipd_core::pick_paste::take_request() {
+                    paste_picked(&request);
+                }
             }
         })?;
 
@@ -2352,6 +2355,39 @@ fn simulate_tab() {
         release_windows_shortcut_modifiers(&mut enigo);
         let _ = enigo.key(Key::Tab, Direction::Click);
     }
+}
+
+/// Paste a clip the person just picked in clipd (see `clipd_core::pick_paste`):
+/// wait for the app it is for to be back in front, then ⌘V. If that app never
+/// comes back, paste nothing.
+fn paste_picked(request: &clipd_core::pick_paste::PasteRequest) {
+    #[cfg(target_os = "macos")]
+    {
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        loop {
+            let front = get_frontmost_app_name();
+            if clipd_core::pick_paste::may_paste(request.target_app.as_deref(), front.as_deref()) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                log::info!(
+                    "📋 Pick-to-paste skipped: {:?} did not come back to the front (front: {:?})",
+                    request.target_app,
+                    front
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // In front is not quite the same as its text field being key again.
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    // Elsewhere clipd's window hides and the previous window takes focus back
+    // on its own; give it the moment that takes.
+    #[cfg(not(target_os = "macos"))]
+    std::thread::sleep(Duration::from_millis(250));
+    simulate_paste();
+    log::info!("📋 Pasted the picked clip into {:?}", request.target_app);
 }
 
 /// Type slots 1…N into the focused form, Tab between fields (see

@@ -409,6 +409,25 @@ impl ClipStore {
     /// Used to keep active multi-slots visible in the GUI even when they fall
     /// outside the recent-N window the palette normally loads.
     pub fn find_by_content(&self, content: &str) -> SqlResult<Option<ClipEntry>> {
+        // By hash first: `content_hash` is indexed and `content` is not, so
+        // matching on the text alone reads every clip's full body. The window
+        // does this for each slot outside its recent list on every refresh —
+        // a scan per slot, every three seconds, on the thread that draws.
+        // Text clips are stored with sha256(content); the content check keeps
+        // a hash collision (or a row hashed some other way) from answering.
+        let hash = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(content.as_bytes()))
+        };
+        let mut by_hash = self.conn.prepare_cached(&format!(
+            "SELECT {} FROM clips WHERE content_hash = ?1 AND content = ?2 \
+             ORDER BY timestamp DESC LIMIT 1",
+            Self::CLIP_COLUMNS
+        ))?;
+        if let Some(found) = by_hash.query_map(params![hash, content], Self::row_to_clip)?.next() {
+            return found.map(Some);
+        }
+        // A row stored under some other hash (files, images, older builds).
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {} FROM clips WHERE content = ?1 ORDER BY timestamp DESC LIMIT 1",
             Self::CLIP_COLUMNS
@@ -1129,6 +1148,23 @@ mod tests {
         let mut entry = ClipEntry::new(content.to_string(), Some(app.to_string()), None);
         entry.timestamp = Utc::now() - chrono::Duration::days(days_ago);
         store.insert(&entry).unwrap()
+    }
+
+    #[test]
+    fn find_by_content_uses_the_hash_and_still_finds_odd_rows() {
+        let store = ClipStore::in_memory().unwrap();
+        let id = insert_aged(&store, "slot text far back in history", 90, "Notes");
+        let found = store.find_by_content("slot text far back in history").unwrap();
+        assert_eq!(found.map(|c| c.id), Some(id));
+        // A row stored under some other hash is still found, by the scan.
+        let mut odd = make_entry("stored with a different hash");
+        odd.content_hash = "not-sha256".into();
+        let odd_id = store.insert(&odd).unwrap();
+        assert_eq!(
+            store.find_by_content("stored with a different hash").unwrap().map(|c| c.id),
+            Some(odd_id)
+        );
+        assert!(store.find_by_content("never copied").unwrap().is_none());
     }
 
     #[test]

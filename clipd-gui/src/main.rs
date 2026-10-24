@@ -2285,6 +2285,16 @@ fn shortcut_badge(ui: &mut egui::Ui, text: &str, c: &clipd_core::ThemeColors) {
         });
 }
 
+/// A theme's swatch in the pickers. Clear Glass is see-through, so its
+/// swatch is too; otherwise it would be a twin of Glass Dark's.
+fn swatch_fill(theme: Theme, tc: &clipd_core::ThemeColors) -> Color32 {
+    if theme.is_clear_glass() {
+        rgba(tc.bg_base, 70)
+    } else {
+        rgb(tc.bg_base)
+    }
+}
+
 /// A background surface, honouring the theme's `surface_alpha`.
 ///
 /// Solid themes report 255 and this is identical to `rgb`. The glass themes
@@ -2506,6 +2516,17 @@ fn clipd_is_frontmost() -> bool {
 fn clipd_is_frontmost() -> bool {
     false
 }
+
+/// Step clipd out of the front, so the app that was there before is again.
+#[cfg(target_os = "macos")]
+fn hide_clipd_app() {
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
+        objc2_app_kit::NSApplication::sharedApplication(mtm).hide(None);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hide_clipd_app() {}
 
 /// A native "choose a file" dialog for a JSON file, via AppleScript — no
 /// extra dependency for one button.
@@ -2900,11 +2921,10 @@ fn theme_named(name: &str) -> Option<Theme> {
         // dark backdrop. Anyone asking for it by name gets the light theme
         // that works.
         "glass-light" | "glasslight" => Some(Theme::Light),
-        // Retired: Glass Dark's job — a dark surface with no colour in it —
-        // is what Dark already does, without a translucency layer to fight.
         "glass-dark" | "glassdark" | "glass" | "glass-minimal" | "glassminimal" => {
-            Some(Theme::Dark)
+            Some(Theme::GlassDark)
         }
+        "clear-glass" | "clearglass" | "clear" | "transparent" => Some(Theme::ClearGlass),
         // Legacy names map to the closest curated theme so existing configs/cli
         // calls don't break. The old colorful themes are gone, but users land in
         // a readable palette instead of an error.
@@ -3822,7 +3842,19 @@ fn paint_glass_shell(
         } else {
             // Neutral to match the grounds: a blue veil over neutral surfaces
             // just puts the cast back on top of the fix.
-            Color32::from_rgba_unmultiplied(12, 12, 14, if native_glass { 142 } else { 186 })
+            // Clear Glass sits on the HUD material, which blurs what is behind
+            // and keeps its colour. Compared at 20/45/50/80 over a wallpaper,
+            // a dark window and a white one: the wallpaper stays vivid up to
+            // 80, but over a white window anything under ~80 left the
+            // timestamps and section labels too faint to read. Without native
+            // glass the veil carries the panel alone.
+            let alpha = match (theme.is_clear_glass(), native_glass) {
+                (true, true) => 85,
+                (true, false) => 120,
+                (false, true) => 142,
+                (false, false) => 186,
+            };
+            Color32::from_rgba_unmultiplied(12, 12, 14, alpha)
         };
         painter.rect_filled(rect, rounding, veil);
 
@@ -4030,7 +4062,10 @@ fn paint_soft_radial_glow(
 /// Older macOS releases fall back to classic vibrancy.
 #[cfg(target_os = "macos")]
 fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>) {
-    let want = theme.is_glass().then_some(false);
+    // Tracked as "is it the clear pane", so switching between the two glass
+    // themes rebuilds the material. (The light glass this once tracked is
+    // retired: every glass theme is dark.)
+    let want = theme.is_glass().then(|| theme.is_clear_glass());
     if want == *on {
         return;
     }
@@ -4040,12 +4075,14 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
     let _ = window_vibrancy::clear_vibrancy(frame);
     *on = None;
 
-    let Some(light) = want else {
+    let Some(clear) = want else {
         write_glass_status("off", false);
         return;
     };
 
     force_view_transparent(frame);
+    let light = false;
+
 
     // Both modes go through the sibling Liquid Glass view.
     //
@@ -4060,10 +4097,25 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
     // The whiteness that prompted the switch is handled where it belongs: in
     // the tint on the glass view, and in the single frost layer painted over
     // it, neither of which can hide the UI.
-    match apply_sibling_liquid_glass(frame, light) {
+    // Clear Glass: the classic material, which blurs *and* saturates what is
+    // behind. Liquid Glass gave a choice of two wrongs for this theme —
+    // Regular averaged the wallpaper to grey, Clear left a text window behind
+    // sharp enough to read through the rows. This keeps the colour and drops
+    // the detail. Falls through to Liquid Glass if it cannot be attached.
+    if clear {
+        match apply_sibling_vibrancy(frame) {
+            Ok(()) => {
+                *on = Some(clear);
+                write_glass_status("vibrancy-behind", light);
+                return;
+            }
+            Err(err) => log::info!("Clear Glass vibrancy unavailable ({err}); using Liquid Glass"),
+        }
+    }
+    match apply_sibling_liquid_glass(frame, light, clear) {
         Ok(()) => {
-            *on = Some(light);
-            write_glass_status("liquid-regular", light);
+            *on = Some(clear);
+            write_glass_status(if clear { "liquid-clear" } else { "liquid-regular" }, light);
         }
         Err(err) => {
             log::info!("Liquid Glass unavailable ({err}); using classic vibrancy");
@@ -4089,7 +4141,7 @@ fn sync_glass_native(frame: &eframe::Frame, theme: Theme, on: &mut Option<bool>)
                 Some(SHELL_ROUND as f64),
             ) {
                 Ok(()) => {
-                    *on = Some(light);
+                    *on = Some(clear);
                     write_glass_status("vibrancy", light);
                 }
                 Err(err) => {
@@ -4181,7 +4233,7 @@ const SIBLING_LIQUID_TAG: isize = 96945937;
 
 /// Tahoe Liquid Glass behind (never around) the egui render surface.
 #[cfg(target_os = "macos")]
-fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool) -> Result<(), String> {
+fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool, clear: bool) -> Result<(), String> {
     use objc2::rc::Retained;
     use objc2::MainThreadMarker;
     use objc2_app_kit::{
@@ -4211,10 +4263,19 @@ fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool) -> Result<(), 
     // Regular resolves toward white only when what is painted on top of it is
     // near-white too; with translucent rows and one even frost it stays a
     // proper frosted sheet.
+    //
+    // That holds for Clear Glass too, which only lands here when its own
+    // material (`apply_sibling_vibrancy`) cannot attach: the lensing style
+    // was tried for it and left a text window behind readable through the
+    // rows.
     let style = objc2_app_kit::NSGlassEffectViewStyle(
         window_vibrancy::NSGlassEffectViewStyle::Regular as isize,
     );
-    let tint = if light {
+    let tint = if clear {
+        // A light smoke: enough that white ink holds over the bright parts of
+        // a wallpaper, not so much that the colours dull.
+        NSColor::colorWithRed_green_blue_alpha(0.045, 0.045, 0.05, 0.18)
+    } else if light {
         // AppKit's untinted light style approaches pure white, and clipd is
         // nearly always over a white document — so at 0.24 the panel was
         // white with a hint of grey, which is what "still white, no glass"
@@ -4253,6 +4314,59 @@ fn apply_sibling_liquid_glass(frame: &eframe::Frame, light: bool) -> Result<(), 
     Ok(())
 }
 
+/// Marks the Clear Glass material view, so it can be found and removed.
+const SIBLING_VIBRANCY_ID: &str = "clipd.clear-glass";
+
+/// The blurred, saturating HUD material behind (never inside) the egui
+/// render surface. Inside the content view, as `window_vibrancy` puts it, it
+/// covers everything clipd draws; as a sibling below it, it is a backdrop.
+#[cfg(target_os = "macos")]
+fn apply_sibling_vibrancy(frame: &eframe::Frame) -> Result<(), String> {
+    use objc2::rc::Retained;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{
+        NSAutoresizingMaskOptions, NSColor, NSUserInterfaceItemIdentification, NSView,
+        NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+        NSVisualEffectView, NSWindowOrderingMode,
+    };
+    use objc2_foundation::NSString;
+
+    let mtm = MainThreadMarker::new().ok_or("not on main thread")?;
+    let metal = ns_metal_view(frame).ok_or("no ns_view")?;
+    let window = metal.window().ok_or("ns_view has no window yet")?;
+    let content = window.contentView().ok_or("window has no contentView")?;
+    let parent = unsafe { content.superview() }.ok_or("contentView has no superview")?;
+
+    let fx = NSVisualEffectView::initWithFrame(mtm.alloc(), content.frame());
+    // HUD: the dark, high-saturation panel material — the wallpaper comes
+    // through as vivid colour, text behind as soft shapes.
+    fx.setMaterial(NSVisualEffectMaterial::HUDWindow);
+    fx.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+    fx.setState(NSVisualEffectState::Active);
+    fx.setIdentifier(Some(&NSString::from_str(SIBLING_VIBRANCY_ID)));
+    fx.setAutoresizingMask(
+        NSAutoresizingMaskOptions::ViewWidthSizable
+            | NSAutoresizingMaskOptions::ViewHeightSizable,
+    );
+    fx.setWantsLayer(true);
+    if let Some(layer) = fx.layer() {
+        layer.setCornerRadius(SHELL_ROUND as f64);
+        layer.setMasksToBounds(true);
+    }
+    let fx_view: Retained<NSView> = Retained::into_super(fx);
+    parent.addSubview_positioned_relativeTo(
+        &fx_view,
+        NSWindowOrderingMode::Below,
+        Some(content.as_ref()),
+    );
+    // A HUD material renders in the window's appearance: pin it dark.
+    force_glass_appearance(frame, false);
+    window.setOpaque(false);
+    window.setBackgroundColor(Some(&NSColor::clearColor()));
+    force_view_transparent(frame);
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn clear_sibling_glass(frame: &eframe::Frame) {
     let Some(metal) = ns_metal_view(frame) else {
@@ -4269,6 +4383,17 @@ fn clear_sibling_glass(frame: &eframe::Frame) {
     };
     if let Some(view) = parent.viewWithTag(SIBLING_LIQUID_TAG) {
         view.removeFromSuperview();
+    }
+    {
+        use objc2_app_kit::NSUserInterfaceItemIdentification;
+        for view in parent.subviews().iter() {
+            if view
+                .identifier()
+                .is_some_and(|id| id.to_string() == SIBLING_VIBRANCY_ID)
+            {
+                view.removeFromSuperview();
+            }
+        }
     }
 }
 
@@ -4450,6 +4575,12 @@ struct ClipdGui {
     main_watcher_started: bool,
     /// When the last show was asked for, to log how fast the window came up.
     main_show_asked: Option<Instant>,
+    /// When the palette was last summoned, and whether anything was picked
+    /// since: the before/after for "how long does fetching a clip take".
+    summoned_at: Option<Instant>,
+    picked_since_summon: bool,
+    /// How the next pick is being made, for the pick event.
+    pick_via: &'static str,
     /// The window has had the keyboard since it was last shown. Clicking away
     /// only hides a window that was actually in use — not one that launched
     /// in the background and never got focus.
@@ -4574,6 +4705,8 @@ struct ClipdGui {
     /// Every slot each text is in. `ClipEntry.slot` holds one; the same text
     /// in slots 2 and 3 is one clip, and its row should say both.
     slots_by_content: HashMap<String, Vec<u8>>,
+    /// Slot texts with no clip in history (see `sync_active_slot_labels`).
+    slot_texts_not_in_history: HashSet<String>,
     /// The popover is showing its Slots view instead of the clipboard.
     hud_slots_view: bool,
     /// How many rows at the top of the list are just-copied clips, set ahead
@@ -4728,7 +4861,9 @@ impl ClipdGui {
         let db_path = ClipStore::default_path();
         let store = ClipStore::new(&db_path).expect("Failed to open clip database");
         let mut clips = store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
-        let slots_by_content = sync_active_slot_labels(&store, &mut clips);
+        let mut slot_texts_not_in_history = HashSet::new();
+        let slots_by_content =
+            sync_active_slot_labels(&store, &mut clips, &mut slot_texts_not_in_history);
         let mut secret_scan_cache: HashMap<i64, Option<String>> = HashMap::new();
         let masked_clip_ids = mask_secret_previews(&mut clips, &mut secret_scan_cache);
         // Warm now, not on the first refresh: a parked popover skips refresh
@@ -4790,6 +4925,9 @@ impl ClipdGui {
             main_hidden: false,
             main_watcher_started: false,
             main_show_asked: None,
+            summoned_at: None,
+            picked_since_summon: false,
+            pick_via: "click",
             main_had_focus: false,
             main_shown_at: None,
             placed_at_caret: PLACED_AT_CARET_ON_LAUNCH.load(std::sync::atomic::Ordering::Relaxed),
@@ -4859,6 +4997,7 @@ impl ClipdGui {
             privacy_read_at: Instant::now(),
             masked_clip_ids,
             slots_by_content,
+            slot_texts_not_in_history,
             hud_slots_view: false,
             fresh_rows: 0,
             pins_hidden: 0,
@@ -4970,18 +5109,32 @@ impl ClipdGui {
 
     fn refresh(&mut self) {
         let refresh_started = Instant::now();
-        self.refresh_inner();
+        let mut steps: Vec<(&'static str, Duration)> = Vec::new();
+        self.refresh_inner(&mut steps);
         let took = refresh_started.elapsed();
-        if took > frame_diag::SLOW {
+        // CLIPD_REFRESH_TRACE=1 logs every refresh, not just the slow ones.
+        if took > frame_diag::SLOW || std::env::var_os("CLIPD_REFRESH_TRACE").is_some() {
+            // Which step, not just how long: "refresh took 130ms" says the
+            // window will hitch, not why.
+            let breakdown = steps
+                .iter()
+                .map(|(step, d)| format!("{step} {}ms", frame_diag::ms(*d)))
+                .collect::<Vec<_>>()
+                .join(", ");
             frame_diag::note(&format!(
-                "refresh took {}ms ({} clips)",
+                "refresh took {}ms ({} clips): {breakdown}",
                 frame_diag::ms(took),
                 self.clips.len()
             ));
         }
     }
 
-    fn refresh_inner(&mut self) {
+    fn refresh_inner(&mut self, steps: &mut Vec<(&'static str, Duration)>) {
+        let mut mark = Instant::now();
+        let mut lap = |steps: &mut Vec<(&'static str, Duration)>, step: &'static str| {
+            steps.push((step, mark.elapsed()));
+            mark = Instant::now();
+        };
         // Resolve the selection to a clip id *before* `clips` is replaced —
         // afterwards `filtered` holds indices into a vector that no longer
         // exists, and reading through them can be out of bounds.
@@ -4993,13 +5146,20 @@ impl ClipdGui {
 
         // Privacy switches can change in another clipd window; pick them up.
         self.privacy_config = clipd_core::privacy::load_privacy_config();
+        lap(steps, "privacy");
         let before: Vec<i64> = self.clips.iter().map(|clip| clip.id).collect();
         self.clips = self.store.get_recent(MAX_LOADED_CLIPS).unwrap_or_default();
-        self.slots_by_content = sync_active_slot_labels(&self.store, &mut self.clips);
+        lap(steps, "load");
+        self.slots_by_content =
+            sync_active_slot_labels(&self.store, &mut self.clips, &mut self.slot_texts_not_in_history);
+        lap(steps, "slots");
         self.masked_clip_ids =
             mask_secret_previews(&mut self.clips, &mut self.secret_scan_cache);
+        lap(steps, "mask");
         warm_sensitive_cache(&self.clips, &self.privacy_config, &mut self.sensitive_cache);
+        lap(steps, "sensitive");
         self.sessions = compute_sessions(&self.clips, self.session_config.window_minutes);
+        lap(steps, "sessions");
         // Rebuild the search index only when the clips changed. This runs every
         // 3s while the window is open, and throwing the index away each time
         // made the next keystroke — or the refresh itself, mid-search — rebuild
@@ -5008,7 +5168,9 @@ impl ClipdGui {
             self.cached_tfidf = None;
         }
         self.refresh_snippets();
+        lap(steps, "snippets");
         self.apply_filter();
+        lap(steps, "filter");
 
         // Ask mode keeps its own list (the retrieved clips), which apply_filter
         // deliberately leaves alone — so re-derive those indices here against
@@ -5122,6 +5284,16 @@ impl ClipdGui {
         }
         log::info!("main window hidden");
         self.main_hidden = true;
+        if let Some(at) = self.summoned_at.take() {
+            if !self.picked_since_summon {
+                // Opened and left without a pick: the friction the pick
+                // changes are meant to remove, counted.
+                clipd_core::telemetry_event(
+                    "palette_closed_without_pick",
+                    &[("ms_open", at.elapsed().as_millis().to_string())],
+                );
+            }
+        }
         self.set_preview_open(ctx, false);
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         clipd_core::set_gui_window_open(false);
@@ -5139,6 +5311,9 @@ impl ClipdGui {
         self.main_hidden = false;
         if was_hidden {
             self.main_show_asked = Some(Instant::now());
+            self.summoned_at = Some(Instant::now());
+            self.picked_since_summon = false;
+            clipd_core::telemetry_event("palette_shown", &[]);
         }
         if was_hidden {
             self.refresh();
@@ -6116,9 +6291,16 @@ impl ClipdGui {
                         egui::Id::new(("hud_row", clip_id)),
                         egui::Sense::click(),
                     );
+                    // A click is the pick: the popover is for grabbing something
+                    // and getting on, and it pastes where you already are. The
+                    // copy button on the row is there for copy-only.
                     if hit.clicked() && !star_clicked && !copy_clicked {
                         self.selected = pos;
-                        *action = Action::Copy;
+                        *action = if self.paste_settings.paste_on_pick {
+                            Action::Paste
+                        } else {
+                            Action::Copy
+                        };
                     }
                     if hit.double_clicked() && !star_clicked && !copy_clicked {
                         self.selected = pos;
@@ -6977,9 +7159,62 @@ impl ClipdGui {
         } else {
             self.do_copy()
         };
-        if pasted && self.paste_settings.return_focus_after_copy {
+        if !pasted {
+            return;
+        }
+        let auto = self.paste_settings.paste_on_pick;
+        self.note_pick(auto);
+        if auto {
+            self.paste_into_previous_app();
+        } else if self.paste_settings.return_focus_after_copy {
             return_focus_to_previous_app();
         }
+    }
+
+    /// The clip is on the clipboard: get back to where the person was and
+    /// have the daemon paste it there (see `clipd_core::pick_paste`).
+    fn paste_into_previous_app(&self) {
+        if self.hud {
+            // The popover is a panel over the app, not an app switch: the
+            // app under it is the target. If a click did bring clipd forward,
+            // step back so that app is in front again.
+            if clipd_is_frontmost() {
+                hide_clipd_app();
+            }
+            clipd_core::pick_paste::request(None);
+        } else {
+            let target = clipd_core::load_last_active_app();
+            return_focus_to_previous_app();
+            clipd_core::pick_paste::request(target);
+        }
+    }
+
+    /// One pick, for the "is fetching a clip getting easier" numbers. No clip
+    /// content, only how and how fast.
+    fn note_pick(&mut self, auto_paste: bool) {
+        let surface = if self.hud { "popover" } else { "palette" };
+        let ms = self
+            .summoned_at
+            .map(|at| at.elapsed().as_millis().to_string())
+            .unwrap_or_default();
+        let row = match self.selected {
+            0 => "1",
+            1..=2 => "2-3",
+            3..=8 => "4-9",
+            _ => "10+",
+        };
+        clipd_core::telemetry_event(
+            "clip_picked",
+            &[
+                ("surface", surface.to_string()),
+                ("via", if self.hud { "popover".to_string() } else { self.pick_via.to_string() }),
+                ("auto_paste", if auto_paste { "yes" } else { "no" }.to_string()),
+                ("ms_to_pick", ms),
+                ("row", row.to_string()),
+                ("searched", if self.search_query.trim().is_empty() { "no" } else { "yes" }.to_string()),
+            ],
+        );
+        self.picked_since_summon = true;
     }
 
     fn persist_actions(&self) {
@@ -7883,6 +8118,7 @@ impl eframe::App for ClipdGui {
                 self.scroll_to_selected = true;
             }
             if i.key_pressed(egui::Key::Enter) && !search_has_focus {
+                self.pick_via = "enter";
                 // Never paste-and-hide out of a question — re-ask instead.
                 action = if self.in_ask_mode() {
                     Action::Ask
@@ -7943,6 +8179,7 @@ impl eframe::App for ClipdGui {
                 for (n, key) in DIGITS.iter().enumerate() {
                     if i.key_pressed(*key) && n < self.filtered.len() {
                         self.selected = n;
+                        self.pick_via = "quick";
                         action = Action::Paste;
                     }
                 }
@@ -8190,10 +8427,18 @@ impl ClipdGui {
                 self.do_copy();
             }
             Action::Paste => {
-                // Pick = copy + get out of the way: hide clipd so the user is
-                // back where they were, ready to Cmd+V.
+                // Pick = paste: hide clipd, put the person back where they
+                // were, and paste there (or just copy, if that is switched off).
                 self.do_paste();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.pick_via = "click";
+                if self.hud {
+                    // The popover is resident and only the palette turns a
+                    // Close into a hide: a Close here quit the process, and
+                    // the next hover waited on a relaunch.
+                    self.hide_hud_offscreen(ctx);
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
             Action::Delete => self.do_delete(),
             Action::Send => self.do_send(ctx),
@@ -8393,11 +8638,15 @@ impl ClipdGui {
                         egui::Sense::click(),
                     );
                     if resp.clicked() || resp.double_clicked() {
-                        if self.set_clipboard(&snip.body)
-                            && self.paste_settings.return_focus_after_copy
-                        {
-                            return_focus_to_previous_app();
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        if self.set_clipboard(&snip.body) {
+                            if self.paste_settings.paste_on_pick {
+                                self.note_pick(true);
+                                self.paste_into_previous_app();
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            } else if self.paste_settings.return_focus_after_copy {
+                                return_focus_to_previous_app();
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
                         }
                     }
                     ui.add_space(ROW_GAP);
@@ -9119,9 +9368,9 @@ impl ClipdGui {
                 ui,
                 c,
                 FooterIcon::Clipboard,
-                &mut self.paste_settings.return_focus_after_copy,
-                "Paste into previous app",
-                "Jump back and paste after you pick a clip",
+                &mut self.paste_settings.paste_on_pick,
+                "Paste when you pick a clip",
+                "Enter, ⌘1–9 or a click in the popover pastes into the app you were in",
             );
             settings_card_divider(ui, c);
             dirty |= settings_toggle_row(
@@ -11537,7 +11786,7 @@ impl ClipdGui {
                     let (rect, resp) =
                         ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
                     let center = rect.center();
-                    ui.painter().circle_filled(center, 8.0, rgb(tc.bg_base));
+                    ui.painter().circle_filled(center, 8.0, swatch_fill(theme, &tc));
                     if theme.is_glass() {
                         if let Some((tl, br)) = theme.shell_glows() {
                             ui.painter().circle_filled(
@@ -11931,7 +12180,7 @@ impl ClipdGui {
                             let (rect, resp) =
                                 ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
                             let center = rect.center();
-                            ui.painter().circle_filled(center, 12.0, rgb(tc.bg_base));
+                            ui.painter().circle_filled(center, 12.0, swatch_fill(theme, &tc));
                             if theme.is_glass() {
                                 if let Some((tl, br)) = theme.shell_glows() {
                                     ui.painter().circle_filled(
@@ -14154,9 +14403,16 @@ fn mask_secret_previews(
 }
 
 /// Label clips with their slot, and return every slot each text is in.
+///
+/// `not_in_history` remembers slot texts the store has no clip for (a slot
+/// filled while capture was paused, say). Looking one up misses the index and
+/// scans the whole table, and without the memo that scan ran for every such
+/// slot on every refresh. A text that is later saved arrives as the newest
+/// clip, inside the loaded window, so it never needs looking up again.
 fn sync_active_slot_labels(
     store: &ClipStore,
     clips: &mut Vec<ClipEntry>,
+    not_in_history: &mut HashSet<String>,
 ) -> HashMap<String, Vec<u8>> {
     let active = store.list_active_slots().unwrap_or_default();
     let mut all_slots: HashMap<String, Vec<u8>> = HashMap::new();
@@ -14184,12 +14440,18 @@ fn sync_active_slot_labels(
     let present: HashSet<&str> = clips.iter().map(|c| c.content.as_str()).collect();
     let mut extras: Vec<ClipEntry> = Vec::new();
     for (slot, content) in &active {
-        if *slot == 0 || present.contains(content.as_str()) {
+        if *slot == 0 || present.contains(content.as_str()) || not_in_history.contains(content) {
             continue;
         }
-        if let Ok(Some(mut clip)) = store.find_by_content(content) {
-            clip.slot = Some(*slot);
-            extras.push(clip);
+        match store.find_by_content(content) {
+            Ok(Some(mut clip)) => {
+                clip.slot = Some(*slot);
+                extras.push(clip);
+            }
+            Ok(None) => {
+                not_in_history.insert(content.clone());
+            }
+            Err(_) => {}
         }
     }
     // At the end, not the front: these are older clips kept loaded so their

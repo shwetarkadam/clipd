@@ -501,6 +501,14 @@ pub struct PasteTransformSettings {
     #[serde(default = "default_true_val")]
     pub open_at_caret: bool,
 
+    /// Picking a clip (Enter, double-click, ⌘1–9, a popover row) pastes it
+    /// into the app you were in, instead of only copying it. A new field
+    /// rather than `return_focus_after_copy`, so everyone gets it: that one
+    /// only switched apps despite promising a paste, and plenty of people
+    /// had turned it off for exactly that reason.
+    #[serde(default = "default_true_val")]
+    pub paste_on_pick: bool,
+
     /// Show the running clip count in the popover. Some people read it as
     /// useful state, others as noise on a panel meant to be glanced at.
     #[serde(default = "default_true_val")]
@@ -614,6 +622,7 @@ impl Default for PasteTransformSettings {
             hud_enabled: true,
             hover_opens_hud: true,
             open_at_caret: true,
+            paste_on_pick: true,
             show_clip_count: true,
             gui_layout: GuiLayout::Palette,
             copy_multi_tap_restore: true,
