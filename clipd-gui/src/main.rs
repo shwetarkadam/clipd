@@ -1219,6 +1219,23 @@ fn draw_search_icon(ui: &mut egui::Ui, col: Color32) {
 /// what an app uses when it has no mark of its own. clipd has one, and the
 /// island was already wearing it while this window introduced the product as
 /// a different app entirely.
+/// Make `rect` a handle for moving the window.
+///
+/// The palette and Settings are borderless, so there is no title bar for
+/// macOS to drag: pressing on the header and moving did nothing, and the
+/// window just sat under the pointer looking frozen. A drag that starts here
+/// is handed to the window server (`StartDrag`), which moves the window
+/// natively — smooth, and with no frames of ours in the loop.
+fn window_drag_zone(ui: &egui::Ui, rect: egui::Rect, id: &'static str) {
+    let resp = ui.interact(rect, egui::Id::new(("window_drag", id)), egui::Sense::drag());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    if resp.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+}
+
 fn draw_brand_mark(ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 22.0), egui::Sense::hover());
     draw_clipd_mark(ui, rect, rgb(c.accent));
@@ -10290,7 +10307,7 @@ impl ClipdGui {
     /// Compact brand row: green "C" + Clipd · pin / settings / close.
     /// In Settings: "Clipd" + "Settings" title, close returns to the list.
     fn render_brand_header(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
-        ui.horizontal(|ui| {
+        let header = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             // The cat stays — it is the app's mark, and the reference's
             // lettered avatar is a placeholder for exactly this.
@@ -10375,6 +10392,11 @@ impl ClipdGui {
                 }
             });
         });
+        // The header is the title bar: drag it to move the window. Not over
+        // the buttons on the right (close, pin, settings), which stay buttons.
+        let r = header.response.rect;
+        let handle = egui::Rect::from_min_max(r.min, egui::pos2((r.right() - 140.0).max(r.left()), r.bottom()));
+        window_drag_zone(ui, handle, "brand_header");
     }
 
     /// The ⚙ menu beside the search field: Settings, the vault, keep on top,
@@ -11773,6 +11795,9 @@ impl ClipdGui {
                     // brand the window keeps, small and a little faded so it
                     // reads as the field's glyph rather than a logo.
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
+                    // The cat doubles as the palette's handle: the rest of
+                    // the bar is the search field.
+                    window_drag_zone(ui, rect, "search_cat");
                     if let Some(tex) = clipd_cat_texture(ui.ctx()) {
                         let size = tex.size_vec2();
                         let scale = (rect.width() / size.x).min(rect.height() / size.y);
