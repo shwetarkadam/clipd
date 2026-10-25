@@ -1219,6 +1219,23 @@ fn draw_search_icon(ui: &mut egui::Ui, col: Color32) {
 /// what an app uses when it has no mark of its own. clipd has one, and the
 /// island was already wearing it while this window introduced the product as
 /// a different app entirely.
+/// Make `rect` a handle for moving the window.
+///
+/// The palette and Settings are borderless, so there is no title bar for
+/// macOS to drag: pressing on the header and moving did nothing, and the
+/// window just sat under the pointer looking frozen. A drag that starts here
+/// is handed to the window server (`StartDrag`), which moves the window
+/// natively — smooth, and with no frames of ours in the loop.
+fn window_drag_zone(ui: &egui::Ui, rect: egui::Rect, id: &'static str) {
+    let resp = ui.interact(rect, egui::Id::new(("window_drag", id)), egui::Sense::drag());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    if resp.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+}
+
 fn draw_brand_mark(ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 22.0), egui::Sense::hover());
     draw_clipd_mark(ui, rect, rgb(c.accent));
@@ -2394,6 +2411,8 @@ enum OnboardStep {
     /// Paste one of them back, in any app.
     Paste,
     Success,
+    /// Offer the faster ways to paste (macOS): each one is the person's call.
+    Faster,
 }
 
 impl OnboardStep {
@@ -2404,6 +2423,7 @@ impl OnboardStep {
             OnboardStep::Try => 4,
             OnboardStep::Success => 8,
             OnboardStep::Paste => 16,
+            OnboardStep::Faster => 32,
         }
     }
     fn name(self) -> &'static str {
@@ -2413,6 +2433,7 @@ impl OnboardStep {
             OnboardStep::Try => "try",
             OnboardStep::Paste => "paste",
             OnboardStep::Success => "success",
+            OnboardStep::Faster => "faster",
         }
     }
 }
@@ -9410,6 +9431,13 @@ impl ClipdGui {
             );
         });
 
+        if cfg!(target_os = "macos") {
+            settings_section(ui, c, "Paste faster");
+            settings_card(ui, c, |ui| {
+                dirty |= self.fast_paste_toggles(ui, c);
+            });
+        }
+
         settings_section(ui, c, "Shortcuts");
         settings_card(ui, c, |ui| {
             settings_value_row(ui, c, FooterIcon::Keyboard, "Open Clipd", "Hotkey for the palette", 180.0, |ui| {
@@ -10279,7 +10307,7 @@ impl ClipdGui {
     /// Compact brand row: green "C" + Clipd · pin / settings / close.
     /// In Settings: "Clipd" + "Settings" title, close returns to the list.
     fn render_brand_header(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
-        ui.horizontal(|ui| {
+        let header = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             // The cat stays — it is the app's mark, and the reference's
             // lettered avatar is a placeholder for exactly this.
@@ -10364,6 +10392,11 @@ impl ClipdGui {
                 }
             });
         });
+        // The header is the title bar: drag it to move the window. Not over
+        // the buttons on the right (close, pin, settings), which stay buttons.
+        let r = header.response.rect;
+        let handle = egui::Rect::from_min_max(r.min, egui::pos2((r.right() - 140.0).max(r.left()), r.bottom()));
+        window_drag_zone(ui, handle, "brand_header");
     }
 
     /// The ⚙ menu beside the search field: Settings, the vault, keep on top,
@@ -10456,6 +10489,7 @@ impl ClipdGui {
         // the separate warning would be the same request twice.
         let introducing = self.render_slot_onboarding(ui, c);
         if !introducing {
+            self.render_fast_paste_offer(ui, c);
             self.render_slot_tip(ui, c);
             self.render_import_offer(ui, c);
             self.render_skill_offer(ui, c);
@@ -11145,6 +11179,7 @@ impl ClipdGui {
                 Some("try") => Some(OnboardStep::Try),
                 Some("paste") => Some(OnboardStep::Paste),
                 Some("success") => Some(OnboardStep::Success),
+                Some("faster") => Some(OnboardStep::Faster),
                 _ => None,
             };
             if let Some(step) = forced {
@@ -11249,7 +11284,7 @@ impl ClipdGui {
             OnboardStep::Idea => 0,
             OnboardStep::Permission => 1,
             OnboardStep::Try => 2,
-            OnboardStep::Paste | OnboardStep::Success => 3,
+            OnboardStep::Paste | OnboardStep::Success | OnboardStep::Faster => 3,
         };
 
         egui::Frame::none()
@@ -11270,7 +11305,7 @@ impl ClipdGui {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if step != OnboardStep::Success
+                        if !matches!(step, OnboardStep::Success | OnboardStep::Faster)
                             && ui
                                 .add(
                                     egui::Label::new(
@@ -11508,7 +11543,33 @@ impl ClipdGui {
                                  until you replace it.{strip}"
                             ),
                         );
+                        // Last, the faster ways to paste — asked, never
+                        // switched on for anyone. macOS only for now.
+                        let next = if cfg!(target_os = "macos") { "Next" } else { "Done" };
+                        if primary(ui, next) {
+                            if cfg!(target_os = "macos") {
+                                self.onboard = Some(OnboardStep::Faster);
+                                self.report_onboard_step(OnboardStep::Faster);
+                            } else {
+                                self.finish_onboarding("done");
+                            }
+                        }
+                    }
+                    OnboardStep::Faster => {
+                        title(ui, "Paste without opening Clipd?");
+                        body(
+                            ui,
+                            "Three shortcuts for getting back something you copied earlier. \
+                             Each is off until you turn it on, and you can change them any time \
+                             in Settings.",
+                        );
+                        ui.add_space(6.0);
+                        if self.fast_paste_toggles(ui, c) {
+                            save_paste_transform_settings(&self.paste_settings);
+                        }
+                        ui.add_space(4.0);
                         if primary(ui, "Done") {
+                            self.paste_settings.fast_paste_offered = true;
                             self.finish_onboarding("done");
                         }
                     }
@@ -11516,6 +11577,111 @@ impl ClipdGui {
             });
         ui.add_space(8.0);
         true
+    }
+
+    /// The three faster-ways-to-paste switches, shared by onboarding, the
+    /// one-time offer and Settings. True when one changed.
+    fn fast_paste_toggles(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> bool {
+        let mut dirty = settings_toggle_row(
+            ui,
+            c,
+            FooterIcon::Keyboard,
+            &mut self.paste_settings.switcher_enabled,
+            "Clipboard switcher — hold ⌃, tap V",
+            "Recent clips appear at your cursor; tap to move along, let go to paste. Like ⌘Tab",
+        );
+        settings_card_divider(ui, c);
+        dirty |= settings_toggle_row(
+            ui,
+            c,
+            FooterIcon::Eye,
+            &mut self.paste_settings.peek_enabled,
+            "Peek — hold ⌘ for a moment",
+            "Shows what ⌘V will paste (and ⌘V ×2, ×3) before you paste it",
+        );
+        settings_card_divider(ui, c);
+        dirty |= settings_toggle_row(
+            ui,
+            c,
+            FooterIcon::Sparkle,
+            &mut self.paste_settings.type_to_paste_enabled,
+            "Type to paste — ;;word then space",
+            ";;alex pastes your latest clip with \"alex\" in it. Also ;;link, ;;email, ;;code, ;;2 for slot 2",
+        );
+        if dirty {
+            self.paste_settings.fast_paste_offered = true;
+            clipd_core::telemetry_event(
+                "fast_paste_settings",
+                &[
+                    ("switcher", self.paste_settings.switcher_enabled.to_string()),
+                    ("peek", self.paste_settings.peek_enabled.to_string()),
+                    ("type_to_paste", self.paste_settings.type_to_paste_enabled.to_string()),
+                ],
+            );
+        }
+        dirty
+    }
+
+    /// For people who were introduced before the faster ways to paste
+    /// existed: one card, once, pointing at the switches. Never turns
+    /// anything on by itself.
+    fn render_fast_paste_offer(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        if !cfg!(target_os = "macos")
+            || self.island_surface
+            || self.paste_settings.fast_paste_offered
+            || !self.paste_settings.slots_onboarding_done
+        {
+            return;
+        }
+        let mut close = false;
+        let mut open_settings = false;
+        egui::Frame::none()
+            .fill(surf(c, c.bg_elevated))
+            .rounding(Rounding::same(10.0))
+            .stroke(Stroke::new(1.0, rgb(c.border)))
+            .inner_margin(Margin::symmetric(14.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("New: paste without opening Clipd")
+                        .size(13.0)
+                        .strong()
+                        .color(rgb(c.text)),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(
+                        "A switcher at your cursor (hold ⌃, tap V), a peek at what ⌘V will paste \
+                         (hold ⌘), and ;;word to paste by typing. All off until you choose.",
+                    )
+                    .size(11.5)
+                    .color(rgb(c.subtext)),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Choose…").clicked() {
+                        open_settings = true;
+                    }
+                    if ui
+                        .add(egui::Label::new(RichText::new("Not now").size(11.5).color(rgb(c.overlay))).sense(egui::Sense::click()))
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+        ui.add_space(8.0);
+        if open_settings || close {
+            self.paste_settings.fast_paste_offered = true;
+            save_paste_transform_settings(&self.paste_settings);
+            clipd_core::telemetry_event(
+                "fast_paste_offer",
+                &[("action", if open_settings { "choose" } else { "dismiss" }.into())],
+            );
+        }
+        if open_settings {
+            self.active_tab = MainTab::Settings;
+        }
     }
 
     /// One quiet line, earned by behaviour: shown only after a burst of
@@ -11629,6 +11795,9 @@ impl ClipdGui {
                     // brand the window keeps, small and a little faded so it
                     // reads as the field's glyph rather than a logo.
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
+                    // The cat doubles as the palette's handle: the rest of
+                    // the bar is the search field.
+                    window_drag_zone(ui, rect, "search_cat");
                     if let Some(tex) = clipd_cat_texture(ui.ctx()) {
                         let size = tex.size_vec2();
                         let scale = (rect.width() / size.x).min(rect.height() / size.y);

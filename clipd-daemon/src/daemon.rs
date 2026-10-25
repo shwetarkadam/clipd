@@ -752,7 +752,29 @@ pub fn run_daemon_with_stop(
         let transform_config = load_transform_config();
         let mut paste_transform = load_paste_transform_settings();
 
+        // Faster ways to paste: the open switcher (its cards and selection),
+        // when a held ⌘ becomes a peek, and whether one is showing.
+        let fast_store = ClipStore::new(&ClipStore::default_path()).ok();
+        let recent_clips = |n: usize| -> Vec<ClipEntry> {
+            fast_store
+                .as_ref()
+                .and_then(|store| store.get_recent(n).ok())
+                .unwrap_or_default()
+        };
+        let mut switcher: Option<(Vec<clipd_core::fast_paste::SwitcherItem>, usize)> = None;
+        let mut switcher_at: Option<(f64, f64)> = None;
+        let mut peek_deadline: Option<Instant> = None;
+        let mut peek_shown = false;
+        let mut fast_flags_read = Instant::now() - Duration::from_secs(10);
+        /// How long ⌘ is held before the peek shows: long enough that every
+        /// ordinary shortcut is over before it.
+        const PEEK_HOLD: Duration = Duration::from_millis(650);
+
         while !stop_hotkey.load(Ordering::Relaxed) {
+            if fast_flags_read.elapsed() >= Duration::from_secs(1) {
+                refresh_fast_flags(&load_paste_transform_settings());
+                fast_flags_read = Instant::now();
+            }
             if let Ok(tick) = hotkey_rx.recv_timeout(Duration::from_millis(50)) {
                 paste_transform = load_paste_transform_settings();
                 match tick {
@@ -940,6 +962,75 @@ pub fn run_daemon_with_stop(
                     HotkeyTick::SendToDevice => {
                         send_clipboard_to_other_mac();
                     }
+                    HotkeyTick::SwitcherTap => {
+                        use clipd_core::fast_paste as fp;
+                        match switcher.as_mut() {
+                            Some((items, sel)) => *sel = fp::next_selection(*sel, items.len()),
+                            None => {
+                                let items = fp::switcher_items(&recent_clips(60));
+                                if !items.is_empty() {
+                                    let sel = fp::first_selection(items.len());
+                                    switcher_at = caret_point();
+                                    switcher = Some((items, sel));
+                                }
+                            }
+                        }
+                        if let Some((items, sel)) = switcher.as_ref() {
+                            fast_overlay(&fp::switcher_payload(items, *sel, switcher_at));
+                        }
+                    }
+                    HotkeyTick::SwitcherPick(_) | HotkeyTick::SwitcherCommit if switcher.is_some() => {
+                        let (items, mut sel) = switcher.take().unwrap_or_default();
+                        if let HotkeyTick::SwitcherPick(n) = tick {
+                            sel = usize::from(n).saturating_sub(1);
+                        }
+                        fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
+                        if let Some(item) = items.get(sel) {
+                            // Kept on the clipboard, so ⌘V pastes it again.
+                            paste_text(&item.content, &suppress, true);
+                            clipd_core::telemetry_event(
+                                "switcher_paste",
+                                &[("position", (sel + 1).to_string())],
+                            );
+                        }
+                    }
+                    HotkeyTick::SwitcherCancel => {
+                        switcher = None;
+                        fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
+                    }
+                    HotkeyTick::SwitcherPick(_) | HotkeyTick::SwitcherCommit => {}
+                    HotkeyTick::PeekArm => {
+                        peek_deadline = Some(Instant::now() + PEEK_HOLD);
+                    }
+                    HotkeyTick::PeekCancel => {
+                        peek_deadline = None;
+                        if peek_shown {
+                            peek_shown = false;
+                            fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
+                        }
+                    }
+                    HotkeyTick::TypePaste { query, erase } => {
+                        let slot_text = |n: u8| hotkey_slot_mgr.get_slot(n).ok().flatten();
+                        match clipd_core::fast_paste::resolve(&query, &recent_clips(300), slot_text) {
+                            Some(text) => {
+                                // The trigger is still being drawn; let the
+                                // app finish handling that space first.
+                                std::thread::sleep(Duration::from_millis(30));
+                                for _ in 0..erase {
+                                    simulate_backspace();
+                                    std::thread::sleep(Duration::from_millis(4));
+                                }
+                                paste_text(&text, &suppress, false);
+                                clipd_core::telemetry_event("type_to_paste", &[("found", "yes".into())]);
+                            }
+                            None => {
+                                // Leave what they typed alone, and say why
+                                // nothing happened.
+                                show_hud(&format!("No clip matches “;;{query}”"));
+                                clipd_core::telemetry_event("type_to_paste", &[("found", "no".into())]);
+                            }
+                        }
+                    }
                     HotkeyTick::ToggleCollect => {
                         collecting = !collecting;
                         collect_next = 1;
@@ -990,6 +1081,20 @@ pub fn run_daemon_with_stop(
             }
 
             let now = Instant::now();
+
+            // ⌘ held long enough on its own: show what ⌘V would paste.
+            if peek_deadline.is_some_and(|dl| now >= dl) {
+                peek_deadline = None;
+                let clipboard = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
+                let lines = clipd_core::fast_paste::peek_lines(
+                    clipboard.as_deref(),
+                    |n| hotkey_slot_mgr.get_slot(n).ok().flatten(),
+                    paste_transform.multi_slot_enabled,
+                );
+                fast_overlay(&clipd_core::fast_paste::peek_payload(&lines, caret_point()));
+                peek_shown = true;
+                clipd_core::telemetry_event("peek_shown", &[]);
+            }
 
             // Cmd+C: 1 tap → auto-save to slot 1 (most recent),
             //        2+ taps → save to slot N, optionally restore clipboard to slot 1
@@ -1303,6 +1408,14 @@ enum HotkeyTick {
     ToggleCollect,           // Ctrl+Option+` — toggle Collect mode on/off
     CommandPalette,          // Ctrl+Space → command palette
     SendToDevice,            // Ctrl+Shift+S — send the clipboard to the other Mac
+    // Faster ways to paste (clipd_core::fast_paste), each opt-in.
+    SwitcherTap,             // ⌃V while the switcher is on: open / move along
+    SwitcherPick(u8),        // ⌃ + 1..9 while it is open: paste that card
+    SwitcherCommit,          // ⌃ let go: paste the selected card
+    SwitcherCancel,          // Esc while it is open
+    PeekArm,                 // ⌘ pressed on its own
+    PeekCancel,              // ⌘ let go, or anything else pressed
+    TypePaste { query: String, erase: usize }, // `;;query` then a space
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2314,18 +2427,28 @@ mod synth {
         }
     }
 
-    /// kVK_Tab: the same key on every layout.
+    /// kVK_Tab / kVK_Delete: the same keys on every layout.
     const TAB: u16 = 48;
+    const BACKSPACE: u16 = 51;
 
     /// A bare Tab, down then up.
     pub fn tab() {
+        key(TAB);
+    }
+
+    /// A bare Backspace, down then up.
+    pub fn backspace() {
+        key(BACKSPACE);
+    }
+
+    fn key(code: u16) {
         unsafe {
             let source = CGEventSourceCreate(PRIVATE_STATE);
             if source.is_null() {
                 return;
             }
             for down in [true, false] {
-                let event = CGEventCreateKeyboardEvent(source, TAB, down);
+                let event = CGEventCreateKeyboardEvent(source, code, down);
                 if event.is_null() {
                     break;
                 }
@@ -2348,6 +2471,11 @@ fn simulate_tab() {
     synth::tab();
 }
 
+#[cfg(target_os = "macos")]
+fn simulate_backspace() {
+    synth::backspace();
+}
+
 #[cfg(not(target_os = "macos"))]
 fn simulate_tab() {
     if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
@@ -2355,6 +2483,89 @@ fn simulate_tab() {
         release_windows_shortcut_modifiers(&mut enigo);
         let _ = enigo.key(Key::Tab, Direction::Click);
     }
+}
+
+// ── Faster ways to paste (see `clipd_core::fast_paste`) ──
+//
+// The listener reads which are on from these bits on every key, so the main
+// loop refreshes them from the settings file once a second rather than the
+// listener touching the disk per keystroke.
+
+#[cfg(target_os = "macos")]
+static FAST_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(target_os = "macos")]
+const FAST_SWITCHER: u8 = 1;
+#[cfg(target_os = "macos")]
+const FAST_PEEK: u8 = 2;
+#[cfg(target_os = "macos")]
+const FAST_TYPE: u8 = 4;
+
+#[cfg(target_os = "macos")]
+fn refresh_fast_flags(settings: &PasteTransformSettings) {
+    let mut bits = 0;
+    if settings.switcher_enabled {
+        bits |= FAST_SWITCHER;
+    }
+    if settings.peek_enabled {
+        bits |= FAST_PEEK;
+    }
+    if settings.type_to_paste_enabled {
+        bits |= FAST_TYPE;
+    }
+    FAST_FLAGS.store(bits, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+fn fast_on(bit: u8) -> bool {
+    FAST_FLAGS.load(Ordering::Relaxed) & bit != 0
+}
+
+/// Draw (or take down) a cursor overlay. Starts the overlay if it is not
+/// already serving.
+#[cfg(target_os = "macos")]
+fn fast_overlay(payload: &str) {
+    let payload = hud_payload_with_clearance(payload);
+    if !hud_server::send(&payload) {
+        hud_server::warm();
+        let _ = hud_server::send(&payload);
+    }
+}
+
+/// Just under the text cursor, when the focused app says where it is.
+#[cfg(target_os = "macos")]
+fn caret_point() -> Option<(f64, f64)> {
+    clipd_core::caret::current().map(|r| (r.x, r.y + r.height))
+}
+
+/// Paste `text` into the focused app. The clipboard keeps it when `keep` (a
+/// switcher pick, so ⌘V pastes it again), otherwise it is put back. Either
+/// way the watcher is held off, so this is not saved as a new copy.
+#[cfg(target_os = "macos")]
+fn paste_text(text: &str, suppress: &AtomicBool, keep: bool) {
+    let mut cb = match Clipboard::new() {
+        Ok(cb) => cb,
+        Err(e) => {
+            log::warn!("Paste: no clipboard ({e})");
+            return;
+        }
+    };
+    let original = cb.get_text().ok();
+    suppress.store(true, Ordering::SeqCst);
+    if cb.set_text(text).is_err() {
+        suppress.store(false, Ordering::SeqCst);
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(40));
+    simulate_paste();
+    // The app reads the clipboard when it handles ⌘V, not when it is sent.
+    std::thread::sleep(Duration::from_millis(180));
+    if !keep {
+        if let Some(original) = original {
+            let _ = cb.set_text(original);
+        }
+    }
+    std::thread::sleep(Duration::from_millis(60));
+    suppress.store(false, Ordering::SeqCst);
 }
 
 /// Paste a clip the person just picked in clipd (see `clipd_core::pick_paste`):
@@ -4572,6 +4783,14 @@ fn start_macos_hotkey_listener(
         /// released. Both inject a keystroke, and both need a clean keyboard.
         pending_letter_paste: Option<u8>,
         pending_letter_copy: Option<u8>,
+        /// Faster ways to paste: the switcher is open (⌃ still held), its V
+        /// is down (so key repeat does not race along the strip), the peek
+        /// is waiting for ⌘ to be held long enough, and the run of
+        /// characters typed at the cursor, for `;;`.
+        switcher_active: bool,
+        switcher_v_down: bool,
+        peek_armed: bool,
+        typed: clipd_core::fast_paste::TypedBuffer,
     }
 
     let state = std::cell::RefCell::new(State {
@@ -4607,6 +4826,10 @@ fn start_macos_hotkey_listener(
         opt_last_tap: None,
         pending_letter_paste: None,
         pending_letter_copy: None,
+        switcher_active: false,
+        switcher_v_down: false,
+        peek_armed: false,
+        typed: clipd_core::fast_paste::TypedBuffer::default(),
     });
 
     grab(move |event: Event| {
@@ -4663,6 +4886,23 @@ fn start_macos_hotkey_listener(
                             s.opt_last_tap = Some(now);
                         }
                     }
+                    // A shortcut is starting: whatever was being typed is not
+                    // a `;;` trigger any more. Shift is just capitals.
+                    if !matches!(key, RKey::ShiftLeft | RKey::ShiftRight) {
+                        s.typed.clear();
+                    }
+                    // ⌘ on its own may be the start of a peek; any other
+                    // modifier joining it means a shortcut, not a peek.
+                    if fast_on(FAST_PEEK)
+                        && matches!(key, RKey::MetaLeft | RKey::MetaRight)
+                        && s.pressed_mods.is_empty()
+                    {
+                        s.peek_armed = true;
+                        let _ = tx.send(HotkeyTick::PeekArm);
+                    } else if s.peek_armed {
+                        s.peek_armed = false;
+                        let _ = tx.send(HotkeyTick::PeekCancel);
+                    }
                     s.pressed_mods.insert(key);
                     return Some(event);
                 }
@@ -4670,6 +4910,75 @@ fn start_macos_hotkey_listener(
                 // Any other key ends a half-finished double-tap, so Option used
                 // as an ordinary modifier never drifts into arming the gesture.
                 s.opt_last_tap = None;
+
+                // ── Faster ways to paste ──
+                // Any key with ⌘ down is a shortcut, not a peek.
+                if s.peek_armed {
+                    s.peek_armed = false;
+                    let _ = tx.send(HotkeyTick::PeekCancel);
+                }
+                // The switcher, while open: V moves along, 1-9 picks, Esc
+                // closes. Everything is swallowed: these keys belong to it.
+                if s.switcher_active && is_ctrl_only(&s.pressed_mods) {
+                    if key == RKey::KeyV {
+                        if !s.switcher_v_down {
+                            s.switcher_v_down = true;
+                            let _ = tx.send(HotkeyTick::SwitcherTap);
+                        }
+                        return None;
+                    }
+                    if key == RKey::Escape {
+                        s.switcher_active = false;
+                        let _ = tx.send(HotkeyTick::SwitcherCancel);
+                        return None;
+                    }
+                    if let Some(n) = key_to_digit_slot(key).filter(|n| (1..=9).contains(n)) {
+                        s.switcher_active = false;
+                        let _ = tx.send(HotkeyTick::SwitcherPick(n));
+                        return None;
+                    }
+                }
+                // ⌃V opens it. Not in a terminal, where ⌃V is "insert the
+                // next character literally" and people use it on purpose.
+                if fast_on(FAST_SWITCHER)
+                    && is_ctrl_only(&s.pressed_mods)
+                    && key == RKey::KeyV
+                    && !is_terminal_frontmost()
+                {
+                    s.switcher_active = true;
+                    s.switcher_v_down = true;
+                    s.typed.clear();
+                    let _ = tx.send(HotkeyTick::SwitcherTap);
+                    return None;
+                }
+                // `;;query` + space: watch plain typing only. The key always
+                // goes through; the daemon erases the trigger afterwards.
+                if fast_on(FAST_TYPE) {
+                    let only_shift = s
+                        .pressed_mods
+                        .iter()
+                        .all(|m| matches!(m, RKey::ShiftLeft | RKey::ShiftRight));
+                    if !only_shift {
+                        s.typed.clear();
+                    } else if key == RKey::Backspace {
+                        s.typed.backspace();
+                    } else {
+                        let shift = !s.pressed_mods.is_empty();
+                        let typed = rdev::code_from_key(key)
+                            .and_then(|code| clipd_core::keyboard_layout::typed_char(code, shift));
+                        match typed {
+                            Some(' ') | Some('\t') => {
+                                if let Some((query, len)) = s.typed.trigger() {
+                                    // +1: the space or tab that ended it.
+                                    let _ = tx.send(HotkeyTick::TypePaste { query, erase: len + 1 });
+                                }
+                                s.typed.clear();
+                            }
+                            Some(c) => s.typed.push(c),
+                            None => s.typed.clear(),
+                        }
+                    }
+                }
 
 
                 // A letter counts whether or not the leader's modifiers are
@@ -5090,6 +5399,16 @@ fn start_macos_hotkey_listener(
                     }
                     // After Cmd+C the OS often never delivers KeyRelease for C; releasing Command
                     // must arm the next Cmd+C / Cmd+V chord.
+                    // Letting go of ⌘ ends a peek; letting go of ⌃ pastes
+                    // the switcher's pick.
+                    if matches!(key, RKey::MetaLeft | RKey::MetaRight) && s.peek_armed {
+                        s.peek_armed = false;
+                        let _ = tx.send(HotkeyTick::PeekCancel);
+                    }
+                    if matches!(key, RKey::ControlLeft | RKey::ControlRight) && s.switcher_active {
+                        s.switcher_active = false;
+                        let _ = tx.send(HotkeyTick::SwitcherCommit);
+                    }
                     if matches!(key, RKey::MetaLeft | RKey::MetaRight) {
                         s.latch_cmd_c = false;
                         s.latch_cmd_v = false;
@@ -5126,6 +5445,7 @@ fn start_macos_hotkey_listener(
                         s.latch_ctrl_shift_s = false;
                     }
                     RKey::KeyV => {
+                        s.switcher_v_down = false;
                         s.latch_ctrl_shift_v = false;
                         s.latch_cmd_shift_v = false;
                         s.latch_cmd_opt_v = false;
@@ -5174,6 +5494,15 @@ fn start_macos_hotkey_listener(
                             s.latch_ctrl_shift_opt_letter_slot[idx] = false;
                         }
                     }
+                }
+            }
+            // A click moves the cursor: the run typed before it is not at
+            // the cursor any more, and ⌘-click is not a peek.
+            EventType::ButtonPress(_) => {
+                s.typed.clear();
+                if s.peek_armed {
+                    s.peek_armed = false;
+                    let _ = tx.send(HotkeyTick::PeekCancel);
                 }
             }
             _ => {}
