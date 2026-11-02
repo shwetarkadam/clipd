@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod ask;
 pub mod ask_eval;
+pub mod auto_letters;
 pub mod caret;
 pub mod enrichment;
 #[cfg(target_os = "macos")]

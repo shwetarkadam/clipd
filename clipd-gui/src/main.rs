@@ -2411,6 +2411,9 @@ enum OnboardStep {
     /// Paste one of them back, in any app.
     Paste,
     Success,
+    /// Letter slots: what fills them, how to name and paste one. On by
+    /// default, with the switches right there to turn off.
+    Letters,
     /// Offer the faster ways to paste (macOS): each one is the person's call.
     Faster,
 }
@@ -2424,6 +2427,7 @@ impl OnboardStep {
             OnboardStep::Success => 8,
             OnboardStep::Paste => 16,
             OnboardStep::Faster => 32,
+            OnboardStep::Letters => 64,
         }
     }
     fn name(self) -> &'static str {
@@ -2434,6 +2438,7 @@ impl OnboardStep {
             OnboardStep::Paste => "paste",
             OnboardStep::Success => "success",
             OnboardStep::Faster => "faster",
+            OnboardStep::Letters => "letters",
         }
     }
 }
@@ -4649,6 +4654,9 @@ struct ClipdGui {
     new_action_output: ActionOutput,
     /// Last action result banner in the preview pane: (ok, message).
     action_status: Option<(bool, String)>,
+    /// A one-line confirmation shown in the footer for a few seconds, in place
+    /// of the key hints ("Slot E now holds this…").
+    footer_note: Option<(String, Instant)>,
     /// A send or undo-send under way on a worker thread; reports the banner
     /// to show when it finishes.
     send_job: Option<std::sync::mpsc::Receiver<(bool, String)>>,
@@ -4975,6 +4983,7 @@ impl ClipdGui {
             new_action_auto: String::new(),
             new_action_output: ActionOutput::Clipboard,
             action_status: None,
+            footer_note: None,
             send_job: None,
             pairing: PairingState::Idle,
             nearby: Vec::new(),
@@ -7153,6 +7162,33 @@ impl ClipdGui {
         }
     }
 
+    /// Give the selected clip a letter: it goes in that letter slot, and the
+    /// automatic letters will leave it there (see `clipd_core::auto_letters`).
+    fn name_selected_clip(&mut self, letter: char) {
+        let Some(clip) = self.selected_clip().cloned() else {
+            return;
+        };
+        if matches!(clip.content_type, ContentType::Image | ContentType::File) {
+            self.footer_note = Some(("Only text clips can go in a letter slot".into(), Instant::now()));
+            return;
+        }
+        let Some(slot) = clipd_core::auto_letters::letter_slot(letter) else {
+            return;
+        };
+        if save_to_slot(slot, &clip.content) {
+            clipd_core::auto_letters::mark_named(letter);
+            self.refresh();
+            let lower = letter.to_ascii_lowercase();
+            self.footer_note = Some((
+                format!("Slot {letter} now holds this · paste with ⌃⌥{letter} or ;;{lower}"),
+                Instant::now(),
+            ));
+            clipd_core::telemetry_event("letter_named", &[]);
+        } else {
+            self.footer_note = Some(("Couldn't save to that slot".into(), Instant::now()));
+        }
+    }
+
     fn do_copy(&mut self) -> bool {
         let Some(clip) = self.selected_clip().cloned() else {
             return false;
@@ -8105,6 +8141,9 @@ impl eframe::App for ClipdGui {
         });
 
         let mut should_cycle_theme = false;
+        // ⌘⌥ + a letter names the selected clip: it goes in that letter slot.
+        // ⌘ is there so ⌥ does not compose an accent in the search field.
+        let mut name_letter: Option<char> = None;
         let mut esc_back = false;
         let mut toggle_preview = false;
         ctx.input(|i| {
@@ -8160,8 +8199,19 @@ impl eframe::App for ClipdGui {
             {
                 action = Action::Delete;
             }
-            if i.key_pressed(egui::Key::T) && i.modifiers.command {
+            if i.key_pressed(egui::Key::T) && i.modifiers.command && !i.modifiers.alt {
                 should_cycle_theme = true;
+            }
+            if i.modifiers.command && i.modifiers.alt && self.paste_settings.letter_slots_enabled {
+                for ev in &i.events {
+                    if let egui::Event::Key { key, pressed: true, .. } = ev {
+                        let name = key.name();
+                        let mut chars = name.chars();
+                        if let (Some(l @ 'A'..='Z'), None) = (chars.next(), chars.next()) {
+                            name_letter = Some(l);
+                        }
+                    }
+                }
             }
             // Cmd+C copies the selected clip without closing the palette
             // (replaces the old preview-pane Copy button).
@@ -8208,6 +8258,9 @@ impl eframe::App for ClipdGui {
         });
         if should_cycle_theme {
             self.cycle_theme(ctx);
+        }
+        if let Some(letter) = name_letter {
+            self.name_selected_clip(letter);
         }
         // Esc backs out one level: Pins/Settings → Clips; preview → list only;
         // bare list → hide. Keyboard must always work even if the mouse is
@@ -9438,6 +9491,20 @@ impl ClipdGui {
             });
         }
 
+        settings_section(ui, c, "Letter slots (advanced)");
+        settings_card(ui, c, |ui| {
+            dirty |= self.letter_slot_toggles(ui, c);
+            if self.paste_settings.letter_slots_enabled {
+                settings_card_divider(ui, c);
+                settings_card_copy(
+                    ui,
+                    c,
+                    "Name anything",
+                    "Select a clip in Clipd and press ⌘⌥ + a letter to keep it in that slot.",
+                );
+            }
+        });
+
         settings_section(ui, c, "Shortcuts");
         settings_card(ui, c, |ui| {
             settings_value_row(ui, c, FooterIcon::Keyboard, "Open Clipd", "Hotkey for the palette", 180.0, |ui| {
@@ -10489,7 +10556,9 @@ impl ClipdGui {
         // the separate warning would be the same request twice.
         let introducing = self.render_slot_onboarding(ui, c);
         if !introducing {
-            self.render_fast_paste_offer(ui, c);
+            if !self.render_letter_slots_offer(ui, c) {
+                self.render_fast_paste_offer(ui, c);
+            }
             self.render_slot_tip(ui, c);
             self.render_import_offer(ui, c);
             self.render_skill_offer(ui, c);
@@ -11180,6 +11249,7 @@ impl ClipdGui {
                 Some("paste") => Some(OnboardStep::Paste),
                 Some("success") => Some(OnboardStep::Success),
                 Some("faster") => Some(OnboardStep::Faster),
+                Some("letters") => Some(OnboardStep::Letters),
                 _ => None,
             };
             if let Some(step) = forced {
@@ -11284,7 +11354,7 @@ impl ClipdGui {
             OnboardStep::Idea => 0,
             OnboardStep::Permission => 1,
             OnboardStep::Try => 2,
-            OnboardStep::Paste | OnboardStep::Success | OnboardStep::Faster => 3,
+            OnboardStep::Paste | OnboardStep::Success | OnboardStep::Letters | OnboardStep::Faster => 3,
         };
 
         egui::Frame::none()
@@ -11305,7 +11375,7 @@ impl ClipdGui {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if !matches!(step, OnboardStep::Success | OnboardStep::Faster)
+                        if !matches!(step, OnboardStep::Success | OnboardStep::Letters | OnboardStep::Faster)
                             && ui
                                 .add(
                                     egui::Label::new(
@@ -11543,11 +11613,32 @@ impl ClipdGui {
                                  until you replace it.{strip}"
                             ),
                         );
-                        // Last, the faster ways to paste — asked, never
+                        if primary(ui, "Next") {
+                            self.onboard = Some(OnboardStep::Letters);
+                            self.report_onboard_step(OnboardStep::Letters);
+                        }
+                    }
+                    OnboardStep::Letters => {
+                        title(ui, "Letter slots fill themselves");
+                        body(
+                            ui,
+                            "E keeps your latest email, L your latest link, P your latest phone \
+                             number and K your latest code — paste one with ⌃⌥ + its letter, or \
+                             type ;;e. To keep anything else, select it in Clipd and press ⌘⌥ + a \
+                             letter. An advanced extra: on now, off any time.",
+                        );
+                        ui.add_space(6.0);
+                        if self.letter_slot_toggles(ui, c) {
+                            save_paste_transform_settings(&self.paste_settings);
+                        }
+                        ui.add_space(4.0);
+                        // Then the faster ways to paste — asked, never
                         // switched on for anyone. macOS only for now.
                         let next = if cfg!(target_os = "macos") { "Next" } else { "Done" };
                         if primary(ui, next) {
+                            self.paste_settings.letter_slots_intro_seen = true;
                             if cfg!(target_os = "macos") {
+                                save_paste_transform_settings(&self.paste_settings);
                                 self.onboard = Some(OnboardStep::Faster);
                                 self.report_onboard_step(OnboardStep::Faster);
                             } else {
@@ -11579,6 +11670,107 @@ impl ClipdGui {
         true
     }
 
+    /// The letter-slot switches, shared by onboarding, the one-time card and
+    /// Settings. True when one changed.
+    fn letter_slot_toggles(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> bool {
+        let mut dirty = settings_toggle_row(
+            ui,
+            c,
+            FooterIcon::Key,
+            &mut self.paste_settings.letter_slots_enabled,
+            "Letter slots A–Z",
+            "26 slots you reach by letter: ⌃⌥ + the letter, ;;letter, or tap ⌘ twice then the letter",
+        );
+        if self.paste_settings.letter_slots_enabled {
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Sparkle,
+                &mut self.paste_settings.auto_letter_slots,
+                "Fill letters automatically",
+                "E latest email · L link · P phone number · K code. Letters you name are never replaced",
+            );
+        }
+        if dirty {
+            self.paste_settings.letter_slots_intro_seen = true;
+            clipd_core::telemetry_event(
+                "letter_slot_settings",
+                &[
+                    ("enabled", self.paste_settings.letter_slots_enabled.to_string()),
+                    ("auto", self.paste_settings.auto_letter_slots.to_string()),
+                ],
+            );
+        }
+        dirty
+    }
+
+    /// For people introduced before letter slots filled themselves: one card,
+    /// once. True while it is showing, so other offers wait their turn.
+    fn render_letter_slots_offer(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> bool {
+        if self.island_surface
+            || self.paste_settings.letter_slots_intro_seen
+            || !self.paste_settings.slots_onboarding_done
+            || !self.paste_settings.letter_slots_enabled
+        {
+            return false;
+        }
+        let mut close = false;
+        let mut open_settings = false;
+        egui::Frame::none()
+            .fill(surf(c, c.bg_elevated))
+            .rounding(Rounding::same(10.0))
+            .stroke(Stroke::new(1.0, rgb(c.border)))
+            .inner_margin(Margin::symmetric(14.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("New: letter slots fill themselves")
+                        .size(13.0)
+                        .strong()
+                        .color(rgb(c.text)),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(
+                        "E is your latest email, L your latest link, P phone number, K code — \
+                         paste with ⌃⌥E or ;;e. To keep anything else, select it here and press \
+                         ⌘⌥ + a letter.",
+                    )
+                    .size(11.5)
+                    .color(rgb(c.subtext)),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Got it").clicked() {
+                        close = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Label::new(RichText::new("Settings").size(11.5).color(rgb(c.overlay)))
+                                .sense(egui::Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        open_settings = true;
+                    }
+                });
+            });
+        ui.add_space(8.0);
+        if open_settings || close {
+            self.paste_settings.letter_slots_intro_seen = true;
+            save_paste_transform_settings(&self.paste_settings);
+            clipd_core::telemetry_event(
+                "letter_slots_offer",
+                &[("action", if open_settings { "settings" } else { "got_it" }.into())],
+            );
+        }
+        if open_settings {
+            self.active_tab = MainTab::Settings;
+        }
+        true
+    }
+
     /// The three faster-ways-to-paste switches, shared by onboarding, the
     /// one-time offer and Settings. True when one changed.
     fn fast_paste_toggles(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> bool {
@@ -11596,8 +11788,8 @@ impl ClipdGui {
             c,
             FooterIcon::Eye,
             &mut self.paste_settings.peek_enabled,
-            "Peek — tap ⌘ twice, or hold it",
-            "Tap ⌘ twice, then a letter or number, to paste that slot. ⌘C then tap ⌘ once more, then a letter, to keep the copy there. Hold ⌘ just to look",
+            "Slot picker — tap ⌘ twice",
+            "Shows what's in your slots; press a letter or number to paste one. Hold ⌘ instead to just look",
         );
         settings_card_divider(ui, c);
         dirty |= settings_toggle_row(
@@ -11907,7 +12099,22 @@ impl ClipdGui {
         // Left — the keys that work right now, while typing in the search:
         // the whole window can be used without the mouse, and this is where
         // that is learned (Spotlight's lesson, Raycast's footer).
-        if self.active_tab == MainTab::Text {
+        let note = self
+            .footer_note
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_millis(3500))
+            .map(|(text, _)| text.clone());
+        if note.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
+        if let (Some(note), MainTab::Text) = (note, self.active_tab) {
+            let left = egui::Rect::from_min_size(rect.min, egui::vec2(full_w * 0.95, row_h));
+            ui.allocate_ui_at_rect(left, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(note).size(12.5).color(rgb(c.text)));
+                });
+            });
+        } else if self.active_tab == MainTab::Text {
             let left = egui::Rect::from_min_size(rect.min, egui::vec2(full_w * 0.72, row_h));
             ui.allocate_ui_at_rect(left, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -13519,7 +13726,7 @@ impl ClipdGui {
                     c,
                     &mut self.paste_settings.letter_slots_enabled,
                     "Letter slots A-Z",
-                    "Adds 26 letter slots: Ctrl+Option+C then A-Z copies to slots 31-56, Ctrl+Option+V then A-Z pastes them.",
+                    "26 slots you reach by letter. E, L, P and K fill themselves (email, link, phone, code); name any clip with ⌘⌥ + a letter in Clipd. Paste with Ctrl+Option + the letter or ;;letter.",
                 ) {
                     save_paste_transform_settings(&self.paste_settings);
                 }

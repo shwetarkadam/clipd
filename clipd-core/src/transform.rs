@@ -527,6 +527,15 @@ pub struct PasteTransformSettings {
     /// or the one-time card for people who onboarded before they existed).
     #[serde(default)]
     pub fast_paste_offered: bool,
+    /// Letter slots fill themselves: E the latest email, L link, P phone
+    /// number, K code (see `crate::auto_letters`). On by default, with the
+    /// letter slots themselves; letters you name are never overwritten.
+    #[serde(default = "default_true_val")]
+    pub auto_letter_slots: bool,
+    /// Whether the letter-slot introduction has been shown (onboarding, or
+    /// the one-time card for people who onboarded before it existed).
+    #[serde(default)]
+    pub letter_slots_intro_seen: bool,
 
     /// Show the running clip count in the popover. Some people read it as
     /// useful state, others as noise on a panel meant to be glanced at.
@@ -646,6 +655,8 @@ impl Default for PasteTransformSettings {
             peek_enabled: false,
             type_to_paste_enabled: false,
             fast_paste_offered: false,
+            auto_letter_slots: true,
+            letter_slots_intro_seen: false,
             show_clip_count: true,
             gui_layout: GuiLayout::Palette,
             copy_multi_tap_restore: true,
