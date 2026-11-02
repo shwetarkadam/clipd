@@ -11596,8 +11596,8 @@ impl ClipdGui {
             c,
             FooterIcon::Eye,
             &mut self.paste_settings.peek_enabled,
-            "Peek — hold ⌘ for a moment",
-            "Shows your slots; keep holding and press 2–9 or a letter to paste one. After ⌘C, keep holding ⌘ and press a letter to keep the copy there",
+            "Peek — tap ⌘ twice, or hold it",
+            "Tap ⌘ twice, then a letter or number, to paste that slot. ⌘C then tap ⌘ once more, then a letter, to keep the copy there. Hold ⌘ just to look",
         );
         settings_card_divider(ui, c);
         dirty |= settings_toggle_row(

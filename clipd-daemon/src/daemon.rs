@@ -770,6 +770,8 @@ pub fn run_daemon_with_stop(
         let mut peek_deadline: Option<Instant> = None;
         let mut peek_shown = false;
         let mut peek_mode = clipd_core::fast_paste::PeekMode::Paste;
+        // The picker closes itself if nothing is picked.
+        let mut picker_deadline: Option<Instant> = None;
         let mut fast_flags_read = Instant::now() - Duration::from_secs(10);
         /// How long ⌘ is held before the peek shows: long enough that every
         /// ordinary shortcut is over before it.
@@ -1021,19 +1023,42 @@ pub fn run_daemon_with_stop(
                         };
                         peek_deadline = Some(Instant::now() + hold);
                     }
+                    HotkeyTick::PickerOpen(code) => {
+                        if let Some(mode) = clipd_core::fast_paste::PeekMode::from_code(code) {
+                            peek_deadline = None;
+                            let clipboard = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
+                            let lines = clipd_core::fast_paste::peek_lines(
+                                mode,
+                                true,
+                                clipboard.as_deref(),
+                                |n| hotkey_slot_mgr.get_slot(n).ok().flatten(),
+                                paste_transform.multi_slot_enabled,
+                                paste_transform.letter_slots_enabled,
+                            );
+                            fast_overlay(&clipd_core::fast_paste::peek_payload(&lines, caret_point()));
+                            PEEK_SHOWN.store(code, Ordering::Relaxed);
+                            peek_shown = true;
+                            picker_deadline = Some(Instant::now() + Duration::from_secs(4));
+                            clipd_core::telemetry_event(
+                                "picker_shown",
+                                &[("mode", if mode == clipd_core::fast_paste::PeekMode::Save { "save" } else { "paste" }.into())],
+                            );
+                        }
+                    }
                     HotkeyTick::PeekCancel => {
                         peek_deadline = None;
+                        picker_deadline = None;
                         PEEK_SHOWN.store(0, Ordering::Relaxed);
                         if peek_shown {
                             peek_shown = false;
                             fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
                         }
                     }
-                    HotkeyTick::PeekChoose(slot) => {
-                        let mode = clipd_core::fast_paste::PeekMode::from_code(
-                            PEEK_SHOWN.swap(0, Ordering::Relaxed),
-                        );
+                    HotkeyTick::PeekChoose(slot, code) => {
+                        PEEK_SHOWN.store(0, Ordering::Relaxed);
+                        let mode = clipd_core::fast_paste::PeekMode::from_code(code);
                         peek_deadline = None;
+                        picker_deadline = None;
                         peek_shown = false;
                         fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
                         let letter = slot >= 31;
@@ -1138,12 +1163,21 @@ pub fn run_daemon_with_stop(
 
             let now = Instant::now();
 
+            // A picker nobody picked from closes itself.
+            if picker_deadline.is_some_and(|dl| now >= dl) {
+                picker_deadline = None;
+                PEEK_SHOWN.store(0, Ordering::Relaxed);
+                peek_shown = false;
+                fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
+            }
+
             // ⌘ held long enough on its own: show what ⌘V would paste.
             if peek_deadline.is_some_and(|dl| now >= dl) {
                 peek_deadline = None;
                 let clipboard = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
                 let lines = clipd_core::fast_paste::peek_lines(
                     peek_mode,
+                    false,
                     clipboard.as_deref(),
                     |n| hotkey_slot_mgr.get_slot(n).ok().flatten(),
                     paste_transform.multi_slot_enabled,
@@ -1475,7 +1509,8 @@ enum HotkeyTick {
     PeekArm,                 // ⌘ pressed on its own
     PeekArmSave,             // ⌘C with ⌘ still held: may become "keep this copy where?"
     PeekCancel,              // ⌘ let go, or anything else pressed
-    PeekChoose(u8),          // with the peek open, ⌘ + a slot's key
+    PeekChoose(u8, u8),      // a slot's key picked in the peek/picker: (slot, PeekMode code)
+    PickerOpen(u8),          // ⌘ tapped twice (paste) or after ⌘C (save): PeekMode code
 
     TypePaste { query: String, erase: usize }, // `;;query` then a space
 }
@@ -4860,6 +4895,17 @@ fn start_macos_hotkey_listener(
         /// Its auto-repeat is not the letter: holding ⌃⌥V a moment too long
         /// used to paste slot V before you could press A.
         leader_key_down: Option<RKey>,
+        /// ⌘ taps for the picker: when a bare ⌘ went down, whether anything
+        /// else has been pressed since, whether that chord was a ⌘C, when a
+        /// ⌘C chord last ended and when the last bare tap was.
+        cmd_down_at: Option<Instant>,
+        cmd_clean: bool,
+        cmd_chord_had_c: bool,
+        last_cmd_c_release: Option<Instant>,
+        last_bare_cmd_tap: Option<Instant>,
+        /// The picker is open until then, in this mode (PeekMode code).
+        picker_until: Option<Instant>,
+        picker_mode: u8,
         peek_armed: bool,
         typed: clipd_core::fast_paste::TypedBuffer,
     }
@@ -4900,6 +4946,13 @@ fn start_macos_hotkey_listener(
         switcher_active: false,
         switcher_v_down: false,
         leader_key_down: None,
+        cmd_down_at: None,
+        cmd_clean: false,
+        cmd_chord_had_c: false,
+        last_cmd_c_release: None,
+        last_bare_cmd_tap: None,
+        picker_until: None,
+        picker_mode: 0,
         peek_armed: false,
         typed: clipd_core::fast_paste::TypedBuffer::default(),
     });
@@ -4963,6 +5016,15 @@ fn start_macos_hotkey_listener(
                     if !matches!(key, RKey::ShiftLeft | RKey::ShiftRight) {
                         s.typed.clear();
                     }
+                    // A bare ⌘ press may be a tap (for the picker); any
+                    // other modifier joining it is a chord, not a tap.
+                    if matches!(key, RKey::MetaLeft | RKey::MetaRight) && s.pressed_mods.is_empty() {
+                        s.cmd_down_at = Some(Instant::now());
+                        s.cmd_clean = true;
+                        s.cmd_chord_had_c = false;
+                    } else {
+                        s.cmd_clean = false;
+                    }
                     // ⌘ on its own may be the start of a peek; any other
                     // modifier joining it means a shortcut, not a peek.
                     if fast_on(FAST_PEEK)
@@ -4984,6 +5046,38 @@ fn start_macos_hotkey_listener(
                 s.opt_last_tap = None;
 
                 // ── Faster ways to paste ──
+                // The picker (opened by a ⌘ tap) takes the next bare key: a
+                // slot's letter or number picks it; Esc closes it; anything
+                // else closes it and goes through as usual.
+                if s.picker_until.is_some_and(|until| Instant::now() <= until) {
+                    let mode = s.picker_mode;
+                    s.picker_until = None;
+                    let bare = s
+                        .pressed_mods
+                        .iter()
+                        .all(|m| matches!(m, RKey::ShiftLeft | RKey::ShiftRight));
+                    let picked = bare
+                        .then(|| {
+                            rdev::code_from_key(key)
+                                .and_then(|code| clipd_core::keyboard_layout::typed_char(code, false))
+                                .and_then(clipd_core::fast_paste::picker_slot_for_key)
+                        })
+                        .flatten();
+                    if let Some(slot) = picked {
+                        let _ = tx.send(HotkeyTick::PeekChoose(slot, mode));
+                        return None;
+                    }
+                    let _ = tx.send(HotkeyTick::PeekCancel);
+                    if key == RKey::Escape {
+                        return None;
+                    }
+                }
+                // Anything pressed during a ⌘ press makes it a chord, not a
+                // tap; a ⌘C chord is remembered, for "⌘C, then tap ⌘".
+                s.cmd_clean = false;
+                if key == RKey::KeyC && is_cmd_only(&s.pressed_mods) {
+                    s.cmd_chord_had_c = true;
+                }
                 // The peek is open: ⌘ + a slot's key picks that slot (paste
                 // it, or keep the copy there), and the key stays out of the
                 // app. Read through the layout, so it is the letter typed.
@@ -4992,7 +5086,7 @@ fn start_macos_hotkey_listener(
                         .and_then(|code| clipd_core::keyboard_layout::typed_char(code, false))
                         .and_then(clipd_core::fast_paste::peek_slot_for_key);
                     if let Some(slot) = picked {
-                        let _ = tx.send(HotkeyTick::PeekChoose(slot));
+                        let _ = tx.send(HotkeyTick::PeekChoose(slot, PEEK_SHOWN.load(Ordering::Relaxed)));
                         return None;
                     }
                 }
@@ -5504,6 +5598,47 @@ fn start_macos_hotkey_listener(
                         s.peek_armed = false;
                         let _ = tx.send(HotkeyTick::PeekCancel);
                     }
+                    // ⌘ taps open the picker: twice to paste a slot, once
+                    // just after ⌘C to keep that copy in one.
+                    if matches!(key, RKey::MetaLeft | RKey::MetaRight) && fast_on(FAST_PEEK) {
+                        /// Longest press that still counts as a tap.
+                        const TAP_MAX: Duration = Duration::from_millis(300);
+                        /// Gap between the two taps of a double tap.
+                        const DOUBLE_TAP: Duration = Duration::from_millis(450);
+                        /// How soon after letting go of ⌘C the tap must come.
+                        const AFTER_COPY: Duration = Duration::from_millis(1000);
+                        let now = Instant::now();
+                        let open = if s.cmd_chord_had_c {
+                            s.last_cmd_c_release = Some(now);
+                            s.last_bare_cmd_tap = None;
+                            None
+                        } else if s.cmd_clean
+                            && s.cmd_down_at.is_some_and(|d| now.duration_since(d) <= TAP_MAX)
+                        {
+                            if s.last_cmd_c_release.is_some_and(|t| now.duration_since(t) <= AFTER_COPY) {
+                                s.last_cmd_c_release = None;
+                                s.last_bare_cmd_tap = None;
+                                Some(clipd_core::fast_paste::PeekMode::Save)
+                            } else if s.last_bare_cmd_tap.is_some_and(|t| now.duration_since(t) <= DOUBLE_TAP) {
+                                s.last_bare_cmd_tap = None;
+                                Some(clipd_core::fast_paste::PeekMode::Paste)
+                            } else {
+                                s.last_bare_cmd_tap = Some(now);
+                                None
+                            }
+                        } else {
+                            s.last_bare_cmd_tap = None;
+                            None
+                        };
+                        if let Some(mode) = open {
+                            s.picker_until = Some(now + Duration::from_secs(4));
+                            s.picker_mode = mode.code();
+                            let _ = tx.send(HotkeyTick::PickerOpen(mode.code()));
+                        }
+                        s.cmd_down_at = None;
+                        s.cmd_clean = false;
+                        s.cmd_chord_had_c = false;
+                    }
                     if matches!(key, RKey::ControlLeft | RKey::ControlRight) && s.switcher_active {
                         s.switcher_active = false;
                         let _ = tx.send(HotkeyTick::SwitcherCommit);
@@ -5605,6 +5740,11 @@ fn start_macos_hotkey_listener(
             // the cursor any more, and ⌘-click is not a peek.
             EventType::ButtonPress(_) => {
                 s.typed.clear();
+                s.cmd_clean = false;
+                s.last_bare_cmd_tap = None;
+                if s.picker_until.take().is_some() {
+                    let _ = tx.send(HotkeyTick::PeekCancel);
+                }
                 if s.peek_armed {
                     s.peek_armed = false;
                     let _ = tx.send(HotkeyTick::PeekCancel);

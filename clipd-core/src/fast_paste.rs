@@ -14,6 +14,10 @@
 //!   keep holding ⌘ and the same tooltip asks where to keep the copy: press
 //!   a letter (or `2`–`9`). ⌘ becomes the one key for every slot, numbered
 //!   and lettered, without a single new chord to learn.
+//! - **Picker** — the same list without the wait: tap ⌘ twice to paste a
+//!   slot, or ⌘C then tap ⌘ once more to keep the copy in one. It opens at
+//!   once and takes a bare key (C and V included), because a deliberate tap
+//!   is not something any shortcut does.
 //! - **Type to paste** — type `;;` and a few letters, then a space, and the
 //!   trigger is replaced by the matching clip: `;;alex` → the latest clip
 //!   with "alex" in it, `;;link` / `;;email` / `;;code` → the latest of that
@@ -157,6 +161,17 @@ impl PeekMode {
 /// Letter slots are stored as 31..=56 (A..=Z); see `slot_badge`.
 const LETTER_SLOT_A: u8 = 31;
 
+/// The slot a bare key picks in the picker (opened by tapping ⌘): `1`–`9`
+/// the numbered slots, any letter its letter slot — C and V too, since no
+/// ⌘ is held.
+pub fn picker_slot_for_key(key: char) -> Option<u8> {
+    match key.to_ascii_lowercase() {
+        d @ '1'..='9' => Some(d as u8 - b'0'),
+        l @ 'a'..='z' => Some(LETTER_SLOT_A + (l as u8 - b'a')),
+        _ => None,
+    }
+}
+
 /// The slot a key picks while the peek is open and ⌘ is held: `1`–`9` the
 /// numbered slots, a letter its letter slot. Not C or V — those stay ⌘C and
 /// ⌘V, so their letter slots are reached with `;;c` / `;;v` (or ⌃⌥C / ⌃⌥V).
@@ -187,8 +202,12 @@ pub fn peek_key_label(slot: u8) -> String {
 /// slots are on), each labelled with the key that pastes it.
 /// Save: what was just copied, then the letter slots already taken, so a
 /// letter is not chosen over something worth keeping.
+///
+/// `picker`: opened by a ⌘ tap rather than a hold, so keys are pressed bare
+/// and every letter is labelled as itself (C and V included).
 pub fn peek_lines(
     mode: PeekMode,
+    picker: bool,
     clipboard: Option<&str>,
     slot: impl Fn(u8) -> Option<String>,
     multi_slot: bool,
@@ -198,38 +217,43 @@ pub fn peek_lines(
         .map(|c| one_line(c, 70))
         .filter(|c| !c.is_empty())
         .unwrap_or_else(|| "(nothing on the clipboard)".to_string());
+    let (lead, how) = if picker {
+        ("press", "· esc closes")
+    } else {
+        ("⌘ +", "")
+    };
     let mut lines = Vec::new();
     match mode {
         PeekMode::Paste => {
-            lines.push(("⌘ +".to_string(), "keep holding, press a key to paste".to_string()));
-            lines.push(("V".to_string(), now));
+            let ask = if picker { "a key to paste that slot" } else { "keep holding, press a key to paste" };
+            lines.push((lead.to_string(), format!("{ask} {how}").trim().to_string()));
+            lines.push((if picker { "⌘V" } else { "V" }.to_string(), now));
         }
         PeekMode::Save => {
-            lines.push((
-                "⌘ +".to_string(),
-                if letters {
-                    "keep holding, press a letter (or 2–9) to keep this copy there"
-                } else {
-                    "keep holding, press 2–9 to keep this copy in that slot"
-                }
-                .to_string(),
-            ));
+            let ask = match (picker, letters) {
+                (true, true) => "a letter (or 2–9) to keep this copy there",
+                (true, false) => "2–9 to keep this copy in that slot",
+                (false, true) => "keep holding, press a letter (or 2–9) to keep this copy there",
+                (false, false) => "keep holding, press 2–9 to keep this copy in that slot",
+            };
+            lines.push((lead.to_string(), format!("{ask} {how}").trim().to_string()));
             lines.push(("copied".to_string(), now));
         }
     }
+    let label = |n: u8| if picker { crate::slot_badge(n) } else { peek_key_label(n) };
     let filled = |n: u8| slot(n).filter(|t| !t.trim().is_empty());
     let mut more = Vec::new();
     if multi_slot && mode == PeekMode::Paste {
         for n in 2..=9u8 {
             if let Some(text) = filled(n) {
-                more.push((peek_key_label(n), one_line(&text, 70)));
+                more.push((label(n), one_line(&text, 70)));
             }
         }
     }
     if letters {
         for n in LETTER_SLOT_A..=LETTER_SLOT_A + 25 {
             if let Some(text) = filled(n) {
-                more.push((peek_key_label(n), one_line(&text, 70)));
+                more.push((label(n), one_line(&text, 70)));
             }
         }
     }
@@ -468,11 +492,11 @@ mod tests {
             34 => Some("delta".to_string()),
             _ => None,
         };
-        let lines = peek_lines(PeekMode::Paste, Some("now"), slot, true, true);
+        let lines = peek_lines(PeekMode::Paste, false, Some("now"), slot, true, true);
         assert_eq!(keys(&lines), ["⌘ +", "V", "2", "5", "A", ";;c", "D"]);
         assert_eq!(lines[2].1, "second line");
         // Numbered slots only with multi-slot on; letters only with letters on.
-        assert_eq!(keys(&peek_lines(PeekMode::Paste, Some("now"), slot, false, false)), ["⌘ +", "V"]);
+        assert_eq!(keys(&peek_lines(PeekMode::Paste, false, Some("now"), slot, false, false)), ["⌘ +", "V"]);
         assert!(peek_payload(&lines, None).contains("LINE\tA\talpha\n"));
     }
 
@@ -483,7 +507,7 @@ mod tests {
             31 => Some("alpha".to_string()),
             _ => None,
         };
-        let lines = peek_lines(PeekMode::Save, Some("just copied"), slot, true, true);
+        let lines = peek_lines(PeekMode::Save, false, Some("just copied"), slot, true, true);
         assert_eq!(keys(&lines), ["⌘ +", "copied", "A"], "numbered slots are not the question here");
         assert_eq!(lines[1].1, "just copied");
     }
@@ -503,9 +527,23 @@ mod tests {
     }
 
     #[test]
+    fn the_picker_takes_bare_keys_c_and_v_included() {
+        assert_eq!(picker_slot_for_key('c'), Some(33));
+        assert_eq!(picker_slot_for_key('V'), Some(52));
+        assert_eq!(picker_slot_for_key('4'), Some(4));
+        assert_eq!(picker_slot_for_key(' '), None);
+        let slot = |n: u8| (n == 33).then(|| "charlie".to_string());
+        let lines = peek_lines(PeekMode::Paste, true, Some("now"), slot, true, true);
+        assert_eq!(keys(&lines), ["press", "⌘V", "C"], "C is just C in the picker");
+        assert!(lines[0].1.ends_with("· esc closes"));
+        let save = peek_lines(PeekMode::Save, true, Some("copied text"), slot, true, true);
+        assert_eq!(save[0].1, "a letter (or 2–9) to keep this copy there · esc closes");
+    }
+
+    #[test]
     fn a_full_peek_stays_short() {
         let every = |_n: u8| Some("x".to_string());
-        let lines = peek_lines(PeekMode::Paste, Some("now"), every, true, true);
+        let lines = peek_lines(PeekMode::Paste, false, Some("now"), every, true, true);
         assert_eq!(lines.len(), PEEK_MAX_LINES);
         // 2 header lines + 8 numbered + 26 letters = 34 slots; 9 shown.
         assert_eq!(lines.last().unwrap().1, "+25 more slots in Clipd");
