@@ -774,6 +774,10 @@ pub fn run_daemon_with_stop(
         /// How long ⌘ is held before the peek shows: long enough that every
         /// ordinary shortcut is over before it.
         const PEEK_HOLD: Duration = Duration::from_millis(650);
+        /// After ⌘C the peek waits for the copy to finish first: at 650ms the
+        /// tap commits and draws its own toast (or the collect strip) in the
+        /// same overlay, which used to land on top of the peek and hide it.
+        const PEEK_SAVE_HOLD: Duration = Duration::from_millis(900);
 
         while !stop_hotkey.load(Ordering::Relaxed) {
             if fast_flags_read.elapsed() >= Duration::from_secs(1) {
@@ -1010,7 +1014,12 @@ pub fn run_daemon_with_stop(
                         } else {
                             clipd_core::fast_paste::PeekMode::Paste
                         };
-                        peek_deadline = Some(Instant::now() + PEEK_HOLD);
+                        let hold = if peek_mode == clipd_core::fast_paste::PeekMode::Save {
+                            PEEK_SAVE_HOLD
+                        } else {
+                            PEEK_HOLD
+                        };
+                        peek_deadline = Some(Instant::now() + hold);
                     }
                     HotkeyTick::PeekCancel => {
                         peek_deadline = None;
