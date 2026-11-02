@@ -85,8 +85,12 @@ fn clear_external_tick_tx() {
 /// The cost is that the slot commits this long after your last tap, which is a
 /// background save nobody is waiting on.
 const TAP_WINDOW: Duration = Duration::from_millis(650);
-/// How long Option+C / Option+V waits for a following A-Z letter slot.
-const LETTER_PREFIX_WINDOW: Duration = Duration::from_millis(900);
+/// How long ⌃⌥C / ⌃⌥V (and ⌘⌥C / ⌘⌥V) wait for the A-Z letter.
+///
+/// It was 900ms, and people moving from the chord to a letter key — often
+/// letting go of the modifiers first — routinely took longer, so the letter
+/// was typed into their document instead. Same as the ⌥⌥ grace.
+const LETTER_PREFIX_WINDOW: Duration = Duration::from_millis(2000);
 /// Max gap between two Cmd+C presses to count as a double-tap (quick letter save).
 const QUICK_DOUBLE_WINDOW: Duration = Duration::from_millis(400);
 /// How long after a double Cmd+C a letter still means "and put it in that slot
@@ -1010,9 +1014,12 @@ pub fn run_daemon_with_stop(
                         }
                     }
                     HotkeyTick::TypePaste { query, erase } => {
+                        // Lengths only: what someone types is not for a log.
+                        log::info!("⌨️  ;; trigger ({} chars)", query.chars().count());
                         let slot_text = |n: u8| hotkey_slot_mgr.get_slot(n).ok().flatten();
                         match clipd_core::fast_paste::resolve(&query, &recent_clips(300), slot_text) {
                             Some(text) => {
+                                log::info!("📋 ;; matched — pasting {} chars", text.chars().count());
                                 // The trigger is still being drawn; let the
                                 // app finish handling that space first.
                                 std::thread::sleep(Duration::from_millis(30));
@@ -1024,6 +1031,7 @@ pub fn run_daemon_with_stop(
                                 clipd_core::telemetry_event("type_to_paste", &[("found", "yes".into())]);
                             }
                             None => {
+                                log::info!("📋 ;; no match");
                                 // Leave what they typed alone, and say why
                                 // nothing happened.
                                 show_hud(&format!("No clip matches “;;{query}”"));
@@ -4799,6 +4807,10 @@ fn start_macos_hotkey_listener(
         /// characters typed at the cursor, for `;;`.
         switcher_active: bool,
         switcher_v_down: bool,
+        /// The C or V that armed a letter-slot chord, while it is still down.
+        /// Its auto-repeat is not the letter: holding ⌃⌥V a moment too long
+        /// used to paste slot V before you could press A.
+        leader_key_down: Option<RKey>,
         peek_armed: bool,
         typed: clipd_core::fast_paste::TypedBuffer,
     }
@@ -4838,6 +4850,7 @@ fn start_macos_hotkey_listener(
         pending_letter_copy: None,
         switcher_active: false,
         switcher_v_down: false,
+        leader_key_down: None,
         peek_armed: false,
         typed: clipd_core::fast_paste::TypedBuffer::default(),
     });
@@ -5007,6 +5020,11 @@ fn start_macos_hotkey_listener(
                     s.letter_copy_prefix_until.is_some_and(|u| now <= u)
                         || s.letter_paste_prefix_until.is_some_and(|u| now <= u)
                 };
+                // The key that armed the chord, repeating while still held,
+                // is not the letter being asked for.
+                if prefix_armed && s.leader_key_down == Some(key) {
+                    return None;
+                }
                 if letter_capture_active()
                     && (is_bare_letter(&s.pressed_mods) || prefix_armed)
                 {
@@ -5214,12 +5232,14 @@ fn start_macos_hotkey_listener(
                     if direct_letter_shortcuts_enabled() && key == RKey::KeyC {
                         s.letter_copy_prefix_until = Some(Instant::now() + LETTER_PREFIX_WINDOW);
                         s.letter_paste_prefix_until = None;
+                        s.leader_key_down = Some(RKey::KeyC);
                         log::info!("⌨️  Ctrl+Option+C → letter copy prefix");
                         return None;
                     }
                     if direct_letter_shortcuts_enabled() && key == RKey::KeyV {
                         s.letter_paste_prefix_until = Some(Instant::now() + LETTER_PREFIX_WINDOW);
                         s.letter_copy_prefix_until = None;
+                        s.leader_key_down = Some(RKey::KeyV);
                         log::info!("⌨️  Ctrl+Option+V → letter paste prefix");
                         return None;
                     }
@@ -5262,12 +5282,14 @@ fn start_macos_hotkey_listener(
                             s.latch_cmd_opt_c = true;
                             s.letter_copy_prefix_until = Some(now + LETTER_PREFIX_WINDOW);
                             s.letter_paste_prefix_until = None;
+                            s.leader_key_down = Some(RKey::KeyC);
                             log::info!("⌨️  Cmd+Option+C → letter slot copy armed");
                         }
                     } else if !s.latch_cmd_opt_v {
                         s.latch_cmd_opt_v = true;
                         s.letter_paste_prefix_until = Some(now + LETTER_PREFIX_WINDOW);
                         s.letter_copy_prefix_until = None;
+                        s.leader_key_down = Some(RKey::KeyV);
                         log::info!("⌨️  Cmd+Option+V → letter slot paste armed");
                     }
                     return None;
@@ -5456,6 +5478,9 @@ fn start_macos_hotkey_listener(
                     }
                     RKey::KeyV => {
                         s.switcher_v_down = false;
+                        if s.leader_key_down == Some(RKey::KeyV) {
+                            s.leader_key_down = None;
+                        }
                         s.latch_ctrl_shift_v = false;
                         s.latch_cmd_shift_v = false;
                         s.latch_cmd_opt_v = false;
@@ -5465,6 +5490,9 @@ fn start_macos_hotkey_listener(
                         s.latch_ctrl_v = false;
                     }
                     RKey::KeyC => {
+                        if s.leader_key_down == Some(RKey::KeyC) {
+                            s.leader_key_down = None;
+                        }
                         s.latch_cmd_opt_c = false;
                         s.latch_ctrl_shift_opt_c = false;
                         s.latch_shift_opt_c = false;

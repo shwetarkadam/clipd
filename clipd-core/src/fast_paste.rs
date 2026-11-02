@@ -15,7 +15,8 @@
 //! - **Type to paste** — type `;;` and a few letters, then a space, and the
 //!   trigger is replaced by the matching clip: `;;alex` → the latest clip
 //!   with "alex" in it, `;;link` / `;;email` / `;;code` → the latest of that
-//!   kind, `;;2` → slot 2.
+//!   kind. Slots by name: `;;2` / `;;20` → numbered slot 2 / 20, `;;a` →
+//!   letter slot A — the one keyboard path to a slot past 9.
 //!
 //! This module is the logic, kept pure so it can be tested; the daemon owns
 //! the keyboard and the pasting, and `clipd-hud` draws the overlays.
@@ -233,7 +234,8 @@ impl TypedBuffer {
 /// What a query asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
-    /// `;;2` — slot 2.
+    /// `;;2`, `;;20` — a numbered slot (1–30); `;;a` — a letter slot, stored
+    /// as 31–56 (see `slot_badge`).
     Slot(u8),
     /// `;;link`, `;;email`, `;;code` — the latest of a kind.
     Kind(ContentType),
@@ -243,10 +245,17 @@ pub enum Query {
 
 pub fn parse_query(q: &str) -> Query {
     let lower = q.to_lowercase();
+    // Numbered slots run 1–30 (⌘V ×N reaches 9; 11–30 are the extended bank).
     if let Ok(n) = lower.parse::<u8>() {
-        if (1..=9).contains(&n) {
+        if (1..=30).contains(&n) {
             return Query::Slot(n);
         }
+    }
+    // One letter is never a useful search (it matches nearly every clip), so
+    // it names a letter slot.
+    let mut chars = lower.chars();
+    if let (Some(c @ 'a'..='z'), None) = (chars.next(), chars.next()) {
+        return Query::Slot(31 + (c as u8 - b'a'));
     }
     match lower.as_str() {
         "link" | "url" => Query::Kind(ContentType::Url),
@@ -329,9 +338,20 @@ mod tests {
             clip("Alex Morgan, 12 High St", "Notes"),
         ];
         let clips: Vec<ClipEntry> = clips;
-        let slot = |n: u8| (n == 2).then(|| "slot two".to_string());
+        let slot = |n: u8| match n {
+            2 => Some("slot two".to_string()),
+            20 => Some("slot twenty".to_string()),
+            31 => Some("letter a".to_string()),
+            _ => None,
+        };
         assert_eq!(resolve("2", &clips, slot).as_deref(), Some("slot two"));
         assert_eq!(resolve("3", &clips, slot), None);
+        // Past ⌘V's reach, and the letter bank.
+        assert_eq!(resolve("20", &clips, slot).as_deref(), Some("slot twenty"));
+        assert_eq!(resolve("a", &clips, slot).as_deref(), Some("letter a"));
+        assert_eq!(resolve("A", &clips, slot).as_deref(), Some("letter a"));
+        assert_eq!(parse_query("z"), Query::Slot(56));
+        assert_eq!(parse_query("31"), Query::Text("31".into()), "31+ are letter slots by number");
         assert_eq!(
             resolve("link", &clips, slot).as_deref(),
             Some("https://github.com/shwetarkadam/clipd/pull/28")

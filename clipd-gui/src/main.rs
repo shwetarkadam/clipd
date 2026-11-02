@@ -11606,7 +11606,7 @@ impl ClipdGui {
             FooterIcon::Sparkle,
             &mut self.paste_settings.type_to_paste_enabled,
             "Type to paste — ;;word then space",
-            ";;alex pastes your latest clip with \"alex\" in it. Also ;;link, ;;email, ;;code, ;;2 for slot 2",
+            ";;alex pastes your latest clip with \"alex\" in it. ;;link, ;;email, ;;code; slots by name: ;;2, ;;20, ;;a",
         );
         if dirty {
             self.paste_settings.fast_paste_offered = true;
