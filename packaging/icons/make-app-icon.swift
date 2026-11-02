@@ -1,10 +1,19 @@
-// Clipd app icon: the helmeted cat on the brand tile, with a clipboard badge.
+// Clipd app icon: the helmeted cat on a tile, with a clipboard badge.
 // Usage (from the repo root):
 //   swiftc -O -o /tmp/make-app-icon packaging/icons/make-app-icon.swift
-//   /tmp/make-app-icon clipd-gui/assets/cat.png packaging/icons/AppIcon-1024.png
+//   /tmp/make-app-icon clipd-gui/assets/cat.png packaging/icons/AppIcon-1024.png [tile-from] [tile-to] [badge-ink]
+// Colours are hex (RRGGBB); the defaults are the shipped icon's.
 import AppKit
 
 let args = CommandLine.arguments
+func hex(_ s: String) -> NSColor {
+    let v = Int(s, radix: 16) ?? 0
+    return NSColor(calibratedRed: CGFloat((v >> 16) & 255) / 255, green: CGFloat((v >> 8) & 255) / 255,
+                   blue: CGFloat(v & 255) / 255, alpha: 1)
+}
+let tileFrom = hex(args.count > 3 ? args[3] : "3A3F47")
+let tileTo = hex(args.count > 4 ? args[4] : "17191D")
+let badgeInk = hex(args.count > 5 ? args[5] : "2A2D33")
 let source = NSBitmapImageRep(data: NSImage(contentsOfFile: args[1])!.tiffRepresentation!)!
 // Crop to the drawing itself: the frame has empty margin around the cat.
 var (minX, minY, maxX, maxY) = (source.pixelsWide, source.pixelsHigh, 0, 0)
@@ -34,8 +43,7 @@ shadow.shadowOffset = NSSize(width: 0, height: -10)
 shadow.set()
 NSColor.black.setFill(); tilePath.fill()
 NSGraphicsContext.restoreGraphicsState()
-let gradient = NSGradient(starting: NSColor(calibratedRed: 0.39, green: 0.40, blue: 0.95, alpha: 1),
-                          ending: NSColor(calibratedRed: 0.55, green: 0.36, blue: 0.96, alpha: 1))!
+let gradient = NSGradient(starting: tileFrom, ending: tileTo)!
 gradient.draw(in: tilePath, angle: -45)
 
 // The cat: as large as the tile allows, nudged up-left to leave the badge room.
@@ -64,7 +72,7 @@ NSColor.white.setFill()
 NSBezierPath(ovalIn: badge).fill()
 NSGraphicsContext.restoreGraphicsState()
 let cfg = NSImage.SymbolConfiguration(pointSize: 150, weight: .semibold)
-    .applying(.init(hierarchicalColor: NSColor(calibratedRed: 0.36, green: 0.33, blue: 0.90, alpha: 1)))
+    .applying(.init(hierarchicalColor: badgeInk))
 if let sym = NSImage(systemSymbolName: "list.clipboard", accessibilityDescription: nil)?
     .withSymbolConfiguration(cfg) {
     let s = sym.size
