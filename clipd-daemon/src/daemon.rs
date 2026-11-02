@@ -1086,10 +1086,20 @@ pub fn run_daemon_with_stop(
             if peek_deadline.is_some_and(|dl| now >= dl) {
                 peek_deadline = None;
                 let clipboard = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
+                // Letter slots are pasted with ⌃⌥ + letter when the direct
+                // chords are on, otherwise with the ⌘⌥V leader.
+                let letter_chord = paste_transform.letter_slots_enabled.then(|| {
+                    if paste_transform.direct_letter_shortcuts_enabled {
+                        "⌃⌥"
+                    } else {
+                        "⌘⌥V "
+                    }
+                });
                 let lines = clipd_core::fast_paste::peek_lines(
                     clipboard.as_deref(),
                     |n| hotkey_slot_mgr.get_slot(n).ok().flatten(),
                     paste_transform.multi_slot_enabled,
+                    letter_chord,
                 );
                 fast_overlay(&clipd_core::fast_paste::peek_payload(&lines, caret_point()));
                 peek_shown = true;

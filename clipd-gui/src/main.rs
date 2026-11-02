@@ -11597,7 +11597,7 @@ impl ClipdGui {
             FooterIcon::Eye,
             &mut self.paste_settings.peek_enabled,
             "Peek — hold ⌘ for a moment",
-            "Shows what ⌘V will paste (and ⌘V ×2, ×3) before you paste it",
+            "Shows what ⌘V will paste, and what's in your numbered and A–Z slots",
         );
         settings_card_divider(ui, c);
         dirty |= settings_toggle_row(
