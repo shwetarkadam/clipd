@@ -661,11 +661,6 @@ pub fn run_daemon_with_stop(
     println!("       Ctrl+Shift+Option+A..Z    → copy, one chord");
     println!("     Ctrl+Option+Space → show recent slot memory");
     println!();
-    println!("     Collect mode (grab a batch, no slot picking):");
-    println!("       Ctrl+Option+`  → toggle on/off (also auto-starts on 2 quick copies)");
-    println!("       then just Cmd+C each item → stacks into slots 1..9");
-    println!("       Cmd+Shift+V    → pick one to paste from the visual list");
-    println!();
     println!(
         "     Ctrl+T → open TUI        {} → open GUI",
         load_paste_transform_settings().open_gui_hotkey.label()
@@ -738,17 +733,10 @@ pub fn run_daemon_with_stop(
         // The slot filled on the latest ⌘C tap, and what it held before.
         let mut cmd_c_live: Option<LiveCopy> = None;
 
-        // ── Collect mode ──
-        // When collecting, each plain Cmd+C lands in the next numbered slot
-        // (1,2,3…) instead of always overwriting slot 1 — so the user can grab
-        // a batch without choosing slots. Started explicitly (Ctrl+Option+`) or
-        // automatically when two quick single copies happen in a row.
-        let mut collecting = false;
-        let mut collect_next: u8 = 1;
-        let mut last_single_copy: Option<Instant> = None;
-        const COLLECT_BANK_MAX: u8 = 9;
-        const AUTO_COLLECT_WINDOW: Duration = Duration::from_millis(2500);
-        const COLLECT_IDLE_RESET: Duration = Duration::from_secs(30);
+        // Collect mode used to live here: plain ⌘Cs filling slots 1, 2, 3…
+        // on their own, switched on by ⌃⌥` or — unasked — by two quick copies.
+        // It overwrote slots nobody had chosen to change. Slots now change
+        // only when someone puts something in one (⌘C ×N, ⌘C ⌘C + letter).
         let paste_rules = load_paste_rules();
         let transform_config = load_transform_config();
         let mut paste_transform = load_paste_transform_settings();
@@ -1085,20 +1073,6 @@ pub fn run_daemon_with_stop(
                             clipd_core::telemetry_event("peek_paste", &[("letter", letter.to_string())]);
                         }
                     }
-                    HotkeyTick::ToggleCollect => {
-                        collecting = !collecting;
-                        collect_next = 1;
-                        last_single_copy = None;
-                        log::info!("📦 Collect mode {}", if collecting { "ON" } else { "OFF" });
-                        #[cfg(target_os = "macos")]
-                        {
-                            if collecting {
-                                show_collect_hud(&hotkey_slot_mgr, 0, true);
-                            } else {
-                                show_collect_done_hud();
-                            }
-                        }
-                    }
                     HotkeyTick::SequencePaste => {
                         if hotkey_slot_mgr.has_content(sequence_slot) {
                             execute_context_paste(
@@ -1163,48 +1137,12 @@ pub fn run_daemon_with_stop(
 
             // Cmd+C: 1 tap → auto-save to slot 1 (most recent),
             //        2+ taps → save to slot N, optionally restore clipboard to slot 1
-            // While collecting, a long pause means the batch is over — drop
-            // back to normal slot-1 behavior so a much-later copy isn't appended.
-            if collecting {
-                if let Some(prev) = last_single_copy {
-                    if now.duration_since(prev) > COLLECT_IDLE_RESET {
-                        collecting = false;
-                        collect_next = 1;
-                        last_single_copy = None;
-                    }
-                }
-            }
 
             if let Some(dl) = cmd_c_deadline {
                 if now >= dl && cmd_c_taps > 0 {
                     if cmd_c_taps == 1 {
-                        let commit = Instant::now();
-                        // Auto-start: a second quick single copy turns collecting on.
-                        if !collecting {
-                            if let Some(prev) = last_single_copy {
-                                if commit.duration_since(prev) <= AUTO_COLLECT_WINDOW {
-                                    collecting = true;
-                                    // Copy #1 is already in slot 1; this one is #2.
-                                    collect_next = 2;
-                                }
-                            }
-                        }
-                        if collecting && collect_next <= COLLECT_BANK_MAX {
-                            let slot = collect_next;
-                            execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
-                            log::info!("📦 Collect → slot {}", slot);
-                            collect_next += 1;
-                            #[cfg(target_os = "macos")]
-                            show_collect_hud(&hotkey_slot_mgr, slot, false);
-                            if collect_next > COLLECT_BANK_MAX {
-                                // Bank full — stop collecting but keep the items.
-                                collecting = false;
-                            }
-                        } else {
-                            execute_copy(1, &hotkey_slot_mgr, &persist_tx);
-                            log::info!("⌨️  Cmd+C → auto-saved to slot 1");
-                        }
-                        last_single_copy = Some(commit);
+                        execute_copy(1, &hotkey_slot_mgr, &persist_tx);
+                        log::info!("⌨️  Cmd+C → auto-saved to slot 1");
                     } else {
                         let slot = primary_slot_for_taps(cmd_c_taps, &paste_transform);
                         match cmd_c_live.take() {
@@ -1470,7 +1408,6 @@ enum HotkeyTick {
     CopySelectionToSlot(u8), // Ctrl+Shift+Option+A..Z — copy selection to slot 31..56
     PasteFromSlot(u8),       // Ctrl+Option+1..9 — paste slot
     SlotMemoryHud,           // Ctrl+Option+Space — show recent slot memory
-    ToggleCollect,           // Ctrl+Option+` — toggle Collect mode on/off
     CommandPalette,          // Ctrl+Space → command palette
     SendToDevice,            // Ctrl+Shift+S — send the clipboard to the other Mac
     // Faster ways to paste (clipd_core::fast_paste), each opt-in.
@@ -3292,61 +3229,6 @@ fn show_slot_memory_hud(mgr: &SlotManager) {
     show_hud(&lines.join("\n"));
 }
 
-/// The Collect-mode panel: the growing stack of slots 1..=9 captured this
-/// batch, newest highlighted. Replaces the per-copy toast while collecting so
-/// the user sees the whole batch, not just the last item.
-#[cfg(target_os = "macos")]
-fn show_collect_hud(mgr: &SlotManager, active_slot: u8, just_started: bool) {
-    let mut rows = Vec::new();
-    let mut count = 0;
-    if let Ok(slots) = mgr.list_slots() {
-        for (slot, content) in slots.into_iter() {
-            if (1..=9).contains(&slot) && !content.trim().is_empty() {
-                count += 1;
-                let preview = truncate(&content, 40);
-                let active = if slot == active_slot { "1" } else { "0" };
-                rows.push(format!(
-                    "ROW\t{}\t{}\t{}\t{}\t{}",
-                    slot,
-                    slot_badge(slot),
-                    content_icon(&preview),
-                    preview,
-                    active,
-                ));
-            }
-        }
-    }
-
-    let title = if just_started || count == 0 {
-        "Collecting — just press ⌘C".to_string()
-    } else {
-        format!(
-            "Collecting · {} item{}",
-            count,
-            if count == 1 { "" } else { "s" }
-        )
-    };
-
-    let mut lines = vec![
-        "STYLE\tlist".to_string(),
-        format!("TITLE\t{}", title),
-        "HINT\t⌃⌥` done".to_string(),
-    ];
-    if rows.is_empty() {
-        lines.push("PREVIEW\tempty\tCopy anything — it stacks here automatically".to_string());
-    } else {
-        lines.extend(rows);
-    }
-    lines.push("FOOT\t⌘⇧V to pick one when pasting".to_string());
-    show_hud(&lines.join("\n"));
-}
-
-/// Brief confirmation toast when Collect mode is turned off.
-#[cfg(target_os = "macos")]
-fn show_collect_done_hud() {
-    show_hud("STYLE\ttoast\nBADGE\t✓\nTITLE\tCollect mode off\nHINT\t⌘⇧V to pick");
-}
-
 /// Show the command palette — a prompt HUD listing all enabled custom actions,
 /// then run the chosen one on the current clipboard.
 #[cfg(target_os = "macos")]
@@ -4913,7 +4795,6 @@ fn start_macos_hotkey_listener(
         latch_ctrl_t: bool,
         latch_ctrl_g: bool,
         latch_ctrl_opt_space: bool,
-        latch_ctrl_opt_backquote: bool,
         latch_cmd_ctrl_c: bool,
         latch_cmd_ctrl_v: bool,
         latch_cmd_c: bool,
@@ -4974,7 +4855,6 @@ fn start_macos_hotkey_listener(
         latch_ctrl_t: false,
         latch_ctrl_g: false,
         latch_ctrl_opt_space: false,
-        latch_ctrl_opt_backquote: false,
         latch_cmd_ctrl_c: false,
         latch_cmd_ctrl_v: false,
         latch_cmd_c: false,
@@ -5395,14 +5275,6 @@ fn start_macos_hotkey_listener(
                         }
                         return None;
                     }
-                    if key == RKey::BackQuote {
-                        if !s.latch_ctrl_opt_backquote {
-                            s.latch_ctrl_opt_backquote = true;
-                            log::info!("⌨️  Ctrl+Option+` → toggle collect mode");
-                            let _ = tx.send(HotkeyTick::ToggleCollect);
-                        }
-                        return None;
-                    }
                     if direct_letter_shortcuts_enabled() && key == RKey::KeyC {
                         s.letter_copy_prefix_until = Some(Instant::now() + LETTER_PREFIX_WINDOW);
                         s.letter_paste_prefix_until = None;
@@ -5710,7 +5582,6 @@ fn start_macos_hotkey_listener(
                         s.latch_ctrl_g = false;
                         s.latch_cmd_shift_v = false;
                     }
-                    RKey::BackQuote => s.latch_ctrl_opt_backquote = false,
                     RKey::Num1
                     | RKey::Num2
                     | RKey::Num3

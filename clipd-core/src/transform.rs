@@ -758,10 +758,9 @@ pub const PRACTICE_LINES: [&str; 3] = ["Ada Lovelace", "ada@example.com", "+44 2
 /// Which practice lines are already sitting in their slot.
 ///
 /// Read from what the slots actually hold, never from which keys were pressed.
-/// clipd has more than one way into a slot — two quick single copies start
-/// collect mode, which stacks later copies into 2, 3, … on its own — and the
-/// exercise should tick for any of them. What matters is that the right thing
-/// ended up in the right place.
+/// clipd has more than one way into a slot (⌘C ×N, the slot strip, the
+/// Settings tools), and the exercise should tick for any of them. What
+/// matters is that the right thing ended up in the right place.
 pub fn practice_marks(slots: &[(u8, String)]) -> [bool; 3] {
     let mut marks = [false; 3];
     for (i, line) in PRACTICE_LINES.iter().enumerate() {
