@@ -519,10 +519,6 @@ pub struct PasteTransformSettings {
     /// Hold ⌘ on its own for a moment: see what ⌘V (and ⌘V ×2, ×3) pastes.
     #[serde(default)]
     pub peek_enabled: bool,
-    /// Type `;;` and a few letters, then a space: replaced by the matching
-    /// clip.
-    #[serde(default)]
-    pub type_to_paste_enabled: bool,
     /// Whether the person has been asked about the three above (onboarding,
     /// or the one-time card for people who onboarded before they existed).
     #[serde(default)]
@@ -653,7 +649,6 @@ impl Default for PasteTransformSettings {
             paste_on_pick: true,
             switcher_enabled: false,
             peek_enabled: false,
-            type_to_paste_enabled: false,
             fast_paste_offered: false,
             auto_letter_slots: true,
             letter_slots_intro_seen: false,

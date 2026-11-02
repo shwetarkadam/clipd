@@ -7206,9 +7206,8 @@ impl ClipdGui {
         if save_to_slot(slot, &clip.content) {
             clipd_core::auto_letters::mark_named(letter);
             self.refresh();
-            let lower = letter.to_ascii_lowercase();
             self.footer_note = Some((
-                format!("Slot {letter} now holds this · paste with ⌃⌥{letter} or ;;{lower}"),
+                format!("Slot {letter} now holds this · paste with ⌃⌥{letter}"),
                 Instant::now(),
             ));
             clipd_core::telemetry_event("letter_named", &[]);
@@ -11707,7 +11706,7 @@ impl ClipdGui {
             FooterIcon::Key,
             &mut self.paste_settings.letter_slots_enabled,
             "Letter slots A–Z",
-            "Copy into one: ⌘C ⌘C, then the letter (keep ⌘ held). Paste: ⌃⌥ + the letter, or ;;letter",
+            "Copy into one: ⌘C ⌘C, then the letter (keep ⌘ held). Paste: ⌃⌥ + the letter",
         );
         if self.paste_settings.letter_slots_enabled {
             settings_card_divider(ui, c);
@@ -11819,15 +11818,6 @@ impl ClipdGui {
             "Slot picker — tap ⌘ twice",
             "Shows what's in your slots; press a letter or number to paste one. Hold ⌘ instead to just look",
         );
-        settings_card_divider(ui, c);
-        dirty |= settings_toggle_row(
-            ui,
-            c,
-            FooterIcon::Sparkle,
-            &mut self.paste_settings.type_to_paste_enabled,
-            "Type to paste — ;;word then space",
-            ";;alex pastes your latest clip with \"alex\" in it. ;;link, ;;email, ;;code; slots by name: ;;2, ;;20, ;;a",
-        );
         if dirty {
             self.paste_settings.fast_paste_offered = true;
             clipd_core::telemetry_event(
@@ -11835,7 +11825,6 @@ impl ClipdGui {
                 &[
                     ("switcher", self.paste_settings.switcher_enabled.to_string()),
                     ("peek", self.paste_settings.peek_enabled.to_string()),
-                    ("type_to_paste", self.paste_settings.type_to_paste_enabled.to_string()),
                 ],
             );
         }
@@ -11871,8 +11860,8 @@ impl ClipdGui {
                 ui.add_space(2.0);
                 ui.label(
                     RichText::new(
-                        "A switcher at your cursor (hold ⌃, tap V), a peek at what ⌘V will paste \
-                         (hold ⌘), and ;;word to paste by typing. All off until you choose.",
+                        "A switcher at your cursor (hold ⌃, tap V), and a picker for your slots \
+                         (tap ⌘ twice). Both off until you choose.",
                     )
                     .size(11.5)
                     .color(rgb(c.subtext)),
@@ -13754,7 +13743,7 @@ impl ClipdGui {
                     c,
                     &mut self.paste_settings.letter_slots_enabled,
                     "Letter slots A-Z",
-                    "26 slots you reach by letter. E, L, P and K fill themselves (email, link, phone, code); name any clip with ⌘⌥ + a letter in Clipd. Paste with Ctrl+Option + the letter or ;;letter.",
+                    "26 slots you reach by letter. E, L, P and K fill themselves (email, link, phone, code); name any clip with ⌘⌥ + a letter in Clipd. Copy into one with ⌘C ⌘C then the letter; paste with Ctrl+Option + the letter.",
                 ) {
                     save_paste_transform_settings(&self.paste_settings);
                 }

@@ -1085,32 +1085,6 @@ pub fn run_daemon_with_stop(
                             clipd_core::telemetry_event("peek_paste", &[("letter", letter.to_string())]);
                         }
                     }
-                    HotkeyTick::TypePaste { query, erase } => {
-                        // Lengths only: what someone types is not for a log.
-                        log::info!("⌨️  ;; trigger ({} chars)", query.chars().count());
-                        let slot_text = |n: u8| hotkey_slot_mgr.get_slot(n).ok().flatten();
-                        match clipd_core::fast_paste::resolve(&query, &recent_clips(300), slot_text) {
-                            Some(text) => {
-                                log::info!("📋 ;; matched — pasting {} chars", text.chars().count());
-                                // The trigger is still being drawn; let the
-                                // app finish handling that space first.
-                                std::thread::sleep(Duration::from_millis(30));
-                                for _ in 0..erase {
-                                    simulate_backspace();
-                                    std::thread::sleep(Duration::from_millis(4));
-                                }
-                                paste_text(&text, &suppress, false);
-                                clipd_core::telemetry_event("type_to_paste", &[("found", "yes".into())]);
-                            }
-                            None => {
-                                log::info!("📋 ;; no match");
-                                // Leave what they typed alone, and say why
-                                // nothing happened.
-                                show_hud(&format!("No clip matches “;;{query}”"));
-                                clipd_core::telemetry_event("type_to_paste", &[("found", "no".into())]);
-                            }
-                        }
-                    }
                     HotkeyTick::ToggleCollect => {
                         collecting = !collecting;
                         collect_next = 1;
@@ -1510,7 +1484,6 @@ enum HotkeyTick {
     PickerOpen,              // ⌘ tapped twice
     CopyTapsToLetter(u8),    // ⌘C ⌘C then a letter, ⌘ still held: copy to that letter slot
 
-    TypePaste { query: String, erase: usize }, // `;;query` then a space
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2522,18 +2495,12 @@ mod synth {
         }
     }
 
-    /// kVK_Tab / kVK_Delete: the same keys on every layout.
+    /// kVK_Tab: the same key on every layout.
     const TAB: u16 = 48;
-    const BACKSPACE: u16 = 51;
 
     /// A bare Tab, down then up.
     pub fn tab() {
         key(TAB);
-    }
-
-    /// A bare Backspace, down then up.
-    pub fn backspace() {
-        key(BACKSPACE);
     }
 
     fn key(code: u16) {
@@ -2564,11 +2531,6 @@ fn simulate_undo() {
 #[cfg(target_os = "macos")]
 fn simulate_tab() {
     synth::tab();
-}
-
-#[cfg(target_os = "macos")]
-fn simulate_backspace() {
-    synth::backspace();
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2621,8 +2583,6 @@ static FAST_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::ne
 const FAST_SWITCHER: u8 = 1;
 #[cfg(target_os = "macos")]
 const FAST_PEEK: u8 = 2;
-#[cfg(target_os = "macos")]
-const FAST_TYPE: u8 = 4;
 /// Letter slots are on (for ⌘C ⌘C + letter).
 #[cfg(target_os = "macos")]
 const FAST_LETTERS: u8 = 8;
@@ -2640,9 +2600,6 @@ fn refresh_fast_flags(settings: &PasteTransformSettings) {
     }
     if settings.peek_enabled {
         bits |= FAST_PEEK;
-    }
-    if settings.type_to_paste_enabled {
-        bits |= FAST_TYPE;
     }
     if settings.letter_slots_enabled {
         bits |= FAST_LETTERS;
@@ -4973,9 +4930,8 @@ fn start_macos_hotkey_listener(
         pending_letter_paste: Option<u8>,
         pending_letter_copy: Option<u8>,
         /// Faster ways to paste: the switcher is open (⌃ still held), its V
-        /// is down (so key repeat does not race along the strip), the peek
-        /// is waiting for ⌘ to be held long enough, and the run of
-        /// characters typed at the cursor, for `;;`.
+        /// is down (so key repeat does not race along the strip), and the
+        /// peek is waiting for ⌘ to be held long enough.
         switcher_active: bool,
         switcher_v_down: bool,
         /// The C or V that armed a letter-slot chord, while it is still down.
@@ -4995,7 +4951,6 @@ fn start_macos_hotkey_listener(
         last_cmd_c_press_at: Option<Instant>,
         c_key_down: bool,
         peek_armed: bool,
-        typed: clipd_core::fast_paste::TypedBuffer,
     }
 
     let state = std::cell::RefCell::new(State {
@@ -5042,7 +4997,6 @@ fn start_macos_hotkey_listener(
         last_cmd_c_press_at: None,
         c_key_down: false,
         peek_armed: false,
-        typed: clipd_core::fast_paste::TypedBuffer::default(),
     });
 
     grab(move |event: Event| {
@@ -5078,11 +5032,6 @@ fn start_macos_hotkey_listener(
                     // Claude desktop app opens its quick entry on a double ⌥,
                     // and clipd then took the first letter typed into it.
                     // ⌘C ⌘C + letter replaces it (see below).
-                    // A shortcut is starting: whatever was being typed is not
-                    // a `;;` trigger any more. Shift is just capitals.
-                    if !matches!(key, RKey::ShiftLeft | RKey::ShiftRight) {
-                        s.typed.clear();
-                    }
                     // A bare ⌘ press may be a tap (for the picker); any
                     // other modifier joining it is a chord, not a tap.
                     if matches!(key, RKey::MetaLeft | RKey::MetaRight) && s.pressed_mods.is_empty() {
@@ -5224,37 +5173,8 @@ fn start_macos_hotkey_listener(
                 {
                     s.switcher_active = true;
                     s.switcher_v_down = true;
-                    s.typed.clear();
                     let _ = tx.send(HotkeyTick::SwitcherTap);
                     return None;
-                }
-                // `;;query` + space: watch plain typing only. The key always
-                // goes through; the daemon erases the trigger afterwards.
-                if fast_on(FAST_TYPE) {
-                    let only_shift = s
-                        .pressed_mods
-                        .iter()
-                        .all(|m| matches!(m, RKey::ShiftLeft | RKey::ShiftRight));
-                    if !only_shift {
-                        s.typed.clear();
-                    } else if key == RKey::Backspace {
-                        s.typed.backspace();
-                    } else {
-                        let shift = !s.pressed_mods.is_empty();
-                        let typed = rdev::code_from_key(key)
-                            .and_then(|code| clipd_core::keyboard_layout::typed_char(code, shift));
-                        match typed {
-                            Some(' ') | Some('\t') => {
-                                if let Some((query, len)) = s.typed.trigger() {
-                                    // +1: the space or tab that ended it.
-                                    let _ = tx.send(HotkeyTick::TypePaste { query, erase: len + 1 });
-                                }
-                                s.typed.clear();
-                            }
-                            Some(c) => s.typed.push(c),
-                            None => s.typed.clear(),
-                        }
-                    }
                 }
 
 
@@ -5813,10 +5733,9 @@ fn start_macos_hotkey_listener(
                     }
                 }
             }
-            // A click moves the cursor: the run typed before it is not at
-            // the cursor any more, and ⌘-click is not a peek.
+            // A click ends a ⌘ tap, the picker and a peek: ⌘-click is none
+            // of them.
             EventType::ButtonPress(_) => {
-                s.typed.clear();
                 s.cmd_clean = false;
                 s.last_bare_cmd_tap = None;
                 if s.picker_until.take().is_some() {

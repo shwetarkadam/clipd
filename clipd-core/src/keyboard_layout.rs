@@ -56,7 +56,8 @@ mod imp {
     static CODES: [AtomicI32; 3] = [AtomicI32::new(-1), AtomicI32::new(-1), AtomicI32::new(-1)];
     static READY: AtomicBool = AtomicBool::new(false);
     /// What each key code types, plain and with Shift (0 = nothing). For
-    /// recognising what someone typed — the `;;` trigger — from a key event
+    /// recognising which letter a key is — a slot's letter in the picker —
+    /// from a key event
     /// that carries only a code.
     static TYPED: [[AtomicU32; 128]; 2] = {
         const Z: AtomicU32 = AtomicU32::new(0);

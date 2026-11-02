@@ -13,7 +13,7 @@
 //!   from Clipd (select it, ⌥ + a letter). A letter you named is yours: the
 //!   automatic letters never overwrite it.
 //!
-//! Pasting is unchanged: ⌃⌥ + the letter, `;;e`, or tap ⌘ twice then the
+//! Pasting is unchanged: ⌃⌥ + the letter, or tap ⌘ twice then the
 //! letter. Secrets are never put in a letter automatically.
 
 use crate::models::ContentType;

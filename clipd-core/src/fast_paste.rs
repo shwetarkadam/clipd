@@ -1,7 +1,7 @@
 //! Faster ways to paste, without opening a window.
 //!
 //! Most of the time someone goes back for a clip it is not a search: it is
-//! "the thing I copied a minute ago in the other tab". Three gestures cover
+//! "the thing I copied a minute ago in the other tab". These gestures cover
 //! that, each opt-in from Settings (they listen to the keyboard in new ways):
 //!
 //! - **Switcher** — hold ⌃ and tap V. A strip of recent clips appears at the
@@ -15,14 +15,9 @@
 //!   slot's key. It opens at once and takes a bare key (C and V included),
 //!   because a deliberate tap is not something any shortcut does.
 //!
-//! Saving into a letter is not a gesture here: asking for a letter at the
-//! moment of copying interrupted people. Letters fill themselves or are
-//! given later (see `crate::auto_letters`).
-//! - **Type to paste** — type `;;` and a few letters, then a space, and the
-//!   trigger is replaced by the matching clip: `;;alex` → the latest clip
-//!   with "alex" in it, `;;link` / `;;email` / `;;code` → the latest of that
-//!   kind. Slots by name: `;;2` / `;;20` → numbered slot 2 / 20, `;;a` →
-//!   letter slot A — the one keyboard path to a slot past 9.
+//! Copying into a letter slot is ⌘C ⌘C then the letter, with the other ⌘C
+//! taps in the daemon; E, L, P and K also fill themselves (see
+//! `crate::auto_letters`).
 //!
 //! This module is the logic, kept pure so it can be tested; the daemon owns
 //! the keyboard and the pasting, and `clipd-hud` draws the overlays.
@@ -148,7 +143,7 @@ pub fn picker_slot_for_key(key: char) -> Option<u8> {
 
 /// The slot a key picks while the peek is open and ⌘ is held: `1`–`9` the
 /// numbered slots, a letter its letter slot. Not C or V — those stay ⌘C and
-/// ⌘V, so their letter slots are reached with `;;c` / `;;v` (or ⌃⌥C / ⌃⌥V).
+/// ⌘V, so their letter slots are reached with ⌃⌥C / ⌃⌥V.
 pub fn peek_slot_for_key(key: char) -> Option<u8> {
     match key.to_ascii_lowercase() {
         d @ '1'..='9' => Some(d as u8 - b'0'),
@@ -158,12 +153,13 @@ pub fn peek_slot_for_key(key: char) -> Option<u8> {
     }
 }
 
-/// How the peek labels `slot`: the key to press with ⌘ held, or the `;;`
-/// name for the two letters ⌘ cannot pick.
+/// How the peek labels `slot`: the key to press with ⌘ held, or — for the
+/// two letters ⌘ cannot pick, since ⌘C and ⌘V stay copy and paste — the
+/// chord that pastes them.
 pub fn peek_key_label(slot: u8) -> String {
     let badge = crate::slot_badge(slot);
     match badge.as_str() {
-        "C" | "V" => format!(";;{}", badge.to_lowercase()),
+        "C" | "V" => format!("⌃⌥{badge}"),
         _ => badge,
     }
 }
@@ -236,184 +232,12 @@ pub fn peek_payload(lines: &[(String, String)], at: Option<(f64, f64)>) -> Strin
 /// The overlay message that takes down a switcher or peek.
 pub const HIDE_PAYLOAD: &str = "STYLE\thide\n";
 
-/// The trigger for type-to-paste.
-pub const TRIGGER: &str = ";;";
-/// Longest query worth matching; anything longer is ordinary typing.
-const MAX_QUERY: usize = 32;
-/// How much typing the buffer keeps.
-const BUFFER_CAP: usize = 48;
-
-/// The last few characters typed, for spotting `;;query`.
-///
-/// Held in memory only, never logged or stored, and cleared on anything that
-/// is not plain typing (a shortcut, an arrow, a click), so it only ever holds
-/// the run of characters at the cursor.
-#[derive(Debug, Default, Clone)]
-pub struct TypedBuffer {
-    text: String,
-}
-
-impl TypedBuffer {
-    pub fn push(&mut self, c: char) {
-        self.text.push(c);
-        let extra = self.text.chars().count().saturating_sub(BUFFER_CAP);
-        if extra > 0 {
-            self.text = self.text.chars().skip(extra).collect();
-        }
-    }
-
-    pub fn backspace(&mut self) {
-        self.text.pop();
-    }
-
-    pub fn clear(&mut self) {
-        self.text.clear();
-    }
-
-    /// When a space or tab is typed: the query after the last `;;`, and how
-    /// many characters the trigger took (`;;` plus the query) — what has to
-    /// be erased before pasting. `None` when the run does not end in one.
-    pub fn trigger(&self) -> Option<(String, usize)> {
-        let at = self.text.rfind(TRIGGER)?;
-        let query = &self.text[at + TRIGGER.len()..];
-        let ok = !query.is_empty()
-            && query.chars().count() <= MAX_QUERY
-            && query
-                .chars()
-                .all(|c| c.is_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | '/' | ':'));
-        ok.then(|| (query.to_string(), TRIGGER.len() + query.chars().count()))
-    }
-}
-
-/// What a query asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Query {
-    /// `;;2`, `;;20` — a numbered slot (1–30); `;;a` — a letter slot, stored
-    /// as 31–56 (see `slot_badge`).
-    Slot(u8),
-    /// `;;link`, `;;email`, `;;code` — the latest of a kind.
-    Kind(ContentType),
-    /// Anything else — the latest clip containing it.
-    Text(String),
-}
-
-pub fn parse_query(q: &str) -> Query {
-    let lower = q.to_lowercase();
-    // Numbered slots run 1–30 (⌘V ×N reaches 9; 11–30 are the extended bank).
-    if let Ok(n) = lower.parse::<u8>() {
-        if (1..=30).contains(&n) {
-            return Query::Slot(n);
-        }
-    }
-    // One letter is never a useful search (it matches nearly every clip), so
-    // it names a letter slot.
-    let mut chars = lower.chars();
-    if let (Some(c @ 'a'..='z'), None) = (chars.next(), chars.next()) {
-        return Query::Slot(31 + (c as u8 - b'a'));
-    }
-    match lower.as_str() {
-        "link" | "url" => Query::Kind(ContentType::Url),
-        "email" | "mail" => Query::Kind(ContentType::Email),
-        "code" => Query::Kind(ContentType::Code),
-        _ => Query::Text(lower),
-    }
-}
-
-/// The text a query pastes, from `clips` (newest first) and the slots.
-pub fn resolve(
-    query: &str,
-    clips: &[ClipEntry],
-    slot: impl Fn(u8) -> Option<String>,
-) -> Option<String> {
-    let pasteable = |c: &&ClipEntry| {
-        !matches!(c.content_type, ContentType::Image | ContentType::File) && !c.content.trim().is_empty()
-    };
-    match parse_query(query) {
-        Query::Slot(n) => slot(n).filter(|t| !t.trim().is_empty()),
-        Query::Kind(kind) => clips
-            .iter()
-            .filter(pasteable)
-            .find(|c| c.content_type == kind)
-            .map(|c| c.content.clone()),
-        Query::Text(needle) => clips
-            .iter()
-            .filter(pasteable)
-            .find(|c| c.content.to_lowercase().contains(&needle))
-            .map(|c| c.content.clone()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn clip(content: &str, app: &str) -> ClipEntry {
         ClipEntry::new(content.to_string(), Some(app.to_string()), None)
-    }
-
-    #[test]
-    fn the_buffer_spots_a_trigger_and_how_much_to_erase() {
-        let mut b = TypedBuffer::default();
-        for c in "hi there ;;alex".chars() {
-            b.push(c);
-        }
-        assert_eq!(b.trigger(), Some(("alex".to_string(), 6)));
-        b.backspace();
-        assert_eq!(b.trigger(), Some(("ale".to_string(), 5)));
-        b.clear();
-        assert_eq!(b.trigger(), None);
-    }
-
-    #[test]
-    fn ordinary_typing_never_triggers() {
-        let mut b = TypedBuffer::default();
-        for c in "for (;;) { x; y }".chars() {
-            b.push(c);
-        }
-        assert_eq!(b.trigger(), None, "a C for-loop is not a query");
-        let mut b = TypedBuffer::default();
-        for c in ";;".chars() {
-            b.push(c);
-        }
-        assert_eq!(b.trigger(), None, "a bare ;; asks for nothing");
-        let mut b = TypedBuffer::default();
-        for c in format!(";;{}", "x".repeat(40)).chars() {
-            b.push(c);
-        }
-        assert_eq!(b.trigger(), None, "too long to be a query");
-    }
-
-    #[test]
-    fn queries_resolve_to_slots_kinds_and_text() {
-        let clips = vec![
-            clip("see you at 5", "Messages"),
-            clip("https://github.com/shwetarkadam/clipd/pull/28", "Brave Browser"),
-            clip("alex@morgan.dev", "Mail"),
-            clip("Alex Morgan, 12 High St", "Notes"),
-        ];
-        let clips: Vec<ClipEntry> = clips;
-        let slot = |n: u8| match n {
-            2 => Some("slot two".to_string()),
-            20 => Some("slot twenty".to_string()),
-            31 => Some("letter a".to_string()),
-            _ => None,
-        };
-        assert_eq!(resolve("2", &clips, slot).as_deref(), Some("slot two"));
-        assert_eq!(resolve("3", &clips, slot), None);
-        // Past ⌘V's reach, and the letter bank.
-        assert_eq!(resolve("20", &clips, slot).as_deref(), Some("slot twenty"));
-        assert_eq!(resolve("a", &clips, slot).as_deref(), Some("letter a"));
-        assert_eq!(resolve("A", &clips, slot).as_deref(), Some("letter a"));
-        assert_eq!(parse_query("z"), Query::Slot(56));
-        assert_eq!(parse_query("31"), Query::Text("31".into()), "31+ are letter slots by number");
-        assert_eq!(
-            resolve("link", &clips, slot).as_deref(),
-            Some("https://github.com/shwetarkadam/clipd/pull/28")
-        );
-        assert_eq!(resolve("email", &clips, slot).as_deref(), Some("alex@morgan.dev"));
-        // Newest match wins, case-insensitive.
-        assert_eq!(resolve("ALEX", &clips, slot).as_deref(), Some("alex@morgan.dev"));
-        assert_eq!(resolve("nothing like this", &clips, slot), None);
     }
 
     #[test]
@@ -450,7 +274,7 @@ mod tests {
             _ => None,
         };
         let lines = peek_lines(false, Some("now"), slot, true, true);
-        assert_eq!(keys(&lines), ["⌘ +", "V", "2", "5", "A", ";;c", "D"]);
+        assert_eq!(keys(&lines), ["⌘ +", "V", "2", "5", "A", "⌃⌥C", "D"]);
         assert_eq!(lines[2].1, "second line");
         // Numbered slots only with multi-slot on; letters only with letters on.
         assert_eq!(keys(&peek_lines(false, Some("now"), slot, false, false)), ["⌘ +", "V"]);
@@ -466,7 +290,7 @@ mod tests {
         assert_eq!(peek_slot_for_key('v'), None);
         assert_eq!(peek_slot_for_key('0'), None);
         assert_eq!(peek_key_label(54), "X");
-        assert_eq!(peek_key_label(52), ";;v");
+        assert_eq!(peek_key_label(52), "⌃⌥V");
     }
 
     #[test]
