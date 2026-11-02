@@ -90,6 +90,7 @@ const TAP_WINDOW: Duration = Duration::from_millis(650);
 /// It was 900ms, and people moving from the chord to a letter key — often
 /// letting go of the modifiers first — routinely took longer, so the letter
 /// was typed into their document instead.
+#[cfg(target_os = "macos")]
 const LETTER_PREFIX_WINDOW: Duration = Duration::from_millis(2000);
 /// After ⌘C ⌘C, how long (⌘ still held) a letter still means "copy into that
 /// letter slot". Long enough that nobody has to hurry to the letter.
@@ -1570,10 +1571,18 @@ fn spawn_windows_grab(
     persist_tx: mpsc::SyncSender<ClipEvent>,
     suppress: Arc<AtomicBool>,
 ) {
-    // Letter must arrive within the grace; paste grace is < the numeric-paste
-    // commit (~430ms) so a letter reliably cancels slot N before it fires.
-    const COPY_LETTER_GRACE: Duration = Duration::from_millis(650);
-    const PASTE_LETTER_GRACE: Duration = Duration::from_millis(450);
+    // How long after Ctrl+C Ctrl+C / Ctrl+V Ctrl+V the letter is waited for.
+    // These were 650ms and 450ms, which made the letter a race — miss it and
+    // the letter was typed into the document. 1.5s, as on macOS.
+    //
+    // Copy: the numbered slot commits after the window (a background save,
+    // so waiting costs nothing). Paste: the numbered slot still pastes on
+    // its own short timing (PASTE_COMMIT_AFTER) so Ctrl+V ×2 is not slow; a
+    // letter that comes after it undoes that one paste and pastes the
+    // letter slot instead.
+    const COPY_LETTER_GRACE: Duration = Duration::from_millis(1500);
+    const PASTE_LETTER_GRACE: Duration = Duration::from_millis(1500);
+    const PASTE_COMMIT_AFTER: Duration = Duration::from_millis(450);
     std::thread::spawn(move || {
         #[derive(Default)]
         struct GrabState {
@@ -1587,8 +1596,13 @@ fn spawn_windows_grab(
             v_taps: u8,
             v_gen: u64,
             paste_letter_until: Option<Instant>,
+            /// The switcher strip is open (Alt still held), and its V is
+            /// down, so key repeat does not race along the strip.
+            sw_active: bool,
+            sw_v_down: bool,
         }
         let state = Arc::new(Mutex::new(GrabState::default()));
+        win_switcher::start(suppress.clone());
 
         let callback = move |event: Event| -> Option<Event> {
             // Let our own synthetic paste keystrokes pass through untouched.
@@ -1659,6 +1673,31 @@ fn spawn_windows_grab(
                 // undo-then-paste design as macOS Cmd+V ×N).
                 EventType::KeyPress(RKey::KeyV) => {
                     let (ctrl, alt, meta) = win_mods_now();
+                    // Hold Alt, tap V: the clipboard switcher. Alt+V, not
+                    // Ctrl+V — Ctrl+V is paste on Windows.
+                    if alt && !ctrl && !meta && win_switcher::on() {
+                        let advance = {
+                            let Ok(mut s) = state.lock() else {
+                                return None;
+                            };
+                            if s.sw_v_down {
+                                false // key repeat
+                            } else {
+                                s.sw_v_down = true;
+                                if !s.sw_active {
+                                    // Keep letting go of Alt from opening the
+                                    // app's menu bar: it was not a bare Alt.
+                                    win_switcher::menu_mask();
+                                }
+                                s.sw_active = true;
+                                true
+                            }
+                        };
+                        if advance {
+                            win_switcher::request(win_switcher::Cmd::Tap);
+                        }
+                        return None;
+                    }
                     if !ctrl || alt || meta {
                         return Some(event);
                     }
@@ -1696,7 +1735,7 @@ fn spawn_windows_grab(
                     let mgr = slot_mgr.clone();
                     let supp = suppress.clone();
                     std::thread::spawn(move || {
-                        std::thread::sleep(PASTE_LETTER_GRACE + Duration::from_millis(120));
+                        std::thread::sleep(PASTE_COMMIT_AFTER + Duration::from_millis(120));
                         let slot = {
                             let Ok(mut s) = st.lock() else {
                                 return;
@@ -1707,7 +1746,9 @@ fn spawn_windows_grab(
                             let slot = s.v_taps.clamp(1, 9);
                             s.v_taps = 0;
                             s.v_last_tap = None;
-                            s.paste_letter_until = None;
+                            // The letter window stays open: a letter now
+                            // replaces this paste (one paste to undo, as
+                            // before).
                             slot
                         };
                         // One native paste (tap 1) already landed — undo it,
@@ -1720,6 +1761,24 @@ fn spawn_windows_grab(
                 }
                 // A bare letter while armed -> letter copy/paste; SUPPRESS it.
                 EventType::KeyPress(key) => {
+                    // While the switcher is open: 1-9 picks, Esc closes.
+                    let switcher_open = state.lock().map(|s| s.sw_active).unwrap_or(false);
+                    if switcher_open {
+                        if key == RKey::Escape {
+                            if let Ok(mut s) = state.lock() {
+                                s.sw_active = false;
+                            }
+                            win_switcher::request(win_switcher::Cmd::Cancel);
+                            return None;
+                        }
+                        if let Some(n) = key_to_digit_slot(key) {
+                            if let Ok(mut s) = state.lock() {
+                                s.sw_active = false;
+                            }
+                            win_switcher::request(win_switcher::Cmd::Commit(Some(n)));
+                            return None;
+                        }
+                    }
                     let Some(idx) = rkey_letter_index(key) else {
                         return Some(event);
                     };
@@ -1779,6 +1838,32 @@ fn spawn_windows_grab(
                         }
                         None => Some(event),
                     }
+                }
+                EventType::KeyRelease(RKey::KeyV) => {
+                    let swallow = state
+                        .lock()
+                        .map(|mut s| {
+                            let was = s.sw_v_down;
+                            s.sw_v_down = false;
+                            was
+                        })
+                        .unwrap_or(false);
+                    if swallow {
+                        None
+                    } else {
+                        Some(event)
+                    }
+                }
+                // Letting go of Alt pastes the switcher's pick.
+                EventType::KeyRelease(RKey::Alt) | EventType::KeyRelease(RKey::AltGr) => {
+                    let was_open = state
+                        .lock()
+                        .map(|mut s| std::mem::replace(&mut s.sw_active, false))
+                        .unwrap_or(false);
+                    if was_open {
+                        win_switcher::request(win_switcher::Cmd::Commit(None));
+                    }
+                    Some(event)
                 }
                 _ => Some(event),
             }
@@ -1843,6 +1928,241 @@ fn spawn_overlay(msg: &str) -> bool {
         }
     }
     false
+}
+
+/// Hold Alt, tap V: the clipboard switcher on Windows (see
+/// `clipd_core::fast_paste`). Alt rather than Ctrl, because Ctrl+V is the
+/// paste itself here; Alt+Tab is the muscle memory it borrows.
+///
+/// The keyboard hook only flips state and sends commands; one worker does
+/// the work in order (load clips, redraw the strip, paste), so letting go of
+/// Alt can never be handled before the tap that opened the strip, and the
+/// hook never waits on the database or the overlay.
+#[cfg(target_os = "windows")]
+mod win_switcher {
+    use super::*;
+    use clipd_core::fast_paste::{self as fp, SwitcherItem};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::process::{Child, Command};
+    use std::sync::OnceLock;
+
+    pub enum Cmd {
+        /// Open the strip, or move along it.
+        Tap,
+        /// Paste the selected card (`None`) or card N, and close.
+        Commit(Option<u8>),
+        Cancel,
+    }
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static WORKER: OnceLock<Mutex<mpsc::Sender<Cmd>>> = OnceLock::new();
+
+    pub fn on() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+
+    pub fn request(cmd: Cmd) {
+        if let Some(Ok(tx)) = WORKER.get().map(|w| w.lock()) {
+            let _ = tx.send(cmd);
+        }
+    }
+
+    /// Start the worker and keep the on/off switch current (read from
+    /// settings once a second, not per key).
+    pub fn start(suppress: Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::channel::<Cmd>();
+        if WORKER.set(Mutex::new(tx)).is_err() {
+            return;
+        }
+        std::thread::spawn(move || {
+            let mut open: Option<(Vec<SwitcherItem>, usize, Option<(f64, f64)>)> = None;
+            let mut overlay: Option<Child> = None;
+            let mut last_flag_read = Instant::now() - Duration::from_secs(10);
+            loop {
+                if last_flag_read.elapsed() >= Duration::from_secs(1) {
+                    let enabled = load_paste_transform_settings().switcher_enabled;
+                    ON.store(enabled, Ordering::Relaxed);
+                    if enabled {
+                        ensure_overlay(&mut overlay);
+                    }
+                    last_flag_read = Instant::now();
+                }
+                let cmd = match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(cmd) => cmd,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                match cmd {
+                    Cmd::Tap => {
+                        match open.as_mut() {
+                            Some((items, sel, _)) => *sel = fp::next_selection(*sel, items.len()),
+                            None => {
+                                let clips = ClipStore::new(&ClipStore::default_path())
+                                    .ok()
+                                    .and_then(|store| store.get_recent(60).ok())
+                                    .unwrap_or_default();
+                                let items = fp::switcher_items(&clips);
+                                if !items.is_empty() {
+                                    let sel = fp::first_selection(items.len());
+                                    open = Some((items, sel, caret_point()));
+                                }
+                            }
+                        }
+                        if let Some((items, sel, at)) = open.as_ref() {
+                            send(&mut overlay, &fp::switcher_payload(items, *sel, *at));
+                        }
+                    }
+                    Cmd::Cancel => {
+                        open = None;
+                        send(&mut overlay, fp::HIDE_PAYLOAD);
+                    }
+                    Cmd::Commit(pick) => {
+                        send(&mut overlay, fp::HIDE_PAYLOAD);
+                        let Some((items, sel, _)) = open.take() else {
+                            continue;
+                        };
+                        let index = pick.map_or(sel, |n| usize::from(n).saturating_sub(1));
+                        if let Some(item) = items.get(index) {
+                            paste(&item.content, &suppress);
+                            log::info!("📋 Switcher pasted card {}", index + 1);
+                            clipd_core::telemetry_event(
+                                "switcher_paste",
+                                &[("position", (index + 1).to_string())],
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Paste `text` once Alt is up, so the app gets a clean Ctrl+V. The clip
+    /// stays on the clipboard (Ctrl+V pastes it again), and the hook lets
+    /// the synthetic keys through untouched.
+    fn paste(text: &str, suppress: &AtomicBool) {
+        for _ in 0..40 {
+            let (_ctrl, alt, _meta) = win_mods_now();
+            if !alt {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let Ok(mut cb) = Clipboard::new() else {
+            return;
+        };
+        suppress.store(true, Ordering::SeqCst);
+        if cb.set_text(text.to_string()).is_ok() {
+            std::thread::sleep(Duration::from_millis(60));
+            simulate_paste();
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        suppress.store(false, Ordering::SeqCst);
+    }
+
+    fn overlay_path() -> Option<PathBuf> {
+        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        ["clipd-overlay.exe", "clipd-overlay"]
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|path| path.exists())
+    }
+
+    fn ensure_overlay(overlay: &mut Option<Child>) {
+        let alive = overlay.as_mut().is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        if alive {
+            return;
+        }
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        *overlay = overlay_path().and_then(|path| {
+            Command::new(path)
+                .env("CLIPD_OVERLAY_SERVE", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .ok()
+        });
+    }
+
+    /// One NUL-terminated message to the strip; restarts it once if gone.
+    fn send(overlay: &mut Option<Child>, payload: &str) {
+        for _ in 0..2 {
+            ensure_overlay(overlay);
+            let sent = overlay
+                .as_mut()
+                .and_then(|child| child.stdin.as_mut())
+                .is_some_and(|stdin| {
+                    stdin.write_all(payload.as_bytes()).is_ok()
+                        && stdin.write_all(&[0]).is_ok()
+                        && stdin.flush().is_ok()
+                });
+            if sent {
+                return;
+            }
+            *overlay = None;
+        }
+    }
+
+    /// Below the text cursor, in physical screen pixels: the caret of the
+    /// focused window if it reports one, otherwise the mouse.
+    fn caret_point() -> Option<(f64, f64)> {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
+            GUITHREADINFO,
+        };
+        unsafe {
+            let front = GetForegroundWindow();
+            if !front.is_null() {
+                let thread = GetWindowThreadProcessId(front, std::ptr::null_mut());
+                let mut info: GUITHREADINFO = std::mem::zeroed();
+                info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+                if GetGUIThreadInfo(thread, &mut info) != 0 && !info.hwndCaret.is_null() {
+                    let mut point = POINT {
+                        x: info.rcCaret.left,
+                        y: info.rcCaret.bottom,
+                    };
+                    if ClientToScreen(info.hwndCaret, &mut point) != 0 {
+                        return Some((point.x as f64, point.y as f64));
+                    }
+                }
+            }
+            let mut point = POINT { x: 0, y: 0 };
+            (GetCursorPos(&mut point) != 0).then(|| (point.x as f64, point.y as f64))
+        }
+    }
+
+    /// Send an unassigned key (VK 0xE8) while Alt is down. Windows opens an
+    /// app's menu bar when Alt is pressed and released with nothing in
+    /// between; the V is swallowed, so without this every switcher use would
+    /// end with the menu bar active. The usual remedy (AutoHotkey's "menu
+    /// mask key").
+    pub fn menu_mask() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+        };
+        const VK_MASK: u16 = 0xE8;
+        let key = |flags| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_MASK,
+                    wScan: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let inputs = [key(0), key(KEYEVENTF_KEYUP)];
+        unsafe {
+            SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+        }
+    }
 }
 
 fn execute_copy(slot: u8, mgr: &SlotManager, persist_tx: &mpsc::SyncSender<ClipEvent>) {
@@ -5975,7 +6295,7 @@ fn is_ctrl_shift_opt(pressed_mods: &HashSet<RKey>) -> bool {
         && !pressed_mods.contains(&RKey::MetaRight)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn key_to_digit_slot(key: RKey) -> Option<u8> {
     match key {
         RKey::Num1 => Some(1),

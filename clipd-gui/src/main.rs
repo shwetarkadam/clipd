@@ -2451,6 +2451,17 @@ impl OnboardStep {
 }
 
 /// Slot `n` in the words a person would press: `⌘C`, `⌘C ×3`.
+/// The letter-slot keys, the way this platform presses them.
+const LETTER_KEYS: &str = if cfg!(target_os = "windows") {
+    "Copy into a letter: Ctrl+C Ctrl+C, then the letter. Paste: Ctrl+V Ctrl+V then the letter, or Ctrl+` then the letter."
+} else {
+    "Copy into a letter: ⌘C ⌘C, then the letter (keep ⌘ held). Paste: ⌃⌥ + the letter."
+};
+
+/// Whether the faster ways to paste exist here: the switcher on macOS and
+/// Windows, the ⌘ peek and picker on macOS only (Windows has Ctrl+`).
+const FAST_PASTE_HERE: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
 fn slot_chord(key: char, n: u8) -> String {
     // Letter slots: ⌃⌥ + the letter pastes one; ⌘C ⌘C then the letter (⌘
     // still held) copies into one.
@@ -8229,7 +8240,13 @@ impl eframe::App for ClipdGui {
             if i.key_pressed(egui::Key::T) && i.modifiers.command && !i.modifiers.alt {
                 should_cycle_theme = true;
             }
-            if i.modifiers.command && i.modifiers.alt && self.paste_settings.letter_slots_enabled {
+            // macOS only: on Windows ⌘⌥ is Ctrl+Alt, which is AltGr on many
+            // European layouts — it types @, € and { there.
+            if cfg!(target_os = "macos")
+                && i.modifiers.command
+                && i.modifiers.alt
+                && self.paste_settings.letter_slots_enabled
+            {
                 for ev in &i.events {
                     if let egui::Event::Key { key, pressed: true, .. } = ev {
                         let name = key.name();
@@ -9511,7 +9528,7 @@ impl ClipdGui {
             );
         });
 
-        if cfg!(target_os = "macos") {
+        if FAST_PASTE_HERE {
             settings_section(ui, c, "Paste faster");
             settings_card(ui, c, |ui| {
                 dirty |= self.fast_paste_toggles(ui, c);
@@ -9527,7 +9544,11 @@ impl ClipdGui {
                     ui,
                     c,
                     "Copy or name",
-                    "⌘C ⌘C then a letter (⌘ held) copies straight into it. For something already copied, select it in Clipd and press ⌘⌥ + the letter.",
+                    if cfg!(target_os = "macos") {
+                        "⌘C ⌘C then a letter (⌘ held) copies straight into it. For something already copied, select it in Clipd and press ⌘⌥ + the letter."
+                    } else {
+                        LETTER_KEYS
+                    },
                 );
             }
         });
@@ -11649,10 +11670,11 @@ impl ClipdGui {
                         title(ui, "Letter slots fill themselves");
                         body(
                             ui,
-                            "Copy into a letter: ⌘C ⌘C, then the letter, keeping ⌘ held. Paste \
-                             it with ⌃⌥ + the letter. E, L, P and K fill themselves with your \
-                             latest email, link, phone number and code. An advanced extra: on now, \
-                             off any time.",
+                            &format!(
+                                "{LETTER_KEYS} E, L, P and K fill themselves with your latest \
+                                 email, link, phone number and code. An advanced extra: on now, \
+                                 off any time."
+                            ),
                         );
                         ui.add_space(6.0);
                         if self.letter_slot_toggles(ui, c) {
@@ -11661,10 +11683,10 @@ impl ClipdGui {
                         ui.add_space(4.0);
                         // Then the faster ways to paste — asked, never
                         // switched on for anyone. macOS only for now.
-                        let next = if cfg!(target_os = "macos") { "Next" } else { "Done" };
+                        let next = if FAST_PASTE_HERE { "Next" } else { "Done" };
                         if primary(ui, next) {
                             self.paste_settings.letter_slots_intro_seen = true;
-                            if cfg!(target_os = "macos") {
+                            if FAST_PASTE_HERE {
                                 save_paste_transform_settings(&self.paste_settings);
                                 self.onboard = Some(OnboardStep::Faster);
                                 self.report_onboard_step(OnboardStep::Faster);
@@ -11706,7 +11728,7 @@ impl ClipdGui {
             FooterIcon::Key,
             &mut self.paste_settings.letter_slots_enabled,
             "Letter slots A–Z",
-            "Copy into one: ⌘C ⌘C, then the letter (keep ⌘ held). Paste: ⌃⌥ + the letter",
+            LETTER_KEYS,
         );
         if self.paste_settings.letter_slots_enabled {
             settings_card_divider(ui, c);
@@ -11760,9 +11782,10 @@ impl ClipdGui {
                 ui.add_space(2.0);
                 ui.label(
                     RichText::new(
-                        "Copy into a letter: ⌘C ⌘C, then the letter (keep ⌘ held); paste with \
-                         ⌃⌥ + the letter. E, L, P and K fill themselves: your latest email, link, \
-                         phone number and code.",
+                        format!(
+                            "{LETTER_KEYS} E, L, P and K fill themselves: your latest email, \
+                             link, phone number and code."
+                        ),
                     )
                     .size(11.5)
                     .color(rgb(c.subtext)),
@@ -11801,23 +11824,36 @@ impl ClipdGui {
     /// The three faster-ways-to-paste switches, shared by onboarding, the
     /// one-time offer and Settings. True when one changed.
     fn fast_paste_toggles(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> bool {
+        let (switcher_title, switcher_hint) = if cfg!(target_os = "windows") {
+            (
+                "Clipboard switcher — hold Alt, tap V",
+                "Recent clips appear at your cursor; tap to move along, let go to paste. Like Alt+Tab",
+            )
+        } else {
+            (
+                "Clipboard switcher — hold ⌃, tap V",
+                "Recent clips appear at your cursor; tap to move along, let go to paste. Like ⌘Tab",
+            )
+        };
         let mut dirty = settings_toggle_row(
             ui,
             c,
             FooterIcon::Keyboard,
             &mut self.paste_settings.switcher_enabled,
-            "Clipboard switcher — hold ⌃, tap V",
-            "Recent clips appear at your cursor; tap to move along, let go to paste. Like ⌘Tab",
+            switcher_title,
+            switcher_hint,
         );
-        settings_card_divider(ui, c);
-        dirty |= settings_toggle_row(
-            ui,
-            c,
-            FooterIcon::Eye,
-            &mut self.paste_settings.peek_enabled,
-            "Slot picker — tap ⌘ twice",
-            "Shows what's in your slots; press a letter or number to paste one. Hold ⌘ instead to just look",
-        );
+        if cfg!(target_os = "macos") {
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Eye,
+                &mut self.paste_settings.peek_enabled,
+                "Slot picker — tap ⌘ twice",
+                "Shows what's in your slots; press a letter or number to paste one. Hold ⌘ instead to just look",
+            );
+        }
         if dirty {
             self.paste_settings.fast_paste_offered = true;
             clipd_core::telemetry_event(
@@ -11835,7 +11871,7 @@ impl ClipdGui {
     /// existed: one card, once, pointing at the switches. Never turns
     /// anything on by itself.
     fn render_fast_paste_offer(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
-        if !cfg!(target_os = "macos")
+        if !FAST_PASTE_HERE
             || self.island_surface
             || self.paste_settings.fast_paste_offered
             || !self.paste_settings.slots_onboarding_done
@@ -11859,10 +11895,13 @@ impl ClipdGui {
                 );
                 ui.add_space(2.0);
                 ui.label(
-                    RichText::new(
+                    RichText::new(if cfg!(target_os = "windows") {
+                        "A switcher at your cursor: hold Alt, tap V to go through recent clips, \
+                         let go to paste. Off until you choose."
+                    } else {
                         "A switcher at your cursor (hold ⌃, tap V), and a picker for your slots \
-                         (tap ⌘ twice). Both off until you choose.",
-                    )
+                         (tap ⌘ twice). Both off until you choose."
+                    })
                     .size(11.5)
                     .color(rgb(c.subtext)),
                 );

@@ -9,6 +9,8 @@
 use eframe::egui::{self, Color32, Margin, RichText, Rounding, Stroke};
 use std::time::{Duration, Instant};
 
+mod switcher;
+
 struct Overlay {
     text: String,
     start: Instant,
@@ -75,6 +77,12 @@ impl eframe::App for Overlay {
 }
 
 fn main() -> eframe::Result {
+    // The switcher strip: one long-lived process fed over stdin (see
+    // `switcher`). Asked for in the environment, so an older daemon that
+    // passes a toast message as arguments still gets a toast.
+    if std::env::var_os("CLIPD_OVERLAY_SERVE").is_some() {
+        return switcher::run();
+    }
     let text = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     let text = if text.trim().is_empty() {
         "clipd".to_string()
