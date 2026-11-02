@@ -2609,7 +2609,7 @@ impl ClipdGui {
                 painter.text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    format!("{n}"),
+                    clipd_core::slot_badge(*n),
                     egui::FontId::proportional(9.5),
                     if on { s.ink } else { s.faint },
                 );
@@ -2634,7 +2634,7 @@ impl ClipdGui {
             };
             clipd_core::telemetry_event("slot_strip", &[("action", "copy".into())]);
             self.island.note(if copied {
-                format!("Copied slot {n} — ⌘V to paste")
+                format!("Copied slot {} — ⌘V to paste", clipd_core::slot_badge(n))
             } else {
                 "Couldn't copy that slot".to_string()
             });
@@ -2644,7 +2644,7 @@ impl ClipdGui {
                 Some(text) if super::save_to_slot(n, &text) => {
                     clipd_core::telemetry_event("slot_strip", &[("action", "fill".into())]);
                     self.refresh();
-                    self.island.note(format!("Saved to slot {n} · next time, {} does it", super::slot_chord('C', n)));
+                    self.island.note(format!("Saved to slot {} · next time, {} does it", clipd_core::slot_badge(n), super::slot_chord('C', n)));
                 }
                 Some(_) => self.island.note("Couldn't save to that slot"),
                 None => self.island.note("Copy something first, then click a slot"),

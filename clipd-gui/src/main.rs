@@ -1356,7 +1356,14 @@ fn slots_first(
 pub(crate) fn slot_paste_keys(slots: &[u8]) -> String {
     let mut keys = slots.iter().map(|n| slot_chord('V', *n));
     let first = keys.next().unwrap_or_default();
-    let rest: Vec<String> = slots[1..].iter().map(|n| if *n == 1 { "⌘V".into() } else { format!("×{n}") }).collect();
+    let rest: Vec<String> = slots[1..]
+        .iter()
+        .map(|n| match *n {
+            1 => "⌘V".into(),
+            31..=56 => slot_chord('V', *n),
+            n => format!("×{n}"),
+        })
+        .collect();
     if rest.is_empty() {
         format!("{first} pastes it")
     } else {
@@ -2445,6 +2452,16 @@ impl OnboardStep {
 
 /// Slot `n` in the words a person would press: `⌘C`, `⌘C ×3`.
 fn slot_chord(key: char, n: u8) -> String {
+    // Letter slots: ⌃⌥ + the letter pastes one; ⌥⌥ then the letter copies the
+    // selection into one.
+    if (31..=56).contains(&n) {
+        let letter = clipd_core::slot_badge(n);
+        return if key == 'V' {
+            format!("⌃⌥{letter}")
+        } else {
+            format!("⌥⌥ {letter}")
+        };
+    }
     if n == 1 {
         format!("⌘{key}")
     } else {
@@ -2461,11 +2478,13 @@ fn slot_chord(key: char, n: u8) -> String {
 pub(crate) fn slot_chip_hint(n: u8, held: Option<&str>, click_verb: &str) -> String {
     match held {
         Some(preview) => format!(
-            "Slot {n}: {preview}\nClick to {click_verb} it · from any app: {}",
+            "Slot {}: {preview}\nClick to {click_verb} it · from any app: {}",
+            clipd_core::slot_badge(n),
             slot_chord('V', n)
         ),
         None => format!(
-            "Slot {n} is empty\nClick to save your latest copy here · from any app: {}",
+            "Slot {} is empty\nClick to save your latest copy here · from any app: {}",
+            clipd_core::slot_badge(n),
             slot_chord('C', n)
         ),
     }
@@ -2489,7 +2508,10 @@ pub(crate) fn save_to_slot(n: u8, text: &str) -> bool {
     }
 }
 
-/// Slots 1-9 as (slot, Some((content, preview))) — read from the slot store.
+/// Slots 1-9 as (slot, Some((content, preview))), then each letter slot that
+/// holds something — read from the slot store. Letters come after the numbers
+/// wherever slots are listed; only filled ones, since twenty-six empty chips
+/// would bury the nine that matter.
 ///
 /// Not from the clips' `slot` labels. A clip carries one label, keyed by its
 /// text, so two slots holding the same text cannot both be represented: one
@@ -2506,7 +2528,13 @@ pub(crate) fn strip_rows_from_store(
     clips: &[ClipEntry],
     mask: impl Fn(&str) -> Option<String>,
 ) -> Vec<(u8, Option<(String, String)>)> {
+    let filled_letters = (31..=56u8).filter(|n| {
+        active
+            .iter()
+            .any(|(slot, content)| slot == n && !content.trim().is_empty())
+    });
     (1..=9u8)
+        .chain(filled_letters)
         .map(|n| {
             let held = active.iter().find(|(slot, _)| *slot == n).map(|(_, content)| {
                 let preview = clips
@@ -5956,7 +5984,7 @@ impl ClipdGui {
             .on_hover_text(if on {
                 "Back to the clipboard"
             } else {
-                "What's in slots 1-9 · ⌘V ×N pastes slot N from any app"
+                "What's in your slots, numbers then letters · ⌘V ×N or ⌃⌥ + letter pastes one"
             });
         if resp.clicked() {
             self.hud_slots_view = !on;
@@ -14794,7 +14822,12 @@ fn sync_active_slot_labels(
     let mut all_slots: HashMap<String, Vec<u8>> = HashMap::new();
     // 1-9 only: those are the slots ⌘V ×N reaches, and the only ones a row's
     // badge can tell you how to paste.
-    for (slot, content) in active.iter().filter(|(slot, _)| (1..=9).contains(slot)) {
+    // Numbered slots 1-9, then letter slots: listed after the numbers
+    // everywhere slots are shown.
+    for (slot, content) in active
+        .iter()
+        .filter(|(slot, _)| (1..=9).contains(slot) || (31..=56).contains(slot))
+    {
         all_slots.entry(content.clone()).or_default().push(*slot);
     }
     for slots in all_slots.values_mut() {
@@ -15981,6 +16014,20 @@ mod slot_strip_tests {
         let rows = strip_rows_from_store(&[(1, long)], &[], |_| None);
         let preview = &rows[0].1.as_ref().unwrap().1;
         assert!(preview.ends_with('…') && preview.chars().count() <= 60, "{preview}");
+    }
+
+    #[test]
+    fn filled_letter_slots_follow_the_numbers() {
+        // E (35) and H (38) hold something; the rest of the letters are empty
+        // and stay out of the strip.
+        let active = vec![(2, "two".to_string()), (38, "h".to_string()), (35, "e".to_string())];
+        let rows = strip_rows_from_store(&active, &[], |_| None);
+        let order: Vec<u8> = rows.iter().map(|(n, _)| *n).collect();
+        assert_eq!(order, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 35, 38]);
+        assert_eq!(slot_chord('V', 35), "⌃⌥E");
+        assert_eq!(slot_chord('C', 38), "⌥⌥ H");
+        assert_eq!(slot_paste_keys(&[2, 35]), "⌘V ×2 or ⌃⌥E pastes it");
+        assert!(slot_chip_hint(38, Some("h"), "paste").starts_with("Slot H: h"));
     }
 
     #[test]

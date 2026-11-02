@@ -40,6 +40,10 @@ struct Payload {
     var slotActive = 0
     var slotFirst = 0
     var slotLast = 0
+    /// The strip's chips as labels (numbers, then filled letter slots), and
+    /// which one is lit. Supersedes the numeric SLOTS range when present.
+    var chipLabels: [String] = []
+    var chipLit = -1
     var rows: [Row] = []
     var buttons: [Button] = []
     var timeout: Double = 0
@@ -91,6 +95,8 @@ func parse(_ text: String) -> Payload {
                 p.slotFirst = Int(f[2]) ?? 0
                 p.slotLast = Int(f[3]) ?? 0
             }
+        case "CHIPS":
+            if f.count > 2 { p.chipLit = Int(f[1]) ?? -1; p.chipLabels = Array(f[2...]) }
         case "PREVIEW": if f.count > 2 { p.previewKind = f[1]; p.preview = f[2] }
         case "TIMEOUT": if f.count > 1 { p.timeout = Double(f[1]) ?? 0 }
         case "AVOIDTOP": if f.count > 1 { p.avoidTop = CGFloat(Double(f[1]) ?? 0) }
@@ -452,8 +458,16 @@ class HUD: NSObject {
         guard let screen = NSScreen.main else { return }
         let pillW: CGFloat = 440, pillH: CGFloat = 74
         let chip: CGFloat = 46, chipGap: CGFloat = 10
-        let chips = max(0, p.slotLast - p.slotFirst + 1)
-        let stripW = chips > 0 ? CGFloat(chips) * chip + CGFloat(chips - 1) * chipGap : 0
+        // Numbers, then letters: a wider gap where the letters start.
+        let labels: [String] = !p.chipLabels.isEmpty
+            ? p.chipLabels
+            : (p.slotLast >= p.slotFirst && p.slotFirst > 0 ? (p.slotFirst...p.slotLast).map { "\($0)" } : [])
+        let lit = !p.chipLabels.isEmpty ? p.chipLit : p.slotActive - p.slotFirst
+        let isLetter: (String) -> Bool = { $0.first?.isLetter ?? false }
+        let bankGap: CGFloat = 12
+        let bankBreaks = labels.indices.dropFirst().filter { !isLetter(labels[$0 - 1]) && isLetter(labels[$0]) }.count
+        let chips = labels.count
+        let stripW = chips > 0 ? CGFloat(chips) * chip + CGFloat(chips - 1) * chipGap + CGFloat(bankBreaks) * bankGap : 0
         let footH: CGFloat = p.foot.isEmpty ? 0 : 16
         let gapPillStrip: CGFloat = chips > 0 ? 14 : 0
         let gapStripFoot: CGFloat = p.foot.isEmpty ? 0 : 12
@@ -515,14 +529,15 @@ class HUD: NSObject {
         if chips > 0 {
             let stripY = pillY - gapPillStrip - chip
             var cx = (w - stripW) / 2
-            for n in p.slotFirst...p.slotLast {
-                let live = n == p.slotActive
+            for (i, name) in labels.enumerated() {
+                if i > 0 && !isLetter(labels[i - 1]) && isLetter(name) { cx += bankGap }
+                let live = i == lit
                 _ = shape(NSRect(x: cx, y: stripY, width: chip, height: chip),
                           fill: ink, radius: 13,
                           border: live ? NSColor(calibratedRed: 0.45, green: 0.62, blue: 0.95, alpha: 0.95)
                                        : NSColor(calibratedWhite: 1.0, alpha: 0.06),
                           borderWidth: live ? 2 : 1)
-                let nl = label("\(n)", size: 15, weight: live ? .semibold : .regular,
+                let nl = label(name, size: 15, weight: live ? .semibold : .regular,
                                color: NSColor(calibratedWhite: 1.0, alpha: live ? 0.95 : 0.45),
                                align: .center)
                 nl.frame = NSRect(x: cx, y: stripY + (chip - 19) / 2, width: chip, height: 19)

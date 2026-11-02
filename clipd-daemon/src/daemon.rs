@@ -3015,6 +3015,60 @@ fn slot_strip(slot: u8) -> Option<(u8, u8)> {
     Some((first, first + 4))
 }
 
+/// The chips under the slot toast, and which one is lit.
+///
+/// A numbered slot shows its run of five numbers, then the letter slots that
+/// hold something: letters come after the numbers wherever slots are listed.
+/// A letter slot shows the filled letters around it. Only filled letters —
+/// twenty-six empty chips would say nothing.
+#[cfg(target_os = "macos")]
+fn strip_chips(slot: u8, filled_letters: &[u8]) -> Option<(Vec<String>, usize)> {
+    const LETTERS_AFTER_NUMBERS: usize = 4;
+    const LETTER_RUN: usize = 7;
+    match slot {
+        1..=9 => {
+            let (first, last) = slot_strip(slot)?;
+            let mut labels: Vec<String> = (first..=last).map(|n| n.to_string()).collect();
+            labels.extend(
+                filled_letters
+                    .iter()
+                    .take(LETTERS_AFTER_NUMBERS)
+                    .map(|n| clipd_core::slot_badge(*n)),
+            );
+            Some((labels, usize::from(slot - first)))
+        }
+        31..=56 => {
+            let mut letters = filled_letters.to_vec();
+            if !letters.contains(&slot) {
+                letters.push(slot);
+                letters.sort_unstable();
+            }
+            let at = letters.iter().position(|n| *n == slot)?;
+            let start = at.saturating_sub(LETTER_RUN / 2).min(letters.len().saturating_sub(LETTER_RUN));
+            let run = &letters[start..(start + LETTER_RUN).min(letters.len())];
+            Some((run.iter().map(|n| clipd_core::slot_badge(*n)).collect(), at - start))
+        }
+        _ => None,
+    }
+}
+
+/// The letter slots that hold something, A to Z.
+#[cfg(target_os = "macos")]
+fn filled_letter_slots() -> Vec<u8> {
+    let mut letters: Vec<u8> = SlotManager::persistent_default()
+        .and_then(|slots| slots.list_slots())
+        .map(|all| {
+            all.into_iter()
+                .filter(|(n, text)| (31..=56).contains(n) && !text.trim().is_empty())
+                .map(|(n, _)| n)
+                .collect()
+        })
+        .unwrap_or_default();
+    letters.sort_unstable();
+    letters.dedup();
+    letters
+}
+
 /// What to press to get this slot back, and how long the count stays open.
 ///
 /// The window is read from TAP_WINDOW rather than written out, so the toast
@@ -3036,12 +3090,12 @@ fn slot_foot(action: &str, slot: u8) -> String {
     )
 }
 
-/// The slot toast: pill, slot strip, chord. Falls back to the plain toast for
-/// the letter and extended banks, where a five-chip strip would be a window
-/// onto twenty-six slots and say nothing.
+/// The slot toast: pill, slot strip, chord. The strip is the numbers, then
+/// the filled letter slots (see `strip_chips`); the extended bank (11-30)
+/// falls back to the plain toast.
 #[cfg(target_os = "macos")]
 fn slot_hud_payload(action: &str, slot: u8, content: Option<&str>) -> Vec<String> {
-    let Some((first, last)) = slot_strip(slot) else {
+    let Some((chips, active)) = strip_chips(slot, &filled_letter_slots()) else {
         let mut lines = vec![
             "STYLE\ttoast".to_string(),
             format!("BADGE\t{}", slot_badge(slot)),
@@ -3061,7 +3115,7 @@ fn slot_hud_payload(action: &str, slot: u8, content: Option<&str>) -> Vec<String
         "STYLE\tslot".to_string(),
         format!("BADGE\t{}", slot_badge(slot)),
         format!("TITLE\t{}", toast_title(action, slot)),
-        format!("SLOTS\t{slot}\t{first}\t{last}"),
+        format!("CHIPS\t{active}\t{}", chips.join("\t")),
         format!("FOOT\t{}", slot_foot(action, slot)),
     ];
     // The avatar shows where the clip came from; the title already carries the
@@ -6449,10 +6503,30 @@ mod slot_mapping_tests {
             assert!((first..=last).contains(&slot), "slot {slot} outside its own strip");
             assert!(first >= 1 && last <= 9, "slot {slot} strip leaves the bank");
         }
-        // The extended and letter banks get the plain toast: a five-chip
-        // window onto twenty-six slots would say nothing.
+        // The numeric run itself stops at 9; letters join it in `strip_chips`.
         assert_eq!(slot_strip(15), None);
         assert_eq!(slot_strip(31), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn filled_letters_follow_the_numbers_in_the_strip() {
+        // A = 31, E = 35, H = 38.
+        let letters = [31, 35, 38];
+        let (chips, lit) = strip_chips(4, &letters).unwrap();
+        assert_eq!(chips, ["2", "3", "4", "5", "6", "A", "E", "H"]);
+        assert_eq!(chips[lit], "4");
+        // A letter slot: the filled letters around it, lit.
+        let (chips, lit) = strip_chips(35, &letters).unwrap();
+        assert_eq!(chips, ["A", "E", "H"]);
+        assert_eq!(chips[lit], "E");
+        // A letter being filled for the first time is shown too.
+        let (chips, lit) = strip_chips(33, &letters).unwrap();
+        assert_eq!(chips, ["A", "C", "E", "H"]);
+        assert_eq!(chips[lit], "C");
+        // No letters filled: just the numbers. The extended bank: plain toast.
+        assert_eq!(strip_chips(1, &[]).unwrap().0.len(), 5);
+        assert!(strip_chips(15, &letters).is_none());
     }
 
     #[cfg(target_os = "macos")]
