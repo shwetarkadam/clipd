@@ -89,22 +89,12 @@ const TAP_WINDOW: Duration = Duration::from_millis(650);
 ///
 /// It was 900ms, and people moving from the chord to a letter key — often
 /// letting go of the modifiers first — routinely took longer, so the letter
-/// was typed into their document instead. Same as the ⌥⌥ grace.
+/// was typed into their document instead.
 const LETTER_PREFIX_WINDOW: Duration = Duration::from_millis(2000);
-/// Max gap between two Cmd+C presses to count as a double-tap (quick letter save).
-const QUICK_DOUBLE_WINDOW: Duration = Duration::from_millis(400);
-/// How long after a double Cmd+C a letter still means "and put it in that slot
-/// too".
-///
-/// This used to be half a second, and it was half a second because the numeric
-/// commit was *held* for exactly that long so a following letter could cancel
-/// it. That made it a race: press the letter in time and you got slot A, miss
-/// and you got slot 2, and you had to know the rule to understand which.
-///
-/// The letter no longer cancels anything — the content lands in the numeric
-/// slot immediately and in the letter slot as well. Nothing is waiting on you,
-/// so the window can be long enough that nobody has to hurry.
-const QUICK_LETTER_GRACE: Duration = Duration::from_millis(2000);
+/// After ⌘C ⌘C, how long (⌘ still held) a letter still means "copy into that
+/// letter slot". Long enough that nobody has to hurry to the letter.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const LETTER_AFTER_DOUBLE_COPY: Duration = Duration::from_millis(1500);
 /// Ignore duplicate key events faster than this (macOS key-repeat / missing KeyRelease on C/V).
 const TAP_DEBOUNCE: Duration = Duration::from_millis(65);
 
@@ -1016,6 +1006,38 @@ pub fn run_daemon_with_stop(
                     HotkeyTick::PeekArm => {
                         peek_deadline = Some(Instant::now() + PEEK_HOLD);
                     }
+                    HotkeyTick::CopyTapsToLetter(slot) => {
+                        // The letter is where this copy was meant to go, not
+                        // the numbered slot the double ⌘C filled on its tap:
+                        // that one gets its old content back, and its pending
+                        // commit is called off.
+                        let live = cmd_c_live.take();
+                        if let Some(live) = &live {
+                            let _ = match &live.previous {
+                                Some(text) => hotkey_slot_mgr.copy_to_slot(live.slot, text),
+                                None => hotkey_slot_mgr.clear_slot(live.slot),
+                            };
+                        }
+                        cmd_c_taps = 0;
+                        cmd_c_deadline = None;
+                        let text = live
+                            .map(|live| live.text)
+                            .or_else(clipd_core::pasteboard::read_text)
+                            .filter(|t| !t.trim().is_empty());
+                        match text {
+                            Some(text) => {
+                                save_text_to_slot(slot, &text, &hotkey_slot_mgr, &persist_tx);
+                                let badge = clipd_core::slot_badge(slot);
+                                if let Some(letter) = badge.chars().next() {
+                                    clipd_core::auto_letters::mark_named(letter);
+                                }
+                                log::info!("⌨️  ⌘C ⌘C {badge} → copied to slot {badge}");
+                                show_slot_content_notification("Copied", slot, &text);
+                                clipd_core::telemetry_event("copy_to_letter", &[("via", "cmd_c_c".into())]);
+                            }
+                            None => log::warn!("⌘C ⌘C + letter: nothing on the clipboard to keep"),
+                        }
+                    }
                     HotkeyTick::PickerOpen => {
                         peek_deadline = None;
                         let clipboard = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
@@ -1486,6 +1508,7 @@ enum HotkeyTick {
     PeekCancel,              // ⌘ let go, or anything else pressed
     PeekChoose(u8),          // a slot's key picked in the peek or the picker
     PickerOpen,              // ⌘ tapped twice
+    CopyTapsToLetter(u8),    // ⌘C ⌘C then a letter, ⌘ still held: copy to that letter slot
 
     TypePaste { query: String, erase: usize }, // `;;query` then a space
 }
@@ -2600,6 +2623,9 @@ const FAST_SWITCHER: u8 = 1;
 const FAST_PEEK: u8 = 2;
 #[cfg(target_os = "macos")]
 const FAST_TYPE: u8 = 4;
+/// Letter slots are on (for ⌘C ⌘C + letter).
+#[cfg(target_os = "macos")]
+const FAST_LETTERS: u8 = 8;
 /// Whether the peek is on screen. The listener reads it to know a ⌘ + letter
 /// is picking a slot rather than a shortcut — only then is the letter kept
 /// from the app.
@@ -2617,6 +2643,9 @@ fn refresh_fast_flags(settings: &PasteTransformSettings) {
     }
     if settings.type_to_paste_enabled {
         bits |= FAST_TYPE;
+    }
+    if settings.letter_slots_enabled {
+        bits |= FAST_LETTERS;
     }
     FAST_FLAGS.store(bits, Ordering::Relaxed);
 }
@@ -3080,7 +3109,7 @@ fn slot_foot(action: &str, slot: u8) -> String {
         _ => match slot {
             1..=9 => format!("⌘C ×{slot}"),
             11..=30 => format!("⌥C ×{}", slot - 10),
-            31..=56 => format!("⌃⌥C {}", (b'A' + (slot - 31)) as char),
+            31..=56 => format!("⌘C ⌘C {}", (b'A' + (slot - 31)) as char),
             _ => "⌘C".to_string(),
         },
     };
@@ -4960,6 +4989,11 @@ fn start_macos_hotkey_listener(
         last_bare_cmd_tap: Option<Instant>,
         /// The picker is open until then.
         picker_until: Option<Instant>,
+        /// ⌘C presses within this hold of ⌘ (key repeat not counted), and
+        /// when the last one was: ⌘C ⌘C then a letter copies to that letter.
+        cmd_c_presses: u8,
+        last_cmd_c_press_at: Option<Instant>,
+        c_key_down: bool,
         peek_armed: bool,
         typed: clipd_core::fast_paste::TypedBuffer,
     }
@@ -5004,6 +5038,9 @@ fn start_macos_hotkey_listener(
         cmd_clean: false,
         last_bare_cmd_tap: None,
         picker_until: None,
+        cmd_c_presses: 0,
+        last_cmd_c_press_at: None,
+        c_key_down: false,
         peek_armed: false,
         typed: clipd_core::fast_paste::TypedBuffer::default(),
     });
@@ -5037,31 +5074,10 @@ fn start_macos_hotkey_listener(
                 reconcile_modifiers(&mut s.pressed_mods, live_mods::held());
 
                 if is_modifier_key(key) {
-                    // Two taps of Option, nothing else in between, arm a letter
-                    // slot save.
-                    //
-                    // Option *alone* types nothing, which is the whole point.
-                    // Option+C and Option+V looked like a tidy mirrored pair
-                    // but they emit ç and √ — so every time clipd failed to
-                    // swallow one, the character landed in the document. A
-                    // modifier on its own cannot do that.
-                    if matches!(key, RKey::Alt | RKey::AltGr)
-                        && letter_capture_active()
-                        && s.pressed_mods.is_empty()
-                    {
-                        let now = Instant::now();
-                        let is_second = s
-                            .opt_last_tap
-                            .is_some_and(|p| now.duration_since(p) < QUICK_DOUBLE_WINDOW);
-                        if is_second {
-                            s.letter_copy_prefix_until = Some(now + QUICK_LETTER_GRACE);
-                            s.letter_paste_prefix_until = None;
-                            s.opt_last_tap = None;
-                            log::info!("⌨️  Option ×2 → letter slot copy armed");
-                        } else {
-                            s.opt_last_tap = Some(now);
-                        }
-                    }
+                    // ⌥ ⌥ used to arm a letter-slot copy. It is gone: the
+                    // Claude desktop app opens its quick entry on a double ⌥,
+                    // and clipd then took the first letter typed into it.
+                    // ⌘C ⌘C + letter replaces it (see below).
                     // A shortcut is starting: whatever was being typed is not
                     // a `;;` trigger any more. Shift is just capitals.
                     if !matches!(key, RKey::ShiftLeft | RKey::ShiftRight) {
@@ -5094,6 +5110,42 @@ fn start_macos_hotkey_listener(
                 // Any other key ends a half-finished double-tap, so Option used
                 // as an ordinary modifier never drifts into arming the gesture.
                 s.opt_last_tap = None;
+
+                // ⌘C ⌘C, then a letter with ⌘ still held: the copy goes in
+                // that letter slot. Only right after a double ⌘C — clipd's own
+                // gesture — so no ordinary ⌘ shortcut is taken; C and V stay
+                // copy and paste.
+                if is_cmd_only(&s.pressed_mods) {
+                    let now = Instant::now();
+                    if key == RKey::KeyC {
+                        if !s.c_key_down {
+                            s.c_key_down = true;
+                            s.cmd_c_presses = if s
+                                .last_cmd_c_press_at
+                                .is_some_and(|t| now.duration_since(t) < TAP_WINDOW)
+                            {
+                                s.cmd_c_presses.saturating_add(1)
+                            } else {
+                                1
+                            };
+                            s.last_cmd_c_press_at = Some(now);
+                        }
+                    } else if s.cmd_c_presses >= 2
+                        && fast_on(FAST_LETTERS)
+                        && s
+                            .last_cmd_c_press_at
+                            .is_some_and(|t| now.duration_since(t) < LETTER_AFTER_DOUBLE_COPY)
+                    {
+                        let letter = rdev::code_from_key(key)
+                            .and_then(|code| clipd_core::keyboard_layout::typed_char(code, false))
+                            .filter(|c| c.is_ascii_alphabetic() && !matches!(c.to_ascii_lowercase(), 'c' | 'v'));
+                        if let Some(slot) = letter.and_then(clipd_core::auto_letters::letter_slot) {
+                            s.cmd_c_presses = 0;
+                            let _ = tx.send(HotkeyTick::CopyTapsToLetter(slot));
+                            return None;
+                        }
+                    }
+                }
 
                 // ── Faster ways to paste ──
                 // The picker (opened by a ⌘ tap) takes the next bare key: a
@@ -5660,6 +5712,9 @@ fn start_macos_hotkey_listener(
                         s.cmd_down_at = None;
                         s.cmd_clean = false;
                     }
+                    if matches!(key, RKey::MetaLeft | RKey::MetaRight) {
+                        s.cmd_c_presses = 0;
+                    }
                     if matches!(key, RKey::ControlLeft | RKey::ControlRight) && s.switcher_active {
                         s.switcher_active = false;
                         let _ = tx.send(HotkeyTick::SwitcherCommit);
@@ -5713,6 +5768,7 @@ fn start_macos_hotkey_listener(
                         s.latch_ctrl_v = false;
                     }
                     RKey::KeyC => {
+                        s.c_key_down = false;
                         if s.leader_key_down == Some(RKey::KeyC) {
                             s.leader_key_down = None;
                         }
@@ -6399,35 +6455,17 @@ mod slot_mapping_tests {
     }
 
     #[test]
-    fn the_letter_gesture_stays_off_the_numeric_keys() {
-        // Letter slots hang off a double-tap of Option, which types nothing on
-        // its own and shares no key with ⌘C / ⌘V. Option+C / Option+V were
-        // tried and are wrong twice over: they emit ç and √, and they already
-        // address the extended 11–30 bank.
+    fn copying_into_a_letter_is_not_a_race() {
+        // ⌘C ⌘C, then a letter with ⌘ held. (A double ⌥ used to arm this, but
+        // the Claude desktop app opens on a double ⌥, and the first letter
+        // typed into it was swallowed.) The letter has to be comfortably
+        // reachable, and the numbered slot the double ⌘C filled is put back,
+        // so a slow letter costs nothing.
         assert!(
-            QUICK_DOUBLE_WINDOW <= Duration::from_millis(600),
-            "two taps that far apart are two separate presses"
-        );
-        assert!(
-            QUICK_LETTER_GRACE >= Duration::from_millis(1500),
-            "the letter that follows should not be a race"
-        );
-    }
-
-    #[test]
-    fn a_quick_letter_save_is_not_a_race() {
-        // The letter window used to double as a stall on the numeric commit:
-        // press the letter in time and the content went to slot A, miss and it
-        // went to slot 2. One gesture, two outcomes, decided by a stopwatch.
-        //
-        // The letter is additive now — the content goes to both — so nothing is
-        // being held back and the window only has to be comfortable.
-        assert!(
-            QUICK_LETTER_GRACE >= Duration::from_millis(1500),
+            LETTER_AFTER_DOUBLE_COPY >= Duration::from_millis(1500),
             "a window you can miss is a window someone has to think about"
         );
-        // The numeric path commits on its own timing, untouched by the letter.
-        assert!(TAP_WINDOW < QUICK_LETTER_GRACE);
+        assert!(TAP_WINDOW < LETTER_AFTER_DOUBLE_COPY);
     }
 
     #[test]

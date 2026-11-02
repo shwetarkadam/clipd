@@ -2452,14 +2452,14 @@ impl OnboardStep {
 
 /// Slot `n` in the words a person would press: `⌘C`, `⌘C ×3`.
 fn slot_chord(key: char, n: u8) -> String {
-    // Letter slots: ⌃⌥ + the letter pastes one; ⌥⌥ then the letter copies the
-    // selection into one.
+    // Letter slots: ⌃⌥ + the letter pastes one; ⌘C ⌘C then the letter (⌘
+    // still held) copies into one.
     if (31..=56).contains(&n) {
         let letter = clipd_core::slot_badge(n);
         return if key == 'V' {
             format!("⌃⌥{letter}")
         } else {
-            format!("⌥⌥ {letter}")
+            format!("⌘C ⌘C {letter}")
         };
     }
     if n == 1 {
@@ -9527,8 +9527,8 @@ impl ClipdGui {
                 settings_card_copy(
                     ui,
                     c,
-                    "Name anything",
-                    "Select a clip in Clipd and press ⌘⌥ + a letter to keep it in that slot.",
+                    "Copy or name",
+                    "⌘C ⌘C then a letter (⌘ held) copies straight into it. For something already copied, select it in Clipd and press ⌘⌥ + the letter.",
                 );
             }
         });
@@ -11650,10 +11650,10 @@ impl ClipdGui {
                         title(ui, "Letter slots fill themselves");
                         body(
                             ui,
-                            "E keeps your latest email, L your latest link, P your latest phone \
-                             number and K your latest code — paste one with ⌃⌥ + its letter, or \
-                             type ;;e. To keep anything else, select it in Clipd and press ⌘⌥ + a \
-                             letter. An advanced extra: on now, off any time.",
+                            "Copy into a letter: ⌘C ⌘C, then the letter, keeping ⌘ held. Paste \
+                             it with ⌃⌥ + the letter. E, L, P and K fill themselves with your \
+                             latest email, link, phone number and code. An advanced extra: on now, \
+                             off any time.",
                         );
                         ui.add_space(6.0);
                         if self.letter_slot_toggles(ui, c) {
@@ -11707,7 +11707,7 @@ impl ClipdGui {
             FooterIcon::Key,
             &mut self.paste_settings.letter_slots_enabled,
             "Letter slots A–Z",
-            "26 slots you reach by letter: ⌃⌥ + the letter, ;;letter, or tap ⌘ twice then the letter",
+            "Copy into one: ⌘C ⌘C, then the letter (keep ⌘ held). Paste: ⌃⌥ + the letter, or ;;letter",
         );
         if self.paste_settings.letter_slots_enabled {
             settings_card_divider(ui, c);
@@ -11761,9 +11761,9 @@ impl ClipdGui {
                 ui.add_space(2.0);
                 ui.label(
                     RichText::new(
-                        "E is your latest email, L your latest link, P phone number, K code — \
-                         paste with ⌃⌥E or ;;e. To keep anything else, select it here and press \
-                         ⌘⌥ + a letter.",
+                        "Copy into a letter: ⌘C ⌘C, then the letter (keep ⌘ held); paste with \
+                         ⌃⌥ + the letter. E, L, P and K fill themselves: your latest email, link, \
+                         phone number and code.",
                     )
                     .size(11.5)
                     .color(rgb(c.subtext)),
@@ -16025,7 +16025,7 @@ mod slot_strip_tests {
         let order: Vec<u8> = rows.iter().map(|(n, _)| *n).collect();
         assert_eq!(order, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 35, 38]);
         assert_eq!(slot_chord('V', 35), "⌃⌥E");
-        assert_eq!(slot_chord('C', 38), "⌥⌥ H");
+        assert_eq!(slot_chord('C', 38), "⌘C ⌘C H");
         assert_eq!(slot_paste_keys(&[2, 35]), "⌘V ×2 or ⌃⌥E pastes it");
         assert!(slot_chip_hint(38, Some("h"), "paste").starts_with("Slot H: h"));
     }
