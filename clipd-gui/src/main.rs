@@ -487,7 +487,7 @@ fn letter_slot_bindings() -> &'static [(&'static str, &'static str)] {
         &[
             ("Ctrl+`  then a letter", "Paste that letter slot"),
             ("Ctrl+`  then Shift+letter", "Save the clipboard to it"),
-            ("Ctrl+C ×N", "Numeric slots 1–9 by tap count"),
+            ("Ctrl+C ×N", "Numeric slots 1–30 by tap count"),
         ]
     }
     #[cfg(not(target_os = "windows"))]
@@ -5967,7 +5967,7 @@ impl ClipdGui {
 
     /// The Slots toggle at the right end of the popover's search bar. Off,
     /// the list is the clipboard (pins, then newest); on, it is what is in
-    /// slots 1-9, in slot order.
+    /// the slots, in slot order.
     fn render_hud_slots_toggle(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         let filled: usize = self.slots_by_content.values().map(Vec::len).sum();
         let on = self.hud_slots_view;
@@ -6790,7 +6790,7 @@ impl ClipdGui {
                 self.filtered = kept;
             }
         }
-        // The popover's Slots view: only what is in slots 1-9, in slot order.
+        // The popover's Slots view: only what is in the slots, in slot order.
         // A view of its own rather than a section on top, so the clipboard
         // keeps its order — pins first, then newest. Slots hold what you set
         // aside on purpose, which in date order sat a hundred rows down.
@@ -13885,7 +13885,7 @@ impl ClipdGui {
                     ui,
                     c,
                     &mut self.paste_settings.multi_slot_enabled,
-                    "Multi-slot copy/paste (slots 1-9)",
+                    "Multi-slot copy/paste (slots 1-30)",
                     "Cmd+C x2 copies to slot 2, Cmd+V x2 pastes it, and so on. Off = Cmd+C/Cmd+V behave normally.",
                 ) {
                     save_paste_transform_settings(&self.paste_settings);
@@ -14848,13 +14848,11 @@ fn sync_active_slot_labels(
 ) -> HashMap<String, Vec<u8>> {
     let active = store.list_active_slots().unwrap_or_default();
     let mut all_slots: HashMap<String, Vec<u8>> = HashMap::new();
-    // 1-9 only: those are the slots ⌘V ×N reaches, and the only ones a row's
-    // badge can tell you how to paste.
-    // Numbered slots 1-9, then letter slots: listed after the numbers
-    // everywhere slots are shown.
+    // Numbered slots 1-30 (all reachable with ⌘V ×N), then letter slots:
+    // listed after the numbers everywhere slots are shown.
     for (slot, content) in active
         .iter()
-        .filter(|(slot, _)| (1..=9).contains(slot) || (31..=56).contains(slot))
+        .filter(|(slot, _)| (1..=30).contains(slot) || (31..=56).contains(slot))
     {
         all_slots.entry(content.clone()).or_default().push(*slot);
     }

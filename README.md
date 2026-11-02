@@ -102,9 +102,9 @@ Enable this in **Paste Settings → Slot Input Mode**.
 
 | Action | Hotkey |
 |--------|--------|
-| Copy to slots 1–9 | `Cmd+C` × N |
+| Copy to slots 1–30 | `Cmd+C` × N |
 | Paste slot 1 | `Cmd+V` |
-| Paste from slots 2–9 | `Cmd+V` × N |
+| Paste from slots 2–30 | `Cmd+V` × N |
 | Copy to slots 11–30 | `Option+C` × N |
 | Paste from slots 11–30 | `Option+V` × N |
 | Paste next queued slot | `Cmd+Option+V` |

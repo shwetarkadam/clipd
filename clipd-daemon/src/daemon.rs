@@ -92,8 +92,9 @@ const TAP_WINDOW: Duration = Duration::from_millis(650);
 /// was typed into their document instead.
 #[cfg(target_os = "macos")]
 const LETTER_PREFIX_WINDOW: Duration = Duration::from_millis(2000);
-/// After ⌘C ⌘C, how long (⌘ still held) a letter still means "copy into that
-/// letter slot". Long enough that nobody has to hurry to the letter.
+/// After ⌘C ⌘C, how long a letter still means "copy into that letter slot",
+/// with ⌘ still held or already let go. Long enough that nobody has to hurry
+/// to the letter.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const LETTER_AFTER_DOUBLE_COPY: Duration = Duration::from_millis(1500);
 /// Ignore duplicate key events faster than this (macOS key-repeat / missing KeyRelease on C/V).
@@ -3251,10 +3252,10 @@ fn show_slot_notification(action: &str, slot: u8) {
 /// never runs off either end.
 #[cfg(target_os = "macos")]
 fn slot_strip(slot: u8) -> Option<(u8, u8)> {
-    if !(1..=9).contains(&slot) {
+    if !(1..=LAST_NUMBERED_SLOT).contains(&slot) {
         return None;
     }
-    let first = slot.saturating_sub(2).max(1).min(5);
+    let first = slot.saturating_sub(2).max(1).min(LAST_NUMBERED_SLOT - 4);
     Some((first, first + 4))
 }
 
@@ -3269,7 +3270,7 @@ fn strip_chips(slot: u8, filled_letters: &[u8]) -> Option<(Vec<String>, usize)> 
     const LETTERS_AFTER_NUMBERS: usize = 4;
     const LETTER_RUN: usize = 7;
     match slot {
-        1..=9 => {
+        1..=LAST_NUMBERED_SLOT => {
             let (first, last) = slot_strip(slot)?;
             let mut labels: Vec<String> = (first..=last).map(|n| n.to_string()).collect();
             labels.extend(
@@ -5151,6 +5152,9 @@ fn start_macos_hotkey_listener(
         cmd_c_presses: u8,
         last_cmd_c_press_at: Option<Instant>,
         c_key_down: bool,
+        /// Until when the next key, if it is a letter, takes the copy just
+        /// made with ⌘C ⌘C into that letter slot.
+        copy_letter_until: Option<Instant>,
         peek_armed: bool,
     }
 
@@ -5196,6 +5200,7 @@ fn start_macos_hotkey_listener(
         cmd_c_presses: 0,
         last_cmd_c_press_at: None,
         c_key_down: false,
+        copy_letter_until: None,
         peek_armed: false,
     });
 
@@ -5260,34 +5265,35 @@ fn start_macos_hotkey_listener(
                 // as an ordinary modifier never drifts into arming the gesture.
                 s.opt_last_tap = None;
 
-                // ⌘C ⌘C, then a letter with ⌘ still held: the copy goes in
-                // that letter slot. Only right after a double ⌘C — clipd's own
-                // gesture — so no ordinary ⌘ shortcut is taken; C and V stay
-                // copy and paste.
-                if is_cmd_only(&s.pressed_mods) {
-                    let now = Instant::now();
-                    if key == RKey::KeyC {
-                        if !s.c_key_down {
-                            s.c_key_down = true;
-                            s.cmd_c_presses = if s
-                                .last_cmd_c_press_at
-                                .is_some_and(|t| now.duration_since(t) < TAP_WINDOW)
-                            {
-                                s.cmd_c_presses.saturating_add(1)
-                            } else {
-                                1
-                            };
-                            s.last_cmd_c_press_at = Some(now);
-                        }
-                    } else if s.cmd_c_presses >= 2
-                        && fast_on(FAST_LETTERS)
-                        && s
+                // ⌘C ⌘C, then a letter: the copy goes in that letter slot.
+                // ⌘ may still be held or already let go — people do both, and
+                // requiring it held meant the letter was simply typed. Only
+                // the key right after a double ⌘C counts, so no ordinary ⌘
+                // shortcut is taken and C and V stay copy and paste.
+                let now = Instant::now();
+                if key == RKey::KeyC && is_cmd_only(&s.pressed_mods) {
+                    if !s.c_key_down {
+                        s.c_key_down = true;
+                        s.cmd_c_presses = if s
                             .last_cmd_c_press_at
-                            .is_some_and(|t| now.duration_since(t) < LETTER_AFTER_DOUBLE_COPY)
-                    {
+                            .is_some_and(|t| now.duration_since(t) < TAP_WINDOW)
+                        {
+                            s.cmd_c_presses.saturating_add(1)
+                        } else {
+                            1
+                        };
+                        s.last_cmd_c_press_at = Some(now);
+                        s.copy_letter_until =
+                            (s.cmd_c_presses >= 2).then(|| now + LETTER_AFTER_DOUBLE_COPY);
+                    }
+                } else if let Some(until) = s.copy_letter_until.take() {
+                    let plain = s.pressed_mods.is_empty() || is_cmd_only(&s.pressed_mods);
+                    if plain && now <= until && fast_on(FAST_LETTERS) {
                         let letter = rdev::code_from_key(key)
                             .and_then(|code| clipd_core::keyboard_layout::typed_char(code, false))
-                            .filter(|c| c.is_ascii_alphabetic() && !matches!(c.to_ascii_lowercase(), 'c' | 'v'));
+                            .filter(char::is_ascii_alphabetic)
+                            .or_else(|| key_to_letter_slot(key).map(|(_, _, letter)| letter))
+                            .filter(|c| !matches!(c.to_ascii_lowercase(), 'c' | 'v'));
                         if let Some(slot) = letter.and_then(clipd_core::auto_letters::letter_slot) {
                             s.cmd_c_presses = 0;
                             let _ = tx.send(HotkeyTick::CopyTapsToLetter(slot));
@@ -5824,9 +5830,6 @@ fn start_macos_hotkey_listener(
                         s.cmd_down_at = None;
                         s.cmd_clean = false;
                     }
-                    if matches!(key, RKey::MetaLeft | RKey::MetaRight) {
-                        s.cmd_c_presses = 0;
-                    }
                     if matches!(key, RKey::ControlLeft | RKey::ControlRight) && s.switcher_active {
                         s.switcher_active = false;
                         let _ = tx.send(HotkeyTick::SwitcherCommit);
@@ -5928,6 +5931,7 @@ fn start_macos_hotkey_listener(
             // of them.
             EventType::ButtonPress(_) => {
                 s.cmd_clean = false;
+                s.copy_letter_until = None;
                 s.last_bare_cmd_tap = None;
                 if s.picker_until.take().is_some() {
                     let _ = tx.send(HotkeyTick::PeekCancel);
@@ -6466,6 +6470,9 @@ fn letter_capture_active() -> bool {
     s.letter_slots_enabled && (s.direct_letter_shortcuts_enabled || s.quick_letter_slots_enabled)
 }
 
+/// The numbered slots are 1..=30; A-Z start at 31.
+const LAST_NUMBERED_SLOT: u8 = 30;
+
 fn upper_slot_for_taps(taps: u8) -> u8 {
     // Keep the extended numeric bank disjoint from the named A-Z bank, which
     // starts at slot 31. Without this cap a long Option+C/V multi-tap sequence
@@ -6473,11 +6480,13 @@ fn upper_slot_for_taps(taps: u8) -> u8 {
     taps.saturating_add(10).min(30)
 }
 
-/// Highest slot a Cmd/Ctrl multi-tap can reach. When multi-slot is disabled
+/// Highest slot a Cmd/Ctrl multi-tap can reach: the whole numbered bank, so
+/// tapping on past 9 keeps going (10, 11, …) instead of piling onto 9. It
+/// stops at 30, where the letter slots begin. When multi-slot is disabled
 /// every tap collapses to slot 1, so Cmd+C/Cmd+V behave like normal copy/paste.
 fn primary_tap_slot_limit(settings: &PasteTransformSettings) -> u8 {
     if settings.multi_slot_enabled {
-        9
+        LAST_NUMBERED_SLOT
     } else {
         1
     }
@@ -6598,13 +6607,15 @@ mod slot_mapping_tests {
     }
 
     #[test]
-    fn numbered_multitaps_map_to_slots_one_through_nine() {
+    fn numbered_multitaps_go_past_nine_and_stop_before_the_letters() {
         let settings = PasteTransformSettings::default();
         assert!(settings.multi_slot_enabled);
         assert_eq!(primary_slot_for_taps(1, &settings), 1);
         assert_eq!(primary_slot_for_taps(2, &settings), 2);
         assert_eq!(primary_slot_for_taps(9, &settings), 9);
-        assert_eq!(primary_slot_for_taps(10, &settings), 9);
+        assert_eq!(primary_slot_for_taps(10, &settings), 10);
+        assert_eq!(primary_slot_for_taps(30, &settings), 30);
+        assert_eq!(primary_slot_for_taps(45, &settings), 30, "never into A-Z");
     }
 
     #[test]
@@ -6635,24 +6646,27 @@ mod slot_mapping_tests {
     #[test]
     fn the_slot_strip_stays_inside_the_bank() {
         // Five chips centred on the live slot, clamped so the window never
-        // runs past either end of 1..9 — a strip that starts at 0 or ends at
-        // 11 is showing slots that do not exist.
+        // runs past either end of 1..30 — a strip that starts at 0 or ends at
+        // 31 is showing slots that do not exist.
         assert_eq!(slot_strip(7), Some((5, 9)));
         assert_eq!(slot_strip(5), Some((3, 7)));
+        // Tapping on past 9 carries the strip with it.
+        assert_eq!(slot_strip(9), Some((7, 11)));
+        assert_eq!(slot_strip(12), Some((10, 14)));
         // Near the ends the window stops moving rather than hanging off.
         assert_eq!(slot_strip(1), Some((1, 5)));
         assert_eq!(slot_strip(2), Some((1, 5)));
-        assert_eq!(slot_strip(9), Some((5, 9)));
-        assert_eq!(slot_strip(8), Some((5, 9)));
+        assert_eq!(slot_strip(30), Some((26, 30)));
+        assert_eq!(slot_strip(29), Some((26, 30)));
         // Every window is five wide and contains the slot it is drawn for.
-        for slot in 1..=9u8 {
+        for slot in 1..=30u8 {
             let (first, last) = slot_strip(slot).expect("numeric slots have a strip");
             assert_eq!(last - first, 4, "slot {slot} strip is not five wide");
             assert!((first..=last).contains(&slot), "slot {slot} outside its own strip");
-            assert!(first >= 1 && last <= 9, "slot {slot} strip leaves the bank");
+            assert!(first >= 1 && last <= 30, "slot {slot} strip leaves the bank");
         }
-        // The numeric run itself stops at 9; letters join it in `strip_chips`.
-        assert_eq!(slot_strip(15), None);
+        // The numeric run stops at 30; letters join it in `strip_chips`.
+        assert_eq!(slot_strip(0), None);
         assert_eq!(slot_strip(31), None);
     }
 
@@ -6672,9 +6686,9 @@ mod slot_mapping_tests {
         let (chips, lit) = strip_chips(33, &letters).unwrap();
         assert_eq!(chips, ["A", "C", "E", "H"]);
         assert_eq!(chips[lit], "C");
-        // No letters filled: just the numbers. The extended bank: plain toast.
+        // No letters filled: just the numbers, past 9 too.
         assert_eq!(strip_chips(1, &[]).unwrap().0.len(), 5);
-        assert!(strip_chips(15, &letters).is_none());
+        assert_eq!(strip_chips(15, &[]).unwrap().0, ["13", "14", "15", "16", "17"]);
     }
 
     #[cfg(target_os = "macos")]
