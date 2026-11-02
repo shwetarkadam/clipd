@@ -11597,7 +11597,7 @@ impl ClipdGui {
             FooterIcon::Eye,
             &mut self.paste_settings.peek_enabled,
             "Peek — hold ⌘ for a moment",
-            "Shows what ⌘V will paste, and what's in your numbered and A–Z slots",
+            "Shows your slots; keep holding and press 2–9 or a letter to paste one. After ⌘C, keep holding ⌘ and press a letter to keep the copy there",
         );
         settings_card_divider(ui, c);
         dirty |= settings_toggle_row(

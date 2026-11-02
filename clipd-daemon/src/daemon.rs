@@ -769,6 +769,7 @@ pub fn run_daemon_with_stop(
         let mut switcher_at: Option<(f64, f64)> = None;
         let mut peek_deadline: Option<Instant> = None;
         let mut peek_shown = false;
+        let mut peek_mode = clipd_core::fast_paste::PeekMode::Paste;
         let mut fast_flags_read = Instant::now() - Duration::from_secs(10);
         /// How long ⌘ is held before the peek shows: long enough that every
         /// ordinary shortcut is over before it.
@@ -1003,14 +1004,52 @@ pub fn run_daemon_with_stop(
                         fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
                     }
                     HotkeyTick::SwitcherPick(_) | HotkeyTick::SwitcherCommit => {}
-                    HotkeyTick::PeekArm => {
+                    HotkeyTick::PeekArm | HotkeyTick::PeekArmSave => {
+                        peek_mode = if matches!(tick, HotkeyTick::PeekArmSave) {
+                            clipd_core::fast_paste::PeekMode::Save
+                        } else {
+                            clipd_core::fast_paste::PeekMode::Paste
+                        };
                         peek_deadline = Some(Instant::now() + PEEK_HOLD);
                     }
                     HotkeyTick::PeekCancel => {
                         peek_deadline = None;
+                        PEEK_SHOWN.store(0, Ordering::Relaxed);
                         if peek_shown {
                             peek_shown = false;
                             fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
+                        }
+                    }
+                    HotkeyTick::PeekChoose(slot) => {
+                        let mode = clipd_core::fast_paste::PeekMode::from_code(
+                            PEEK_SHOWN.swap(0, Ordering::Relaxed),
+                        );
+                        peek_deadline = None;
+                        peek_shown = false;
+                        fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
+                        let letter = slot >= 31;
+                        if letter && !paste_transform.letter_slots_enabled {
+                            continue;
+                        }
+                        match mode {
+                            Some(clipd_core::fast_paste::PeekMode::Paste) => {
+                                log::info!("⌨️  ⌘ peek → paste slot {}", clipd_core::slot_badge(slot));
+                                execute_direct_paste(
+                                    slot,
+                                    &hotkey_slot_mgr,
+                                    &suppress,
+                                    &transform_config,
+                                    &paste_transform,
+                                );
+                                clipd_core::telemetry_event("peek_paste", &[("letter", letter.to_string())]);
+                            }
+                            Some(clipd_core::fast_paste::PeekMode::Save) => {
+                                log::info!("⌨️  ⌘C peek → keep copy in slot {}", clipd_core::slot_badge(slot));
+                                execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
+                                show_slot_notification("Copy", slot);
+                                clipd_core::telemetry_event("peek_save", &[("letter", letter.to_string())]);
+                            }
+                            None => {}
                         }
                     }
                     HotkeyTick::TypePaste { query, erase } => {
@@ -1094,22 +1133,15 @@ pub fn run_daemon_with_stop(
             if peek_deadline.is_some_and(|dl| now >= dl) {
                 peek_deadline = None;
                 let clipboard = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
-                // Letter slots are pasted with ⌃⌥ + letter when the direct
-                // chords are on, otherwise with the ⌘⌥V leader.
-                let letter_chord = paste_transform.letter_slots_enabled.then(|| {
-                    if paste_transform.direct_letter_shortcuts_enabled {
-                        "⌃⌥"
-                    } else {
-                        "⌘⌥V "
-                    }
-                });
                 let lines = clipd_core::fast_paste::peek_lines(
+                    peek_mode,
                     clipboard.as_deref(),
                     |n| hotkey_slot_mgr.get_slot(n).ok().flatten(),
                     paste_transform.multi_slot_enabled,
-                    letter_chord,
+                    paste_transform.letter_slots_enabled,
                 );
                 fast_overlay(&clipd_core::fast_paste::peek_payload(&lines, caret_point()));
+                PEEK_SHOWN.store(peek_mode.code(), Ordering::Relaxed);
                 peek_shown = true;
                 clipd_core::telemetry_event("peek_shown", &[]);
             }
@@ -1432,7 +1464,10 @@ enum HotkeyTick {
     SwitcherCommit,          // ⌃ let go: paste the selected card
     SwitcherCancel,          // Esc while it is open
     PeekArm,                 // ⌘ pressed on its own
+    PeekArmSave,             // ⌘C with ⌘ still held: may become "keep this copy where?"
     PeekCancel,              // ⌘ let go, or anything else pressed
+    PeekChoose(u8),          // with the peek open, ⌘ + a slot's key
+
     TypePaste { query: String, erase: usize }, // `;;query` then a space
 }
 
@@ -2517,6 +2552,11 @@ const FAST_SWITCHER: u8 = 1;
 const FAST_PEEK: u8 = 2;
 #[cfg(target_os = "macos")]
 const FAST_TYPE: u8 = 4;
+/// Which peek is on screen (`fast_paste::PeekMode::code`, 0 for none). The
+/// listener reads it to know a ⌘ + letter is picking a slot rather than a
+/// shortcut — only then is the letter kept from the app.
+#[cfg(target_os = "macos")]
+static PEEK_SHOWN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 #[cfg(target_os = "macos")]
 fn refresh_fast_flags(settings: &PasteTransformSettings) {
@@ -4935,10 +4975,28 @@ fn start_macos_hotkey_listener(
                 s.opt_last_tap = None;
 
                 // ── Faster ways to paste ──
-                // Any key with ⌘ down is a shortcut, not a peek.
+                // The peek is open: ⌘ + a slot's key picks that slot (paste
+                // it, or keep the copy there), and the key stays out of the
+                // app. Read through the layout, so it is the letter typed.
+                if PEEK_SHOWN.load(Ordering::Relaxed) != 0 && is_cmd_only(&s.pressed_mods) {
+                    let picked = rdev::code_from_key(key)
+                        .and_then(|code| clipd_core::keyboard_layout::typed_char(code, false))
+                        .and_then(clipd_core::fast_paste::peek_slot_for_key);
+                    if let Some(slot) = picked {
+                        let _ = tx.send(HotkeyTick::PeekChoose(slot));
+                        return None;
+                    }
+                }
+                // Any other key with ⌘ down is a shortcut, not a peek.
                 if s.peek_armed {
                     s.peek_armed = false;
                     let _ = tx.send(HotkeyTick::PeekCancel);
+                }
+                // …except ⌘C, held on afterwards: that may become the peek
+                // that asks which slot to keep the copy in.
+                if fast_on(FAST_PEEK) && is_cmd_only(&s.pressed_mods) && key == RKey::KeyC {
+                    s.peek_armed = true;
+                    let _ = tx.send(HotkeyTick::PeekArmSave);
                 }
                 // The switcher, while open: V moves along, 1-9 picks, Esc
                 // closes. Everything is swallowed: these keys belong to it.
