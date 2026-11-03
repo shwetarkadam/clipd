@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod ask;
 pub mod ask_eval;
+pub mod auto_letters;
 pub mod caret;
 pub mod enrichment;
 #[cfg(target_os = "macos")]
@@ -24,6 +25,7 @@ pub mod secret_clipboard;
 pub mod semantic;
 pub mod session;
 pub mod slots;
+pub mod fast_paste;
 pub mod focus;
 pub mod form_fill;
 pub mod keyboard_layout;

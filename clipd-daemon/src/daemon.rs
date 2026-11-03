@@ -85,22 +85,26 @@ fn clear_external_tick_tx() {
 /// The cost is that the slot commits this long after your last tap, which is a
 /// background save nobody is waiting on.
 const TAP_WINDOW: Duration = Duration::from_millis(650);
-/// How long Option+C / Option+V waits for a following A-Z letter slot.
-const LETTER_PREFIX_WINDOW: Duration = Duration::from_millis(900);
-/// Max gap between two Cmd+C presses to count as a double-tap (quick letter save).
-const QUICK_DOUBLE_WINDOW: Duration = Duration::from_millis(400);
-/// How long after a double Cmd+C a letter still means "and put it in that slot
-/// too".
+/// How long ⌃⌥C / ⌃⌥V (and ⌘⌥C / ⌘⌥V) wait for the A-Z letter.
 ///
-/// This used to be half a second, and it was half a second because the numeric
-/// commit was *held* for exactly that long so a following letter could cancel
-/// it. That made it a race: press the letter in time and you got slot A, miss
-/// and you got slot 2, and you had to know the rule to understand which.
-///
-/// The letter no longer cancels anything — the content lands in the numeric
-/// slot immediately and in the letter slot as well. Nothing is waiting on you,
-/// so the window can be long enough that nobody has to hurry.
-const QUICK_LETTER_GRACE: Duration = Duration::from_millis(2000);
+/// It was 900ms, and people moving from the chord to a letter key — often
+/// letting go of the modifiers first — routinely took longer, so the letter
+/// was typed into their document instead.
+#[cfg(target_os = "macos")]
+const LETTER_PREFIX_WINDOW: Duration = Duration::from_millis(2000);
+/// After ⌘C ⌘C, how long a letter still means "copy into that letter slot",
+/// with ⌘ still held or already let go. Long enough that nobody has to hurry
+/// to the letter.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const LETTER_AFTER_DOUBLE_COPY: Duration = Duration::from_millis(1500);
+/// While jumping during ⌘V ⌘V, how long after one digit a second still makes
+/// a two-digit slot (1 then 2 → 12).
+#[cfg(target_os = "macos")]
+const JUMP_SECOND_DIGIT: Duration = Duration::from_millis(700);
+/// How long after the last ⌘V tap a jump key is still taken, ⌘ held. ⌘ let
+/// go ends it sooner.
+#[cfg(target_os = "macos")]
+const JUMP_AFTER_PASTE: Duration = Duration::from_millis(3000);
 /// Ignore duplicate key events faster than this (macOS key-repeat / missing KeyRelease on C/V).
 const TAP_DEBOUNCE: Duration = Duration::from_millis(65);
 
@@ -280,6 +284,12 @@ pub fn run_daemon_with_stop(
         .name("clipd-lan".into())
         .spawn(move || run_lan_transport(&lan_db_path, lan_stop))?;
 
+    // Letters someone filled by hand before automatic letters existed stay
+    // theirs (once, on the first run with them).
+    clipd_core::auto_letters::protect_existing(|slot| {
+        slot_manager.get_slot(slot).ok().flatten().is_some_and(|t| !t.trim().is_empty())
+    });
+
     // ── Store Writer Thread ──
     let slot_writer = slot_manager.clone();
     let store_handle = std::thread::Builder::new()
@@ -363,6 +373,7 @@ pub fn run_daemon_with_stop(
                                     truncate(&entry.preview, 60)
                                 );
                                 run_auto_actions(&entry);
+                                auto_letter_slot(&slot_writer, &entry);
                                 // Spawn enrichment (link preview, translation, tagging).
                                 clipd_core::spawn_enrichment(
                                     id,
@@ -660,11 +671,6 @@ pub fn run_daemon_with_stop(
     println!("       Ctrl+Shift+Option+A..Z    → copy, one chord");
     println!("     Ctrl+Option+Space → show recent slot memory");
     println!();
-    println!("     Collect mode (grab a batch, no slot picking):");
-    println!("       Ctrl+Option+`  → toggle on/off (also auto-starts on 2 quick copies)");
-    println!("       then just Cmd+C each item → stacks into slots 1..9");
-    println!("       Cmd+Shift+V    → pick one to paste from the visual list");
-    println!();
     println!(
         "     Ctrl+T → open TUI        {} → open GUI",
         load_paste_transform_settings().open_gui_hotkey.label()
@@ -734,25 +740,47 @@ pub fn run_daemon_with_stop(
         // Whether a paste is showing in the person's app that the next tap
         // should replace (the native one from tap 1, or our last swap).
         let mut cmd_v_showing = false;
+        // When the last ⌘V ×N paste settled, so a jump just after it still
+        // knows there is a paste on screen to replace.
+        #[cfg(target_os = "macos")]
+        let mut last_multi_paste_at: Option<Instant> = None;
         // The slot filled on the latest ⌘C tap, and what it held before.
         let mut cmd_c_live: Option<LiveCopy> = None;
 
-        // ── Collect mode ──
-        // When collecting, each plain Cmd+C lands in the next numbered slot
-        // (1,2,3…) instead of always overwriting slot 1 — so the user can grab
-        // a batch without choosing slots. Started explicitly (Ctrl+Option+`) or
-        // automatically when two quick single copies happen in a row.
-        let mut collecting = false;
-        let mut collect_next: u8 = 1;
-        let mut last_single_copy: Option<Instant> = None;
-        const COLLECT_BANK_MAX: u8 = 9;
-        const AUTO_COLLECT_WINDOW: Duration = Duration::from_millis(2500);
-        const COLLECT_IDLE_RESET: Duration = Duration::from_secs(30);
+        // Collect mode used to live here: plain ⌘Cs filling slots 1, 2, 3…
+        // on their own, switched on by ⌃⌥` or — unasked — by two quick copies.
+        // It overwrote slots nobody had chosen to change. Slots now change
+        // only when someone puts something in one (⌘C ×N, ⌘C ⌘C + letter).
         let paste_rules = load_paste_rules();
         let transform_config = load_transform_config();
         let mut paste_transform = load_paste_transform_settings();
 
+        // Faster ways to paste: the open switcher (its cards and selection),
+        // when a held ⌘ becomes a peek, and whether one is showing.
+        let fast_store = ClipStore::new(&ClipStore::default_path()).ok();
+        let recent_clips = |n: usize| -> Vec<ClipEntry> {
+            fast_store
+                .as_ref()
+                .and_then(|store| store.get_recent(n).ok())
+                .unwrap_or_default()
+        };
+        let mut switcher: Option<(Vec<clipd_core::fast_paste::SwitcherItem>, usize)> = None;
+        let mut switcher_at: Option<(f64, f64)> = None;
+        let mut peek_deadline: Option<Instant> = None;
+        let mut peek_shown = false;
+        // The picker closes itself if nothing is picked.
+        let mut picker_deadline: Option<Instant> = None;
+        let mut fast_flags_read = Instant::now() - Duration::from_secs(10);
+        /// How long ⌘ is held before the peek shows: long enough that every
+        /// ordinary shortcut is over before it.
+        const PEEK_HOLD: Duration = Duration::from_millis(650);
+
+
         while !stop_hotkey.load(Ordering::Relaxed) {
+            if fast_flags_read.elapsed() >= Duration::from_secs(1) {
+                refresh_fast_flags(&load_paste_transform_settings());
+                fast_flags_read = Instant::now();
+            }
             if let Ok(tick) = hotkey_rx.recv_timeout(Duration::from_millis(50)) {
                 paste_transform = load_paste_transform_settings();
                 match tick {
@@ -940,18 +968,147 @@ pub fn run_daemon_with_stop(
                     HotkeyTick::SendToDevice => {
                         send_clipboard_to_other_mac();
                     }
-                    HotkeyTick::ToggleCollect => {
-                        collecting = !collecting;
-                        collect_next = 1;
-                        last_single_copy = None;
-                        log::info!("📦 Collect mode {}", if collecting { "ON" } else { "OFF" });
-                        #[cfg(target_os = "macos")]
-                        {
-                            if collecting {
-                                show_collect_hud(&hotkey_slot_mgr, 0, true);
-                            } else {
-                                show_collect_done_hud();
+                    HotkeyTick::SwitcherTap => {
+                        use clipd_core::fast_paste as fp;
+                        match switcher.as_mut() {
+                            Some((items, sel)) => *sel = fp::next_selection(*sel, items.len()),
+                            None => {
+                                let items = fp::switcher_items(&recent_clips(60));
+                                if !items.is_empty() {
+                                    let sel = fp::first_selection(items.len());
+                                    switcher_at = caret_point();
+                                    switcher = Some((items, sel));
+                                }
                             }
+                        }
+                        if let Some((items, sel)) = switcher.as_ref() {
+                            fast_overlay(&fp::switcher_payload(items, *sel, switcher_at));
+                        }
+                    }
+                    HotkeyTick::SwitcherPick(_) | HotkeyTick::SwitcherCommit if switcher.is_some() => {
+                        let (items, mut sel) = switcher.take().unwrap_or_default();
+                        if let HotkeyTick::SwitcherPick(n) = tick {
+                            sel = usize::from(n).saturating_sub(1);
+                        }
+                        fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
+                        if let Some(item) = items.get(sel) {
+                            // Kept on the clipboard, so ⌘V pastes it again.
+                            paste_text(&item.content, &suppress, true);
+                            clipd_core::telemetry_event(
+                                "switcher_paste",
+                                &[("position", (sel + 1).to_string())],
+                            );
+                        }
+                    }
+                    HotkeyTick::SwitcherCancel => {
+                        switcher = None;
+                        fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
+                    }
+                    HotkeyTick::SwitcherPick(_) | HotkeyTick::SwitcherCommit => {}
+                    HotkeyTick::PeekArm => {
+                        peek_deadline = Some(Instant::now() + PEEK_HOLD);
+                    }
+                    HotkeyTick::CopyTapsToLetter(slot) => {
+                        // The letter is where this copy was meant to go, not
+                        // the numbered slot the double ⌘C filled on its tap:
+                        // that one gets its old content back, and its pending
+                        // commit is called off.
+                        let live = cmd_c_live.take();
+                        if let Some(live) = &live {
+                            let _ = match &live.previous {
+                                Some(text) => hotkey_slot_mgr.copy_to_slot(live.slot, text),
+                                None => hotkey_slot_mgr.clear_slot(live.slot),
+                            };
+                        }
+                        cmd_c_taps = 0;
+                        cmd_c_deadline = None;
+                        let text = live
+                            .map(|live| live.text)
+                            .or_else(clipd_core::pasteboard::read_text)
+                            .filter(|t| !t.trim().is_empty());
+                        match text {
+                            Some(text) => {
+                                save_text_to_slot(slot, &text, &hotkey_slot_mgr, &persist_tx);
+                                let badge = clipd_core::slot_badge(slot);
+                                if let Some(letter) = badge.chars().next() {
+                                    clipd_core::auto_letters::mark_named(letter);
+                                }
+                                log::info!("⌨️  ⌘C ⌘C {badge} → copied to slot {badge}");
+                                show_slot_content_notification("Copied", slot, &text);
+                                clipd_core::telemetry_event("copy_to_letter", &[("via", "cmd_c_c".into())]);
+                            }
+                            None => log::warn!("⌘C ⌘C + letter: nothing on the clipboard to keep"),
+                        }
+                    }
+                    HotkeyTick::PasteJump(slot) => {
+                        // The paste on screen is the last tap's; this one
+                        // replaces it. If that paste has already settled
+                        // (its window closed and the clipboard was handed
+                        // back), it is still there to replace: start a new
+                        // round so the clipboard is handed back again after.
+                        let now = Instant::now();
+                        if cmd_v_taps < 2 {
+                            cmd_v_saved_clipboard = clipd_core::pasteboard::read_text();
+                            cmd_v_showing = last_multi_paste_at
+                                .is_some_and(|at| now.duration_since(at) < Duration::from_secs(4));
+                            cmd_v_live = None;
+                            cmd_v_taps = 2;
+                        }
+                        cmd_v_deadline = Some(now + TAP_WINDOW);
+                        suppress.store(true, Ordering::SeqCst);
+                        log::info!("⌨️  ⌘V jump → slot {}", clipd_core::slot_badge(slot));
+                        show_slot_notification("Paste", slot);
+                        if let Some(text) = paste_slot_live(slot, cmd_v_showing, &hotkey_slot_mgr) {
+                            cmd_v_showing = true;
+                            cmd_v_live = Some((slot, text));
+                        }
+                        clipd_core::telemetry_event("paste_jump", &[]);
+                    }
+                    HotkeyTick::PickerOpen => {
+                        peek_deadline = None;
+                        let clipboard = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
+                        let lines = clipd_core::fast_paste::peek_lines(
+                            true,
+                            clipboard.as_deref(),
+                            |n| hotkey_slot_mgr.get_slot(n).ok().flatten(),
+                            paste_transform.multi_slot_enabled,
+                            paste_transform.letter_slots_enabled,
+                        );
+                        fast_overlay(&clipd_core::fast_paste::peek_payload(&lines, caret_point()));
+                        PEEK_SHOWN.store(true, Ordering::Relaxed);
+                        peek_shown = true;
+                        picker_deadline = Some(Instant::now() + Duration::from_secs(4));
+                        clipd_core::telemetry_event("picker_shown", &[]);
+                    }
+                    HotkeyTick::PeekCancel => {
+                        peek_deadline = None;
+                        picker_deadline = None;
+                        PEEK_SHOWN.store(false, Ordering::Relaxed);
+                        if peek_shown {
+                            peek_shown = false;
+                            fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
+                        }
+                    }
+                    HotkeyTick::PeekChoose(slot) => {
+                        let was_open = PEEK_SHOWN.swap(false, Ordering::Relaxed);
+                        peek_deadline = None;
+                        picker_deadline = None;
+                        peek_shown = false;
+                        fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
+                        let letter = slot >= 31;
+                        if letter && !paste_transform.letter_slots_enabled {
+                            continue;
+                        }
+                        if was_open {
+                            log::info!("⌨️  ⌘ peek → paste slot {}", clipd_core::slot_badge(slot));
+                            execute_direct_paste(
+                                slot,
+                                &hotkey_slot_mgr,
+                                &suppress,
+                                &transform_config,
+                                &paste_transform,
+                            );
+                            clipd_core::telemetry_event("peek_paste", &[("letter", letter.to_string())]);
                         }
                     }
                     HotkeyTick::SequencePaste => {
@@ -991,50 +1148,39 @@ pub fn run_daemon_with_stop(
 
             let now = Instant::now();
 
+            // A picker nobody picked from closes itself.
+            if picker_deadline.is_some_and(|dl| now >= dl) {
+                picker_deadline = None;
+                PEEK_SHOWN.store(false, Ordering::Relaxed);
+                peek_shown = false;
+                fast_overlay(clipd_core::fast_paste::HIDE_PAYLOAD);
+            }
+
+            // ⌘ held long enough on its own: show what ⌘V would paste.
+            if peek_deadline.is_some_and(|dl| now >= dl) {
+                peek_deadline = None;
+                let clipboard = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
+                let lines = clipd_core::fast_paste::peek_lines(
+                    false,
+                    clipboard.as_deref(),
+                    |n| hotkey_slot_mgr.get_slot(n).ok().flatten(),
+                    paste_transform.multi_slot_enabled,
+                    paste_transform.letter_slots_enabled,
+                );
+                fast_overlay(&clipd_core::fast_paste::peek_payload(&lines, caret_point()));
+                PEEK_SHOWN.store(true, Ordering::Relaxed);
+                peek_shown = true;
+                clipd_core::telemetry_event("peek_shown", &[]);
+            }
+
             // Cmd+C: 1 tap → auto-save to slot 1 (most recent),
             //        2+ taps → save to slot N, optionally restore clipboard to slot 1
-            // While collecting, a long pause means the batch is over — drop
-            // back to normal slot-1 behavior so a much-later copy isn't appended.
-            if collecting {
-                if let Some(prev) = last_single_copy {
-                    if now.duration_since(prev) > COLLECT_IDLE_RESET {
-                        collecting = false;
-                        collect_next = 1;
-                        last_single_copy = None;
-                    }
-                }
-            }
 
             if let Some(dl) = cmd_c_deadline {
                 if now >= dl && cmd_c_taps > 0 {
                     if cmd_c_taps == 1 {
-                        let commit = Instant::now();
-                        // Auto-start: a second quick single copy turns collecting on.
-                        if !collecting {
-                            if let Some(prev) = last_single_copy {
-                                if commit.duration_since(prev) <= AUTO_COLLECT_WINDOW {
-                                    collecting = true;
-                                    // Copy #1 is already in slot 1; this one is #2.
-                                    collect_next = 2;
-                                }
-                            }
-                        }
-                        if collecting && collect_next <= COLLECT_BANK_MAX {
-                            let slot = collect_next;
-                            execute_copy(slot, &hotkey_slot_mgr, &persist_tx);
-                            log::info!("📦 Collect → slot {}", slot);
-                            collect_next += 1;
-                            #[cfg(target_os = "macos")]
-                            show_collect_hud(&hotkey_slot_mgr, slot, false);
-                            if collect_next > COLLECT_BANK_MAX {
-                                // Bank full — stop collecting but keep the items.
-                                collecting = false;
-                            }
-                        } else {
-                            execute_copy(1, &hotkey_slot_mgr, &persist_tx);
-                            log::info!("⌨️  Cmd+C → auto-saved to slot 1");
-                        }
-                        last_single_copy = Some(commit);
+                        execute_copy(1, &hotkey_slot_mgr, &persist_tx);
+                        log::info!("⌨️  Cmd+C → auto-saved to slot 1");
                     } else {
                         let slot = primary_slot_for_taps(cmd_c_taps, &paste_transform);
                         match cmd_c_live.take() {
@@ -1071,6 +1217,10 @@ pub fn run_daemon_with_stop(
                         // The paste already happened, on its tap. What is left
                         // is bookkeeping, and handing the clipboard back.
                         if let Some((slot, text)) = cmd_v_live.take() {
+                            #[cfg(target_os = "macos")]
+                            {
+                                last_multi_paste_at = Some(now);
+                            }
                             clipd_core::record_slot_paste(slot);
                             log::info!("📋 Pasted from slot {} on its tap: {}", slot, truncate(&text, 40));
                             #[cfg(target_os = "macos")]
@@ -1300,9 +1450,20 @@ enum HotkeyTick {
     CopySelectionToSlot(u8), // Ctrl+Shift+Option+A..Z — copy selection to slot 31..56
     PasteFromSlot(u8),       // Ctrl+Option+1..9 — paste slot
     SlotMemoryHud,           // Ctrl+Option+Space — show recent slot memory
-    ToggleCollect,           // Ctrl+Option+` — toggle Collect mode on/off
     CommandPalette,          // Ctrl+Space → command palette
     SendToDevice,            // Ctrl+Shift+S — send the clipboard to the other Mac
+    // Faster ways to paste (clipd_core::fast_paste), each opt-in.
+    SwitcherTap,             // ⌃V while the switcher is on: open / move along
+    SwitcherPick(u8),        // ⌃ + 1..9 while it is open: paste that card
+    SwitcherCommit,          // ⌃ let go: paste the selected card
+    SwitcherCancel,          // Esc while it is open
+    PeekArm,                 // ⌘ pressed on its own
+    PeekCancel,              // ⌘ let go, or anything else pressed
+    PeekChoose(u8),          // a slot's key picked in the peek or the picker
+    PickerOpen,              // ⌘ tapped twice
+    CopyTapsToLetter(u8),    // ⌘C ⌘C then a letter, ⌘ still held: copy to that letter slot
+    PasteJump(u8),           // ⌘V ⌘V, ⌘ still held, then a slot's key: paste that slot instead
+
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1452,10 +1613,18 @@ fn spawn_windows_grab(
     persist_tx: mpsc::SyncSender<ClipEvent>,
     suppress: Arc<AtomicBool>,
 ) {
-    // Letter must arrive within the grace; paste grace is < the numeric-paste
-    // commit (~430ms) so a letter reliably cancels slot N before it fires.
-    const COPY_LETTER_GRACE: Duration = Duration::from_millis(650);
-    const PASTE_LETTER_GRACE: Duration = Duration::from_millis(450);
+    // How long after Ctrl+C Ctrl+C / Ctrl+V Ctrl+V the letter is waited for.
+    // These were 650ms and 450ms, which made the letter a race — miss it and
+    // the letter was typed into the document. 1.5s, as on macOS.
+    //
+    // Copy: the numbered slot commits after the window (a background save,
+    // so waiting costs nothing). Paste: the numbered slot still pastes on
+    // its own short timing (PASTE_COMMIT_AFTER) so Ctrl+V ×2 is not slow; a
+    // letter that comes after it undoes that one paste and pastes the
+    // letter slot instead.
+    const COPY_LETTER_GRACE: Duration = Duration::from_millis(1500);
+    const PASTE_LETTER_GRACE: Duration = Duration::from_millis(1500);
+    const PASTE_COMMIT_AFTER: Duration = Duration::from_millis(450);
     std::thread::spawn(move || {
         #[derive(Default)]
         struct GrabState {
@@ -1469,8 +1638,13 @@ fn spawn_windows_grab(
             v_taps: u8,
             v_gen: u64,
             paste_letter_until: Option<Instant>,
+            /// The switcher strip is open (Alt still held), and its V is
+            /// down, so key repeat does not race along the strip.
+            sw_active: bool,
+            sw_v_down: bool,
         }
         let state = Arc::new(Mutex::new(GrabState::default()));
+        win_switcher::start(suppress.clone());
 
         let callback = move |event: Event| -> Option<Event> {
             // Let our own synthetic paste keystrokes pass through untouched.
@@ -1541,6 +1715,31 @@ fn spawn_windows_grab(
                 // undo-then-paste design as macOS Cmd+V ×N).
                 EventType::KeyPress(RKey::KeyV) => {
                     let (ctrl, alt, meta) = win_mods_now();
+                    // Hold Alt, tap V: the clipboard switcher. Alt+V, not
+                    // Ctrl+V — Ctrl+V is paste on Windows.
+                    if alt && !ctrl && !meta && win_switcher::on() {
+                        let advance = {
+                            let Ok(mut s) = state.lock() else {
+                                return None;
+                            };
+                            if s.sw_v_down {
+                                false // key repeat
+                            } else {
+                                s.sw_v_down = true;
+                                if !s.sw_active {
+                                    // Keep letting go of Alt from opening the
+                                    // app's menu bar: it was not a bare Alt.
+                                    win_switcher::menu_mask();
+                                }
+                                s.sw_active = true;
+                                true
+                            }
+                        };
+                        if advance {
+                            win_switcher::request(win_switcher::Cmd::Tap);
+                        }
+                        return None;
+                    }
                     if !ctrl || alt || meta {
                         return Some(event);
                     }
@@ -1578,7 +1777,7 @@ fn spawn_windows_grab(
                     let mgr = slot_mgr.clone();
                     let supp = suppress.clone();
                     std::thread::spawn(move || {
-                        std::thread::sleep(PASTE_LETTER_GRACE + Duration::from_millis(120));
+                        std::thread::sleep(PASTE_COMMIT_AFTER + Duration::from_millis(120));
                         let slot = {
                             let Ok(mut s) = st.lock() else {
                                 return;
@@ -1589,7 +1788,9 @@ fn spawn_windows_grab(
                             let slot = s.v_taps.clamp(1, 9);
                             s.v_taps = 0;
                             s.v_last_tap = None;
-                            s.paste_letter_until = None;
+                            // The letter window stays open: a letter now
+                            // replaces this paste (one paste to undo, as
+                            // before).
                             slot
                         };
                         // One native paste (tap 1) already landed — undo it,
@@ -1602,6 +1803,24 @@ fn spawn_windows_grab(
                 }
                 // A bare letter while armed -> letter copy/paste; SUPPRESS it.
                 EventType::KeyPress(key) => {
+                    // While the switcher is open: 1-9 picks, Esc closes.
+                    let switcher_open = state.lock().map(|s| s.sw_active).unwrap_or(false);
+                    if switcher_open {
+                        if key == RKey::Escape {
+                            if let Ok(mut s) = state.lock() {
+                                s.sw_active = false;
+                            }
+                            win_switcher::request(win_switcher::Cmd::Cancel);
+                            return None;
+                        }
+                        if let Some(n) = key_to_digit_slot(key) {
+                            if let Ok(mut s) = state.lock() {
+                                s.sw_active = false;
+                            }
+                            win_switcher::request(win_switcher::Cmd::Commit(Some(n)));
+                            return None;
+                        }
+                    }
                     let Some(idx) = rkey_letter_index(key) else {
                         return Some(event);
                     };
@@ -1661,6 +1880,32 @@ fn spawn_windows_grab(
                         }
                         None => Some(event),
                     }
+                }
+                EventType::KeyRelease(RKey::KeyV) => {
+                    let swallow = state
+                        .lock()
+                        .map(|mut s| {
+                            let was = s.sw_v_down;
+                            s.sw_v_down = false;
+                            was
+                        })
+                        .unwrap_or(false);
+                    if swallow {
+                        None
+                    } else {
+                        Some(event)
+                    }
+                }
+                // Letting go of Alt pastes the switcher's pick.
+                EventType::KeyRelease(RKey::Alt) | EventType::KeyRelease(RKey::AltGr) => {
+                    let was_open = state
+                        .lock()
+                        .map(|mut s| std::mem::replace(&mut s.sw_active, false))
+                        .unwrap_or(false);
+                    if was_open {
+                        win_switcher::request(win_switcher::Cmd::Commit(None));
+                    }
+                    Some(event)
                 }
                 _ => Some(event),
             }
@@ -1725,6 +1970,241 @@ fn spawn_overlay(msg: &str) -> bool {
         }
     }
     false
+}
+
+/// Hold Alt, tap V: the clipboard switcher on Windows (see
+/// `clipd_core::fast_paste`). Alt rather than Ctrl, because Ctrl+V is the
+/// paste itself here; Alt+Tab is the muscle memory it borrows.
+///
+/// The keyboard hook only flips state and sends commands; one worker does
+/// the work in order (load clips, redraw the strip, paste), so letting go of
+/// Alt can never be handled before the tap that opened the strip, and the
+/// hook never waits on the database or the overlay.
+#[cfg(target_os = "windows")]
+mod win_switcher {
+    use super::*;
+    use clipd_core::fast_paste::{self as fp, SwitcherItem};
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::process::{Child, Command};
+    use std::sync::OnceLock;
+
+    pub enum Cmd {
+        /// Open the strip, or move along it.
+        Tap,
+        /// Paste the selected card (`None`) or card N, and close.
+        Commit(Option<u8>),
+        Cancel,
+    }
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static WORKER: OnceLock<Mutex<mpsc::Sender<Cmd>>> = OnceLock::new();
+
+    pub fn on() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+
+    pub fn request(cmd: Cmd) {
+        if let Some(Ok(tx)) = WORKER.get().map(|w| w.lock()) {
+            let _ = tx.send(cmd);
+        }
+    }
+
+    /// Start the worker and keep the on/off switch current (read from
+    /// settings once a second, not per key).
+    pub fn start(suppress: Arc<AtomicBool>) {
+        let (tx, rx) = mpsc::channel::<Cmd>();
+        if WORKER.set(Mutex::new(tx)).is_err() {
+            return;
+        }
+        std::thread::spawn(move || {
+            let mut open: Option<(Vec<SwitcherItem>, usize, Option<(f64, f64)>)> = None;
+            let mut overlay: Option<Child> = None;
+            let mut last_flag_read = Instant::now() - Duration::from_secs(10);
+            loop {
+                if last_flag_read.elapsed() >= Duration::from_secs(1) {
+                    let enabled = load_paste_transform_settings().switcher_enabled;
+                    ON.store(enabled, Ordering::Relaxed);
+                    if enabled {
+                        ensure_overlay(&mut overlay);
+                    }
+                    last_flag_read = Instant::now();
+                }
+                let cmd = match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(cmd) => cmd,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                match cmd {
+                    Cmd::Tap => {
+                        match open.as_mut() {
+                            Some((items, sel, _)) => *sel = fp::next_selection(*sel, items.len()),
+                            None => {
+                                let clips = ClipStore::new(&ClipStore::default_path())
+                                    .ok()
+                                    .and_then(|store| store.get_recent(60).ok())
+                                    .unwrap_or_default();
+                                let items = fp::switcher_items(&clips);
+                                if !items.is_empty() {
+                                    let sel = fp::first_selection(items.len());
+                                    open = Some((items, sel, caret_point()));
+                                }
+                            }
+                        }
+                        if let Some((items, sel, at)) = open.as_ref() {
+                            send(&mut overlay, &fp::switcher_payload(items, *sel, *at));
+                        }
+                    }
+                    Cmd::Cancel => {
+                        open = None;
+                        send(&mut overlay, fp::HIDE_PAYLOAD);
+                    }
+                    Cmd::Commit(pick) => {
+                        send(&mut overlay, fp::HIDE_PAYLOAD);
+                        let Some((items, sel, _)) = open.take() else {
+                            continue;
+                        };
+                        let index = pick.map_or(sel, |n| usize::from(n).saturating_sub(1));
+                        if let Some(item) = items.get(index) {
+                            paste(&item.content, &suppress);
+                            log::info!("📋 Switcher pasted card {}", index + 1);
+                            clipd_core::telemetry_event(
+                                "switcher_paste",
+                                &[("position", (index + 1).to_string())],
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Paste `text` once Alt is up, so the app gets a clean Ctrl+V. The clip
+    /// stays on the clipboard (Ctrl+V pastes it again), and the hook lets
+    /// the synthetic keys through untouched.
+    fn paste(text: &str, suppress: &AtomicBool) {
+        for _ in 0..40 {
+            let (_ctrl, alt, _meta) = win_mods_now();
+            if !alt {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let Ok(mut cb) = Clipboard::new() else {
+            return;
+        };
+        suppress.store(true, Ordering::SeqCst);
+        if cb.set_text(text.to_string()).is_ok() {
+            std::thread::sleep(Duration::from_millis(60));
+            simulate_paste();
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        suppress.store(false, Ordering::SeqCst);
+    }
+
+    fn overlay_path() -> Option<PathBuf> {
+        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        ["clipd-overlay.exe", "clipd-overlay"]
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|path| path.exists())
+    }
+
+    fn ensure_overlay(overlay: &mut Option<Child>) {
+        let alive = overlay.as_mut().is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        if alive {
+            return;
+        }
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        *overlay = overlay_path().and_then(|path| {
+            Command::new(path)
+                .env("CLIPD_OVERLAY_SERVE", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .ok()
+        });
+    }
+
+    /// One NUL-terminated message to the strip; restarts it once if gone.
+    fn send(overlay: &mut Option<Child>, payload: &str) {
+        for _ in 0..2 {
+            ensure_overlay(overlay);
+            let sent = overlay
+                .as_mut()
+                .and_then(|child| child.stdin.as_mut())
+                .is_some_and(|stdin| {
+                    stdin.write_all(payload.as_bytes()).is_ok()
+                        && stdin.write_all(&[0]).is_ok()
+                        && stdin.flush().is_ok()
+                });
+            if sent {
+                return;
+            }
+            *overlay = None;
+        }
+    }
+
+    /// Below the text cursor, in physical screen pixels: the caret of the
+    /// focused window if it reports one, otherwise the mouse.
+    fn caret_point() -> Option<(f64, f64)> {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
+            GUITHREADINFO,
+        };
+        unsafe {
+            let front = GetForegroundWindow();
+            if !front.is_null() {
+                let thread = GetWindowThreadProcessId(front, std::ptr::null_mut());
+                let mut info: GUITHREADINFO = std::mem::zeroed();
+                info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+                if GetGUIThreadInfo(thread, &mut info) != 0 && !info.hwndCaret.is_null() {
+                    let mut point = POINT {
+                        x: info.rcCaret.left,
+                        y: info.rcCaret.bottom,
+                    };
+                    if ClientToScreen(info.hwndCaret, &mut point) != 0 {
+                        return Some((point.x as f64, point.y as f64));
+                    }
+                }
+            }
+            let mut point = POINT { x: 0, y: 0 };
+            (GetCursorPos(&mut point) != 0).then(|| (point.x as f64, point.y as f64))
+        }
+    }
+
+    /// Send an unassigned key (VK 0xE8) while Alt is down. Windows opens an
+    /// app's menu bar when Alt is pressed and released with nothing in
+    /// between; the V is swallowed, so without this every switcher use would
+    /// end with the menu bar active. The usual remedy (AutoHotkey's "menu
+    /// mask key").
+    pub fn menu_mask() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+        };
+        const VK_MASK: u16 = 0xE8;
+        let key = |flags| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_MASK,
+                    wScan: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let inputs = [key(0), key(KEYEVENTF_KEYUP)];
+        unsafe {
+            SendInput(inputs.len() as u32, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+        }
+    }
 }
 
 fn execute_copy(slot: u8, mgr: &SlotManager, persist_tx: &mpsc::SyncSender<ClipEvent>) {
@@ -2319,13 +2799,17 @@ mod synth {
 
     /// A bare Tab, down then up.
     pub fn tab() {
+        key(TAB);
+    }
+
+    fn key(code: u16) {
         unsafe {
             let source = CGEventSourceCreate(PRIVATE_STATE);
             if source.is_null() {
                 return;
             }
             for down in [true, false] {
-                let event = CGEventCreateKeyboardEvent(source, TAB, down);
+                let event = CGEventCreateKeyboardEvent(source, code, down);
                 if event.is_null() {
                     break;
                 }
@@ -2355,6 +2839,124 @@ fn simulate_tab() {
         release_windows_shortcut_modifiers(&mut enigo);
         let _ = enigo.key(Key::Tab, Direction::Click);
     }
+}
+
+/// Keep the automatic letter slot for this copy's kind fresh (E email, L link,
+/// P phone, K code; see `clipd_core::auto_letters`). Never a letter the person
+/// named, and never anything that looks like a secret.
+fn auto_letter_slot(mgr: &SlotManager, entry: &ClipEntry) {
+    let settings = load_paste_transform_settings();
+    if !settings.letter_slots_enabled || !settings.auto_letter_slots {
+        return;
+    }
+    let Some(letter) = clipd_core::auto_letters::auto_letter_for(&entry.content, &entry.content_type) else {
+        return;
+    };
+    if clipd_core::auto_letters::named_letters().contains(&letter) {
+        return;
+    }
+    let privacy = clipd_core::privacy::load_privacy_config();
+    if clipd_core::mcp_consent::withhold_from_ai(&entry.content, entry.source_app.as_deref(), &privacy) {
+        return;
+    }
+    if let Some(slot) = clipd_core::auto_letters::letter_slot(letter) {
+        if mgr.copy_to_slot(slot, &entry.content).is_ok() {
+            let what = clipd_core::auto_letters::AUTO_LETTERS
+                .iter()
+                .find(|(l, _)| *l == letter)
+                .map_or("clip", |(_, what)| *what);
+            log::info!("🔤 Slot {letter} now holds the latest {what}");
+        }
+    }
+}
+
+// ── Faster ways to paste (see `clipd_core::fast_paste`) ──
+//
+// The listener reads which are on from these bits on every key, so the main
+// loop refreshes them from the settings file once a second rather than the
+// listener touching the disk per keystroke.
+
+#[cfg(target_os = "macos")]
+static FAST_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(target_os = "macos")]
+const FAST_SWITCHER: u8 = 1;
+#[cfg(target_os = "macos")]
+const FAST_PEEK: u8 = 2;
+/// Letter slots are on (for ⌘C ⌘C + letter).
+#[cfg(target_os = "macos")]
+const FAST_LETTERS: u8 = 8;
+/// Whether the peek is on screen. The listener reads it to know a ⌘ + letter
+/// is picking a slot rather than a shortcut — only then is the letter kept
+/// from the app.
+#[cfg(target_os = "macos")]
+static PEEK_SHOWN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+fn refresh_fast_flags(settings: &PasteTransformSettings) {
+    let mut bits = 0;
+    if settings.switcher_enabled {
+        bits |= FAST_SWITCHER;
+    }
+    if settings.peek_enabled {
+        bits |= FAST_PEEK;
+    }
+    if settings.letter_slots_enabled {
+        bits |= FAST_LETTERS;
+    }
+    FAST_FLAGS.store(bits, Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+fn fast_on(bit: u8) -> bool {
+    FAST_FLAGS.load(Ordering::Relaxed) & bit != 0
+}
+
+/// Draw (or take down) a cursor overlay. Starts the overlay if it is not
+/// already serving.
+#[cfg(target_os = "macos")]
+fn fast_overlay(payload: &str) {
+    let payload = hud_payload_with_clearance(payload);
+    if !hud_server::send(&payload) {
+        hud_server::warm();
+        let _ = hud_server::send(&payload);
+    }
+}
+
+/// Just under the text cursor, when the focused app says where it is.
+#[cfg(target_os = "macos")]
+fn caret_point() -> Option<(f64, f64)> {
+    clipd_core::caret::current().map(|r| (r.x, r.y + r.height))
+}
+
+/// Paste `text` into the focused app. The clipboard keeps it when `keep` (a
+/// switcher pick, so ⌘V pastes it again), otherwise it is put back. Either
+/// way the watcher is held off, so this is not saved as a new copy.
+#[cfg(target_os = "macos")]
+fn paste_text(text: &str, suppress: &AtomicBool, keep: bool) {
+    let mut cb = match Clipboard::new() {
+        Ok(cb) => cb,
+        Err(e) => {
+            log::warn!("Paste: no clipboard ({e})");
+            return;
+        }
+    };
+    let original = cb.get_text().ok();
+    suppress.store(true, Ordering::SeqCst);
+    if cb.set_text(text).is_err() {
+        suppress.store(false, Ordering::SeqCst);
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(40));
+    simulate_paste();
+    // The app reads the clipboard when it handles ⌘V, not when it is sent.
+    std::thread::sleep(Duration::from_millis(180));
+    if !keep {
+        if let Some(original) = original {
+            let _ = cb.set_text(original);
+        }
+    }
+    std::thread::sleep(Duration::from_millis(60));
+    suppress.store(false, Ordering::SeqCst);
 }
 
 /// Paste a clip the person just picked in clipd (see `clipd_core::pick_paste`):
@@ -2691,11 +3293,65 @@ fn show_slot_notification(action: &str, slot: u8) {
 /// never runs off either end.
 #[cfg(target_os = "macos")]
 fn slot_strip(slot: u8) -> Option<(u8, u8)> {
-    if !(1..=9).contains(&slot) {
+    if !(1..=LAST_NUMBERED_SLOT).contains(&slot) {
         return None;
     }
-    let first = slot.saturating_sub(2).max(1).min(5);
+    let first = slot.saturating_sub(2).max(1).min(LAST_NUMBERED_SLOT - 4);
     Some((first, first + 4))
+}
+
+/// The chips under the slot toast, and which one is lit.
+///
+/// A numbered slot shows its run of five numbers, then the letter slots that
+/// hold something: letters come after the numbers wherever slots are listed.
+/// A letter slot shows the filled letters around it. Only filled letters —
+/// twenty-six empty chips would say nothing.
+#[cfg(target_os = "macos")]
+fn strip_chips(slot: u8, filled_letters: &[u8]) -> Option<(Vec<String>, usize)> {
+    const LETTERS_AFTER_NUMBERS: usize = 4;
+    const LETTER_RUN: usize = 7;
+    match slot {
+        1..=LAST_NUMBERED_SLOT => {
+            let (first, last) = slot_strip(slot)?;
+            let mut labels: Vec<String> = (first..=last).map(|n| n.to_string()).collect();
+            labels.extend(
+                filled_letters
+                    .iter()
+                    .take(LETTERS_AFTER_NUMBERS)
+                    .map(|n| clipd_core::slot_badge(*n)),
+            );
+            Some((labels, usize::from(slot - first)))
+        }
+        31..=56 => {
+            let mut letters = filled_letters.to_vec();
+            if !letters.contains(&slot) {
+                letters.push(slot);
+                letters.sort_unstable();
+            }
+            let at = letters.iter().position(|n| *n == slot)?;
+            let start = at.saturating_sub(LETTER_RUN / 2).min(letters.len().saturating_sub(LETTER_RUN));
+            let run = &letters[start..(start + LETTER_RUN).min(letters.len())];
+            Some((run.iter().map(|n| clipd_core::slot_badge(*n)).collect(), at - start))
+        }
+        _ => None,
+    }
+}
+
+/// The letter slots that hold something, A to Z.
+#[cfg(target_os = "macos")]
+fn filled_letter_slots() -> Vec<u8> {
+    let mut letters: Vec<u8> = SlotManager::persistent_default()
+        .and_then(|slots| slots.list_slots())
+        .map(|all| {
+            all.into_iter()
+                .filter(|(n, text)| (31..=56).contains(n) && !text.trim().is_empty())
+                .map(|(n, _)| n)
+                .collect()
+        })
+        .unwrap_or_default();
+    letters.sort_unstable();
+    letters.dedup();
+    letters
 }
 
 /// What to press to get this slot back, and how long the count stays open.
@@ -2709,7 +3365,7 @@ fn slot_foot(action: &str, slot: u8) -> String {
         _ => match slot {
             1..=9 => format!("⌘C ×{slot}"),
             11..=30 => format!("⌥C ×{}", slot - 10),
-            31..=56 => format!("⌃⌥C {}", (b'A' + (slot - 31)) as char),
+            31..=56 => format!("⌘C ⌘C {}", (b'A' + (slot - 31)) as char),
             _ => "⌘C".to_string(),
         },
     };
@@ -2719,12 +3375,12 @@ fn slot_foot(action: &str, slot: u8) -> String {
     )
 }
 
-/// The slot toast: pill, slot strip, chord. Falls back to the plain toast for
-/// the letter and extended banks, where a five-chip strip would be a window
-/// onto twenty-six slots and say nothing.
+/// The slot toast: pill, slot strip, chord. The strip is the numbers, then
+/// the filled letter slots (see `strip_chips`); the extended bank (11-30)
+/// falls back to the plain toast.
 #[cfg(target_os = "macos")]
 fn slot_hud_payload(action: &str, slot: u8, content: Option<&str>) -> Vec<String> {
-    let Some((first, last)) = slot_strip(slot) else {
+    let Some((chips, active)) = strip_chips(slot, &filled_letter_slots()) else {
         let mut lines = vec![
             "STYLE\ttoast".to_string(),
             format!("BADGE\t{}", slot_badge(slot)),
@@ -2744,7 +3400,7 @@ fn slot_hud_payload(action: &str, slot: u8, content: Option<&str>) -> Vec<String
         "STYLE\tslot".to_string(),
         format!("BADGE\t{}", slot_badge(slot)),
         format!("TITLE\t{}", toast_title(action, slot)),
-        format!("SLOTS\t{slot}\t{first}\t{last}"),
+        format!("CHIPS\t{active}\t{}", chips.join("\t")),
         format!("FOOT\t{}", slot_foot(action, slot)),
     ];
     // The avatar shows where the clip came from; the title already carries the
@@ -2933,61 +3589,6 @@ fn show_slot_memory_hud(mgr: &SlotManager) {
     }
     lines.push("FOOT\tCmd 1-9 · ⌥ 11-30 · Letters A-Z".to_string());
     show_hud(&lines.join("\n"));
-}
-
-/// The Collect-mode panel: the growing stack of slots 1..=9 captured this
-/// batch, newest highlighted. Replaces the per-copy toast while collecting so
-/// the user sees the whole batch, not just the last item.
-#[cfg(target_os = "macos")]
-fn show_collect_hud(mgr: &SlotManager, active_slot: u8, just_started: bool) {
-    let mut rows = Vec::new();
-    let mut count = 0;
-    if let Ok(slots) = mgr.list_slots() {
-        for (slot, content) in slots.into_iter() {
-            if (1..=9).contains(&slot) && !content.trim().is_empty() {
-                count += 1;
-                let preview = truncate(&content, 40);
-                let active = if slot == active_slot { "1" } else { "0" };
-                rows.push(format!(
-                    "ROW\t{}\t{}\t{}\t{}\t{}",
-                    slot,
-                    slot_badge(slot),
-                    content_icon(&preview),
-                    preview,
-                    active,
-                ));
-            }
-        }
-    }
-
-    let title = if just_started || count == 0 {
-        "Collecting — just press ⌘C".to_string()
-    } else {
-        format!(
-            "Collecting · {} item{}",
-            count,
-            if count == 1 { "" } else { "s" }
-        )
-    };
-
-    let mut lines = vec![
-        "STYLE\tlist".to_string(),
-        format!("TITLE\t{}", title),
-        "HINT\t⌃⌥` done".to_string(),
-    ];
-    if rows.is_empty() {
-        lines.push("PREVIEW\tempty\tCopy anything — it stacks here automatically".to_string());
-    } else {
-        lines.extend(rows);
-    }
-    lines.push("FOOT\t⌘⇧V to pick one when pasting".to_string());
-    show_hud(&lines.join("\n"));
-}
-
-/// Brief confirmation toast when Collect mode is turned off.
-#[cfg(target_os = "macos")]
-fn show_collect_done_hud() {
-    show_hud("STYLE\ttoast\nBADGE\t✓\nTITLE\tCollect mode off\nHINT\t⌘⇧V to pick");
 }
 
 /// Show the command palette — a prompt HUD listing all enabled custom actions,
@@ -4556,7 +5157,6 @@ fn start_macos_hotkey_listener(
         latch_ctrl_t: bool,
         latch_ctrl_g: bool,
         latch_ctrl_opt_space: bool,
-        latch_ctrl_opt_backquote: bool,
         latch_cmd_ctrl_c: bool,
         latch_cmd_ctrl_v: bool,
         latch_cmd_c: bool,
@@ -4572,6 +5172,38 @@ fn start_macos_hotkey_listener(
         /// released. Both inject a keystroke, and both need a clean keyboard.
         pending_letter_paste: Option<u8>,
         pending_letter_copy: Option<u8>,
+        /// Faster ways to paste: the switcher is open (⌃ still held), its V
+        /// is down (so key repeat does not race along the strip), and the
+        /// peek is waiting for ⌘ to be held long enough.
+        switcher_active: bool,
+        switcher_v_down: bool,
+        /// The C or V that armed a letter-slot chord, while it is still down.
+        /// Its auto-repeat is not the letter: holding ⌃⌥V a moment too long
+        /// used to paste slot V before you could press A.
+        leader_key_down: Option<RKey>,
+        /// ⌘ taps for the picker: when a bare ⌘ went down, whether anything
+        /// else has been pressed since, and when the last bare tap was.
+        cmd_down_at: Option<Instant>,
+        cmd_clean: bool,
+        last_bare_cmd_tap: Option<Instant>,
+        /// The picker is open until then.
+        picker_until: Option<Instant>,
+        /// ⌘C presses within this hold of ⌘ (key repeat not counted), and
+        /// when the last one was: ⌘C ⌘C then a letter copies to that letter.
+        cmd_c_presses: u8,
+        last_cmd_c_press_at: Option<Instant>,
+        c_key_down: bool,
+        /// Until when the next key, if it is a letter, takes the copy just
+        /// made with ⌘C ⌘C into that letter slot.
+        copy_letter_until: Option<Instant>,
+        /// After ⌘V ⌘V, while ⌘ stays down: until when a slot's key jumps
+        /// the paste to that slot.
+        paste_jump_until: Option<Instant>,
+        /// The first digit of a possible two-digit jump, and when.
+        jump_digit: Option<(u8, Instant)>,
+        /// The jump key still held, so its key repeat is not passed on.
+        jump_key_down: Option<RKey>,
+        peek_armed: bool,
     }
 
     let state = std::cell::RefCell::new(State {
@@ -4595,7 +5227,6 @@ fn start_macos_hotkey_listener(
         latch_ctrl_t: false,
         latch_ctrl_g: false,
         latch_ctrl_opt_space: false,
-        latch_ctrl_opt_backquote: false,
         latch_cmd_ctrl_c: false,
         latch_cmd_ctrl_v: false,
         latch_cmd_c: false,
@@ -4607,6 +5238,21 @@ fn start_macos_hotkey_listener(
         opt_last_tap: None,
         pending_letter_paste: None,
         pending_letter_copy: None,
+        switcher_active: false,
+        switcher_v_down: false,
+        leader_key_down: None,
+        cmd_down_at: None,
+        cmd_clean: false,
+        last_bare_cmd_tap: None,
+        picker_until: None,
+        cmd_c_presses: 0,
+        last_cmd_c_press_at: None,
+        c_key_down: false,
+        copy_letter_until: None,
+        paste_jump_until: None,
+        jump_digit: None,
+        jump_key_down: None,
+        peek_armed: false,
     });
 
     grab(move |event: Event| {
@@ -4638,30 +5284,29 @@ fn start_macos_hotkey_listener(
                 reconcile_modifiers(&mut s.pressed_mods, live_mods::held());
 
                 if is_modifier_key(key) {
-                    // Two taps of Option, nothing else in between, arm a letter
-                    // slot save.
-                    //
-                    // Option *alone* types nothing, which is the whole point.
-                    // Option+C and Option+V looked like a tidy mirrored pair
-                    // but they emit ç and √ — so every time clipd failed to
-                    // swallow one, the character landed in the document. A
-                    // modifier on its own cannot do that.
-                    if matches!(key, RKey::Alt | RKey::AltGr)
-                        && letter_capture_active()
+                    // ⌥ ⌥ used to arm a letter-slot copy. It is gone: the
+                    // Claude desktop app opens its quick entry on a double ⌥,
+                    // and clipd then took the first letter typed into it.
+                    // ⌘C ⌘C + letter replaces it (see below).
+                    // A bare ⌘ press may be a tap (for the picker); any
+                    // other modifier joining it is a chord, not a tap.
+                    if matches!(key, RKey::MetaLeft | RKey::MetaRight) && s.pressed_mods.is_empty() {
+                        s.cmd_down_at = Some(Instant::now());
+                        s.cmd_clean = true;
+                    } else {
+                        s.cmd_clean = false;
+                    }
+                    // ⌘ on its own may be the start of a peek; any other
+                    // modifier joining it means a shortcut, not a peek.
+                    if fast_on(FAST_PEEK)
+                        && matches!(key, RKey::MetaLeft | RKey::MetaRight)
                         && s.pressed_mods.is_empty()
                     {
-                        let now = Instant::now();
-                        let is_second = s
-                            .opt_last_tap
-                            .is_some_and(|p| now.duration_since(p) < QUICK_DOUBLE_WINDOW);
-                        if is_second {
-                            s.letter_copy_prefix_until = Some(now + QUICK_LETTER_GRACE);
-                            s.letter_paste_prefix_until = None;
-                            s.opt_last_tap = None;
-                            log::info!("⌨️  Option ×2 → letter slot copy armed");
-                        } else {
-                            s.opt_last_tap = Some(now);
-                        }
+                        s.peek_armed = true;
+                        let _ = tx.send(HotkeyTick::PeekArm);
+                    } else if s.peek_armed {
+                        s.peek_armed = false;
+                        let _ = tx.send(HotkeyTick::PeekCancel);
                     }
                     s.pressed_mods.insert(key);
                     return Some(event);
@@ -4670,6 +5315,155 @@ fn start_macos_hotkey_listener(
                 // Any other key ends a half-finished double-tap, so Option used
                 // as an ordinary modifier never drifts into arming the gesture.
                 s.opt_last_tap = None;
+
+                // ⌘V ⌘V …, ⌘ still held, then a slot's key: jump the paste
+                // straight to that slot — K for letter K, 1 then 2 for slot 12
+                // — instead of tapping V on through thirty slots. Only while
+                // ⌘ stays down after clipd's own multi-tap, so no ordinary ⌘
+                // shortcut is taken; letting go of ⌘ ends it.
+                if s.jump_key_down == Some(key) {
+                    return None;
+                }
+                if key != RKey::KeyV {
+                    if let Some(until) = s.paste_jump_until {
+                        let now = Instant::now();
+                        let target = if now <= until && is_cmd_only(&s.pressed_mods) {
+                            jump_target(key, &mut s.jump_digit, now)
+                        } else {
+                            None
+                        };
+                        match target {
+                            Some(slot) => {
+                                s.paste_jump_until = Some(now + JUMP_AFTER_PASTE);
+                                s.jump_key_down = Some(key);
+                                let _ = tx.send(HotkeyTick::PasteJump(slot));
+                                return None;
+                            }
+                            None => {
+                                s.paste_jump_until = None;
+                                s.jump_digit = None;
+                            }
+                        }
+                    }
+                }
+
+                // ⌘C ⌘C, then a letter: the copy goes in that letter slot.
+                // ⌘ may still be held or already let go — people do both, and
+                // requiring it held meant the letter was simply typed. Only
+                // the key right after a double ⌘C counts, so no ordinary ⌘
+                // shortcut is taken and C and V stay copy and paste.
+                let now = Instant::now();
+                if key == RKey::KeyC && is_cmd_only(&s.pressed_mods) {
+                    if !s.c_key_down {
+                        s.c_key_down = true;
+                        s.cmd_c_presses = if s
+                            .last_cmd_c_press_at
+                            .is_some_and(|t| now.duration_since(t) < TAP_WINDOW)
+                        {
+                            s.cmd_c_presses.saturating_add(1)
+                        } else {
+                            1
+                        };
+                        s.last_cmd_c_press_at = Some(now);
+                        s.copy_letter_until =
+                            (s.cmd_c_presses >= 2).then(|| now + LETTER_AFTER_DOUBLE_COPY);
+                    }
+                } else if let Some(until) = s.copy_letter_until.take() {
+                    let plain = s.pressed_mods.is_empty() || is_cmd_only(&s.pressed_mods);
+                    if plain && now <= until && fast_on(FAST_LETTERS) {
+                        let letter = rdev::code_from_key(key)
+                            .and_then(|code| clipd_core::keyboard_layout::typed_char(code, false))
+                            .filter(char::is_ascii_alphabetic)
+                            .or_else(|| key_to_letter_slot(key).map(|(_, _, letter)| letter))
+                            .filter(|c| !matches!(c.to_ascii_lowercase(), 'c' | 'v'));
+                        if let Some(slot) = letter.and_then(clipd_core::auto_letters::letter_slot) {
+                            s.cmd_c_presses = 0;
+                            let _ = tx.send(HotkeyTick::CopyTapsToLetter(slot));
+                            return None;
+                        }
+                    }
+                }
+
+                // ── Faster ways to paste ──
+                // The picker (opened by a ⌘ tap) takes the next bare key: a
+                // slot's letter or number picks it; Esc closes it; anything
+                // else closes it and goes through as usual.
+                if s.picker_until.is_some_and(|until| Instant::now() <= until) {
+                    s.picker_until = None;
+                    let bare = s
+                        .pressed_mods
+                        .iter()
+                        .all(|m| matches!(m, RKey::ShiftLeft | RKey::ShiftRight));
+                    let picked = bare
+                        .then(|| {
+                            rdev::code_from_key(key)
+                                .and_then(|code| clipd_core::keyboard_layout::typed_char(code, false))
+                                .and_then(clipd_core::fast_paste::picker_slot_for_key)
+                        })
+                        .flatten();
+                    if let Some(slot) = picked {
+                        let _ = tx.send(HotkeyTick::PeekChoose(slot));
+                        return None;
+                    }
+                    let _ = tx.send(HotkeyTick::PeekCancel);
+                    if key == RKey::Escape {
+                        return None;
+                    }
+                }
+                // Anything pressed during a ⌘ press makes it a chord, not a
+                // tap.
+                s.cmd_clean = false;
+                // The peek is open: ⌘ + a slot's key picks that slot (paste
+                // it, or keep the copy there), and the key stays out of the
+                // app. Read through the layout, so it is the letter typed.
+                if PEEK_SHOWN.load(Ordering::Relaxed) && is_cmd_only(&s.pressed_mods) {
+                    let picked = rdev::code_from_key(key)
+                        .and_then(|code| clipd_core::keyboard_layout::typed_char(code, false))
+                        .and_then(clipd_core::fast_paste::peek_slot_for_key);
+                    if let Some(slot) = picked {
+                        let _ = tx.send(HotkeyTick::PeekChoose(slot));
+                        return None;
+                    }
+                }
+                // Any other key with ⌘ down is a shortcut, not a peek.
+                if s.peek_armed {
+                    s.peek_armed = false;
+                    let _ = tx.send(HotkeyTick::PeekCancel);
+                }
+
+                // The switcher, while open: V moves along, 1-9 picks, Esc
+                // closes. Everything is swallowed: these keys belong to it.
+                if s.switcher_active && is_ctrl_only(&s.pressed_mods) {
+                    if key == RKey::KeyV {
+                        if !s.switcher_v_down {
+                            s.switcher_v_down = true;
+                            let _ = tx.send(HotkeyTick::SwitcherTap);
+                        }
+                        return None;
+                    }
+                    if key == RKey::Escape {
+                        s.switcher_active = false;
+                        let _ = tx.send(HotkeyTick::SwitcherCancel);
+                        return None;
+                    }
+                    if let Some(n) = key_to_digit_slot(key).filter(|n| (1..=9).contains(n)) {
+                        s.switcher_active = false;
+                        let _ = tx.send(HotkeyTick::SwitcherPick(n));
+                        return None;
+                    }
+                }
+                // ⌃V opens it. Not in a terminal, where ⌃V is "insert the
+                // next character literally" and people use it on purpose.
+                if fast_on(FAST_SWITCHER)
+                    && is_ctrl_only(&s.pressed_mods)
+                    && key == RKey::KeyV
+                    && !is_terminal_frontmost()
+                {
+                    s.switcher_active = true;
+                    s.switcher_v_down = true;
+                    let _ = tx.send(HotkeyTick::SwitcherTap);
+                    return None;
+                }
 
 
                 // A letter counts whether or not the leader's modifiers are
@@ -4688,6 +5482,11 @@ fn start_macos_hotkey_listener(
                     s.letter_copy_prefix_until.is_some_and(|u| now <= u)
                         || s.letter_paste_prefix_until.is_some_and(|u| now <= u)
                 };
+                // The key that armed the chord, repeating while still held,
+                // is not the letter being asked for.
+                if prefix_armed && s.leader_key_down == Some(key) {
+                    return None;
+                }
                 if letter_capture_active()
                     && (is_bare_letter(&s.pressed_mods) || prefix_armed)
                 {
@@ -4884,23 +5683,17 @@ fn start_macos_hotkey_listener(
                         }
                         return None;
                     }
-                    if key == RKey::BackQuote {
-                        if !s.latch_ctrl_opt_backquote {
-                            s.latch_ctrl_opt_backquote = true;
-                            log::info!("⌨️  Ctrl+Option+` → toggle collect mode");
-                            let _ = tx.send(HotkeyTick::ToggleCollect);
-                        }
-                        return None;
-                    }
                     if direct_letter_shortcuts_enabled() && key == RKey::KeyC {
                         s.letter_copy_prefix_until = Some(Instant::now() + LETTER_PREFIX_WINDOW);
                         s.letter_paste_prefix_until = None;
+                        s.leader_key_down = Some(RKey::KeyC);
                         log::info!("⌨️  Ctrl+Option+C → letter copy prefix");
                         return None;
                     }
                     if direct_letter_shortcuts_enabled() && key == RKey::KeyV {
                         s.letter_paste_prefix_until = Some(Instant::now() + LETTER_PREFIX_WINDOW);
                         s.letter_copy_prefix_until = None;
+                        s.leader_key_down = Some(RKey::KeyV);
                         log::info!("⌨️  Ctrl+Option+V → letter paste prefix");
                         return None;
                     }
@@ -4943,12 +5736,14 @@ fn start_macos_hotkey_listener(
                             s.latch_cmd_opt_c = true;
                             s.letter_copy_prefix_until = Some(now + LETTER_PREFIX_WINDOW);
                             s.letter_paste_prefix_until = None;
+                            s.leader_key_down = Some(RKey::KeyC);
                             log::info!("⌨️  Cmd+Option+C → letter slot copy armed");
                         }
                     } else if !s.latch_cmd_opt_v {
                         s.latch_cmd_opt_v = true;
                         s.letter_paste_prefix_until = Some(now + LETTER_PREFIX_WINDOW);
                         s.letter_copy_prefix_until = None;
+                        s.leader_key_down = Some(RKey::KeyV);
                         log::info!("⌨️  Cmd+Option+V → letter slot paste armed");
                     }
                     return None;
@@ -5038,15 +5833,9 @@ fn start_macos_hotkey_listener(
                 }
                 // Cmd+V (just Cmd, no Ctrl/Shift/Option)
                 if is_cmd_only(&s.pressed_mods) && key == RKey::KeyV {
-                    // Deliberately no ⌘V ⌘V letter arming here.
-                    //
-                    // ⌘V ×2 already means "paste slot 2", and unlike the copy
-                    // side that clash cannot be deferred: a double ⌘C can hold
-                    // its numeric commit for half a second and let a following
-                    // letter cancel it, but a paste has already put the content
-                    // into your app by then. There is nothing left to take
-                    // back. Letter paste stays on Ctrl+Option+letter, which is
-                    // one chord, no timing, and collides with nothing.
+                    // A slot's key after ⌘V ⌘V (⌘ held) jumps to that slot:
+                    // see the jump above. Each tap's paste replaces the last,
+                    // so a jump can replace it too.
                     let _ = tx.send(HotkeyTick::CmdVTap);
                     // A ⌘V that continues a multi-tap is not a paste of the
                     // clipboard: the daemon pastes the slot for this count
@@ -5058,6 +5847,10 @@ fn start_macos_hotkey_listener(
                         .is_some_and(|prev| now.duration_since(prev) < TAP_WINDOW)
                         && load_paste_transform_settings().multi_slot_enabled;
                     s.cmd_v_last_press = Some(now);
+                    if continues {
+                        s.paste_jump_until = Some(now + JUMP_AFTER_PASTE);
+                        s.jump_digit = None;
+                    }
                     return if continues { None } else { Some(event) };
                 }
 
@@ -5076,6 +5869,13 @@ fn start_macos_hotkey_listener(
                 }
             }
             EventType::KeyRelease(key) => {
+                if s.jump_key_down == Some(key) {
+                    s.jump_key_down = None;
+                }
+                if matches!(key, RKey::MetaLeft | RKey::MetaRight) {
+                    s.paste_jump_until = None;
+                    s.jump_digit = None;
+                }
                 if is_modifier_key(key) {
                     s.pressed_mods.remove(&key);
                     // The chord is off the keyboard — a deferred letter paste
@@ -5090,6 +5890,37 @@ fn start_macos_hotkey_listener(
                     }
                     // After Cmd+C the OS often never delivers KeyRelease for C; releasing Command
                     // must arm the next Cmd+C / Cmd+V chord.
+                    // Letting go of ⌘ ends a peek; letting go of ⌃ pastes
+                    // the switcher's pick.
+                    if matches!(key, RKey::MetaLeft | RKey::MetaRight) && s.peek_armed {
+                        s.peek_armed = false;
+                        let _ = tx.send(HotkeyTick::PeekCancel);
+                    }
+                    // Two quick ⌘ taps open the picker, to paste a slot.
+                    if matches!(key, RKey::MetaLeft | RKey::MetaRight) && fast_on(FAST_PEEK) {
+                        /// Longest press that still counts as a tap.
+                        const TAP_MAX: Duration = Duration::from_millis(300);
+                        /// Gap between the two taps of a double tap.
+                        const DOUBLE_TAP: Duration = Duration::from_millis(450);
+                        let now = Instant::now();
+                        let is_tap = s.cmd_clean
+                            && s.cmd_down_at.is_some_and(|d| now.duration_since(d) <= TAP_MAX);
+                        if !is_tap {
+                            s.last_bare_cmd_tap = None;
+                        } else if s.last_bare_cmd_tap.is_some_and(|t| now.duration_since(t) <= DOUBLE_TAP) {
+                            s.last_bare_cmd_tap = None;
+                            s.picker_until = Some(now + Duration::from_secs(4));
+                            let _ = tx.send(HotkeyTick::PickerOpen);
+                        } else {
+                            s.last_bare_cmd_tap = Some(now);
+                        }
+                        s.cmd_down_at = None;
+                        s.cmd_clean = false;
+                    }
+                    if matches!(key, RKey::ControlLeft | RKey::ControlRight) && s.switcher_active {
+                        s.switcher_active = false;
+                        let _ = tx.send(HotkeyTick::SwitcherCommit);
+                    }
                     if matches!(key, RKey::MetaLeft | RKey::MetaRight) {
                         s.latch_cmd_c = false;
                         s.latch_cmd_v = false;
@@ -5126,6 +5957,10 @@ fn start_macos_hotkey_listener(
                         s.latch_ctrl_shift_s = false;
                     }
                     RKey::KeyV => {
+                        s.switcher_v_down = false;
+                        if s.leader_key_down == Some(RKey::KeyV) {
+                            s.leader_key_down = None;
+                        }
                         s.latch_ctrl_shift_v = false;
                         s.latch_cmd_shift_v = false;
                         s.latch_cmd_opt_v = false;
@@ -5135,6 +5970,10 @@ fn start_macos_hotkey_listener(
                         s.latch_ctrl_v = false;
                     }
                     RKey::KeyC => {
+                        s.c_key_down = false;
+                        if s.leader_key_down == Some(RKey::KeyC) {
+                            s.leader_key_down = None;
+                        }
                         s.latch_cmd_opt_c = false;
                         s.latch_ctrl_shift_opt_c = false;
                         s.latch_shift_opt_c = false;
@@ -5153,7 +5992,6 @@ fn start_macos_hotkey_listener(
                         s.latch_ctrl_g = false;
                         s.latch_cmd_shift_v = false;
                     }
-                    RKey::BackQuote => s.latch_ctrl_opt_backquote = false,
                     RKey::Num1
                     | RKey::Num2
                     | RKey::Num3
@@ -5174,6 +6012,21 @@ fn start_macos_hotkey_listener(
                             s.latch_ctrl_shift_opt_letter_slot[idx] = false;
                         }
                     }
+                }
+            }
+            // A click ends a ⌘ tap, the picker and a peek: ⌘-click is none
+            // of them.
+            EventType::ButtonPress(_) => {
+                s.cmd_clean = false;
+                s.copy_letter_until = None;
+                s.paste_jump_until = None;
+                s.last_bare_cmd_tap = None;
+                if s.picker_until.take().is_some() {
+                    let _ = tx.send(HotkeyTick::PeekCancel);
+                }
+                if s.peek_armed {
+                    s.peek_armed = false;
+                    let _ = tx.send(HotkeyTick::PeekCancel);
                 }
             }
             _ => {}
@@ -5534,7 +6387,7 @@ fn is_ctrl_shift_opt(pressed_mods: &HashSet<RKey>) -> bool {
         && !pressed_mods.contains(&RKey::MetaRight)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn key_to_digit_slot(key: RKey) -> Option<u8> {
     match key {
         RKey::Num1 => Some(1),
@@ -5548,6 +6401,48 @@ fn key_to_digit_slot(key: RKey) -> Option<u8> {
         RKey::Num9 => Some(9),
         _ => None,
     }
+}
+
+/// The slot a key jumps to during ⌘V ⌘V: a letter's slot, or a number. A
+/// second digit soon after the first makes a two-digit slot up to 30 (1, 2 →
+/// 12); otherwise each digit is its own slot. C and V are not letters here:
+/// ⌘C and ⌘V stay copy and paste.
+#[cfg(target_os = "macos")]
+fn jump_target(key: RKey, first_digit: &mut Option<(u8, Instant)>, now: Instant) -> Option<u8> {
+    let digit = match key {
+        RKey::Num0 => Some(0),
+        other => key_to_digit_slot(other),
+    };
+    if let Some(d) = digit {
+        if let Some(n) = two_digit_slot(first_digit.take(), d, now) {
+            return Some(n);
+        }
+        if d == 0 {
+            return None;
+        }
+        *first_digit = Some((d, now));
+        return Some(d);
+    }
+    *first_digit = None;
+    if !fast_on(FAST_LETTERS) {
+        return None;
+    }
+    let letter = rdev::code_from_key(key)
+        .and_then(|code| clipd_core::keyboard_layout::typed_char(code, false))
+        .filter(char::is_ascii_alphabetic)
+        .or_else(|| key_to_letter_slot(key).map(|(_, _, letter)| letter))
+        .filter(|c| !matches!(c.to_ascii_lowercase(), 'c' | 'v'))?;
+    clipd_core::auto_letters::letter_slot(letter)
+}
+
+/// The slot two digits make, when the second came soon enough after the
+/// first and the number is one of 10..=30.
+#[cfg(target_os = "macos")]
+fn two_digit_slot(first: Option<(u8, Instant)>, second: u8, now: Instant) -> Option<u8> {
+    first
+        .filter(|(_, at)| now.duration_since(*at) <= JUMP_SECOND_DIGIT)
+        .map(|(first, _)| first * 10 + second)
+        .filter(|n| (10..=LAST_NUMBERED_SLOT).contains(n))
 }
 
 #[cfg(target_os = "macos")]
@@ -5705,6 +6600,9 @@ fn letter_capture_active() -> bool {
     s.letter_slots_enabled && (s.direct_letter_shortcuts_enabled || s.quick_letter_slots_enabled)
 }
 
+/// The numbered slots are 1..=30; A-Z start at 31.
+const LAST_NUMBERED_SLOT: u8 = 30;
+
 fn upper_slot_for_taps(taps: u8) -> u8 {
     // Keep the extended numeric bank disjoint from the named A-Z bank, which
     // starts at slot 31. Without this cap a long Option+C/V multi-tap sequence
@@ -5712,11 +6610,13 @@ fn upper_slot_for_taps(taps: u8) -> u8 {
     taps.saturating_add(10).min(30)
 }
 
-/// Highest slot a Cmd/Ctrl multi-tap can reach. When multi-slot is disabled
+/// Highest slot a Cmd/Ctrl multi-tap can reach: the whole numbered bank, so
+/// tapping on past 9 keeps going (10, 11, …) instead of piling onto 9. It
+/// stops at 30, where the letter slots begin. When multi-slot is disabled
 /// every tap collapses to slot 1, so Cmd+C/Cmd+V behave like normal copy/paste.
 fn primary_tap_slot_limit(settings: &PasteTransformSettings) -> u8 {
     if settings.multi_slot_enabled {
-        9
+        LAST_NUMBERED_SLOT
     } else {
         1
     }
@@ -5804,35 +6704,17 @@ mod slot_mapping_tests {
     }
 
     #[test]
-    fn the_letter_gesture_stays_off_the_numeric_keys() {
-        // Letter slots hang off a double-tap of Option, which types nothing on
-        // its own and shares no key with ⌘C / ⌘V. Option+C / Option+V were
-        // tried and are wrong twice over: they emit ç and √, and they already
-        // address the extended 11–30 bank.
+    fn copying_into_a_letter_is_not_a_race() {
+        // ⌘C ⌘C, then a letter with ⌘ held. (A double ⌥ used to arm this, but
+        // the Claude desktop app opens on a double ⌥, and the first letter
+        // typed into it was swallowed.) The letter has to be comfortably
+        // reachable, and the numbered slot the double ⌘C filled is put back,
+        // so a slow letter costs nothing.
         assert!(
-            QUICK_DOUBLE_WINDOW <= Duration::from_millis(600),
-            "two taps that far apart are two separate presses"
-        );
-        assert!(
-            QUICK_LETTER_GRACE >= Duration::from_millis(1500),
-            "the letter that follows should not be a race"
-        );
-    }
-
-    #[test]
-    fn a_quick_letter_save_is_not_a_race() {
-        // The letter window used to double as a stall on the numeric commit:
-        // press the letter in time and the content went to slot A, miss and it
-        // went to slot 2. One gesture, two outcomes, decided by a stopwatch.
-        //
-        // The letter is additive now — the content goes to both — so nothing is
-        // being held back and the window only has to be comfortable.
-        assert!(
-            QUICK_LETTER_GRACE >= Duration::from_millis(1500),
+            LETTER_AFTER_DOUBLE_COPY >= Duration::from_millis(1500),
             "a window you can miss is a window someone has to think about"
         );
-        // The numeric path commits on its own timing, untouched by the letter.
-        assert!(TAP_WINDOW < QUICK_LETTER_GRACE);
+        assert!(TAP_WINDOW < LETTER_AFTER_DOUBLE_COPY);
     }
 
     #[test]
@@ -5855,13 +6737,15 @@ mod slot_mapping_tests {
     }
 
     #[test]
-    fn numbered_multitaps_map_to_slots_one_through_nine() {
+    fn numbered_multitaps_go_past_nine_and_stop_before_the_letters() {
         let settings = PasteTransformSettings::default();
         assert!(settings.multi_slot_enabled);
         assert_eq!(primary_slot_for_taps(1, &settings), 1);
         assert_eq!(primary_slot_for_taps(2, &settings), 2);
         assert_eq!(primary_slot_for_taps(9, &settings), 9);
-        assert_eq!(primary_slot_for_taps(10, &settings), 9);
+        assert_eq!(primary_slot_for_taps(10, &settings), 10);
+        assert_eq!(primary_slot_for_taps(30, &settings), 30);
+        assert_eq!(primary_slot_for_taps(45, &settings), 30, "never into A-Z");
     }
 
     #[test]
@@ -5890,28 +6774,65 @@ mod slot_mapping_tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn two_digits_make_slots_ten_to_thirty() {
+        let t = Instant::now();
+        let soon = t + Duration::from_millis(300);
+        let late = t + JUMP_SECOND_DIGIT + Duration::from_millis(1);
+        assert_eq!(two_digit_slot(Some((1, t)), 2, soon), Some(12));
+        assert_eq!(two_digit_slot(Some((3, t)), 0, soon), Some(30));
+        assert_eq!(two_digit_slot(Some((2, t)), 0, soon), Some(20));
+        assert_eq!(two_digit_slot(Some((3, t)), 1, soon), None, "31 is A, not a number");
+        assert_eq!(two_digit_slot(Some((1, t)), 2, late), None, "too slow: just 2");
+        assert_eq!(two_digit_slot(None, 4, soon), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn the_slot_strip_stays_inside_the_bank() {
         // Five chips centred on the live slot, clamped so the window never
-        // runs past either end of 1..9 — a strip that starts at 0 or ends at
-        // 11 is showing slots that do not exist.
+        // runs past either end of 1..30 — a strip that starts at 0 or ends at
+        // 31 is showing slots that do not exist.
         assert_eq!(slot_strip(7), Some((5, 9)));
         assert_eq!(slot_strip(5), Some((3, 7)));
+        // Tapping on past 9 carries the strip with it.
+        assert_eq!(slot_strip(9), Some((7, 11)));
+        assert_eq!(slot_strip(12), Some((10, 14)));
         // Near the ends the window stops moving rather than hanging off.
         assert_eq!(slot_strip(1), Some((1, 5)));
         assert_eq!(slot_strip(2), Some((1, 5)));
-        assert_eq!(slot_strip(9), Some((5, 9)));
-        assert_eq!(slot_strip(8), Some((5, 9)));
+        assert_eq!(slot_strip(30), Some((26, 30)));
+        assert_eq!(slot_strip(29), Some((26, 30)));
         // Every window is five wide and contains the slot it is drawn for.
-        for slot in 1..=9u8 {
+        for slot in 1..=30u8 {
             let (first, last) = slot_strip(slot).expect("numeric slots have a strip");
             assert_eq!(last - first, 4, "slot {slot} strip is not five wide");
             assert!((first..=last).contains(&slot), "slot {slot} outside its own strip");
-            assert!(first >= 1 && last <= 9, "slot {slot} strip leaves the bank");
+            assert!(first >= 1 && last <= 30, "slot {slot} strip leaves the bank");
         }
-        // The extended and letter banks get the plain toast: a five-chip
-        // window onto twenty-six slots would say nothing.
-        assert_eq!(slot_strip(15), None);
+        // The numeric run stops at 30; letters join it in `strip_chips`.
+        assert_eq!(slot_strip(0), None);
         assert_eq!(slot_strip(31), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn filled_letters_follow_the_numbers_in_the_strip() {
+        // A = 31, E = 35, H = 38.
+        let letters = [31, 35, 38];
+        let (chips, lit) = strip_chips(4, &letters).unwrap();
+        assert_eq!(chips, ["2", "3", "4", "5", "6", "A", "E", "H"]);
+        assert_eq!(chips[lit], "4");
+        // A letter slot: the filled letters around it, lit.
+        let (chips, lit) = strip_chips(35, &letters).unwrap();
+        assert_eq!(chips, ["A", "E", "H"]);
+        assert_eq!(chips[lit], "E");
+        // A letter being filled for the first time is shown too.
+        let (chips, lit) = strip_chips(33, &letters).unwrap();
+        assert_eq!(chips, ["A", "C", "E", "H"]);
+        assert_eq!(chips[lit], "C");
+        // No letters filled: just the numbers, past 9 too.
+        assert_eq!(strip_chips(1, &[]).unwrap().0.len(), 5);
+        assert_eq!(strip_chips(15, &[]).unwrap().0, ["13", "14", "15", "16", "17"]);
     }
 
     #[cfg(target_os = "macos")]

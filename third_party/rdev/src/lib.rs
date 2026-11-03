@@ -228,6 +228,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use crate::macos::Keyboard;
 #[cfg(target_os = "macos")]
+pub use crate::macos::code_from_key;
+#[cfg(target_os = "macos")]
 use crate::macos::{display_size as _display_size, listen as _listen, simulate as _simulate};
 
 #[cfg(target_os = "linux")]

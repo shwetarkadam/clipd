@@ -509,6 +509,30 @@ pub struct PasteTransformSettings {
     #[serde(default = "default_true_val")]
     pub paste_on_pick: bool,
 
+    /// Faster ways to paste (see `crate::fast_paste`). All opt-in: each one
+    /// listens to the keyboard in a new way, so it is the person's call.
+    ///
+    /// Hold ⌃ and tap V: a strip of recent clips at the text cursor; let go
+    /// to paste the selected one.
+    #[serde(default)]
+    pub switcher_enabled: bool,
+    /// Hold ⌘ on its own for a moment: see what ⌘V (and ⌘V ×2, ×3) pastes.
+    #[serde(default)]
+    pub peek_enabled: bool,
+    /// Whether the person has been asked about the three above (onboarding,
+    /// or the one-time card for people who onboarded before they existed).
+    #[serde(default)]
+    pub fast_paste_offered: bool,
+    /// Letter slots fill themselves: E the latest email, L link, P phone
+    /// number, K code (see `crate::auto_letters`). On by default, with the
+    /// letter slots themselves; letters you name are never overwritten.
+    #[serde(default = "default_true_val")]
+    pub auto_letter_slots: bool,
+    /// Whether the letter-slot introduction has been shown (onboarding, or
+    /// the one-time card for people who onboarded before it existed).
+    #[serde(default)]
+    pub letter_slots_intro_seen: bool,
+
     /// Show the running clip count in the popover. Some people read it as
     /// useful state, others as noise on a panel meant to be glanced at.
     #[serde(default = "default_true_val")]
@@ -623,6 +647,11 @@ impl Default for PasteTransformSettings {
             hover_opens_hud: true,
             open_at_caret: true,
             paste_on_pick: true,
+            switcher_enabled: false,
+            peek_enabled: false,
+            fast_paste_offered: false,
+            auto_letter_slots: true,
+            letter_slots_intro_seen: false,
             show_clip_count: true,
             gui_layout: GuiLayout::Palette,
             copy_multi_tap_restore: true,
@@ -729,10 +758,9 @@ pub const PRACTICE_LINES: [&str; 3] = ["Ada Lovelace", "ada@example.com", "+44 2
 /// Which practice lines are already sitting in their slot.
 ///
 /// Read from what the slots actually hold, never from which keys were pressed.
-/// clipd has more than one way into a slot — two quick single copies start
-/// collect mode, which stacks later copies into 2, 3, … on its own — and the
-/// exercise should tick for any of them. What matters is that the right thing
-/// ended up in the right place.
+/// clipd has more than one way into a slot (⌘C ×N, the slot strip, the
+/// Settings tools), and the exercise should tick for any of them. What
+/// matters is that the right thing ended up in the right place.
 pub fn practice_marks(slots: &[(u8, String)]) -> [bool; 3] {
     let mut marks = [false; 3];
     for (i, line) in PRACTICE_LINES.iter().enumerate() {

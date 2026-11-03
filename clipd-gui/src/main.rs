@@ -487,7 +487,7 @@ fn letter_slot_bindings() -> &'static [(&'static str, &'static str)] {
         &[
             ("Ctrl+`  then a letter", "Paste that letter slot"),
             ("Ctrl+`  then Shift+letter", "Save the clipboard to it"),
-            ("Ctrl+C ×N", "Numeric slots 1–9 by tap count"),
+            ("Ctrl+C ×N", "Numeric slots 1–30 by tap count"),
         ]
     }
     #[cfg(not(target_os = "windows"))]
@@ -1219,6 +1219,23 @@ fn draw_search_icon(ui: &mut egui::Ui, col: Color32) {
 /// what an app uses when it has no mark of its own. clipd has one, and the
 /// island was already wearing it while this window introduced the product as
 /// a different app entirely.
+/// Make `rect` a handle for moving the window.
+///
+/// The palette and Settings are borderless, so there is no title bar for
+/// macOS to drag: pressing on the header and moving did nothing, and the
+/// window just sat under the pointer looking frozen. A drag that starts here
+/// is handed to the window server (`StartDrag`), which moves the window
+/// natively — smooth, and with no frames of ours in the loop.
+fn window_drag_zone(ui: &egui::Ui, rect: egui::Rect, id: &'static str) {
+    let resp = ui.interact(rect, egui::Id::new(("window_drag", id)), egui::Sense::drag());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    if resp.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+}
+
 fn draw_brand_mark(ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 22.0), egui::Sense::hover());
     draw_clipd_mark(ui, rect, rgb(c.accent));
@@ -1339,7 +1356,14 @@ fn slots_first(
 pub(crate) fn slot_paste_keys(slots: &[u8]) -> String {
     let mut keys = slots.iter().map(|n| slot_chord('V', *n));
     let first = keys.next().unwrap_or_default();
-    let rest: Vec<String> = slots[1..].iter().map(|n| if *n == 1 { "⌘V".into() } else { format!("×{n}") }).collect();
+    let rest: Vec<String> = slots[1..]
+        .iter()
+        .map(|n| match *n {
+            1 => "⌘V".into(),
+            31..=56 => slot_chord('V', *n),
+            n => format!("×{n}"),
+        })
+        .collect();
     if rest.is_empty() {
         format!("{first} pastes it")
     } else {
@@ -2394,6 +2418,11 @@ enum OnboardStep {
     /// Paste one of them back, in any app.
     Paste,
     Success,
+    /// Letter slots: what fills them, how to name and paste one. On by
+    /// default, with the switches right there to turn off.
+    Letters,
+    /// Offer the faster ways to paste (macOS): each one is the person's call.
+    Faster,
 }
 
 impl OnboardStep {
@@ -2404,6 +2433,8 @@ impl OnboardStep {
             OnboardStep::Try => 4,
             OnboardStep::Success => 8,
             OnboardStep::Paste => 16,
+            OnboardStep::Faster => 32,
+            OnboardStep::Letters => 64,
         }
     }
     fn name(self) -> &'static str {
@@ -2413,12 +2444,35 @@ impl OnboardStep {
             OnboardStep::Try => "try",
             OnboardStep::Paste => "paste",
             OnboardStep::Success => "success",
+            OnboardStep::Faster => "faster",
+            OnboardStep::Letters => "letters",
         }
     }
 }
 
 /// Slot `n` in the words a person would press: `⌘C`, `⌘C ×3`.
+/// The letter-slot keys, the way this platform presses them.
+const LETTER_KEYS: &str = if cfg!(target_os = "windows") {
+    "Copy into a letter: Ctrl+C Ctrl+C, then the letter. Paste: Ctrl+V Ctrl+V then the letter, or Ctrl+` then the letter."
+} else {
+    "Copy into a letter: ⌘C ⌘C, then the letter. Paste: ⌃⌥ + the letter, or ⌘V ⌘V then the letter with ⌘ still held."
+};
+
+/// Whether the faster ways to paste exist here: the switcher on macOS and
+/// Windows, the ⌘ peek and picker on macOS only (Windows has Ctrl+`).
+const FAST_PASTE_HERE: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
 fn slot_chord(key: char, n: u8) -> String {
+    // Letter slots: ⌃⌥ + the letter pastes one; ⌘C ⌘C then the letter (⌘
+    // still held) copies into one.
+    if (31..=56).contains(&n) {
+        let letter = clipd_core::slot_badge(n);
+        return if key == 'V' {
+            format!("⌃⌥{letter}")
+        } else {
+            format!("⌘C ⌘C {letter}")
+        };
+    }
     if n == 1 {
         format!("⌘{key}")
     } else {
@@ -2435,11 +2489,13 @@ fn slot_chord(key: char, n: u8) -> String {
 pub(crate) fn slot_chip_hint(n: u8, held: Option<&str>, click_verb: &str) -> String {
     match held {
         Some(preview) => format!(
-            "Slot {n}: {preview}\nClick to {click_verb} it · from any app: {}",
+            "Slot {}: {preview}\nClick to {click_verb} it · from any app: {}",
+            clipd_core::slot_badge(n),
             slot_chord('V', n)
         ),
         None => format!(
-            "Slot {n} is empty\nClick to save your latest copy here · from any app: {}",
+            "Slot {} is empty\nClick to save your latest copy here · from any app: {}",
+            clipd_core::slot_badge(n),
             slot_chord('C', n)
         ),
     }
@@ -2463,7 +2519,10 @@ pub(crate) fn save_to_slot(n: u8, text: &str) -> bool {
     }
 }
 
-/// Slots 1-9 as (slot, Some((content, preview))) — read from the slot store.
+/// Slots 1-9 as (slot, Some((content, preview))), then each letter slot that
+/// holds something — read from the slot store. Letters come after the numbers
+/// wherever slots are listed; only filled ones, since twenty-six empty chips
+/// would bury the nine that matter.
 ///
 /// Not from the clips' `slot` labels. A clip carries one label, keyed by its
 /// text, so two slots holding the same text cannot both be represented: one
@@ -2480,7 +2539,13 @@ pub(crate) fn strip_rows_from_store(
     clips: &[ClipEntry],
     mask: impl Fn(&str) -> Option<String>,
 ) -> Vec<(u8, Option<(String, String)>)> {
+    let filled_letters = (31..=56u8).filter(|n| {
+        active
+            .iter()
+            .any(|(slot, content)| slot == n && !content.trim().is_empty())
+    });
     (1..=9u8)
+        .chain(filled_letters)
         .map(|n| {
             let held = active.iter().find(|(slot, _)| *slot == n).map(|(_, content)| {
                 let preview = clips
@@ -4628,6 +4693,9 @@ struct ClipdGui {
     new_action_output: ActionOutput,
     /// Last action result banner in the preview pane: (ok, message).
     action_status: Option<(bool, String)>,
+    /// A one-line confirmation shown in the footer for a few seconds, in place
+    /// of the key hints ("Slot E now holds this…").
+    footer_note: Option<(String, Instant)>,
     /// A send or undo-send under way on a worker thread; reports the banner
     /// to show when it finishes.
     send_job: Option<std::sync::mpsc::Receiver<(bool, String)>>,
@@ -4954,6 +5022,7 @@ impl ClipdGui {
             new_action_auto: String::new(),
             new_action_output: ActionOutput::Clipboard,
             action_status: None,
+            footer_note: None,
             send_job: None,
             pairing: PairingState::Idle,
             nearby: Vec::new(),
@@ -5898,7 +5967,7 @@ impl ClipdGui {
 
     /// The Slots toggle at the right end of the popover's search bar. Off,
     /// the list is the clipboard (pins, then newest); on, it is what is in
-    /// slots 1-9, in slot order.
+    /// the slots, in slot order.
     fn render_hud_slots_toggle(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
         let filled: usize = self.slots_by_content.values().map(Vec::len).sum();
         let on = self.hud_slots_view;
@@ -5926,7 +5995,7 @@ impl ClipdGui {
             .on_hover_text(if on {
                 "Back to the clipboard"
             } else {
-                "What's in slots 1-9 · ⌘V ×N pastes slot N from any app"
+                "What's in your slots, numbers then letters · ⌘V ×N or ⌃⌥ + letter pastes one"
             });
         if resp.clicked() {
             self.hud_slots_view = !on;
@@ -6721,7 +6790,7 @@ impl ClipdGui {
                 self.filtered = kept;
             }
         }
-        // The popover's Slots view: only what is in slots 1-9, in slot order.
+        // The popover's Slots view: only what is in the slots, in slot order.
         // A view of its own rather than a section on top, so the clipboard
         // keeps its order — pins first, then newest. Slots hold what you set
         // aside on purpose, which in date order sat a hundred rows down.
@@ -7129,6 +7198,32 @@ impl ClipdGui {
                 self.action_status = Some((false, "The send stopped unexpectedly.".into()));
                 self.send_job = None;
             }
+        }
+    }
+
+    /// Give the selected clip a letter: it goes in that letter slot, and the
+    /// automatic letters will leave it there (see `clipd_core::auto_letters`).
+    fn name_selected_clip(&mut self, letter: char) {
+        let Some(clip) = self.selected_clip().cloned() else {
+            return;
+        };
+        if matches!(clip.content_type, ContentType::Image | ContentType::File) {
+            self.footer_note = Some(("Only text clips can go in a letter slot".into(), Instant::now()));
+            return;
+        }
+        let Some(slot) = clipd_core::auto_letters::letter_slot(letter) else {
+            return;
+        };
+        if save_to_slot(slot, &clip.content) {
+            clipd_core::auto_letters::mark_named(letter);
+            self.refresh();
+            self.footer_note = Some((
+                format!("Slot {letter} now holds this · paste with ⌃⌥{letter}"),
+                Instant::now(),
+            ));
+            clipd_core::telemetry_event("letter_named", &[]);
+        } else {
+            self.footer_note = Some(("Couldn't save to that slot".into(), Instant::now()));
         }
     }
 
@@ -8084,6 +8179,9 @@ impl eframe::App for ClipdGui {
         });
 
         let mut should_cycle_theme = false;
+        // ⌘⌥ + a letter names the selected clip: it goes in that letter slot.
+        // ⌘ is there so ⌥ does not compose an accent in the search field.
+        let mut name_letter: Option<char> = None;
         let mut esc_back = false;
         let mut toggle_preview = false;
         ctx.input(|i| {
@@ -8139,8 +8237,25 @@ impl eframe::App for ClipdGui {
             {
                 action = Action::Delete;
             }
-            if i.key_pressed(egui::Key::T) && i.modifiers.command {
+            if i.key_pressed(egui::Key::T) && i.modifiers.command && !i.modifiers.alt {
                 should_cycle_theme = true;
+            }
+            // macOS only: on Windows ⌘⌥ is Ctrl+Alt, which is AltGr on many
+            // European layouts — it types @, € and { there.
+            if cfg!(target_os = "macos")
+                && i.modifiers.command
+                && i.modifiers.alt
+                && self.paste_settings.letter_slots_enabled
+            {
+                for ev in &i.events {
+                    if let egui::Event::Key { key, pressed: true, .. } = ev {
+                        let name = key.name();
+                        let mut chars = name.chars();
+                        if let (Some(l @ 'A'..='Z'), None) = (chars.next(), chars.next()) {
+                            name_letter = Some(l);
+                        }
+                    }
+                }
             }
             // Cmd+C copies the selected clip without closing the palette
             // (replaces the old preview-pane Copy button).
@@ -8187,6 +8302,9 @@ impl eframe::App for ClipdGui {
         });
         if should_cycle_theme {
             self.cycle_theme(ctx);
+        }
+        if let Some(letter) = name_letter {
+            self.name_selected_clip(letter);
         }
         // Esc backs out one level: Pins/Settings → Clips; preview → list only;
         // bare list → hide. Keyboard must always work even if the mouse is
@@ -9410,6 +9528,31 @@ impl ClipdGui {
             );
         });
 
+        if FAST_PASTE_HERE {
+            settings_section(ui, c, "Paste faster");
+            settings_card(ui, c, |ui| {
+                dirty |= self.fast_paste_toggles(ui, c);
+            });
+        }
+
+        settings_section(ui, c, "Letter slots (advanced)");
+        settings_card(ui, c, |ui| {
+            dirty |= self.letter_slot_toggles(ui, c);
+            if self.paste_settings.letter_slots_enabled {
+                settings_card_divider(ui, c);
+                settings_card_copy(
+                    ui,
+                    c,
+                    "Copy or name",
+                    if cfg!(target_os = "macos") {
+                        "⌘C ⌘C then a letter (⌘ held) copies straight into it. For something already copied, select it in Clipd and press ⌘⌥ + the letter."
+                    } else {
+                        LETTER_KEYS
+                    },
+                );
+            }
+        });
+
         settings_section(ui, c, "Shortcuts");
         settings_card(ui, c, |ui| {
             settings_value_row(ui, c, FooterIcon::Keyboard, "Open Clipd", "Hotkey for the palette", 180.0, |ui| {
@@ -10279,7 +10422,7 @@ impl ClipdGui {
     /// Compact brand row: green "C" + Clipd · pin / settings / close.
     /// In Settings: "Clipd" + "Settings" title, close returns to the list.
     fn render_brand_header(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
-        ui.horizontal(|ui| {
+        let header = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             // The cat stays — it is the app's mark, and the reference's
             // lettered avatar is a placeholder for exactly this.
@@ -10364,6 +10507,11 @@ impl ClipdGui {
                 }
             });
         });
+        // The header is the title bar: drag it to move the window. Not over
+        // the buttons on the right (close, pin, settings), which stay buttons.
+        let r = header.response.rect;
+        let handle = egui::Rect::from_min_max(r.min, egui::pos2((r.right() - 140.0).max(r.left()), r.bottom()));
+        window_drag_zone(ui, handle, "brand_header");
     }
 
     /// The ⚙ menu beside the search field: Settings, the vault, keep on top,
@@ -10456,6 +10604,9 @@ impl ClipdGui {
         // the separate warning would be the same request twice.
         let introducing = self.render_slot_onboarding(ui, c);
         if !introducing {
+            if !self.render_letter_slots_offer(ui, c) {
+                self.render_fast_paste_offer(ui, c);
+            }
             self.render_slot_tip(ui, c);
             self.render_import_offer(ui, c);
             self.render_skill_offer(ui, c);
@@ -11145,6 +11296,8 @@ impl ClipdGui {
                 Some("try") => Some(OnboardStep::Try),
                 Some("paste") => Some(OnboardStep::Paste),
                 Some("success") => Some(OnboardStep::Success),
+                Some("faster") => Some(OnboardStep::Faster),
+                Some("letters") => Some(OnboardStep::Letters),
                 _ => None,
             };
             if let Some(step) = forced {
@@ -11249,7 +11402,7 @@ impl ClipdGui {
             OnboardStep::Idea => 0,
             OnboardStep::Permission => 1,
             OnboardStep::Try => 2,
-            OnboardStep::Paste | OnboardStep::Success => 3,
+            OnboardStep::Paste | OnboardStep::Success | OnboardStep::Letters | OnboardStep::Faster => 3,
         };
 
         egui::Frame::none()
@@ -11270,7 +11423,7 @@ impl ClipdGui {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if step != OnboardStep::Success
+                        if !matches!(step, OnboardStep::Success | OnboardStep::Letters | OnboardStep::Faster)
                             && ui
                                 .add(
                                     egui::Label::new(
@@ -11508,7 +11661,55 @@ impl ClipdGui {
                                  until you replace it.{strip}"
                             ),
                         );
+                        if primary(ui, "Next") {
+                            self.onboard = Some(OnboardStep::Letters);
+                            self.report_onboard_step(OnboardStep::Letters);
+                        }
+                    }
+                    OnboardStep::Letters => {
+                        title(ui, "Letter slots fill themselves");
+                        body(
+                            ui,
+                            &format!(
+                                "{LETTER_KEYS} E, L, P and K fill themselves with your latest \
+                                 email, link, phone number and code. An advanced extra: on now, \
+                                 off any time."
+                            ),
+                        );
+                        ui.add_space(6.0);
+                        if self.letter_slot_toggles(ui, c) {
+                            save_paste_transform_settings(&self.paste_settings);
+                        }
+                        ui.add_space(4.0);
+                        // Then the faster ways to paste — asked, never
+                        // switched on for anyone. macOS only for now.
+                        let next = if FAST_PASTE_HERE { "Next" } else { "Done" };
+                        if primary(ui, next) {
+                            self.paste_settings.letter_slots_intro_seen = true;
+                            if FAST_PASTE_HERE {
+                                save_paste_transform_settings(&self.paste_settings);
+                                self.onboard = Some(OnboardStep::Faster);
+                                self.report_onboard_step(OnboardStep::Faster);
+                            } else {
+                                self.finish_onboarding("done");
+                            }
+                        }
+                    }
+                    OnboardStep::Faster => {
+                        title(ui, "Paste without opening Clipd?");
+                        body(
+                            ui,
+                            "Three shortcuts for getting back something you copied earlier. \
+                             Each is off until you turn it on, and you can change them any time \
+                             in Settings.",
+                        );
+                        ui.add_space(6.0);
+                        if self.fast_paste_toggles(ui, c) {
+                            save_paste_transform_settings(&self.paste_settings);
+                        }
+                        ui.add_space(4.0);
                         if primary(ui, "Done") {
+                            self.paste_settings.fast_paste_offered = true;
                             self.finish_onboarding("done");
                         }
                     }
@@ -11516,6 +11717,219 @@ impl ClipdGui {
             });
         ui.add_space(8.0);
         true
+    }
+
+    /// The letter-slot switches, shared by onboarding, the one-time card and
+    /// Settings. True when one changed.
+    fn letter_slot_toggles(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> bool {
+        let mut dirty = settings_toggle_row(
+            ui,
+            c,
+            FooterIcon::Key,
+            &mut self.paste_settings.letter_slots_enabled,
+            "Letter slots A–Z",
+            LETTER_KEYS,
+        );
+        if self.paste_settings.letter_slots_enabled {
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Sparkle,
+                &mut self.paste_settings.auto_letter_slots,
+                "Fill letters automatically",
+                "E latest email · L link · P phone number · K code. Letters you name are never replaced",
+            );
+        }
+        if dirty {
+            self.paste_settings.letter_slots_intro_seen = true;
+            clipd_core::telemetry_event(
+                "letter_slot_settings",
+                &[
+                    ("enabled", self.paste_settings.letter_slots_enabled.to_string()),
+                    ("auto", self.paste_settings.auto_letter_slots.to_string()),
+                ],
+            );
+        }
+        dirty
+    }
+
+    /// For people introduced before letter slots filled themselves: one card,
+    /// once. True while it is showing, so other offers wait their turn.
+    fn render_letter_slots_offer(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> bool {
+        if self.island_surface
+            || self.paste_settings.letter_slots_intro_seen
+            || !self.paste_settings.slots_onboarding_done
+            || !self.paste_settings.letter_slots_enabled
+        {
+            return false;
+        }
+        let mut close = false;
+        let mut open_settings = false;
+        egui::Frame::none()
+            .fill(surf(c, c.bg_elevated))
+            .rounding(Rounding::same(10.0))
+            .stroke(Stroke::new(1.0, rgb(c.border)))
+            .inner_margin(Margin::symmetric(14.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("New: letter slots fill themselves")
+                        .size(13.0)
+                        .strong()
+                        .color(rgb(c.text)),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(
+                        format!(
+                            "{LETTER_KEYS} E, L, P and K fill themselves: your latest email, \
+                             link, phone number and code."
+                        ),
+                    )
+                    .size(11.5)
+                    .color(rgb(c.subtext)),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Got it").clicked() {
+                        close = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Label::new(RichText::new("Settings").size(11.5).color(rgb(c.overlay)))
+                                .sense(egui::Sense::click()),
+                        )
+                        .clicked()
+                    {
+                        open_settings = true;
+                    }
+                });
+            });
+        ui.add_space(8.0);
+        if open_settings || close {
+            self.paste_settings.letter_slots_intro_seen = true;
+            save_paste_transform_settings(&self.paste_settings);
+            clipd_core::telemetry_event(
+                "letter_slots_offer",
+                &[("action", if open_settings { "settings" } else { "got_it" }.into())],
+            );
+        }
+        if open_settings {
+            self.active_tab = MainTab::Settings;
+        }
+        true
+    }
+
+    /// The three faster-ways-to-paste switches, shared by onboarding, the
+    /// one-time offer and Settings. True when one changed.
+    fn fast_paste_toggles(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) -> bool {
+        let (switcher_title, switcher_hint) = if cfg!(target_os = "windows") {
+            (
+                "Clipboard switcher — hold Alt, tap V",
+                "Recent clips appear at your cursor; tap to move along, let go to paste. Like Alt+Tab",
+            )
+        } else {
+            (
+                "Clipboard switcher — hold ⌃, tap V",
+                "Recent clips appear at your cursor; tap to move along, let go to paste. Like ⌘Tab",
+            )
+        };
+        let mut dirty = settings_toggle_row(
+            ui,
+            c,
+            FooterIcon::Keyboard,
+            &mut self.paste_settings.switcher_enabled,
+            switcher_title,
+            switcher_hint,
+        );
+        if cfg!(target_os = "macos") {
+            settings_card_divider(ui, c);
+            dirty |= settings_toggle_row(
+                ui,
+                c,
+                FooterIcon::Eye,
+                &mut self.paste_settings.peek_enabled,
+                "Slot picker — tap ⌘ twice",
+                "Shows what's in your slots; press a letter or number to paste one. Hold ⌘ instead to just look",
+            );
+        }
+        if dirty {
+            self.paste_settings.fast_paste_offered = true;
+            clipd_core::telemetry_event(
+                "fast_paste_settings",
+                &[
+                    ("switcher", self.paste_settings.switcher_enabled.to_string()),
+                    ("peek", self.paste_settings.peek_enabled.to_string()),
+                ],
+            );
+        }
+        dirty
+    }
+
+    /// For people who were introduced before the faster ways to paste
+    /// existed: one card, once, pointing at the switches. Never turns
+    /// anything on by itself.
+    fn render_fast_paste_offer(&mut self, ui: &mut egui::Ui, c: &clipd_core::ThemeColors) {
+        if !FAST_PASTE_HERE
+            || self.island_surface
+            || self.paste_settings.fast_paste_offered
+            || !self.paste_settings.slots_onboarding_done
+        {
+            return;
+        }
+        let mut close = false;
+        let mut open_settings = false;
+        egui::Frame::none()
+            .fill(surf(c, c.bg_elevated))
+            .rounding(Rounding::same(10.0))
+            .stroke(Stroke::new(1.0, rgb(c.border)))
+            .inner_margin(Margin::symmetric(14.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("New: paste without opening Clipd")
+                        .size(13.0)
+                        .strong()
+                        .color(rgb(c.text)),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(if cfg!(target_os = "windows") {
+                        "A switcher at your cursor: hold Alt, tap V to go through recent clips, \
+                         let go to paste. Off until you choose."
+                    } else {
+                        "A switcher at your cursor (hold ⌃, tap V), and a picker for your slots \
+                         (tap ⌘ twice). Both off until you choose."
+                    })
+                    .size(11.5)
+                    .color(rgb(c.subtext)),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Choose…").clicked() {
+                        open_settings = true;
+                    }
+                    if ui
+                        .add(egui::Label::new(RichText::new("Not now").size(11.5).color(rgb(c.overlay))).sense(egui::Sense::click()))
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+        ui.add_space(8.0);
+        if open_settings || close {
+            self.paste_settings.fast_paste_offered = true;
+            save_paste_transform_settings(&self.paste_settings);
+            clipd_core::telemetry_event(
+                "fast_paste_offer",
+                &[("action", if open_settings { "choose" } else { "dismiss" }.into())],
+            );
+        }
+        if open_settings {
+            self.active_tab = MainTab::Settings;
+        }
     }
 
     /// One quiet line, earned by behaviour: shown only after a burst of
@@ -11629,6 +12043,9 @@ impl ClipdGui {
                     // brand the window keeps, small and a little faded so it
                     // reads as the field's glyph rather than a logo.
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
+                    // The cat doubles as the palette's handle: the rest of
+                    // the bar is the search field.
+                    window_drag_zone(ui, rect, "search_cat");
                     if let Some(tex) = clipd_cat_texture(ui.ctx()) {
                         let size = tex.size_vec2();
                         let scale = (rect.width() / size.x).min(rect.height() / size.y);
@@ -11738,7 +12155,22 @@ impl ClipdGui {
         // Left — the keys that work right now, while typing in the search:
         // the whole window can be used without the mouse, and this is where
         // that is learned (Spotlight's lesson, Raycast's footer).
-        if self.active_tab == MainTab::Text {
+        let note = self
+            .footer_note
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_millis(3500))
+            .map(|(text, _)| text.clone());
+        if note.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
+        if let (Some(note), MainTab::Text) = (note, self.active_tab) {
+            let left = egui::Rect::from_min_size(rect.min, egui::vec2(full_w * 0.95, row_h));
+            ui.allocate_ui_at_rect(left, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(note).size(12.5).color(rgb(c.text)));
+                });
+            });
+        } else if self.active_tab == MainTab::Text {
             let left = egui::Rect::from_min_size(rect.min, egui::vec2(full_w * 0.72, row_h));
             ui.allocate_ui_at_rect(left, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -13350,7 +13782,7 @@ impl ClipdGui {
                     c,
                     &mut self.paste_settings.letter_slots_enabled,
                     "Letter slots A-Z",
-                    "Adds 26 letter slots: Ctrl+Option+C then A-Z copies to slots 31-56, Ctrl+Option+V then A-Z pastes them.",
+                    "26 slots you reach by letter. E, L, P and K fill themselves (email, link, phone, code); name any clip with ⌘⌥ + a letter in Clipd. Copy into one with ⌘C ⌘C then the letter; paste with Ctrl+Option + the letter.",
                 ) {
                     save_paste_transform_settings(&self.paste_settings);
                 }
@@ -13453,8 +13885,12 @@ impl ClipdGui {
                     ui,
                     c,
                     &mut self.paste_settings.multi_slot_enabled,
-                    "Multi-slot copy/paste (slots 1-9)",
-                    "Cmd+C x2 copies to slot 2, Cmd+V x2 pastes it, and so on. Off = Cmd+C/Cmd+V behave normally.",
+                    "Multi-slot copy/paste (slots 1-30)",
+                    if cfg!(target_os = "macos") {
+                        "Cmd+C x2 copies to slot 2, Cmd+V x2 pastes it, and so on. While tapping Cmd+V, keep Cmd held and press a slot's key (K, or 1 2 for 12) to jump there. Off = Cmd+C/Cmd+V behave normally."
+                    } else {
+                        "Cmd+C x2 copies to slot 2, Cmd+V x2 pastes it, and so on. Off = Cmd+C/Cmd+V behave normally."
+                    },
                 ) {
                     save_paste_transform_settings(&self.paste_settings);
                 }
@@ -14416,9 +14852,12 @@ fn sync_active_slot_labels(
 ) -> HashMap<String, Vec<u8>> {
     let active = store.list_active_slots().unwrap_or_default();
     let mut all_slots: HashMap<String, Vec<u8>> = HashMap::new();
-    // 1-9 only: those are the slots ⌘V ×N reaches, and the only ones a row's
-    // badge can tell you how to paste.
-    for (slot, content) in active.iter().filter(|(slot, _)| (1..=9).contains(slot)) {
+    // Numbered slots 1-30 (all reachable with ⌘V ×N), then letter slots:
+    // listed after the numbers everywhere slots are shown.
+    for (slot, content) in active
+        .iter()
+        .filter(|(slot, _)| (1..=30).contains(slot) || (31..=56).contains(slot))
+    {
         all_slots.entry(content.clone()).or_default().push(*slot);
     }
     for slots in all_slots.values_mut() {
@@ -15605,6 +16044,20 @@ mod slot_strip_tests {
         let rows = strip_rows_from_store(&[(1, long)], &[], |_| None);
         let preview = &rows[0].1.as_ref().unwrap().1;
         assert!(preview.ends_with('…') && preview.chars().count() <= 60, "{preview}");
+    }
+
+    #[test]
+    fn filled_letter_slots_follow_the_numbers() {
+        // E (35) and H (38) hold something; the rest of the letters are empty
+        // and stay out of the strip.
+        let active = vec![(2, "two".to_string()), (38, "h".to_string()), (35, "e".to_string())];
+        let rows = strip_rows_from_store(&active, &[], |_| None);
+        let order: Vec<u8> = rows.iter().map(|(n, _)| *n).collect();
+        assert_eq!(order, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 35, 38]);
+        assert_eq!(slot_chord('V', 35), "⌃⌥E");
+        assert_eq!(slot_chord('C', 38), "⌘C ⌘C H");
+        assert_eq!(slot_paste_keys(&[2, 35]), "⌘V ×2 or ⌃⌥E pastes it");
+        assert!(slot_chip_hint(38, Some("h"), "paste").starts_with("Slot H: h"));
     }
 
     #[test]

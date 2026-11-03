@@ -65,6 +65,12 @@ pub fn capture() {
     }
 }
 
+/// Where the text cursor is right now, read directly. For overlays drawn by
+/// the daemon itself, which has the Accessibility trust to ask.
+pub fn current() -> Option<CaretRect> {
+    read_caret()
+}
+
 /// The caret captured for this summon, if any. Taking it removes it: one
 /// summon, one placement.
 pub fn take_fresh() -> Option<CaretRect> {
