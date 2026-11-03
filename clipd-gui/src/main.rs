@@ -2455,7 +2455,7 @@ impl OnboardStep {
 const LETTER_KEYS: &str = if cfg!(target_os = "windows") {
     "Copy into a letter: Ctrl+C Ctrl+C, then the letter. Paste: Ctrl+V Ctrl+V then the letter, or Ctrl+` then the letter."
 } else {
-    "Copy into a letter: ⌘C ⌘C, then the letter (keep ⌘ held). Paste: ⌃⌥ + the letter."
+    "Copy into a letter: ⌘C ⌘C, then the letter. Paste: ⌃⌥ + the letter, or ⌘V ⌘V then the letter with ⌘ still held."
 };
 
 /// Whether the faster ways to paste exist here: the switcher on macOS and
@@ -13886,7 +13886,11 @@ impl ClipdGui {
                     c,
                     &mut self.paste_settings.multi_slot_enabled,
                     "Multi-slot copy/paste (slots 1-30)",
-                    "Cmd+C x2 copies to slot 2, Cmd+V x2 pastes it, and so on. Off = Cmd+C/Cmd+V behave normally.",
+                    if cfg!(target_os = "macos") {
+                        "Cmd+C x2 copies to slot 2, Cmd+V x2 pastes it, and so on. While tapping Cmd+V, keep Cmd held and press a slot's key (K, or 1 2 for 12) to jump there. Off = Cmd+C/Cmd+V behave normally."
+                    } else {
+                        "Cmd+C x2 copies to slot 2, Cmd+V x2 pastes it, and so on. Off = Cmd+C/Cmd+V behave normally."
+                    },
                 ) {
                     save_paste_transform_settings(&self.paste_settings);
                 }

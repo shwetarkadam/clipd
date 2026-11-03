@@ -105,6 +105,7 @@ Enable this in **Paste Settings → Slot Input Mode**.
 | Copy to slots 1–30 | `Cmd+C` × N |
 | Paste slot 1 | `Cmd+V` |
 | Paste from slots 2–30 | `Cmd+V` × N |
+| Jump to any slot while pasting | `Cmd+V` `Cmd+V`, keep `Cmd` held, then the slot's key (`K`, or `1` `2` for 12) |
 | Copy to slots 11–30 | `Option+C` × N |
 | Paste from slots 11–30 | `Option+V` × N |
 | Paste next queued slot | `Cmd+Option+V` |

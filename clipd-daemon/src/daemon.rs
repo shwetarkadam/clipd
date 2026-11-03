@@ -97,6 +97,14 @@ const LETTER_PREFIX_WINDOW: Duration = Duration::from_millis(2000);
 /// to the letter.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const LETTER_AFTER_DOUBLE_COPY: Duration = Duration::from_millis(1500);
+/// While jumping during ⌘V ⌘V, how long after one digit a second still makes
+/// a two-digit slot (1 then 2 → 12).
+#[cfg(target_os = "macos")]
+const JUMP_SECOND_DIGIT: Duration = Duration::from_millis(700);
+/// How long after the last ⌘V tap a jump key is still taken, ⌘ held. ⌘ let
+/// go ends it sooner.
+#[cfg(target_os = "macos")]
+const JUMP_AFTER_PASTE: Duration = Duration::from_millis(3000);
 /// Ignore duplicate key events faster than this (macOS key-repeat / missing KeyRelease on C/V).
 const TAP_DEBOUNCE: Duration = Duration::from_millis(65);
 
@@ -732,6 +740,10 @@ pub fn run_daemon_with_stop(
         // Whether a paste is showing in the person's app that the next tap
         // should replace (the native one from tap 1, or our last swap).
         let mut cmd_v_showing = false;
+        // When the last ⌘V ×N paste settled, so a jump just after it still
+        // knows there is a paste on screen to replace.
+        #[cfg(target_os = "macos")]
+        let mut last_multi_paste_at: Option<Instant> = None;
         // The slot filled on the latest ⌘C tap, and what it held before.
         let mut cmd_c_live: Option<LiveCopy> = None;
 
@@ -1028,6 +1040,30 @@ pub fn run_daemon_with_stop(
                             None => log::warn!("⌘C ⌘C + letter: nothing on the clipboard to keep"),
                         }
                     }
+                    HotkeyTick::PasteJump(slot) => {
+                        // The paste on screen is the last tap's; this one
+                        // replaces it. If that paste has already settled
+                        // (its window closed and the clipboard was handed
+                        // back), it is still there to replace: start a new
+                        // round so the clipboard is handed back again after.
+                        let now = Instant::now();
+                        if cmd_v_taps < 2 {
+                            cmd_v_saved_clipboard = clipd_core::pasteboard::read_text();
+                            cmd_v_showing = last_multi_paste_at
+                                .is_some_and(|at| now.duration_since(at) < Duration::from_secs(4));
+                            cmd_v_live = None;
+                            cmd_v_taps = 2;
+                        }
+                        cmd_v_deadline = Some(now + TAP_WINDOW);
+                        suppress.store(true, Ordering::SeqCst);
+                        log::info!("⌨️  ⌘V jump → slot {}", clipd_core::slot_badge(slot));
+                        show_slot_notification("Paste", slot);
+                        if let Some(text) = paste_slot_live(slot, cmd_v_showing, &hotkey_slot_mgr) {
+                            cmd_v_showing = true;
+                            cmd_v_live = Some((slot, text));
+                        }
+                        clipd_core::telemetry_event("paste_jump", &[]);
+                    }
                     HotkeyTick::PickerOpen => {
                         peek_deadline = None;
                         let clipboard = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
@@ -1181,6 +1217,10 @@ pub fn run_daemon_with_stop(
                         // The paste already happened, on its tap. What is left
                         // is bookkeeping, and handing the clipboard back.
                         if let Some((slot, text)) = cmd_v_live.take() {
+                            #[cfg(target_os = "macos")]
+                            {
+                                last_multi_paste_at = Some(now);
+                            }
                             clipd_core::record_slot_paste(slot);
                             log::info!("📋 Pasted from slot {} on its tap: {}", slot, truncate(&text, 40));
                             #[cfg(target_os = "macos")]
@@ -1422,6 +1462,7 @@ enum HotkeyTick {
     PeekChoose(u8),          // a slot's key picked in the peek or the picker
     PickerOpen,              // ⌘ tapped twice
     CopyTapsToLetter(u8),    // ⌘C ⌘C then a letter, ⌘ still held: copy to that letter slot
+    PasteJump(u8),           // ⌘V ⌘V, ⌘ still held, then a slot's key: paste that slot instead
 
 }
 
@@ -5155,6 +5196,13 @@ fn start_macos_hotkey_listener(
         /// Until when the next key, if it is a letter, takes the copy just
         /// made with ⌘C ⌘C into that letter slot.
         copy_letter_until: Option<Instant>,
+        /// After ⌘V ⌘V, while ⌘ stays down: until when a slot's key jumps
+        /// the paste to that slot.
+        paste_jump_until: Option<Instant>,
+        /// The first digit of a possible two-digit jump, and when.
+        jump_digit: Option<(u8, Instant)>,
+        /// The jump key still held, so its key repeat is not passed on.
+        jump_key_down: Option<RKey>,
         peek_armed: bool,
     }
 
@@ -5201,6 +5249,9 @@ fn start_macos_hotkey_listener(
         last_cmd_c_press_at: None,
         c_key_down: false,
         copy_letter_until: None,
+        paste_jump_until: None,
+        jump_digit: None,
+        jump_key_down: None,
         peek_armed: false,
     });
 
@@ -5264,6 +5315,37 @@ fn start_macos_hotkey_listener(
                 // Any other key ends a half-finished double-tap, so Option used
                 // as an ordinary modifier never drifts into arming the gesture.
                 s.opt_last_tap = None;
+
+                // ⌘V ⌘V …, ⌘ still held, then a slot's key: jump the paste
+                // straight to that slot — K for letter K, 1 then 2 for slot 12
+                // — instead of tapping V on through thirty slots. Only while
+                // ⌘ stays down after clipd's own multi-tap, so no ordinary ⌘
+                // shortcut is taken; letting go of ⌘ ends it.
+                if s.jump_key_down == Some(key) {
+                    return None;
+                }
+                if key != RKey::KeyV {
+                    if let Some(until) = s.paste_jump_until {
+                        let now = Instant::now();
+                        let target = if now <= until && is_cmd_only(&s.pressed_mods) {
+                            jump_target(key, &mut s.jump_digit, now)
+                        } else {
+                            None
+                        };
+                        match target {
+                            Some(slot) => {
+                                s.paste_jump_until = Some(now + JUMP_AFTER_PASTE);
+                                s.jump_key_down = Some(key);
+                                let _ = tx.send(HotkeyTick::PasteJump(slot));
+                                return None;
+                            }
+                            None => {
+                                s.paste_jump_until = None;
+                                s.jump_digit = None;
+                            }
+                        }
+                    }
+                }
 
                 // ⌘C ⌘C, then a letter: the copy goes in that letter slot.
                 // ⌘ may still be held or already let go — people do both, and
@@ -5751,15 +5833,9 @@ fn start_macos_hotkey_listener(
                 }
                 // Cmd+V (just Cmd, no Ctrl/Shift/Option)
                 if is_cmd_only(&s.pressed_mods) && key == RKey::KeyV {
-                    // Deliberately no ⌘V ⌘V letter arming here.
-                    //
-                    // ⌘V ×2 already means "paste slot 2", and unlike the copy
-                    // side that clash cannot be deferred: a double ⌘C can hold
-                    // its numeric commit for half a second and let a following
-                    // letter cancel it, but a paste has already put the content
-                    // into your app by then. There is nothing left to take
-                    // back. Letter paste stays on Ctrl+Option+letter, which is
-                    // one chord, no timing, and collides with nothing.
+                    // A slot's key after ⌘V ⌘V (⌘ held) jumps to that slot:
+                    // see the jump above. Each tap's paste replaces the last,
+                    // so a jump can replace it too.
                     let _ = tx.send(HotkeyTick::CmdVTap);
                     // A ⌘V that continues a multi-tap is not a paste of the
                     // clipboard: the daemon pastes the slot for this count
@@ -5771,6 +5847,10 @@ fn start_macos_hotkey_listener(
                         .is_some_and(|prev| now.duration_since(prev) < TAP_WINDOW)
                         && load_paste_transform_settings().multi_slot_enabled;
                     s.cmd_v_last_press = Some(now);
+                    if continues {
+                        s.paste_jump_until = Some(now + JUMP_AFTER_PASTE);
+                        s.jump_digit = None;
+                    }
                     return if continues { None } else { Some(event) };
                 }
 
@@ -5789,6 +5869,13 @@ fn start_macos_hotkey_listener(
                 }
             }
             EventType::KeyRelease(key) => {
+                if s.jump_key_down == Some(key) {
+                    s.jump_key_down = None;
+                }
+                if matches!(key, RKey::MetaLeft | RKey::MetaRight) {
+                    s.paste_jump_until = None;
+                    s.jump_digit = None;
+                }
                 if is_modifier_key(key) {
                     s.pressed_mods.remove(&key);
                     // The chord is off the keyboard — a deferred letter paste
@@ -5932,6 +6019,7 @@ fn start_macos_hotkey_listener(
             EventType::ButtonPress(_) => {
                 s.cmd_clean = false;
                 s.copy_letter_until = None;
+                s.paste_jump_until = None;
                 s.last_bare_cmd_tap = None;
                 if s.picker_until.take().is_some() {
                     let _ = tx.send(HotkeyTick::PeekCancel);
@@ -6315,6 +6403,48 @@ fn key_to_digit_slot(key: RKey) -> Option<u8> {
     }
 }
 
+/// The slot a key jumps to during ⌘V ⌘V: a letter's slot, or a number. A
+/// second digit soon after the first makes a two-digit slot up to 30 (1, 2 →
+/// 12); otherwise each digit is its own slot. C and V are not letters here:
+/// ⌘C and ⌘V stay copy and paste.
+#[cfg(target_os = "macos")]
+fn jump_target(key: RKey, first_digit: &mut Option<(u8, Instant)>, now: Instant) -> Option<u8> {
+    let digit = match key {
+        RKey::Num0 => Some(0),
+        other => key_to_digit_slot(other),
+    };
+    if let Some(d) = digit {
+        if let Some(n) = two_digit_slot(first_digit.take(), d, now) {
+            return Some(n);
+        }
+        if d == 0 {
+            return None;
+        }
+        *first_digit = Some((d, now));
+        return Some(d);
+    }
+    *first_digit = None;
+    if !fast_on(FAST_LETTERS) {
+        return None;
+    }
+    let letter = rdev::code_from_key(key)
+        .and_then(|code| clipd_core::keyboard_layout::typed_char(code, false))
+        .filter(char::is_ascii_alphabetic)
+        .or_else(|| key_to_letter_slot(key).map(|(_, _, letter)| letter))
+        .filter(|c| !matches!(c.to_ascii_lowercase(), 'c' | 'v'))?;
+    clipd_core::auto_letters::letter_slot(letter)
+}
+
+/// The slot two digits make, when the second came soon enough after the
+/// first and the number is one of 10..=30.
+#[cfg(target_os = "macos")]
+fn two_digit_slot(first: Option<(u8, Instant)>, second: u8, now: Instant) -> Option<u8> {
+    first
+        .filter(|(_, at)| now.duration_since(*at) <= JUMP_SECOND_DIGIT)
+        .map(|(first, _)| first * 10 + second)
+        .filter(|n| (10..=LAST_NUMBERED_SLOT).contains(n))
+}
+
 #[cfg(target_os = "macos")]
 fn key_to_letter_slot(key: RKey) -> Option<(u8, usize, char)> {
     let idx = match key {
@@ -6640,6 +6770,20 @@ mod slot_mapping_tests {
         assert_eq!(key_to_letter_slot(RKey::KeyM), Some((43, 12, 'M')));
         assert_eq!(key_to_letter_slot(RKey::KeyZ), Some((56, 25, 'Z')));
         assert_eq!(key_to_letter_slot(RKey::Num1), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_digits_make_slots_ten_to_thirty() {
+        let t = Instant::now();
+        let soon = t + Duration::from_millis(300);
+        let late = t + JUMP_SECOND_DIGIT + Duration::from_millis(1);
+        assert_eq!(two_digit_slot(Some((1, t)), 2, soon), Some(12));
+        assert_eq!(two_digit_slot(Some((3, t)), 0, soon), Some(30));
+        assert_eq!(two_digit_slot(Some((2, t)), 0, soon), Some(20));
+        assert_eq!(two_digit_slot(Some((3, t)), 1, soon), None, "31 is A, not a number");
+        assert_eq!(two_digit_slot(Some((1, t)), 2, late), None, "too slow: just 2");
+        assert_eq!(two_digit_slot(None, 4, soon), None);
     }
 
     #[cfg(target_os = "macos")]
